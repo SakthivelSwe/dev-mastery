@@ -1,0 +1,249 @@
+# =============================================================
+# DevMastery — Local Development Infrastructure
+# All services are 100% free & open source.
+#
+# Usage:
+#   npm run infra:up      → Start all services
+#   npm run infra:down    → Stop all services
+#   npm run infra:status  → Check health status
+#   npm run infra:logs    → Follow logs
+# =============================================================
+
+services:
+
+  # ─── PostgreSQL 16 ────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: devmastery-postgres
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: devmastery
+      POSTGRES_USER: devmastery
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devmastery_dev_secret}
+      POSTGRES_HOST_AUTH_METHOD: trust
+      # Create additional databases for judge0 and glitchtip
+      POSTGRES_MULTIPLE_DATABASES: devmastery,judge0
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devmastery -d devmastery"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─── Valkey 7.x (Redis-compatible, Apache 2.0) ────────────
+  # Valkey is the Linux Foundation fork of Redis — drop-in replacement.
+  # spring-data-redis connects to Valkey without any code change.
+  valkey:
+    image: valkey/valkey:7-alpine
+    container_name: devmastery-valkey
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    command: valkey-server --appendonly yes --save 60 1
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ─── OpenSearch 2.x (Apache 2.0) ──────────────────────────
+  # AWS fork of Elasticsearch — identical REST API, fully free.
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: devmastery-opensearch
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ─── Apache Kafka 3.7 (KRaft mode — no Zookeeper) ─────────
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: devmastery-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ─── MinIO (S3-compatible, AGPL 3.0) ──────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: devmastery-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console UI (http://localhost:9001)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-devmastery_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-devmastery_minio_secret_32chars}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Judge0 CE — Self-hosted Code Execution (Apache 2.0) ──
+  # Provides sandboxed code execution for Java, Python, JS, Kotlin, SQL.
+  # Unlimited executions — no API key, no rate limit.
+  judge0-server:
+    image: judge0/judge0:1.13.1
+    container_name: devmastery-judge0-server
+    restart: unless-stopped
+    ports:
+      - "2358:2358"
+    environment:
+      REDIS_URL: redis://valkey:6379/1
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: devmastery
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devmastery_dev_secret}
+      POSTGRES_DB: judge0
+      RAILS_ENV: production
+      SECRET_KEY_BASE: judge0_dev_secret_key_base_change_in_prod
+    privileged: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  judge0-workers:
+    image: judge0/judge0:1.13.1
+    container_name: devmastery-judge0-workers
+    restart: unless-stopped
+    command: ["./scripts/workers"]
+    environment:
+      REDIS_URL: redis://valkey:6379/1
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: devmastery
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devmastery_dev_secret}
+      POSTGRES_DB: judge0
+      RAILS_ENV: production
+      SECRET_KEY_BASE: judge0_dev_secret_key_base_change_in_prod
+    privileged: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  # ─── HashiCorp Vault Community (secrets management) ───────
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: devmastery-vault
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-devmastery-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    command: server -dev
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://localhost:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Prometheus (metrics collection) ──────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: devmastery-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+
+  # ─── Grafana (dashboards & alerting) ──────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: devmastery-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-devmastery_grafana}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+# ─── Named Volumes (persistent data) ────────────────────────
+volumes:
+  postgres-data:
+    name: devmastery-postgres-data
+  valkey-data:
+    name: devmastery-valkey-data
+  opensearch-data:
+    name: devmastery-opensearch-data
+  kafka-data:
+    name: devmastery-kafka-data
+  minio-data:
+    name: devmastery-minio-data
+  prometheus-data:
+    name: devmastery-prometheus-data
+  grafana-data:
+    name: devmastery-grafana-data
