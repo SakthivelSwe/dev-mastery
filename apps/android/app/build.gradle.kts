@@ -17,10 +17,10 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = rootProject.file("devmastery.jks")
-            storePassword = "devmastery123"
-            keyAlias = "devmastery"
-            keyPassword = "devmastery123"
+            storeFile = file(System.getenv("SIGNING_STORE_FILE") ?: rootProject.file("devmastery.jks"))
+            storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: "devmastery123"
+            keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: "devmastery"
+            keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: "devmastery123"
         }
     }
 
