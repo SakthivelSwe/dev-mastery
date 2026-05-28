@@ -1,0 +1,149 @@
+---
+slug: "grpc-spring"
+title: "gRPC with Spring Boot"
+level: 5
+---
+
+## WHY
+REST APIs using JSON over HTTP/1.1 are great for web browsers. But JSON is terribly inefficient for backend-to-backend microservice communication.
+JSON is plain text. A number like `123456789` takes 9 bytes. You have to send the field names (`"age": 25`) over and over again in every request. Parsing JSON takes heavy CPU power.
+If Microservice A calls Microservice B 10,000 times a second, JSON is a massive bottleneck.
+**gRPC** (developed by Google) is a high-performance RPC framework. It uses **Protocol Buffers (Protobuf)**, which serializes data into pure, compressed binary formats over incredibly fast HTTP/2 connections. It is strictly typed, automatically generates your Java client/server code, and is up to 10x faster than standard JSON REST APIs!
+
+## THEORY
+### Protocol Buffers (.proto files)
+In REST, you write Java DTOs. In gRPC, you write a `.proto` file.
+This file is language-agnostic. You define your messages and services in this file. Then, a compiler generates the actual Java classes (or Python, or Go) for you!
+
+### RPC (Remote Procedure Call)
+Unlike REST, which focuses on "Resources" (GET `/users/1`), gRPC focuses on "Actions". You are literally calling a method on a remote server exactly as if it were a local Java function: `userService.getUser(request)`.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "grpc-binary-flow" }
+```
+
+## CODE
+
+Spring Boot doesn't have official native gRPC starters (yet), so we rely on the incredibly popular community library `grpc-spring-boot-starter`.
+
+### 1. The .proto File
+You create a file `src/main/proto/calculator.proto`. Notice there is no Java code here!
+
+```protobuf
+syntax = "proto3";
+
+// Where should the auto-generated Java code be placed?
+option java_package = "com.example.grpc";
+option java_multiple_files = true;
+
+// Define the API Service (The interface)
+service CalculatorService {
+    // Defines a method that takes a Request and returns a Response
+    rpc Add (AdditionRequest) returns (AdditionResponse);
+}
+
+// Define the exact binary structure of the Request
+message AdditionRequest {
+    int32 number_a = 1; // The '1' is a binary positional tag, NOT the value!
+    int32 number_b = 2;
+}
+
+// Define the exact binary structure of the Response
+message AdditionResponse {
+    int32 result = 1;
+}
+```
+*Note: You run `mvn compile`. A special Maven plugin reads this file and auto-generates massive, complex Java classes for `AdditionRequest` and a base class for `CalculatorService`!*
+
+### 2. The Spring Boot Server (Provider)
+Now we implement the generated interface in our Spring Boot app to handle incoming gRPC requests.
+
+```java
+import com.example.grpc.AdditionRequest;
+import com.example.grpc.AdditionResponse;
+import com.example.grpc.CalculatorServiceGrpc;
+import io.grpc.stub.StreamObserver;
+import net.devh.boot.grpc.server.service.GrpcService;
+
+// This magic annotation registers this class as a gRPC Server endpoint!
+@GrpcService
+public class CalculatorServiceImpl extends CalculatorServiceGrpc.CalculatorServiceImplBase {
+
+    @Override
+    public void add(AdditionRequest request, StreamObserver<AdditionResponse> responseObserver) {
+        
+        // 1. Extract the typed data from the auto-generated Request object
+        int a = request.getNumberA();
+        int b = request.getNumberB();
+        int sum = a + b;
+
+        // 2. Build the auto-generated Response object
+        AdditionResponse response = AdditionResponse.newBuilder()
+                .setResult(sum)
+                .build();
+
+        // 3. Send the binary response back to the client!
+        responseObserver.onNext(response);
+        
+        // 4. Close the HTTP/2 connection stream!
+        responseObserver.onCompleted();
+    }
+}
+```
+
+### 3. The Spring Boot Client (Consumer)
+If Microservice B needs to call Microservice A, it uses an auto-generated "Stub".
+
+```java
+import com.example.grpc.AdditionRequest;
+import com.example.grpc.AdditionResponse;
+import com.example.grpc.CalculatorServiceGrpc;
+import net.devh.boot.grpc.client.inject.GrpcClient;
+import org.springframework.stereotype.Service;
+
+@Service
+public class MathClientService {
+
+    // Injects an HTTP/2 client pointing to the remote gRPC server!
+    @GrpcClient("calculator-server")
+    private CalculatorServiceGrpc.CalculatorServiceBlockingStub calculatorStub;
+
+    public int performRemoteAddition(int a, int b) {
+        // Build the request
+        AdditionRequest request = AdditionRequest.newBuilder()
+                .setNumberA(a)
+                .setNumberB(b)
+                .build();
+
+        // MAKE THE REMOTE NETWORK CALL!
+        // To the developer, it looks exactly like a local method call!
+        AdditionResponse response = calculatorStub.add(request);
+
+        return response.getResult();
+    }
+}
+```
+
+## REAL_WORLD
+**Streaming (The True Power of gRPC)**
+REST is strictly Request/Response. You ask for data, you wait, you get data.
+Because gRPC uses HTTP/2, it supports **Bidirectional Streaming** out of the box!
+Imagine an Uber clone where the driver's phone is constantly sending GPS coordinates, and the server is constantly sending route updates.
+In gRPC, you define it like this: `rpc StreamGPS (stream Location) returns (stream RouteUpdate);`
+The client and server open a single, persistent HTTP/2 connection. Both sides can fire binary messages at each other continuously, asynchronously, and concurrently for hours without ever closing the connection! This is impossible in standard REST and vastly outperforms WebSockets!
+
+## INTERVIEW
+**Q: You have a `User.proto` file. A message is defined as: `message User { string name = 1; int32 age = 2; }`. This has been running in production for a year. The business requires a change: they want to rename the `name` field to `full_name`, and they want to delete the `age` field entirely. How do you safely update the `.proto` file without breaking older microservices that haven't been deployed yet?**
+A: **You can rename fields freely, but you must NEVER change or reuse the integer Tags!**
+The magic of Protobuf's speed is that it *does not send field names over the network*. It only sends the integer tag (1, 2) and the raw binary value.
+Therefore, renaming `string name = 1;` to `string full_name = 1;` is 100% backward compatible! The old clients looking for "name" and new clients looking for "full_name" both just look at Tag 1 in the binary stream!
+However, deleting fields requires extreme caution. If you delete `int32 age = 2;`, you must guarantee that nobody EVER uses the number `2` again. If a developer later comes along and adds `string email = 2;`, older clients will receive the string email, assume it is an integer age (because it's on Tag 2), and completely crash with a parsing error!
+*The Fix:* If you delete a field, you must reserve its tag number forever:
+```protobuf
+message User {
+    string full_name = 1;
+    reserved 2; // Prevents any future developer from ever reusing tag 2!
+    reserved "age"; // Prevents reusing the name
+}
+```

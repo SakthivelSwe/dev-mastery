@@ -1,0 +1,131 @@
+---
+slug: "pagination-api"
+title: "API Pagination"
+level: 3
+---
+
+## WHY
+If your database has 10 million users, and a mobile app calls `GET /users`, what happens? The database tries to load 10 million rows into RAM, the server crashes, and the API goes down. Even if it survived, the mobile app would freeze trying to download a 5GB JSON response. 
+
+**Pagination** is mandatory for any API that returns a list of items. It breaks the data into small, manageable chunks (pages) that the client can request one at a time.
+
+## THEORY
+### The Two Main Types of Pagination
+1. **Offset-Based Pagination:** The classic approach using `page` and `limit`. (e.g., "Give me 50 items, skipping the first 100").
+2. **Cursor-Based Pagination:** The modern approach for infinite scrolling. Uses a pointer (cursor) to say "Give me the 50 items that come *after* this specific item".
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "pagination-api" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Offset-Based Pagination)
+This is the easiest to implement and the easiest for clients to understand.
+
+```text
+The API Request:
+GET /users?page=3&limit=20
+(or sometimes written as `?offset=40&limit=20`)
+
+The API Response:
+{
+  "data": [
+    { "id": 41, "name": "User 41" },
+    // ... 19 more users
+  ],
+  "meta": {
+    "total_records": 1500,
+    "current_page": 3,
+    "total_pages": 75,
+    "limit": 20
+  }
+}
+```
+**Database Implementation (SQL):**
+```sql
+SELECT * FROM users ORDER BY id ASC LIMIT 20 OFFSET 40;
+```
+
+### Level 2 — Building Blocks (The Problems with Offset)
+Offset pagination is great for UI with specific page numbers (`[<] 1 2 3 [4] 5 [>]`), but it has two massive flaws:
+
+**1. Performance degradation at scale:**
+When you ask the database for `OFFSET 100000 LIMIT 20`, the database DOES NOT just jump to row 100,000. It must scan and discard the first 100,000 rows before returning the 20! Deep pagination is incredibly slow in standard SQL.
+
+**2. Data drift (Missing/Duplicate items):**
+Imagine a user is on Page 1 (items 1-10) of a Twitter feed. While they are reading, a new tweet is inserted at the top. Everything shifts down. When the user clicks "Page 2" (requesting items 11-20), item 10 has shifted into position 11. The user will see item 10 *again* on Page 2!
+
+### Level 3 — Intermediate (Cursor-Based Pagination)
+Cursor-based pagination (or Keyset Pagination) solves both performance and data drift problems. It is the industry standard for infinite scrolling (Instagram, Twitter, Facebook).
+
+Instead of "Skip 40 items", you say "Get items that come *after* ID 40".
+
+```text
+The Initial Request:
+GET /users?limit=20
+
+The Response:
+{
+  "data": [
+    { "id": 1, "name": "User 1" },
+    // ... 
+    { "id": 20, "name": "User 20" }
+  ],
+  "meta": {
+    "next_cursor": "MjA=" // (Usually a Base64 encoded string representing ID 20)
+  }
+}
+
+The Next Request (The client passes the cursor back!):
+GET /users?limit=20&cursor=MjA=
+```
+
+**Database Implementation (SQL):**
+```sql
+-- Assuming the cursor "MjA=" decodes to ID 20
+-- The database uses an INDEX to instantly jump to ID > 20. 
+-- No scanning required! It takes 1ms whether it's page 1 or page 10,000.
+SELECT * FROM users WHERE id > 20 ORDER BY id ASC LIMIT 20;
+```
+
+### Level 4 — Advanced (Complex Cursors)
+What if you aren't sorting by a unique ID? What if you are sorting by `created_at` date? Dates are not unique (multiple users can be created at the exact same millisecond). If you use `WHERE created_at < '2023-10-01'`, you might skip users!
+
+To build a robust cursor, the cursor must contain a **tie-breaker** (a combination of the sort field AND a unique identifier).
+
+```sql
+-- The cursor encodes BOTH the timestamp and the unique ID.
+-- Example: Cursor decodes to { created_at: '2023-10-01 10:00', id: 45 }
+
+SELECT * FROM users 
+WHERE (created_at < '2023-10-01 10:00') 
+   OR (created_at = '2023-10-01 10:00' AND id > 45)
+ORDER BY created_at DESC, id ASC 
+LIMIT 20;
+```
+This guarantees you never miss a row and never duplicate a row, regardless of how fast data is being inserted or deleted!
+
+## REAL_WORLD
+**HATEOAS Links for Pagination**
+Many enterprise APIs don't force the client to construct the next URL or parse cursors. They simply provide full URLs in the response body (or in the `Link` HTTP header) following HATEOAS principles.
+
+```json
+// Example from GitHub API
+{
+  "data": [ ... ],
+  "links": {
+    "next": "https://api.github.com/users?since=34&limit=20",
+    "prev": null
+  }
+}
+```
+The client just looks for `links.next` and fetches it. They don't even need to know if the API is using Offset or Cursor pagination under the hood!
+
+## INTERVIEW
+**Q: When would you choose Offset pagination over Cursor pagination?**
+A: Offset pagination is required when the UI needs to display total page numbers and allow the user to jump to a specific page (e.g., jumping directly to Page 7 of an e-commerce catalog). Cursor pagination cannot calculate "total pages" and cannot jump to an arbitrary page (because you must know the cursor of Page 6 to get to Page 7).
+
+**Q: Why do we Base64 encode the cursor?**
+A: To make it opaque. The client should not know that the cursor represents an internal database ID or a timestamp. By making it opaque, the backend is free to completely rewrite the pagination logic (e.g., migrating from MySQL to DynamoDB) without breaking the client, because the client just treats the cursor as a meaningless string of characters to pass back.

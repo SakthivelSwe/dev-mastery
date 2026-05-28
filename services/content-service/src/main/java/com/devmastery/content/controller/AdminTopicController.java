@@ -47,6 +47,32 @@ public class AdminTopicController {
         return ResponseEntity.ok().build();
     }
 
+    @PostMapping("/{slug}/layers")
+    @Operation(summary = "Bulk import all 9 layers (MDX content) for a single topic")
+    public ResponseEntity<Void> importLayers(
+            @PathVariable String slug,
+            @RequestBody AdminTopicSectionsImportRequest request) {
+        adminTopicService.importSections(slug, request);
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/layers/batch")
+    @Operation(summary = "Bulk import up to 50 topics at once")
+    public ResponseEntity<Void> batchImportLayers(
+            @RequestBody AdminTopicBatchImportRequest request) {
+        adminTopicService.batchImport(request);
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/{slug}/layers/validate")
+    @Operation(summary = "Dry-run validation for topic layers")
+    public ResponseEntity<ValidationReport> validateLayers(
+            @PathVariable String slug,
+            @RequestBody AdminTopicSectionsImportRequest request) {
+        ValidationReport report = adminTopicService.validateSections(slug, request);
+        return ResponseEntity.ok(report);
+    }
+
     @PutMapping("/{slug}/draft")
     @Operation(summary = "Auto-save full topic draft")
     public ResponseEntity<Void> updateDraft(

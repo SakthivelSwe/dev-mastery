@@ -1,0 +1,136 @@
+---
+slug: "views"
+title: "SQL Views (Virtual Tables)"
+level: 3
+---
+
+## WHY
+Imagine you have a complex dashboard that needs to display the total sales per employee, including their department name and manager. 
+To get this data, you have to write a massive `SELECT` query joining `employees`, `departments`, `sales`, and `managers` tables, grouped by employee ID. 
+If 10 different applications need this exact same data, do you really want to copy and paste a 50-line `JOIN` query into 10 different codebases? What if the database schema changes?
+
+**Views** solve this by saving the complex query inside the database itself as a "Virtual Table." You can query a View exactly like a normal table (`SELECT * FROM employee_sales_view`), hiding the underlying complexity and providing a unified, secure interface for your applications.
+
+## THEORY
+### Regular Views vs Materialized Views
+- **Regular View (Virtual Table):** Does not actually store any data! It is just a saved SQL query. Every time you `SELECT` from the View, the database secretly executes the underlying complex query in real-time. It is always 100% up-to-date, but can be slow if the underlying query is massive.
+- **Materialized View (Physical Table):** Actually runs the query and saves the physical result data to the hard drive! Querying it is blazingly fast ($O(1)$ read time), but the data becomes stale immediately. You must manually "Refresh" the materialized view to get new data.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SQLVisualizer", "state": "sql-views" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating a Regular View)
+Let's abstract away a common, annoying join query.
+
+```sql
+-- 1. Create the View
+CREATE VIEW active_users_view AS
+SELECT 
+    u.id, 
+    u.first_name, 
+    u.last_name, 
+    p.subscription_tier
+FROM users u
+JOIN profiles p ON u.id = p.user_id
+WHERE u.is_active = true 
+  AND u.banned = false;
+
+-- 2. Query the View just like a normal table!
+SELECT * FROM active_users_view WHERE subscription_tier = 'PRO';
+
+-- 3. Modify the View (Replace it entirely)
+CREATE OR REPLACE VIEW active_users_view AS
+SELECT id, first_name, last_name, subscription_tier, created_at -- Added a new column!
+FROM users
+JOIN profiles ON users.id = profiles.user_id
+WHERE is_active = true;
+```
+
+### Level 2 — Building Blocks (Security via Views)
+Views are incredible for security. You can grant an analyst access to the `employee_directory_view` without giving them access to the underlying `employees` table (which contains sensitive data like passwords or salaries).
+
+```sql
+-- The original table has sensitive data:
+-- employees (id, name, department, salary, social_security_number)
+
+-- 1. Create a View that explicitly OMITS the sensitive columns!
+CREATE VIEW public_employee_directory AS
+SELECT 
+    id, 
+    name, 
+    department
+FROM employees;
+
+-- 2. Grant the Analyst role permission to read the VIEW, but NOT the table!
+GRANT SELECT ON public_employee_directory TO analyst_role;
+REVOKE ALL ON employees FROM analyst_role;
+
+-- Now the analyst can see who works here, but cannot see their salary!
+```
+
+### Level 3 — Intermediate (Materialized Views)
+If you have a massive BI (Business Intelligence) query that calculates yearly revenue across 50 million rows, a Regular View will freeze the database for 10 seconds every time someone opens the dashboard. 
+We use a Materialized View to cache the result!
+
+```sql
+-- 1. Create the Materialized View (This takes 10 seconds to run)
+CREATE MATERIALIZED VIEW monthly_revenue_report AS
+SELECT 
+    DATE_TRUNC('month', order_date) AS month,
+    SUM(total_amount) AS revenue,
+    COUNT(*) AS total_orders
+FROM orders
+WHERE status = 'COMPLETED'
+GROUP BY DATE_TRUNC('month', order_date);
+
+-- 2. Querying it is instant! (Returns the pre-calculated data)
+SELECT * FROM monthly_revenue_report;
+
+-- 3. But it gets stale! We must run a REFRESH command to update the physical data!
+-- (Usually triggered by a Cron job every night at 2:00 AM)
+REFRESH MATERIALIZED VIEW monthly_revenue_report;
+```
+
+### Level 4 — Advanced (Updatable Views and WITH CHECK OPTION)
+By default, Views are read-only. However, if a View is simple enough (no `JOIN`, `GROUP BY`, or `DISTINCT`), PostgreSQL and MySQL allow you to actually `INSERT` or `UPDATE` data *through* the view into the underlying table!
+
+```sql
+CREATE VIEW premium_users AS
+SELECT id, username, status 
+FROM users 
+WHERE status = 'PREMIUM'
+-- The magic clause: Prevents users from inserting data that violates the View's WHERE clause!
+WITH CHECK OPTION; 
+
+-- This works perfectly! It inserts into the underlying 'users' table.
+INSERT INTO premium_users (username, status) 
+VALUES ('johndoe', 'PREMIUM');
+
+-- ERROR! Fails because the CHECK OPTION detects that 'BASIC' violates the View's WHERE clause!
+INSERT INTO premium_users (username, status) 
+VALUES ('janedoe', 'BASIC'); 
+```
+
+## REAL_WORLD
+**Legacy System Abstraction**
+Imagine you join a company whose database was designed in 1998. The main table is called `tbl_usr_data_98` and the columns are named `usr_nm`, `usr_phn_num_tx`, and `flg_actv_bin`. 
+Your modern ORM (like Hibernate or Prisma) will struggle with these horrific names. Instead of trying to rename the tables (which would instantly break the 25-year-old legacy C++ applications that still rely on them), modern engineering teams create a **View** to act as an abstraction layer!
+```sql
+CREATE VIEW users AS 
+SELECT 
+  usr_nm AS username, 
+  usr_phn_num_tx AS phone_number, 
+  flg_actv_bin AS is_active 
+FROM tbl_usr_data_98;
+```
+Now, your modern Node.js application can happily `SELECT username FROM users`, completely insulated from the horrific underlying legacy schema!
+
+## INTERVIEW
+**Q: I have a Materialized View for a dashboard. When I run `REFRESH MATERIALIZED VIEW`, the entire dashboard goes offline for 10 seconds because the View is locked while it recalculates. How do I fix this?**
+A: **Use `REFRESH MATERIALIZED VIEW CONCURRENTLY`.** 
+A standard refresh locks the table, preventing anyone from reading it while the new data is calculated. If you add the `CONCURRENTLY` keyword, PostgreSQL will create a hidden, temporary copy of the new data in the background. Once the calculation is complete, it instantly swaps the pointers. The dashboard never goes offline and can continuously read the old data right up until the exact millisecond the new data is ready! 
+*(Note: To use `CONCURRENTLY`, the materialized view must have at least one `UNIQUE` index).*

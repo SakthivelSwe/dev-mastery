@@ -1,0 +1,121 @@
+---
+slug: "pg-replication-setup"
+title: "PostgreSQL Streaming Replication"
+level: 4
+---
+
+## WHY
+A single PostgreSQL server is a Single Point of Failure (SPOF). If the motherboard burns out, your application is completely offline until you can restore a backup (which might take hours).
+Furthermore, if your application has a massively read-heavy workload (like an analytics dashboard), a single server will eventually run out of CPU and RAM. 
+**Replication** solves both problems. It creates exact, real-time clones of your database (Standbys). If the Primary dies, a Standby takes over instantly (High Availability). You can also route all `SELECT` queries to the Standbys, instantly multiplying your read capacity (Read Scaling).
+
+## THEORY
+### Physical Streaming Replication
+PostgreSQL achieves replication by exploiting the **Write-Ahead Log (WAL)**.
+Remember, every single change to the database is written to the WAL *before* it is written to the actual data files.
+In Streaming Replication, the Primary server simply opens a continuous network stream to the Standby servers. Every time a block of WAL is generated on the Primary, it is instantly streamed across the network to the Standby. The Standby receives the WAL and replays it continuously, keeping itself identical to the Primary.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-replication" }
+```
+
+## CODE
+
+### Level 1 — Configuring the Primary
+To allow replication, the Primary server must be configured to generate enough WAL data and allow the Standby to connect.
+
+```ini
+# postgresql.conf (On the Primary Server)
+
+# Set the WAL level to 'replica' (includes enough info to reconstruct the DB)
+wal_level = replica
+
+# How many standby servers are allowed to connect?
+max_wal_senders = 5
+
+# Retain some old WAL files in case a standby temporarily disconnects
+wal_keep_size = 1GB 
+```
+You must also edit `pg_hba.conf` to explicitly allow the `repl_user` to connect via the replication protocol from the Standby's IP address:
+`host replication repl_user 10.0.0.5/32 md5`
+
+### Level 2 — Initializing the Standby (`pg_basebackup`)
+A Standby server cannot just connect and start reading WAL. It must have an exact byte-for-byte baseline copy of the Primary's data directory first. We use `pg_basebackup` for this.
+
+```bash
+# On the empty Standby Server!
+# Stop postgres, wipe the empty data directory.
+sudo systemctl stop postgresql
+rm -rf /var/lib/postgresql/data/*
+
+# Use pg_basebackup to clone the Primary!
+# -R automatically creates the replication configuration files!
+pg_basebackup -h 10.0.0.1 -D /var/lib/postgresql/data -U repl_user -v -P -R -X stream
+
+# Start the Standby! It is now syncing!
+sudo systemctl start postgresql
+```
+
+### Level 3 — Asynchronous vs. Synchronous Replication
+By default, PostgreSQL replication is **Asynchronous**.
+1. Application sends `COMMIT` to Primary.
+2. Primary writes WAL to its local disk.
+3. Primary returns `Success` to the Application immediately!
+4. (Millisecond later) Primary streams WAL to the Standby.
+*The Danger:* If the Primary explodes exactly at Step 3, the application thinks the data is saved, but the Standby never received it. If you failover to the Standby, that transaction is lost forever (Data Loss).
+
+If you are a bank and cannot tolerate losing a single transaction, you must enable **Synchronous Replication**.
+
+```ini
+# postgresql.conf (On the Primary)
+# Tell Postgres that the standby named 'standby1' MUST confirm receipt!
+synchronous_standby_names = 'standby1'
+```
+*The Tradeoff:* In Synchronous mode, Step 3 is delayed. The Primary *will not* return `Success` to the application until `standby1` replies "I received the WAL over the network." This guarantees zero data loss, but it adds network latency to every single write query in your application!
+
+### Level 4 — Replication Slots (Protecting the Standby)
+What happens if the Standby server reboots and is offline for 10 minutes?
+During those 10 minutes, the Primary is still processing thousands of transactions and generating WAL files. If the Primary runs out of disk space, it will delete the old WAL files. 
+When the Standby comes back online, it asks the Primary for the WAL from 10 minutes ago. The Primary says: "I already deleted it." The Standby is now permanently broken and must be completely rebuilt from scratch using `pg_basebackup`.
+
+**The Solution: Replication Slots.**
+A Replication Slot is a marker on the Primary. It tells the Primary: *"Do NOT delete any WAL files until this specific Standby has confirmed it has replayed them."*
+
+```sql
+-- On the Primary: Create the physical slot
+SELECT pg_create_physical_replication_slot('standby1_slot');
+```
+```ini
+# postgresql.conf (On the Standby)
+# Tell the standby to use the slot when connecting!
+primary_slot_name = 'standby1_slot'
+```
+Now, if the Standby goes offline, the Primary will hoard all the WAL files on its own hard drive until the Standby returns. *(Warning: If the Standby dies forever, the Primary will hoard WAL infinitely until its hard drive hits 100% and crashes the Primary! You must monitor replication slots!)*
+
+## REAL_WORLD
+**Logical Replication**
+Physical Streaming Replication clones the *entire* database server byte-for-byte. You cannot filter it. You cannot write to the Standby.
+What if you only want to replicate a *single table* (e.g., `users`), and you want to replicate it to a completely different database that handles Analytics?
+You use **Logical Replication** (Publish/Subscribe).
+Logical Replication decodes the WAL into raw SQL `INSERT/UPDATE` statements. 
+
+```sql
+-- On the Primary Database (The Publisher)
+CREATE PUBLICATION my_pub FOR TABLE users, orders;
+
+-- On the Analytics Database (The Subscriber)
+CREATE SUBSCRIPTION my_sub 
+CONNECTION 'host=10.0.0.1 dbname=main user=repl_user' 
+PUBLICATION my_pub;
+```
+Logical Replication allows you to replicate specific tables, between different major versions of Postgres, and the Subscriber database remains fully writeable!
+
+## INTERVIEW
+**Q: You set up a Standby server for Read-Scaling. A data scientist is running a massive 45-minute `SELECT` query on the Standby to generate a report. Suddenly, their query is violently killed by Postgres with the error: `canceling statement due to conflict with recovery`. Why did this happen?**
+A: **Replication Conflicts (MVCC vacuuming on the Primary).**
+The Primary database doesn't know what queries are running on the Standby. 
+If the Primary updates a row, it creates a new MVCC version. Eventually, the `VACUUM` process on the Primary deletes the old, dead row to free up space. This "Delete" command is streamed via WAL to the Standby.
+However, the data scientist's 45-minute query on the Standby is still actively trying to read that exact old row! 
+The Standby is trapped: It must replay the WAL (delete the row) to stay in sync with the Primary, but doing so will destroy the data scientist's query. By default, Postgres chooses replication over long-running queries, killing the data scientist's `SELECT`.
+*The Fix:* Enable `hot_standby_feedback = on` in the Standby's configuration. This makes the Standby whisper to the Primary over the network: *"Hey, I'm still using MVCC row X, please don't VACUUM it yet!"* The Primary will pause vacuuming that row until the data scientist's report finishes.

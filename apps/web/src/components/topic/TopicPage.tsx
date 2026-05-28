@@ -8,6 +8,9 @@ import { Bot, ChevronRight, Check } from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
 import CodeEditorShell from '@/components/code/CodeEditorShell';
 import QuizView from '@/components/quiz/QuizView';
+import FeynmanCheckPanel from './FeynmanCheckPanel';
+import BuildChallengePanel from './BuildChallengePanel';
+import SpacedReviewWidget from './SpacedReviewWidget';
 import { useAiChat } from '@/hooks/useAiChat';
 
 export default function TopicPage({ topicSlug }: { topicSlug: string }) {
@@ -90,6 +93,12 @@ export default function TopicPage({ topicSlug }: { topicSlug: string }) {
             )}
           </>
         );
+      case 'feynman':
+        return <FeynmanCheckPanel />;
+      case 'build':
+        return <BuildChallengePanel />;
+      case 'spaced-review':
+        return <SpacedReviewWidget />;
       default:
         return (
           <div className="flex items-center justify-center h-full text-muted-foreground">

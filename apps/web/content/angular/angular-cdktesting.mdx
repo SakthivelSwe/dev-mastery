@@ -1,0 +1,144 @@
+---
+slug: "angular-cdktesting"
+title: "Angular CDK Testing"
+level: 5
+---
+
+## WHY
+Testing Angular UI components using standard `fixture.nativeElement.querySelector('.mat-select-arrow')` is notoriously fragile.
+If the component author updates their HTML structure, changes a CSS class name, or replaces a `<button>` with an `<a>` tag, your test will instantly break—even though the component still works perfectly for the user!
+The **Angular Component Dev Kit (CDK) Test Harnesses** solve this. They provide an abstracted, programmatic API for interacting with components in tests. Instead of hunting for CSS classes, you simply ask the Harness to "click the third option."
+
+## THEORY
+### What is a Test Harness?
+A Test Harness is a class that knows exactly how to interact with a specific UI component's DOM.
+When you use a Harness, you decouple your test logic from the component's internal HTML implementation. The test interacts with the Harness, and the Harness interacts with the DOM.
+If the component's HTML changes in a future version, the component author updates the Harness. Your tests remain 100% unchanged and continue to pass!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "angular-cdk-testing" }
+```
+
+## CODE
+
+### Level 1 — The Testing Environment Loader
+To use Harnesses, you must create a `HarnessLoader` in your `beforeEach` block. The loader acts as a factory that searches the compiled DOM for components and attaches Harnesses to them.
+
+```typescript
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { TestbedHarnessEnvironment } from '@angular/cdk/testing/testbed';
+import { HarnessLoader } from '@angular/cdk/testing';
+import { SettingsComponent } from './settings.component';
+import { MatButtonModule } from '@angular/material/button';
+
+describe('SettingsComponent', () => {
+  let fixture: ComponentFixture<SettingsComponent>;
+  let loader: HarnessLoader; // The CDK Loader!
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [SettingsComponent, MatButtonModule]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(SettingsComponent);
+    
+    // Create the loader by passing it the fixture!
+    loader = TestbedHarnessEnvironment.loader(fixture);
+  });
+});
+```
+
+### Level 2 — Interacting with Material Components
+Angular Material provides official Harnesses for every single one of its components!
+
+```typescript
+// Import the specific Harness!
+import { MatButtonHarness } from '@angular/material/button/testing';
+
+it('should disable the save button', async () => {
+  // 1. Ask the loader to find a MatButton inside the DOM!
+  // By default, it returns the first one it finds.
+  const saveButton = await loader.getHarness(MatButtonHarness);
+
+  // 2. We don't check DOM attributes! We ask the Harness for the state!
+  expect(await saveButton.isDisabled()).toBeFalse();
+
+  // 3. We use the Harness to click it, bypassing DOM event simulation!
+  await saveButton.click();
+
+  expect(await saveButton.isDisabled()).toBeTrue();
+});
+```
+
+### Level 3 — Filtering and Searching
+If your page has 10 buttons, how do you get the specific one you want?
+Every Harness allows you to pass a filter object to search by text, ID, or state!
+
+```typescript
+import { MatSelectHarness } from '@angular/material/select/testing';
+
+it('should select a country from the dropdown', async () => {
+  
+  // Search for a specific dropdown based on its placeholder text!
+  const countryDropdown = await loader.getHarness(MatSelectHarness.with({
+    selector: '#country-select' // Or use a CSS selector!
+  }));
+
+  // The Harness knows all the complex animation timings required to open a dropdown!
+  await countryDropdown.open();
+
+  // The Harness can find nested options and click them!
+  await countryDropdown.clickOptions({ text: 'Canada' });
+
+  // Verify the value was updated!
+  expect(await countryDropdown.getValueText()).toBe('Canada');
+});
+```
+
+### Level 4 — Building a Custom Harness
+If you build a complex custom component (e.g., a massive `InteractiveGraphComponent`), you should build and export a Harness for it so other developers can test it easily!
+
+```typescript
+// 1. Create the Harness Class extending ComponentHarness
+import { ComponentHarness } from '@angular/cdk/testing';
+
+export class GraphHarness extends ComponentHarness {
+  // 2. Define the host selector (how the loader finds your component)
+  static hostSelector = 'app-interactive-graph';
+
+  // 3. Create locators to find specific elements INSIDE your component's template
+  private getZoomInButton = this.locatorFor('.btn-zoom-in');
+  private getNodes = this.locatorForAll('.graph-node');
+
+  // 4. Expose public methods for testers to use!
+  async zoomIn(): Promise<void> {
+    const button = await this.getZoomInButton();
+    await button.click();
+  }
+
+  async getNodeCount(): Promise<number> {
+    const nodes = await this.getNodes();
+    return nodes.length;
+  }
+}
+```
+Now, any developer using your Graph component can write tests like: `await graphHarness.zoomIn()`, without ever looking at your internal HTML!
+
+## REAL_WORLD
+**End-to-End (E2E) Testing with Harnesses**
+The true magic of the CDK Testing architecture is that Harnesses are entirely environment-agnostic. 
+The exact same `MatButtonHarness` code you wrote above for a Karma/Jest Unit Test can be executed inside a **Protractor or Cypress E2E Test**. 
+The CDK provides different `HarnessEnvironments`. In a Unit Test, you use `TestbedHarnessEnvironment`. In Cypress, you use `CypressHarnessEnvironment`. The Harness executes the exact same programmatic API (`button.click()`), but behind the scenes, the environment dictates whether it simulates a virtual DOM click, or commands a real Chrome browser to physically move the mouse and click the pixel! This allows you to share massive amounts of testing logic between Unit and E2E suites!
+
+## INTERVIEW
+**Q: You use a `MatDialogHarness` to test if a Modal popup appears. However, `loader.getHarness(MatDialogHarness)` throws an error saying "Failed to find element". You know the code works because you can see the modal when running the app. Why can't the loader find the modal in the test?**
+A: **The Document Root Loader.**
+In Angular, overlays (like Modals, Snackbars, and Dropdown panels) are not physically rendered inside the Component's DOM tree. To avoid CSS `z-index` and `overflow: hidden` issues, Angular Material creates a global `<div class="cdk-overlay-container">` completely outside the `<body>` element, and injects the modal there.
+When you create a standard `TestbedHarnessEnvironment.loader(fixture)`, that loader is restricted *strictly* to the HTML inside the specific component you are testing. It cannot see the global overlay container!
+*The Fix:* To find global overlays in a test, you must use the Document Root Loader:
+```typescript
+// Use documentRootLoader instead of loader!
+const rootLoader = TestbedHarnessEnvironment.documentRootLoader(fixture);
+const dialog = await rootLoader.getHarness(MatDialogHarness);
+```

@@ -1,0 +1,138 @@
+---
+slug: "websockets-api"
+title: "WebSockets & Real-Time APIs"
+level: 3
+---
+
+## WHY
+HTTP is a fundamentally **stateless, request-response** protocol. The client asks a question, the server answers, and the connection is immediately severed.
+If you are building a live chat application, a stock trading dashboard, or a multiplayer game, HTTP is terrible. To get new messages, the client would have to ask the server "Do you have new messages?" every single second (a technique called Long Polling). This creates massive, unnecessary network traffic and CPU load on the server.
+
+**WebSockets** provide a persistent, full-duplex, bidirectional communication channel over a single TCP connection. The client connects once, and the server can "push" data down to the client at any time, instantly, without the client ever asking.
+
+## THEORY
+### The Handshake Upgrade
+WebSockets start their life as a standard HTTP `GET` request. 
+The client sends a request to the server with special headers: `Connection: Upgrade` and `Upgrade: websocket`. 
+If the server supports WebSockets, it responds with an HTTP `101 Switching Protocols` status code. The HTTP protocol is instantly discarded, and the raw TCP connection is kept open indefinitely for raw, bidirectional data framing.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "websockets" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Browser API)
+Connecting to a WebSocket from a frontend application is incredibly simple using the native browser `WebSocket` object.
+
+```javascript
+// 1. Connect to the server (Notice the 'ws://' or 'wss://' protocol!)
+const socket = new WebSocket('wss://api.mycompany.com/chat');
+
+// 2. Listen for the connection to open
+socket.onopen = (event) => {
+    console.log('Connected to server!');
+    // Send a message TO the server!
+    socket.send(JSON.stringify({ type: 'JOIN_ROOM', room: 'general' }));
+};
+
+// 3. Listen for incoming messages PUSHED from the server
+socket.onmessage = (event) => {
+    // The data is usually a JSON string
+    const data = JSON.parse(event.data);
+    console.log('New message received:', data.text);
+};
+
+// 4. Handle disconnections
+socket.onclose = (event) => {
+    console.log('Disconnected from server.');
+};
+```
+
+### Level 2 — Building Blocks (A Simple Node.js Server)
+Using the popular `ws` library to build a WebSocket server.
+
+```javascript
+const WebSocket = require('ws');
+
+// Start a WebSocket server on port 8080
+const wss = new WebSocket.Server({ port: 8080 });
+
+// When a new client connects...
+wss.on('connection', (socket, request) => {
+    console.log('New client connected!');
+
+    // Listen for messages FROM this specific client
+    socket.on('message', (messageBuffer) => {
+        const message = messageBuffer.toString();
+        console.log('Received:', message);
+
+        // Echo the message back to them!
+        socket.send(`Server received: ${message}`);
+    });
+    
+    // Push a message to them immediately!
+    socket.send('Welcome to the WebSocket server!');
+});
+```
+
+### Level 3 — Intermediate (Broadcasting & Socket.IO)
+If User A sends a message in a chat room, the server needs to push that message out to Users B, C, and D. This is called Broadcasting.
+While raw WebSockets can do this, libraries like **Socket.IO** abstract away the complex room management and provide automatic reconnection logic.
+
+```javascript
+// Using Socket.IO (Server)
+const io = require('socket.io')(3000);
+
+io.on('connection', (socket) => {
+    
+    // A client wants to join a specific chat room
+    socket.on('join_room', (roomId) => {
+        socket.join(roomId); 
+    });
+
+    // A client sends a message to the room
+    socket.on('send_message', (data) => {
+        // Broadcast the message to EVERYONE else in that specific room!
+        socket.to(data.roomId).emit('new_message', data);
+    });
+});
+```
+
+### Level 4 — Advanced (Scaling WebSockets with Redis Pub/Sub)
+Here is the hardest architectural problem with WebSockets: 
+Imagine you have 10,000 users. Your Node.js server cannot handle 10,000 open TCP connections, so you scale out to 3 Node.js servers behind an AWS Load Balancer.
+- User A connects to Server 1.
+- User B connects to Server 2.
+If User A sends a message to the "General" room, Server 1 tries to broadcast it. But Server 1 doesn't know User B exists! Server 1 only broadcasts to its own local clients.
+
+To scale WebSockets horizontally, you must implement a **Pub/Sub Backplane** (usually Redis).
+
+```javascript
+// When Server 1 receives a message from User A:
+// 1. It broadcasts the message to its LOCAL connected clients.
+// 2. It PUBLISHES the message to Redis!
+redisPublisher.publish('room_general', JSON.stringify(message));
+
+// Meanwhile, ALL servers are SUBSCRIBED to Redis!
+redisSubscriber.subscribe('room_general', (channel, redisMessage) => {
+    // When Server 2 hears the message from Redis, 
+    // it broadcasts it to ITS local connected clients!
+    // Now User B receives the message!
+});
+```
+*(Note: Socket.IO has a built-in "Redis Adapter" that implements this exact logic automatically!)*
+
+## REAL_WORLD
+**Server-Sent Events (SSE) vs. WebSockets**
+Many developers default to WebSockets whenever they need real-time data. But WebSockets are complex, require special load balancer configurations, and break traditional HTTP caching.
+If you are building a live sports score ticker, the client NEVER sends data to the server; data only flows *down* to the client. 
+For unidirectional data flows, **Server-Sent Events (SSE)** is significantly better. It operates over standard HTTP, natively supports auto-reconnection, works flawlessly through corporate firewalls, and is vastly simpler to scale than raw WebSockets.
+*Rule of thumb:* If you need bidirectional low-latency (Chat, Multiplayer Gaming, Collaborative Whiteboards), use WebSockets. If you just need to push live updates to the client (Stock tickers, Live Feeds, CI/CD status), use SSE.
+
+## INTERVIEW
+**Q: I have a WebSocket server. Sometimes users complain that their connection drops after exactly 60 seconds of inactivity. My Node.js server doesn't have a 60-second timeout. What is happening?**
+A: **The Load Balancer is killing the idle connection.**
+AWS Elastic Load Balancers (and nginx/HAProxy) have strict idle timeout limits (often 60 seconds by default) to prevent zombie connections from eating up memory. If no data travels across the TCP connection for 60 seconds, the proxy assumes the connection is dead and forcefully closes it. 
+To keep WebSockets alive indefinitely behind a load balancer, you must implement **Ping/Pong Heartbeats**. The client (or server) must send a tiny "Ping" message every ~30 seconds. The other side replies with "Pong". This ensures data is constantly flowing across the wire, preventing the proxy from dropping the connection.

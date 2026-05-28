@@ -1,0 +1,92 @@
+---
+slug: "sd-load-balancing"
+title: "Load Balancing"
+level: 3
+---
+
+## WHY
+Once you decide to horizontally scale your application from 1 server to 10 servers, you encounter a massive networking problem. 
+
+If you own the domain `www.example.com`, which of the 10 server IP addresses does that domain point to in the DNS registry? You can't point a single domain to 10 different web servers simultaneously and expect the user's browser to magically choose one that isn't busy.
+
+You need a traffic cop. You point the domain to exactly ONE server: **The Load Balancer**. The Load Balancer intercepts every single incoming HTTP request, looks at its pool of 10 backend web servers, picks the one that is the least busy, and forwards the request to it.
+
+## THEORY
+### Layer 4 vs Layer 7 Load Balancing
+Load balancers operate at different layers of the OSI networking model.
+- **Layer 4 (Transport Layer):** The load balancer only looks at the IP Address and TCP Port. It is incredibly fast because it doesn't inspect the content of the HTTP request. It blindly forwards packets.
+- **Layer 7 (Application Layer):** The load balancer decrypts the SSL certificate and inspects the actual HTTP Headers, URL paths, and Cookies. It is slightly slower, but far more intelligent. It can say, *"Oh, the URL is `/api/billing`. I will route this specifically to the Billing Microservices cluster instead of the General cluster."*
+
+### Health Checks
+A Load Balancer isn't just a router; it's a doctor. It constantly sends "ping" requests (Health Checks) to every server in the pool. If Server #3 crashes and stops responding to the pings, the Load Balancer instantly marks Server #3 as "Dead" and stops sending traffic to it, ensuring users never see a 500 Error.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sd-load-balancer" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Routing Algorithms)
+How does the Load Balancer actually decide which server gets the next request? It uses an algorithm.
+
+1. **Round Robin:** The simplest algorithm. Request 1 goes to Server A. Request 2 goes to Server B. Request 3 goes to Server C. Request 4 goes back to Server A. 
+2. **Least Connections:** The load balancer keeps track of exactly how many active TCP connections each server has. It routes the next request to the server with the fewest active connections. This is vastly superior to Round Robin if some requests take 5 seconds to process and others take 50 milliseconds.
+3. **IP Hash:** The load balancer runs a mathematical hash on the User's IP Address. Based on the hash, it guarantees that User #123 will *always* be routed to Server B, every single time. 
+
+### Level 2 — Building Blocks (Sticky Sessions / Session Affinity)
+If your application is poorly designed and stores user login state in local RAM (a Stateful architecture), you **must** use the **IP Hash** algorithm (also known as Sticky Sessions). 
+
+If you use Round Robin with a Stateful server, the user logs in on Server A, but their very next request is routed to Server B, and Server B kicks them out because it doesn't have their session in memory! 
+*Note: Sticky sessions are an anti-pattern. You should make your servers stateless and use a centralized Redis cache instead.*
+
+### Level 3 — Intermediate (Nginx Configuration)
+In the real world, the most famous open-source Load Balancer is **Nginx** (or HAProxy). 
+Here is exactly what an Nginx Layer 7 Load Balancer configuration looks like:
+
+```nginx
+# 1. Define the pool of backend servers
+upstream my_backend_cluster {
+    # We are using the default Round Robin algorithm here
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+    server 10.0.0.3:8080;
+}
+
+# 2. Configure the Load Balancer itself
+server {
+    listen 80;
+    server_name www.example.com;
+
+    location / {
+        # 3. Intercept the request and proxy it to the pool!
+        proxy_pass http://my_backend_cluster;
+        
+        # Pass the original user's IP address to the backend server
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### Level 4 — Advanced (Load Balancing the Load Balancer)
+Wait. If all traffic must go through the Load Balancer first... doesn't the Load Balancer itself become a Single Point of Failure (SPOF)? If the Load Balancer crashes, the whole company goes offline! Furthermore, if you get 10 million requests per second, a single Load Balancer will run out of CPU and crash!
+
+How do you scale the Load Balancer? 
+You use **DNS Round Robin**. 
+In your DNS registry (Route 53 / Cloudflare), you point `www.example.com` to multiple IP addresses (e.g., Load Balancer A and Load Balancer B). The DNS server itself acts as a massive, global load balancer, handing out different Load Balancer IP addresses to different users around the world!
+
+## REAL_WORLD
+In modern Cloud Architecture, you almost never configure Nginx manually. 
+If you use AWS, you use the **Application Load Balancer (ALB)**. It is a fully managed service. AWS guarantees its uptime, automatically scales it under the hood if traffic spikes, handles SSL certificate termination automatically, and integrates seamlessly with AWS Auto-Scaling Groups. 
+
+It abstracts away all the raw networking math, allowing developers to focus purely on application code.
+
+## INTERVIEW
+**Q: What is SSL Termination?**
+A: Decrypting HTTPS traffic requires heavy CPU math. If you force your 10 backend web servers to decrypt HTTPS traffic, they will waste 30% of their CPU power just doing math. A Layer 7 Load Balancer performs **SSL Termination**. It intercepts the encrypted HTTPS request, decrypts it using its massive CPU, and forwards it to the backend web servers as plain, unencrypted HTTP over the secure internal network. This frees up your backend servers to focus entirely on business logic.
+
+**Q: In a Microservices architecture, how does the Load Balancer know where the "Billing" service is if servers are constantly being created and destroyed by Auto-Scaling?**
+A: Hardcoding IP addresses in the Load Balancer config (like `10.0.0.1`) is impossible in modern cloud environments because IPs change dynamically. We solve this using **Service Discovery** (e.g., Consul, Zookeeper, or Kubernetes CoreDNS). When a new Billing server boots up, it registers its IP with the Service Discovery registry. The Load Balancer queries the registry in real-time to find out exactly where the active Billing servers currently live.
+
+**Q: Why might the "Least Connections" algorithm fail to distribute load perfectly?**
+A: It only tracks the *number* of active TCP connections, not the CPU intensity of those connections. Server A might have 10 connections downloading tiny text files (0.1% CPU). Server B might have 2 connections processing massive 4K video renders (100% CPU). The Load Balancer will blindly send the next request to Server B because 2 < 10, causing Server B to crash. Advanced load balancers use custom metrics (like querying the actual CPU usage of the server) to make smarter decisions.

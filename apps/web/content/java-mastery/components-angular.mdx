@@ -1,0 +1,414 @@
+---
+title: components-angular
+slug: components-angular
+---
+
+### Layer 1: Core Mechanics & Architecture
+
+At the heart of Angular’s rendering architecture lies the Ivy compiler (ngtsc), which compiles declarative component metadata into highly optimized, imperative JavaScript instructions. When you define an Angular component using the `@Component` decorator, the compiler transforms the template and style metadata into a static definition block attached directly to the component class as static properties: `ɵcmp` (Component Definition) and `ɵdir` (Directive Definition).
+
+```typescript
+// Conceptual output of the Ivy compiler for a standalone component
+static ɵcmp = i0.ɵɵdefineComponent({
+  type: MyComponent,
+  selectors: [["my-component"]],
+  decls: 2,
+  vars: 1,
+  template: function MyComponent_Template(rf, ctx) {
+    if (rf & 1) {
+      i0.ɵɵelementStart(0, "h1");
+      i0.ɵɵtext(1);
+      i0.ɵɵelementEnd();
+    }
+    if (rf & 2) {
+      i0.ɵɵadvance(1);
+      i0.ɵɵtextInterpolate(ctx.title);
+    }
+  },
+  dependencies: [],
+  encapsulation: 2
+});
+```
+
+#### LView and TView Memory Structures
+
+Angular manages components at runtime using two internal logical data structures: `TView` (Template View) and `LView` (Logical View). Understanding the distinction between these two structures is critical for diagnosing advanced memory issues and understanding template execution.
+
+*   **`TView` (Logical Template/Type View)**: This is a single, shared structural blueprint created once for each component type. It contains static metadata, such as directive matches, queries, and template instructions, that do not change across instances. It is stored globally for that component class.
+*   **`LView` (Logical Instance View)**: This is an array-like structure created for *every instance* of a component. It holds the actual state, binding values, DOM element references, and projected content specific to that instance.
+
+The indexes of `LView` map directly to the slots defined in `TView`. For instance, if `TView` defines that index `5` is a text node with a binding, `LView[5]` will store the actual DOM text node, and `LView[5 + 1]` (or similar offset) will hold the current value of the binding to execute dirty checking.
+
+#### Lifecycle Hook Execution Order and Internal Scheduling
+
+During change detection, Angular’s runtime executes component lifecycle hooks in a strict, deterministic sequence. This execution is driven by the state flags of the current `LView`.
+
+```
+[Component Creation]
+       │
+       ▼
+1. constructor()
+       │
+       ▼
+2. ngOnChanges() (If inputs exist)
+       │
+       ▼
+3. ngOnInit()
+       │
+       ▼
+4. ngDoCheck()
+       │
+   ┌───┴────────────────────────┐
+   ▼                            ▼
+[Content Phase]              [View Phase]
+5. ngAfterContentInit()      7. ngAfterViewInit()
+6. ngAfterContentChecked()   8. ngAfterViewChecked()
+   │                            │
+   └───────────┬────────────────┘
+               ▼
+       9. ngOnDestroy()
+```
+
+1.  **`ngOnChanges`**: Triggered when any bound input properties change. The internal framework checks the `LView` input slots against the incoming values.
+2.  **`ngOnInit`**: Executed once after the first `ngOnChanges` evaluation.
+3.  **`ngDoCheck`**: Executed during every change detection run, allowing custom change detection algorithms.
+4.  **`ngAfterContentInit` / `ngAfterContentChecked`**: Executed after content projected via `<ng-content>` is initialized and checked.
+5.  **`ngAfterViewInit` / `ngAfterViewChecked`**: Executed after the component’s own template (view) has been initialized and checked.
+
+---
+
+### Layer 2: Advanced API Design & Implementation
+
+To build resilient, high-performance components, we must leverage Angular 17+ standalone patterns, bypassing legacy `NgModule` declarations entirely. The following component showcases host bindings via the modern `host` metadata block, dynamic component loading using `ViewContainerRef`, and the dynamic injection of providers.
+
+To generate a standalone component using the Angular CLI:
+```bash
+ng generate component components/dynamic-portal --standalone --inline-style --inline-template
+```
+
+Here is the complete production-grade implementation:
+
+```typescript
+import {
+  Component,
+  Input,
+  ViewChild,
+  ViewContainerRef,
+  Type,
+  ComponentRef,
+  OnDestroy,
+  inject,
+  HostAttributeToken,
+  Directive
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Directive({
+  selector: '[portalHost]',
+  standalone: true
+})
+export class PortalHostDirective {
+  public viewContainerRef = inject(ViewContainerRef);
+}
+
+@Component({
+  selector: 'app-dynamic-portal',
+  standalone: true,
+  imports: [CommonModule, PortalHostDirective],
+  template: `
+    <div class="portal-container">
+      <header class="portal-header">
+        <h3>Portal Host: {{ role }}</h3>
+      </header>
+      <ng-template portalHost></ng-template>
+    </div>
+  `,
+  styles: [`
+    :host {
+      display: block;
+      border: 1px solid #ccc;
+      padding: 16px;
+      margin: 8px 0;
+    }
+    .portal-container {
+      font-family: sans-serif;
+    }
+  `],
+  host: {
+    '[class.active-portal]': 'isActive',
+    '(click)': 'onHostClick($event)'
+  }
+})
+export class DynamicPortalComponent implements OnDestroy {
+  // Injecting static host attributes using HostAttributeToken
+  protected role = inject(new HostAttributeToken('role'), { optional: true }) ?? 'generic';
+  
+  @ViewChild(PortalHostDirective, { static: true }) 
+  private portalHost!: PortalHostDirective;
+
+  protected isActive = true;
+  private activeComponentRef: ComponentRef<any> | null = null;
+
+  public onHostClick(event: Event): void {
+    event.stopPropagation();
+    this.isActive = !this.isActive;
+  }
+
+  /**
+   * Dynamically instantiates a component and projects it into the view.
+   */
+  public async loadComponent<T>(componentFactory: () => Promise<Type<T>>): Promise<ComponentRef<T>> {
+    this.destroyActiveComponent();
+
+    const componentType = await componentFactory();
+    const containerRef = this.portalHost.viewContainerRef;
+    
+    // Instantiate component inside the current dynamic injection context
+    this.activeComponentRef = containerRef.createComponent(componentType);
+    this.activeComponentRef.changeDetectorRef.markForCheck();
+    
+    return this.activeComponentRef;
+  }
+
+  private destroyActiveComponent(): void {
+    if (this.activeComponentRef) {
+      this.activeComponentRef.destroy();
+      this.activeComponentRef = null;
+    }
+  }
+
+  public ngOnDestroy(): void {
+    this.destroyActiveComponent();
+  }
+}
+```
+
+---
+
+### Layer 3: Reactive & State Integration
+
+Angular 17.1+ introduces Signal-based inputs and outputs, replacing the legacy `@Input` and `@Output` decorators with a unified, reactive model. This provides compile-time safety and optimal change detection execution.
+
+```typescript
+import { Component, input, model, output, computed, effect } from '@angular/core';
+
+@Component({
+  selector: 'app-signal-counter',
+  standalone: true,
+  template: `
+    <div class="counter-card">
+      <p>Count: {{ count() }}</p>
+      <p>Derived Double: {{ doubleCount() }}</p>
+      <button (click)="increment()">Increment</button>
+      <button (click)="reset()">Reset</button>
+    </div>
+  `
+})
+export class SignalCounterComponent {
+  // Read-only Signal input
+  public step = input<number>(1);
+
+  // Writable Model Signal (two-way binding)
+  public count = model<number>(0);
+
+  // Output emitter
+  public thresholdReached = output<number>();
+
+  // Computed signal derived from input and model signals
+  protected doubleCount = computed(() => this.count() * 2);
+
+  constructor() {
+    // Reactive effect to monitor value changes and emit outputs
+    effect(() => {
+      const currentCount = this.count();
+      if (currentCount >= 100) {
+        this.thresholdReached.emit(currentCount);
+      }
+    });
+  }
+
+  protected increment(): void {
+    this.count.update(current => current + this.step());
+  }
+
+  protected reset(): void {
+    this.count.set(0);
+  }
+}
+```
+
+---
+
+### Layer 4: Performance, Memory & Edge Cases
+
+When dynamically loading components via `ViewContainerRef`, failing to clean up resources properly can lead to severe memory leaks. Each dynamically instantiated component must be manually destroyed if its parent container is not torn down.
+
+```typescript
+// Memory Leak Vector: Retaining references in closures or services
+@Component({ ... })
+export class LeakContainerComponent {
+  private refs: ComponentRef<any>[] = [];
+  private container = inject(ViewContainerRef);
+
+  public addComponent(type: Type<any>) {
+    const ref = this.container.createComponent(type);
+    this.refs.push(ref); // If we forget to remove this reference on destroy, we leak DOM nodes.
+  }
+
+  // Mitigation Strategy:
+  public ngOnDestroy() {
+    this.refs.forEach(ref => ref.destroy());
+    this.refs = [];
+  }
+}
+```
+
+#### Detaching and Re-attaching Views
+
+To bypass Angular's default change detection cycles for highly demanding UI elements (e.g., real-time charts), you can detach the component’s view from the main change detection tree using `ChangeDetectorRef`.
+
+```typescript
+import { Component, ChangeDetectorRef, inject, OnInit } from '@angular/core';
+
+@Component({
+  selector: 'app-detached-perf',
+  standalone: true,
+  template: `<div>Data Point: {{ data }}</div>`
+})
+export class DetachedPerfComponent implements OnInit {
+  private cdr = inject(ChangeDetectorRef);
+  protected data = 0;
+
+  public ngOnInit(): void {
+    this.cdr.detach(); // Detaches this view from the change detector tree.
+  }
+
+  public updateData(newData: number): void {
+    this.data = newData;
+    // Explicitly run change detection only for this component subtree
+    this.cdr.detectChanges();
+  }
+}
+```
+
+---
+
+### Layer 5: Enterprise-Grade Patterns & Real-World Architecture
+
+#### The Compound Component Pattern
+
+In enterprise design systems, components like select dropdowns, tabs, and tables must be highly composable. The Compound Component Pattern leverages content queries (`ContentChildren`) to coordinate state between parent and child components dynamically.
+
+```typescript
+import { 
+  Component, 
+  ContentChildren, 
+  QueryList, 
+  AfterContentInit, 
+  Input, 
+  Output, 
+  EventEmitter, 
+  Directive,
+  HostListener
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Directive({
+  selector: 'app-tab-panel',
+  standalone: true
+})
+export class TabPanelDirective {
+  @Input({ required: true }) public title!: string;
+  public active = false;
+}
+
+@Component({
+  selector: 'app-tabs-container',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <div class="tabs-nav">
+      <button 
+        *ngFor="let tab of tabs; let i = index" 
+        [class.active]="tab.active"
+        (click)="selectTab(tab)">
+        {{ tab.title }}
+      </button>
+    </div>
+    <div class="tabs-content">
+      <ng-content></ng-content>
+    </div>
+  `
+})
+export class TabsContainerComponent implements AfterContentInit {
+  @ContentChildren(TabPanelDirective) 
+  public tabs!: QueryList<TabPanelDirective>;
+
+  @Output() public tabChanged = new EventEmitter<string>();
+
+  public ngAfterContentInit(): void {
+    const activeTab = this.tabs.find(tab => tab.active);
+    if (!activeTab && this.tabs.length > 0) {
+      this.selectTab(this.tabs.first);
+    }
+  }
+
+  public selectTab(selectedTab: TabPanelDirective): void {
+    this.tabs.forEach(tab => (tab.active = false));
+    selectedTab.active = true;
+    this.tabChanged.emit(selectedTab.title);
+  }
+}
+```
+
+---
+
+### Layer 6: Production-Grade Verification & Testing
+
+To test dynamic component creation and structural changes, you must configure unit tests with precise injection contexts and verify lifecycle executions.
+
+```typescript
+import { TestBed, ComponentFixture } from '@angular/core/testing';
+import { DynamicPortalComponent, PortalHostDirective } from './dynamic-portal.component';
+import { Component, NgModule } from '@angular/core';
+
+@Component({
+  template: `<div>Dynamic Stub</div>`,
+  standalone: true
+})
+class StubComponent {}
+
+describe('DynamicPortalComponent', () => {
+  let component: DynamicPortalComponent;
+  let fixture: ComponentFixture<DynamicPortalComponent>;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [DynamicPortalComponent, PortalHostDirective, StubComponent]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(DynamicPortalComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it('should dynamically instantiate a component and clean it up on destruction', async () => {
+    const componentRefPromise = component.loadComponent(() => Promise.resolve(StubComponent));
+    
+    // Resolve dynamic component loading promise
+    const componentRef = await componentRefPromise;
+    fixture.detectChanges();
+
+    expect(componentRef).toBeTruthy();
+    expect(fixture.nativeElement.textContent).toContain('Dynamic Stub');
+
+    // Destroy parent component and assert child destruction
+    component.ngOnDestroy();
+    fixture.detectChanges();
+    
+    expect(fixture.nativeElement.textContent).not.toContain('Dynamic Stub');
+  });
+});
+```
+
+---

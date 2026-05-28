@@ -1,0 +1,143 @@
+---
+slug: "dockerfile-best-practices"
+title: "Dockerfile Best Practices"
+level: 2
+---
+
+## WHY
+Writing a Dockerfile that *works* is easy. Writing a Dockerfile that produces **small, secure, fast-building** images that are easy to maintain takes discipline.
+Bad Dockerfiles are common: they create 1 GB+ images, rebuild from scratch every time any file changes (wasting 10+ minutes in CI), run as root, and contain secrets baked into layers.
+These best practices separate production-quality Docker images from amateur ones.
+
+## THEORY
+### The Four Goals
+1. **Minimal size:** Fewer layers, Alpine base images, multi-stage builds
+2. **Fast builds:** Maximize cache efficiency through smart layer ordering
+3. **Security:** Non-root user, no secrets in layers, minimal capabilities
+4. **Maintainability:** Clear structure, comments, pinned versions
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "dockerfile-best-practices" }
+```
+
+## CODE
+
+### The Gold Standard Node.js Dockerfile
+```dockerfile
+# ============================================================
+# STAGE 1: Dependencies
+# ============================================================
+FROM node:20-alpine AS deps
+
+# Install system dependencies if needed (e.g., for native modules)
+# RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+# Copy ONLY package files first — maximizes cache hit for npm install!
+COPY package.json package-lock.json ./
+
+# Use 'npm ci' (not 'npm install') for reproducible, locked installs
+RUN npm ci --only=production && npm cache clean --force
+
+# ============================================================
+# STAGE 2: Build (only for TypeScript/webpack projects)
+# ============================================================
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+# Copy ALL deps (including devDependencies for build tools)
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# ============================================================
+# STAGE 3: Final Production Image
+# ============================================================
+FROM node:20-alpine AS production
+
+# BEST PRACTICE 1: Create non-root user BEFORE anything else
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+WORKDIR /app
+
+# BEST PRACTICE 2: Copy only what's needed from builder stages
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --chown=nextjs:nodejs package.json ./
+
+# BEST PRACTICE 3: Set NODE_ENV for optimizations
+ENV NODE_ENV=production
+
+# BEST PRACTICE 4: Don't run as root!
+USER nextjs
+
+# BEST PRACTICE 5: Health check
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD wget -q --spider http://localhost:3000/health || exit 1
+
+EXPOSE 3000
+
+CMD ["node", "dist/server.js"]
+```
+
+### A .dockerignore File is Mandatory
+```text
+# .dockerignore — like .gitignore but for Docker build context
+
+# These files should NEVER be in your image:
+node_modules           # Huge — let npm install create these in the container
+.git                   # Git history is unnecessary in images
+.env                   # NEVER copy .env files with secrets!
+*.log                  # Logs don't belong in images
+Dockerfile*            # Meta!
+docker-compose*.yml    # Meta!
+README.md
+tests/
+coverage/
+.nyc_output/
+```
+
+Without `.dockerignore`, Docker sends your entire `node_modules` folder (potentially hundreds of MB) to the daemon on every `docker build`, even if you're not using them. Massively slow.
+
+### Pinning Versions (Production Must-Do)
+```dockerfile
+# BAD: Unpinned versions — could break randomly after updates!
+FROM node:latest
+RUN apt-get install -y curl
+
+# GOOD: Pin exact versions
+FROM node:20.11.1-alpine3.19
+RUN apk add --no-cache curl=8.5.0-r0
+```
+
+## REAL_WORLD
+**The .dockerignore Impact**
+Without `.dockerignore`:
+- `docker build` sends 800 MB (including `node_modules`) to Docker daemon
+- Build context upload: 45 seconds
+- Every build: 45 seconds wasted
+
+With `.dockerignore` (excluding `node_modules`):
+- `docker build` sends only 5 MB (just source code)
+- Build context upload: 0.5 seconds
+- Every build: near-instant context upload
+
+## INTERVIEW
+**Q: You inspect a Docker image someone built and find that a secret API key was accidentally included in a layer. They've already `docker push`-ed this image to a public registry. Can they fix this by simply running a new `docker build` without the secret and pushing again?**
+A: **No! The old image with the secret is still on the public registry and must be deleted manually.**
+
+Even if the developer builds a new image without the secret and pushes `latest`, the old image layers containing the secret are **still stored** in the registry with their original digests. Anyone who already pulled the old `latest` has the secret. Anyone who accesses the registry's stored layers can still find the secret.
+
+The correct response:
+1. **Immediately** delete the affected image/tag from the registry
+2. **Rotate the secret** — assume it's compromised
+3. Fix the Dockerfile to not include the secret
+4. Use Docker BuildKit secrets for build-time secrets: `RUN --mount=type=secret,id=api_key cat /run/secrets/api_key`
+5. Push the clean image
+
+Docker image layers are immutable content-addressed blobs. "Overwriting" a tag only changes which digest it points to — old blobs remain stored until garbage-collected by the registry.

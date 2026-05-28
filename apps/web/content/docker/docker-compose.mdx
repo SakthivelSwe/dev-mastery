@@ -1,0 +1,170 @@
+---
+slug: "docker-compose"
+title: "Docker Compose"
+level: 3
+---
+
+## WHY
+A real application isn't just one container. It's a **web app** container + a **database** container + a **Redis cache** container + maybe a **reverse proxy** container.
+Running all these manually is painful:
+```bash
+docker run -p 5432:5432 -e POSTGRES_PASSWORD=secret postgres:15
+docker run -p 6379:6379 redis:7
+docker run -p 8080:8080 --link postgres --link redis my-api:1.0
+```
+Managing multiple containers this way — networking them, setting environment variables, ensuring start order — quickly becomes a full-time job.
+**Docker Compose** solves this completely. You define your entire multi-container application in a single `docker-compose.yml` file. Then one command (`docker compose up`) starts, networks, and configures every container in perfect order.
+
+## THEORY
+### The Compose File
+A `docker-compose.yml` file defines:
+- **Services:** Each container (your app, database, cache, etc.)
+- **Networks:** How the containers talk to each other (Compose auto-creates a shared network!)
+- **Volumes:** Where persistent data lives (database files survive container restarts)
+- **Environment Variables:** Secrets and configuration per service
+
+### Magic DNS (Service Discovery)
+The most powerful Compose feature: containers in the same Compose network can reach each other using their **service name as the hostname**!
+If you name your database service `postgres`, your application container connects using `jdbc:postgresql://postgres:5432/mydb` — Docker's DNS resolves `postgres` automatically. No IP addresses needed!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-compose-network" }
+```
+
+## CODE
+
+### Full-Stack App with Docker Compose
+```yaml
+# docker-compose.yml
+version: '3.9'
+
+services:
+  # --- Backend Spring Boot API ---
+  api:
+    build: ./backend             # Build from the ./backend/Dockerfile
+    ports:
+      - "8080:8080"              # Map host:container port
+    environment:
+      # These use the SERVICE NAME 'db' as the hostname — auto-resolved by Docker DNS!
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/appdb
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}  # Reads from .env file
+      SPRING_REDIS_HOST: redis
+    depends_on:
+      db:
+        condition: service_healthy    # Wait for db to pass health check before starting!
+      redis:
+        condition: service_started
+
+  # --- PostgreSQL Database ---
+  db:
+    image: postgres:15-alpine         # Use official image, no Dockerfile needed
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Named volume = data persists!
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    healthcheck:                       # Compose waits for this before 'api' starts
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis Cache ---
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+  # --- React Frontend ---
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+# Named volumes persist across container restarts!
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+### Essential Compose Commands
+```bash
+# Start all services (detached mode = runs in background)
+docker compose up -d
+
+# View logs from all services
+docker compose logs -f
+
+# View logs from just the API
+docker compose logs -f api
+
+# Stop all containers (but keep volumes!)
+docker compose down
+
+# Stop AND delete all volumes (fresh database!)
+docker compose down -v
+
+# Rebuild a specific service image
+docker compose build api
+
+# Scale a service to 3 instances
+docker compose up -d --scale api=3
+
+# Execute a command inside a running container
+docker compose exec db psql -U postgres -d appdb
+
+# Show status of all services
+docker compose ps
+```
+
+### .env File for Secrets
+```bash
+# .env file (NEVER commit this to Git!)
+DB_PASSWORD=super_secure_password_123
+API_KEY=sk-abcdef123456
+REDIS_PASSWORD=another_secure_pass
+```
+
+## REAL_WORLD
+**Local Development with Live Reloading**
+By default, Compose builds your code into the image. If you change code, you rebuild. 
+For development, use **bind mounts** to map your local source code directory into the container. The container sees code changes instantly!
+
+```yaml
+services:
+  api:
+    build: .
+    volumes:
+      # Bind mount: your local ./src is mounted into the container's /app/src
+      # When you save a file in VS Code, the container sees it immediately!
+      - ./src:/app/src
+    command: npm run dev  # Override CMD to use nodemon for live reload
+```
+
+## INTERVIEW
+**Q: In Docker Compose, you define `depends_on: [db]` for your API service. A developer on your team says "the API still crashes on startup because it can't connect to the database — it starts before Postgres is ready." How do you fix this?**
+A: **`depends_on` only waits for the container to START, not for the service inside to be READY.**
+
+`depends_on: [db]` simply waits for the `db` container process to begin. Postgres takes a few seconds to initialize its data directory and accept connections AFTER the container starts.
+
+The fix is to use `depends_on` with a `condition: service_healthy` combined with a `healthcheck` on the `db` service:
+
+```yaml
+services:
+  api:
+    depends_on:
+      db:
+        condition: service_healthy  # Wait for health check to PASS
+
+  db:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+```
+
+Now Docker Compose will keep checking `pg_isready` every 5 seconds and only start the `api` container once Postgres is actually accepting connections.

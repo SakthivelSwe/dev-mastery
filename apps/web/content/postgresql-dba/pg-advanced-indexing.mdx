@@ -1,0 +1,77 @@
+---
+slug: "pg-indexing-internals"
+title: "PostgreSQL Indexing Internals"
+level: 5
+---
+
+## WHY
+Every developer knows they should "add an index" to make a query faster. But very few developers understand *how* the index actually works, why an index might be ignored by the query planner, or the severe performance penalties of over-indexing.
+
+A DBA must deeply understand the internal data structures of PostgreSQL indexes (B-Trees, Hash, GiST, GIN, BRIN) to diagnose slow queries and optimize storage.
+
+## THEORY
+### The Anatomy of a B-Tree
+The default index in PostgreSQL (and 99% of relational databases) is the **B-Tree (Balanced Tree)**.
+An index is fundamentally a separate data structure stored on the hard drive. It duplicates the indexed column's data and sorts it.
+- **Root Node:** The top of the tree, containing pointers to branch nodes.
+- **Branch Nodes:** Intermediate nodes dividing the data range.
+- **Leaf Nodes:** The bottom of the tree. They contain the actual indexed value (e.g., `id = 45`) and a **TID (Tuple Identifier)**. The TID (e.g., `Block 5, Offset 12`) tells Postgres exactly where the physical row lives in the massive underlying Table file!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-btree" }
+```
+
+## CODE
+
+### Level 1 — The Index Only Scan
+Normally, a query uses an **Index Scan**:
+1. Postgres traverses the B-Tree index to find `id = 45`.
+2. It reads the Leaf Node and finds the TID (`Block 5, Offset 12`).
+3. It jumps to the actual Table file on the hard drive, reads Block 5, and extracts the full row to return to the user.
+
+If you run `SELECT id, name FROM users WHERE id = 45`, step 3 is required to fetch the `name`.
+However, if you run `SELECT id FROM users WHERE id = 45`, Postgres realizes that the only data you requested (`id`) is *already stored inside the Index Leaf Node!* 
+Postgres executes an **Index Only Scan**, completely skipping Step 3. This halves the Disk IO and is the fastest possible way to retrieve data.
+
+### Level 2 — Covering Indexes (INCLUDE)
+What if you run `SELECT id, status FROM users WHERE id = 45;` a million times a second? You want an Index Only Scan, but `status` isn't in the index.
+You *could* create a composite index: `CREATE INDEX idx_user_id_status ON users(id, status);`. But this makes the B-Tree massive and slows down inserts because Postgres has to sort the tree by `status` as well!
+
+**The Solution: Covering Indexes.**
+```sql
+CREATE INDEX idx_user_id ON users (id) INCLUDE (status);
+```
+This creates a B-Tree sorted ONLY by `id`. But, at the very bottom (the Leaf Nodes), it attaches a copy of the `status` string as a payload! It doesn't sort by it, it just carries it. Now, your query can achieve a blazingly fast Index Only Scan without bloating the tree traversal logic!
+
+### Level 3 — Partial Indexes
+If you have an `orders` table with 10 million rows, but 9.9 million are `status = 'completed'` and only 100,000 are `status = 'pending'`, creating a standard index on `status` is a waste of disk space. A query for 'completed' orders will just do a full table scan anyway because it returns 99% of the table!
+
+**The Solution: Partial Indexes.**
+```sql
+-- This index ONLY indexes the 100,000 pending rows!
+-- The index is incredibly tiny (a few kilobytes instead of megabytes),
+-- lightning fast to search, and perfectly optimized for the application queue!
+CREATE INDEX idx_pending_orders ON orders (status) WHERE status = 'pending';
+```
+
+### Level 4 — Advanced Index Types (GIN and BRIN)
+B-Trees are useless for certain data types.
+1. **JSONB and Arrays:** A B-Tree cannot search *inside* a JSON document. You must use a **GIN (Generalized Inverted Index)**. GIN takes every key-value pair inside the JSON and indexes them individually. `CREATE INDEX idx_json ON events USING GIN (payload);`
+2. **Time-Series Data:** If you have 5 Billion logs appended sequentially by time, a B-Tree will consume 50GB of RAM just for the index! You use a **BRIN (Block Range Index)**. BRIN doesn't index every row. It simply says: "Block 1 of the hard drive contains dates from Jan 1 to Jan 5. Block 2 contains Jan 6 to Jan 10." A BRIN index on 5 Billion rows might only be 2 Megabytes! `CREATE INDEX idx_logs_time ON logs USING BRIN (created_at);`
+
+## REAL_WORLD
+**Index Bloat and REINDEX**
+When you UPDATE a row, Postgres creates a new version of the row (MVCC). It also must create a new entry in the B-Tree index pointing to the new row! The old index entry is marked "dead".
+Over time, if you do millions of updates, the B-Tree becomes bloated with dead entries. The tree grows physically larger, requiring more RAM and Disk IO to traverse, slowing down queries.
+While `VACUUM` attempts to clean up dead index entries, heavily updated tables will eventually suffer from severe **Index Bloat**.
+DBAs monitor index bloat using specialized scripts. If an index is heavily bloated, they must rebuild it from scratch without locking the table:
+`REINDEX INDEX CONCURRENTLY idx_users_email;`
+
+## INTERVIEW
+**Q: A developer runs `SELECT * FROM users WHERE first_name LIKE '%John%';`. They complain the query takes 5 seconds, even though there is a B-Tree index on `first_name`. Why did Postgres ignore the index and do a Full Table Scan?**
+A: **The Left-Wildcard Problem.**
+A B-Tree index is sorted alphabetically, exactly like a physical telephone book. 
+If you ask me to find someone whose name *starts* with 'John' (`'John%'`), I can instantly flip to the 'J' section of the telephone book and find them. (Postgres can use the index for this!).
+If you ask me to find someone whose name *contains* 'John' (`'%John%'`), I cannot use the alphabetical sorting. I must start at page 1 and read every single name in the entire telephone book. Postgres is forced to execute a Full Table Scan because the left wildcard destroys the mathematical utility of the B-Tree sort order.
+*(To fix this, you would need to use a Trigram (pg_trgm) GIN index, which indexes sequences of 3 characters, allowing fast substring matching!).*

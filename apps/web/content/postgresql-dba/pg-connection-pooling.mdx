@@ -1,0 +1,121 @@
+---
+slug: "pg-connection-pooling"
+title: "PostgreSQL Connection Pooling (PgBouncer)"
+level: 3
+---
+
+## WHY
+PostgreSQL is a **Process-Based** architecture, not Thread-Based (like MySQL or Java). 
+Every time a web application opens a connection to Postgres, the operating system physically `fork()`s a massive, memory-heavy process (usually taking 5MB - 10MB of RAM). 
+If a serverless AWS Lambda function scales up to handle a traffic spike, it might open 2,000 simultaneous connections to Postgres. 2,000 connections * 10MB = 20GB of RAM instantly consumed just to keep the connections open, leaving zero RAM for actual query execution. The database will crash immediately (OOM Kill).
+
+To survive modern web architectures, you must place a **Connection Pooler** in front of PostgreSQL.
+
+## THEORY
+### How Connection Pooling Works
+A web application (like a Node.js API) receives 1,000 HTTP requests per second. Each request needs to run a 1-millisecond SQL query. 
+Instead of opening 1,000 connections to the database, the application connects to a lightweight Proxy (the Connection Pooler). 
+The Proxy holds exactly 100 persistent, long-running connections to PostgreSQL. 
+When the 1,000 web requests hit the Proxy, the Proxy rapidly multiplexes (juggles) the SQL queries across the 100 actual database connections. Because the queries are so fast, the 100 connections can easily handle the 1,000 requests per second, and the database CPU/RAM remains completely unstressed!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-pooling" }
+```
+
+## CODE
+
+### Level 1 — PgBouncer (The Standard)
+**PgBouncer** is the undisputed king of PostgreSQL connection pooling. It is a blazingly fast, lightweight C daemon. It uses virtually zero RAM per connection.
+
+You install PgBouncer on the database server (or a dedicated proxy server), and you configure your web application to connect to PgBouncer (usually Port 6432) instead of Postgres (Port 5432).
+
+```ini
+# pgbouncer.ini
+
+[databases]
+# Map the incoming request to the actual database
+# PgBouncer listens on 6432, but talks to Postgres on 5432
+my_database = host=127.0.0.1 port=5432 dbname=my_database
+
+[pgbouncer]
+listen_port = 6432
+listen_addr = *
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+
+# THE MAGIC: Limit the actual connections to Postgres!
+# PgBouncer will NEVER open more than 100 connections to Postgres,
+# even if 5,000 clients connect to PgBouncer!
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 100
+```
+
+### Level 2 — The Three Pooling Modes
+PgBouncer operates in three different modes, which dictate when it "juggles" a connection. Choosing the wrong mode will break your application.
+
+1. **Session Pooling:** When Client A connects, they are permanently glued to Postgres Connection #1 until they explicitly disconnect. This defeats the purpose for modern web apps because if you have 2,000 clients, you still need 2,000 connections.
+2. **Transaction Pooling (The Gold Standard):** Client A is assigned Postgres Connection #1 *only for the duration of a transaction* (`BEGIN ... COMMIT`). The millisecond the `COMMIT` happens, PgBouncer rips Connection #1 away from Client A and gives it to Client B! This allows 100 DB connections to serve 5,000 clients.
+3. **Statement Pooling:** The most aggressive. PgBouncer rips the connection away after every single SQL statement, even inside a transaction. (Rarely used, breaks `BEGIN/COMMIT` logic).
+
+### Level 3 — The Dangers of Transaction Pooling
+If you use **Transaction Pooling** (which you should), you must fundamentally change how you write SQL in your application.
+Because PgBouncer might give you Connection #1 for your first transaction, and Connection #45 for your second transaction, you **cannot use Session-Level State**.
+
+```sql
+-- THIS WILL BREAK IN TRANSACTION POOLING!
+
+-- Transaction 1 (Runs on Connection #1)
+BEGIN;
+-- Developer sets a session variable
+SET statement_timeout = '10s'; 
+SELECT * FROM huge_table;
+COMMIT;
+
+-- PgBouncer takes Connection #1 and gives it to a completely different user!
+-- The new user executes a query, and because they inherited Connection #1, 
+-- their query is suddenly and unexpectedly killed after 10 seconds due to the 
+-- leftover session state!
+```
+*Rule:* In Transaction Pooling, you cannot use `PREPARE` statements, `SET` commands, or `LISTEN/NOTIFY`. The connection must be perfectly stateless! (If you must use Prepared Statements, modern PgBouncer supports them via `max_prepared_statements`, but it requires careful configuration).
+
+### Level 4 — PgBouncer Admin Console
+PgBouncer is not just a dumb proxy; it provides an incredible administrative interface. You can connect directly to a fake database named `pgbouncer` to control the proxy via SQL!
+
+```bash
+# Connect to the admin console
+psql -p 6432 -U admin pgbouncer
+```
+
+```sql
+-- Show real-time pooling statistics!
+SHOW POOLS;
+-- (Outputs how many clients are waiting, how many servers are active)
+
+-- EMERGENCY COMMAND: PAUSE!
+-- If your Postgres database is crashing, you can PAUSE the pooler.
+-- PgBouncer will stop sending queries to Postgres, but it will hold the 
+-- web application connections open (they will just wait/hang).
+-- You can restart Postgres safely, and then run RESUME. 
+-- The web application will never throw a "Connection Refused" error, it will just experience a 10-second lag!
+PAUSE my_database;
+RESUME my_database;
+```
+
+## REAL_WORLD
+**Application-Level Pooling vs. PgBouncer**
+Doesn't Prisma, TypeORM, or Java HikariCP already have connection pooling built-in? Why do I need PgBouncer?
+Yes, application-level pools are great. But they are *local* to the application instance.
+If your Node.js app is deployed to Kubernetes, and K8s scales your app from 2 pods to 50 pods (to handle a traffic spike), and each pod's internal connection pool is set to 20... you just hit the database with $50 \times 20 = 1,000$ simultaneous connections! The database crashes.
+By placing PgBouncer directly in front of the database, it acts as a global choke-point. Even if Kubernetes spins up 5,000 pods, PgBouncer will calmly queue the requests and guarantee that exactly 100 connections hit the actual database, saving your production environment.
+
+## INTERVIEW
+**Q: We deployed PgBouncer in Transaction Pooling mode. Our Node.js application uses Prepared Statements for security and performance. Suddenly, the application starts throwing errors: `prepared statement "s1" does not exist` or `prepared statement "s1" already exists`. What is causing this?**
+A: **Connection Juggling and Prepared Statements incompatibility.**
+A Prepared Statement is stored in the memory of a specific PostgreSQL connection.
+1. The Node app asks PgBouncer to `PREPARE s1 AS SELECT * FROM users`. PgBouncer routes this to Postgres Connection A.
+2. The Node app executes a transaction and commits. PgBouncer takes Connection A away.
+3. The Node app tries to `EXECUTE s1`. PgBouncer routes this to Postgres Connection B.
+4. Connection B looks in its memory, doesn't find `s1`, and throws a fatal error!
+**The Fix:** You must either disable Prepared Statements in your ORM/Application driver (e.g., in Prisma, add `?pgbouncer=true` to the connection URL), OR you must configure PgBouncer to track and manage prepared statements at the proxy level by enabling `max_prepared_statements` in `pgbouncer.ini`.

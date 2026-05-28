@@ -1,0 +1,171 @@
+---
+slug: "graphql-basics"
+title: "GraphQL Basics"
+level: 4
+---
+
+## WHY
+In standard REST APIs, the server dictates the exact structure of the data returned. If a mobile app only needs a user's `name` and `avatar`, but the `GET /users/1` endpoint returns a massive JSON object with 50 fields, you have **over-fetching** (wasting bandwidth). If the app also needs the user's recent posts, it must make a second network request to `GET /users/1/posts` — this is **under-fetching** (causing N+1 network requests).
+
+**GraphQL** (created by Facebook) solves this by letting the *client* specify exactly what data it wants. The client sends a query detailing the exact shape of the response it expects, and the server returns exactly that shape. Nothing more, nothing less.
+
+## THEORY
+### Core Concepts
+1. **Schema:** A strongly-typed contract between client and server, defining all possible queries and data types.
+2. **Query:** How the client requests data (equivalent to REST `GET`).
+3. **Mutation:** How the client modifies data (equivalent to REST `POST`/`PUT`/`DELETE`).
+4. **Resolver:** The backend function that actually fetches the data for a specific field in the schema.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "graphql-basics" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Query)
+```graphql
+# THE REQUEST (from the client)
+# Notice we only ask for exactly what we need!
+query GetUserProfile {
+  user(id: "123") {
+    name
+    avatarUrl
+    # Nested request: Get the user's posts in the SAME network call!
+    posts(limit: 2) {
+      title
+      likes
+    }
+  }
+}
+
+# THE RESPONSE (from the server)
+# The response perfectly matches the shape of the query!
+{
+  "data": {
+    "user": {
+      "name": "Alice",
+      "avatarUrl": "https://cdn.com/alice.jpg",
+      "posts": [
+        { "title": "GraphQL is awesome", "likes": 42 },
+        { "title": "REST vs GraphQL", "likes": 15 }
+      ]
+    }
+  }
+}
+```
+
+### Level 2 — Building Blocks (The Schema)
+The backend must define a schema using the Schema Definition Language (SDL).
+
+```graphql
+# Define custom types
+type User {
+  id: ID!              # The ! means "Required" (non-null)
+  name: String!
+  email: String!
+  avatarUrl: String
+  posts(limit: Int): [Post!]!  # Returns a list of Posts
+}
+
+type Post {
+  id: ID!
+  title: String!
+  content: String!
+  likes: Int!
+  author: User!        # Bidirectional relationship!
+}
+
+# The Root Query type (Entry points for reading data)
+type Query {
+  user(id: ID!): User
+  allUsers: [User!]!
+  post(id: ID!): Post
+}
+
+# The Root Mutation type (Entry points for writing data)
+type Mutation {
+  createPost(userId: ID!, title: String!, content: String!): Post!
+  likePost(postId: ID!): Post!
+}
+```
+
+### Level 3 — Intermediate (Resolvers)
+A Schema is just a definition. **Resolvers** are the actual backend functions (in Node.js, Java, Go, etc.) that fetch the data.
+Every field on every type can have its own resolver function!
+
+```javascript
+// Node.js Apollo Server Example
+const resolvers = {
+  // Resolvers for the Root Query
+  Query: {
+    // Fetches the initial user from the database
+    user: async (_, args, context) => {
+      return await db.users.findById(args.id);
+    }
+  },
+  
+  // Resolvers for specific fields on the User type
+  User: {
+    // The "posts" field needs special logic to fetch from a different DB table!
+    // The 'parent' argument is the User object returned by the root Query.
+    posts: async (parent, args, context) => {
+      return await db.posts.findByAuthorId(parent.id, args.limit);
+    },
+    
+    // You can even compute fields on the fly!
+    avatarUrl: (parent) => {
+      return parent.avatarUrl || "https://default.avatar/user.png";
+    }
+  },
+  
+  // Resolvers for Mutations
+  Mutation: {
+    createPost: async (_, args, context) => {
+      if (!context.isAuthenticated) throw new Error("Unauthorized");
+      return await db.posts.insert({
+        authorId: args.userId,
+        title: args.title,
+        content: args.content
+      });
+    }
+  }
+};
+```
+
+### Level 4 — Advanced (The N+1 Problem in GraphQL)
+Because GraphQL resolves fields recursively, it is notorious for causing the N+1 Database Query Problem.
+
+```graphql
+# If the client runs this query:
+query {
+  allUsers {
+    name
+    posts { title }
+  }
+}
+```
+**What happens on the backend?**
+1. Resolver `Query.allUsers` runs. (1 DB query returning 100 users).
+2. For *each* of the 100 users, the resolver `User.posts` runs. (100 separate DB queries!).
+Total: 101 database queries for a single HTTP request!
+
+**The Solution: DataLoader**
+DataLoader is a utility that waits 10ms to collect all the individual `User.posts(userId)` requests, batches all 100 user IDs together, and executes ONE database query: `SELECT * FROM posts WHERE user_id IN (1, 2, ..., 100)`. It then maps the results back to the individual resolvers.
+*Always use DataLoader when resolving relationships in GraphQL!*
+
+## REAL_WORLD
+GitHub's v4 API is entirely GraphQL. If you want to fetch an issue, its comments, the authors of those comments, and the authors' avatars, you can do it in a single GraphQL query instead of 50 REST calls.
+
+However, GraphQL adds significant complexity:
+- **Caching is hard:** In REST, `GET /users/123` can be cached easily at the HTTP level (CDN). In GraphQL, every request is a `POST` to `/graphql` with a different query body, making HTTP caching impossible. You must implement complex application-level caching (like Apollo Client).
+- **Security is hard:** A malicious user can send a deeply nested query: `user { posts { author { posts { author ... } } } }` that instantly crashes your database. You must implement Query Depth Limiting and Query Complexity Cost Analysis.
+
+## INTERVIEW
+**Q: When should you choose REST over GraphQL?**
+A: Choose REST when:
+- The API is public-facing and simplicity/discoverability is the highest priority.
+- You need robust HTTP-level caching (e.g., serving product catalog pages via CDN).
+- The client access patterns are simple and predictable (no complex relationships).
+- You want to use standard tools (API Gateways, WAFs) that natively understand REST URLs.
+Choose GraphQL when you are building a "Backend for Frontend" (BFF) where the client needs extreme flexibility to query complex relationship graphs without over/under-fetching.

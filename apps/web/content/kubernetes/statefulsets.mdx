@@ -1,0 +1,124 @@
+---
+slug: "statefulsets"
+title: "StatefulSets"
+level: 4
+---
+
+## WHY
+Deployments are great for stateless applications — any Pod can be killed and replaced with an identical one, since they're all interchangeable. But databases, Kafka brokers, and ZooKeeper nodes are NOT interchangeable.
+A PostgreSQL primary node has a different role than a replica. A Kafka broker has a specific ID that partitions depend on. These require stable identity, stable storage, and ordered start/shutdown.
+**StatefulSets** provide exactly these guarantees for stateful applications.
+
+## THEORY
+### What Makes StatefulSets Different from Deployments
+1. **Stable Pod Names:** Pods get ordered names: `postgres-0`, `postgres-1`, `postgres-2`. Never random UUIDs.
+2. **Stable Network Identity:** Each Pod gets a stable DNS entry: `postgres-0.postgres-headless.default.svc.cluster.local`
+3. **Ordered Deployment:** Pods deploy in order (0 first, then 1, then 2). Scaled down in reverse.
+4. **Per-Pod PVCs:** Each Pod gets its OWN Persistent Volume Claim — individual, durable storage that stays with the Pod identity (not shared!).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "statefulsets" }
+```
+
+## CODE
+
+### StatefulSet Example (PostgreSQL)
+```yaml
+# Headless service for stable DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+spec:
+  clusterIP: None    # Headless! DNS returns individual Pod IPs
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+---
+# StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres-headless  # Connects to the headless service!
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POD_NAME           # Pod can know its own identity!
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  # Each Pod gets its OWN PVC!
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+### StatefulSet vs Deployment
+```bash
+# After creating the StatefulSet:
+kubectl get pods -l app=postgres
+# NAME         READY   STATUS
+# postgres-0   1/1     Running   ← Always postgres-0, not random UUID!
+# postgres-1   1/1     Running   ← Created AFTER postgres-0 is running!
+# postgres-2   1/1     Running   ← Created AFTER postgres-1 is running!
+
+kubectl get pvc
+# NAME               STATUS   CAPACITY
+# data-postgres-0    Bound    50Gi     ← postgres-0's private PVC!
+# data-postgres-1    Bound    50Gi     ← postgres-1's private PVC!
+# data-postgres-2    Bound    50Gi     ← postgres-2's private PVC!
+
+# DNS entries:
+# postgres-0.postgres-headless.default.svc.cluster.local
+# postgres-1.postgres-headless.default.svc.cluster.local
+# postgres-2.postgres-headless.default.svc.cluster.local
+```
+
+## REAL_WORLD
+**Primary/Replica Configuration via Pod Ordinal**
+```bash
+# In startup scripts, check the pod name to determine role!
+if [[ $POD_NAME == *"-0" ]]; then
+  echo "This is the PRIMARY node!"
+  # Configure as primary (read/write)
+else
+  echo "This is a REPLICA!"
+  # Configure replication from postgres-0.postgres-headless
+fi
+```
+
+Many StatefulSet applications (Redis Cluster, MongoDB ReplicaSet, Kafka) use this pattern: pod index 0 is always the primary/leader, others are replicas.
+
+## INTERVIEW
+**Q: You scale a StatefulSet from 3 to 2 replicas. Which Pod is deleted? If you then scale back to 3, does it get the same PVC?**
+
+A: **Pod with the highest index is deleted first** (`postgres-2` is deleted when scaling from 3→2). StatefulSets always scale down in reverse ordinal order.
+
+**The PVC survives!** When `postgres-2` is deleted, the PVC `data-postgres-2` is NOT deleted (it persists with its data). This is critical for safety.
+
+When you scale back to 3, Kubernetes creates a new `postgres-2` Pod and it **reattaches to the existing `data-postgres-2` PVC** — all its data is intact! This is the key advantage of StatefulSets: Pod identity is permanent, and storage follows that identity across restarts and rescheduling.
+
+This is fundamentally different from Deployments where Pods are interchangeable and don't have persistent identity-bound storage.

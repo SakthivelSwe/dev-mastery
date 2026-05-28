@@ -1,0 +1,178 @@
+---
+slug: "docker-compose-advanced"
+title: "Docker Compose Advanced"
+level: 3
+---
+
+## WHY
+Basic Docker Compose (`docker compose up`) covers local development. But production deployments, CI/CD pipelines, and complex multi-environment setups require advanced Compose features: environment-specific overrides, secret management, profiles, extension fields, and health check integration.
+These advanced patterns are what separate teams who struggle with Docker from those who use it with confidence and efficiency.
+
+## THEORY
+### Key Advanced Features
+- **Override files:** Merge multiple compose files for environment-specific configs
+- **Profiles:** Conditionally include services (e.g., run mock services only in dev)
+- **Secrets:** Reference Docker secrets safely (for Swarm deployment)
+- **Extension fields:** Reuse YAML blocks with anchors
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "compose-advanced" }
+```
+
+## CODE
+
+### Environment Override Pattern
+```yaml
+# docker-compose.yml (base config — shared by all environments)
+services:
+  api:
+    image: my-api:latest
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+
+# docker-compose.override.yml (automatically applied in development!)
+# This file is loaded automatically without -f flag
+services:
+  api:
+    build: .  # Build from source in development
+    volumes:
+      - ./src:/app/src  # Hot-reload for dev
+    ports:
+      - "3000:3000"
+```
+
+```yaml
+# docker-compose.prod.yml (explicitly loaded for production)
+services:
+  api:
+    image: myregistry/my-api:${IMAGE_TAG}  # Use pre-built image, not build
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+```
+
+```bash
+# Development (auto-loads docker-compose.override.yml)
+docker compose up
+
+# Production (explicitly merge base + prod config)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+### Profiles (Conditional Services)
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: my-api  # Always starts
+
+  # This service ONLY starts when 'mock' profile is active
+  mock-payment-service:
+    image: mock-payments:latest
+    profiles: [mock]
+
+  # This service ONLY starts when 'debug' profile is active
+  mailhog:
+    image: mailhog/mailhog
+    profiles: [debug]
+    ports: ["8025:8025"]
+```
+
+```bash
+# Normal development (no mock services)
+docker compose up
+
+# Development with mock payment service
+docker compose --profile mock up
+
+# Development with ALL debug tools
+docker compose --profile mock --profile debug up
+```
+
+### YAML Anchors (DRY Config)
+```yaml
+# Reuse common config blocks using YAML anchors (&) and references (*)
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-healthcheck: &default-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 60s
+
+services:
+  api:
+    image: my-api
+    logging: *default-logging    # Reuse the logging config!
+    healthcheck:
+      <<: *default-healthcheck   # Merge the healthcheck config!
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+
+  worker:
+    image: my-worker
+    logging: *default-logging    # Same logging config, DRY!
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "node", "healthcheck.js"]
+```
+
+### Running Tasks with Compose
+```bash
+# Run a one-off task against the database
+docker compose run --rm api npm run db:migrate
+
+# Run tests (creates fresh containers, runs tests, then removes containers)
+docker compose run --rm api npm test
+
+# Open a shell in a running service
+docker compose exec api sh
+
+# Execute raw SQL against the database service
+docker compose exec db psql -U postgres -c "SELECT count(*) FROM users;"
+```
+
+## REAL_WORLD
+**Environment-Specific .env Files**
+```bash
+# .env (default — not committed to git)
+IMAGE_TAG=latest
+DB_PASSWORD=devsecret
+REDIS_HOST=redis
+
+# .env.production (committed — no secrets, just references)
+IMAGE_TAG=${GITHUB_SHA}
+DB_PASSWORD=${PRODUCTION_DB_PASSWORD}
+REDIS_HOST=production-redis.internal
+```
+
+```bash
+# Load a specific env file
+docker compose --env-file .env.staging up -d
+```
+
+## INTERVIEW
+**Q: Your Docker Compose setup has a `docker-compose.yml` and a `docker-compose.override.yml`. A new team member runs `docker compose up` and gets unexpected behavior because the override file contains dev-specific settings they didn't know about. How do you prevent this confusion?**
+A: The `docker-compose.override.yml` is automatically merged by Docker Compose, which is convenient but confusing for new team members.
+
+Best practices:
+1. **Rename the override:** Instead of the auto-loaded `docker-compose.override.yml`, use `docker-compose.dev.yml` and require explicit loading: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up`. This makes the multi-file nature explicit.
+
+2. **Document in README:** Always clearly document which compose files exist, their purpose, and the exact commands to use for each environment.
+
+3. **Use a Makefile or scripts:**
+```makefile
+# Makefile
+dev:
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+prod:
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+Running `make dev` or `make prod` is self-documenting and prevents mistakes.

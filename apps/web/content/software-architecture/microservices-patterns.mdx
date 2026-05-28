@@ -1,0 +1,144 @@
+---
+slug: "microservices-patterns"
+title: "Microservices Patterns"
+level: 4
+---
+
+## WHY
+Microservices architectures solve the Monolith scaling problem — you can deploy and scale individual services independently. But they introduce a new class of problems: How do you handle a transaction that spans 5 different services? What happens if Service B fails mid-transaction after Service A has already committed? How do you keep data consistent across databases that belong to different services?
+
+Microservices Patterns are the battle-tested solutions to these distributed system challenges.
+
+## THEORY
+### Core Patterns Categories
+1. **Data Management:** How each service manages its own data.
+2. **Transactions:** How to handle cross-service transactions.
+3. **Communication:** Synchronous (REST/gRPC) vs Asynchronous (Kafka/RabbitMQ).
+4. **Resilience:** Circuit Breakers, Timeouts, Retries.
+5. **Discovery:** How services find each other's network addresses.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "microservices-patterns" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Database-per-Service Pattern)
+```
+GOLDEN RULE: Each microservice owns its OWN database.
+No two services share the same database!
+
+✅ CORRECT:
+Order Service     → PostgreSQL (orders DB)
+Product Service   → MongoDB (catalog DB)
+User Service      → PostgreSQL (users DB)
+Inventory Service → Cassandra (inventory DB)
+
+❌ WRONG: Multiple services sharing one database
+[Order Service + Product Service + User Service] → Shared PostgreSQL
+
+WHY SEPARATE?
+- Independent scaling: Scale the Product DB and Order DB separately
+- Loose coupling: Order Service doesn't break if User DB schema changes
+- Tech diversity: Use the right database for each service's use case
+- Autonomous deployment: Change Order Service DB schema without downtime for others
+```
+
+### Level 2 — Building Blocks (The Saga Pattern)
+For a transaction spanning multiple services (e.g., "Place Order" → Reserve Inventory → Charge Payment → Schedule Shipping), you can't use a traditional SQL transaction. Instead, use the **Saga Pattern**.
+
+```
+CHOREOGRAPHY SAGA (Event-Driven):
+Order Service: Creates Order → publishes "OrderCreated" event
+Inventory Service: Receives event → Reserves stock → publishes "InventoryReserved"
+Payment Service: Receives event → Charges card → publishes "PaymentCompleted"
+Shipping Service: Receives event → Schedules delivery → publishes "ShipmentScheduled"
+
+COMPENSATING TRANSACTIONS (Rollback):
+If Payment fails after Inventory is reserved:
+Payment Service: publishes "PaymentFailed"
+Inventory Service: Receives event → RELEASES the reservation (undo!)
+Order Service: Receives event → Marks order as "FAILED"
+
+No distributed transaction lock needed! Each service is autonomous.
+```
+
+### Level 3 — Intermediate (Circuit Breaker Pattern)
+```java
+// Without Circuit Breaker:
+// If Payment Service is down, every Order request WAITS 30 seconds
+// before timing out, exhausting your thread pool and cascading failure!
+
+// WITH Circuit Breaker (Resilience4j):
+@Service
+public class PaymentClient {
+
+    @CircuitBreaker(
+        name = "paymentService",
+        fallbackMethod = "paymentFallback"
+    )
+    @TimeLimiter(name = "paymentService") // Timeout after 3 seconds!
+    @Retry(name = "paymentService")       // Retry 3 times before failing
+    public CompletableFuture<PaymentResult> chargeCard(PaymentRequest request) {
+        return restTemplate.postForObject("/payments/charge", request, PaymentResult.class);
+    }
+    
+    // Fallback: Called when Circuit Breaker is OPEN or call fails!
+    public CompletableFuture<PaymentResult> paymentFallback(PaymentRequest req, Exception ex) {
+        // Option 1: Immediate failure with meaningful error
+        return CompletableFuture.completedFuture(new PaymentResult("FAILED", "Payment service unavailable"));
+        // Option 2: Queue for async processing when service recovers
+    }
+}
+```
+
+### Level 4 — Advanced (Service Discovery + API Gateway Pattern)
+```yaml
+# Kubernetes-native service discovery:
+# Services register themselves with the cluster DNS automatically!
+
+# Order Service wants to call Product Service:
+# It uses the Kubernetes Service DNS name: 
+# product-service.production.svc.cluster.local:8080
+
+# No hardcoded IP addresses! Kubernetes handles routing to healthy pods.
+
+# Kong API Gateway Config (manages all entry traffic):
+services:
+  - name: order-service
+    url: http://order-service.production:8080
+    connect_timeout: 5000  # 5 second timeout
+    routes:
+      - name: create-order
+        paths: ["/api/v1/orders"]
+        methods: ["POST"]
+    plugins:
+      - name: jwt         # Validate JWT before forwarding
+      - name: rate-limiting
+        config: { minute: 1000 }
+      - name: request-transformer
+        config:
+          add:
+            headers: ["X-Service-Name:api-gateway"]
+```
+
+## REAL_WORLD
+**The Strangler Fig Pattern — Migrating a Monolith to Microservices:**
+
+You don't rewrite your entire monolith at once (that's catastrophic). Instead:
+1. Put an API Gateway in front of the monolith.
+2. Identify one bounded domain (e.g., User Authentication).
+3. Build it as a new microservice.
+4. Route `/auth/*` traffic to the new service via the Gateway.
+5. Remove the old auth code from the monolith.
+6. Repeat for the next domain.
+
+Over 12-18 months, you "strangle" the monolith — extracting services one by one — until the monolith is gone. This is how Amazon, Netflix, and Uber actually migrated from monoliths to microservices.
+
+## INTERVIEW
+**Q: What is the CQRS pattern?**
+A: **Command Query Responsibility Segregation** separates the "write model" (Commands: create, update, delete) from the "read model" (Queries: get, search). The Write side uses a normalized database optimized for consistency. The Read side uses a denormalized database (or Elasticsearch) optimized for query speed. Changes from the Write side are propagated to the Read side asynchronously (via events or CDC). Twitter's feed architecture is a form of CQRS — you write tweets to a normalized DB, but you read from a pre-computed Redis feed.
+
+**Q: How do you debug a request that fails across 5 microservices?**
+A: **Distributed Tracing** (OpenTelemetry). Every request gets a unique `Trace-ID`. Each service propagates this ID in its outgoing requests. A tracing system (Jaeger, Tempo) collects all "spans" (segments of work) for a given Trace-ID, creating a visual waterfall diagram showing exactly which service was called, in what order, how long each took, and where the failure occurred.

@@ -1,0 +1,189 @@
+---
+slug: "server-actions"
+title: "Server Actions in Next.js"
+level: 3
+---
+
+## WHY
+Traditional full-stack development requires creating REST API endpoints for every form submission, data mutation, or user action. In Next.js + React, that means: write a `route.ts` handler, then write a `fetch()` call in the client, then handle loading/error states, then validate on both sides.
+**Server Actions** (Next.js 14+) let you write server-side functions that are called directly from your React components — no API endpoint needed. Form submissions, mutations, and server-side operations can all be handled with plain `async function`s marked with `'use server'`.
+
+## THEORY
+### How Server Actions Work
+A Server Action is an `async` function with the `'use server'` directive. Under the hood, Next.js:
+1. Replaces the function call with a secure POST request to a hidden auto-generated endpoint
+2. Executes the function on the server
+3. Returns the result to the client
+
+The developer writes: `await createUser(formData)`. The framework handles all the HTTP plumbing.
+
+### Benefits
+- **No API boilerplate:** No separate `route.ts` handler needed
+- **Type-safe:** TypeScript types flow from server to client automatically
+- **Progressive enhancement:** Forms work without JavaScript (HTML form action)
+- **Automatic revalidation:** Invalidate cached data after mutations
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "server-actions-flow" }
+```
+
+## CODE
+
+### Basic Server Action
+```typescript
+// app/actions.ts — Server Actions file
+'use server';  // All functions in this file run on the server!
+
+import { db } from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+
+export async function createUser(formData: FormData) {
+  // This runs on the SERVER — safe to access DB directly!
+  const name = formData.get('name') as string;
+  const email = formData.get('email') as string;
+
+  // Validate
+  if (!name || !email) {
+    return { error: 'Name and email are required' };
+  }
+
+  // Insert into database
+  await db.users.create({
+    data: { name, email }
+  });
+
+  // Revalidate the users page cache
+  revalidatePath('/users');
+
+  // Redirect to users list
+  redirect('/users');
+}
+```
+
+### Using Server Actions in a Form
+```tsx
+// app/users/new/page.tsx
+import { createUser } from '@/app/actions';
+
+export default function NewUserPage() {
+  return (
+    <form action={createUser}>  {/* Pass the Server Action directly! */}
+      <input name="name" placeholder="Name" required />
+      <input name="email" type="email" placeholder="Email" required />
+      <button type="submit">Create User</button>
+    </form>
+  );
+}
+// When submitted: Next.js calls createUser(formData) on the server!
+// Works even without JavaScript (progressive enhancement)!
+```
+
+### Server Action with useFormState (Loading + Error Handling)
+```tsx
+// app/users/new/page.tsx
+'use client';
+import { useFormState, useFormStatus } from 'react-dom';
+import { createUser } from '@/app/actions';
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Creating...' : 'Create User'}
+    </button>
+  );
+}
+
+export default function NewUserPage() {
+  const [state, formAction] = useFormState(createUser, null);
+
+  return (
+    <form action={formAction}>
+      {state?.error && <p className="error">{state.error}</p>}
+      <input name="name" placeholder="Name" required />
+      <input name="email" type="email" placeholder="Email" required />
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+### Server Action Without a Form (Mutation Button)
+```tsx
+// app/components/DeleteButton.tsx
+'use client';
+import { deleteUser } from '@/app/actions';
+
+export function DeleteButton({ userId }: { userId: string }) {
+  return (
+    <button onClick={() => deleteUser(userId)}>
+      Delete
+    </button>
+  );
+}
+```
+
+```typescript
+// app/actions.ts
+'use server';
+export async function deleteUser(userId: string) {
+  await db.users.delete({ where: { id: userId } });
+  revalidatePath('/users');
+}
+```
+
+## REAL_WORLD
+**Server Actions Replace Complex Patterns**
+
+Before Server Actions:
+```
+Client: fetch('/api/users', { method: 'POST', body: JSON.stringify(data) })
+→ Route Handler: export async function POST(req) { ... }
+→ DB query
+→ Response
+→ Client: setState(result) + reload data + error handling
+= 50+ lines of boilerplate per mutation
+```
+
+After Server Actions:
+```
+Client: <form action={createUser}>
+→ createUser(formData) — 10 lines, same file
+= Progressive enhancement, type-safe, instant cache invalidation
+```
+
+## INTERVIEW
+**Q: How do you handle authentication in a Server Action? You don't want just any user to be able to call the `deletePost` action.**
+
+A: Server Actions run on the server, so you have full access to server-side session data. Authenticate inside the action itself:
+
+```typescript
+'use server';
+import { auth } from '@/lib/auth';
+import { redirect } from 'next/navigation';
+
+export async function deletePost(postId: string) {
+  // 1. Get the current session
+  const session = await auth();
+  
+  // 2. If not authenticated, redirect to login
+  if (!session) {
+    redirect('/login');
+  }
+  
+  // 3. Check authorization — verify the user OWNS the post
+  const post = await db.posts.findUnique({ where: { id: postId } });
+  
+  if (post.authorId !== session.user.id) {
+    throw new Error('Unauthorized: You can only delete your own posts');
+  }
+  
+  // 4. Safe to proceed
+  await db.posts.delete({ where: { id: postId } });
+  revalidatePath('/posts');
+}
+```
+
+**Never trust client-provided user IDs** — always get the identity from the server-side session. The `session.user.id` comes from a signed, httpOnly cookie that the client cannot forge.

@@ -1,0 +1,133 @@
+---
+slug: "event-loop"
+title: "The Event Loop"
+level: 3
+---
+
+## WHY
+JavaScript is strictly **Single-Threaded**. It only has one Call Stack, meaning it can only execute one piece of code at a time.
+So, if JavaScript is single-threaded, how can it make an HTTP request that takes 5 seconds, whilst simultaneously updating a smooth 60FPS animation on the screen, without freezing the browser?
+The answer is the **Event Loop**. It is the invisible conductor of JavaScript. Understanding it is the difference between a Junior developer who guesses why `setTimeout` is behaving weirdly, and a Senior developer who guarantees perfect performance.
+
+## THEORY
+### The Big Picture Components
+1. **The Call Stack:** Where your JavaScript code actually executes. It runs synchronously, line by line.
+2. **Web APIs (or Node.js C++ APIs):** These are NOT JavaScript! When you call `fetch()` or `setTimeout()`, JS offloads the heavy lifting to the browser's C++ threads. The JS thread moves on immediately!
+3. **The Callback Queue (Task Queue):** When the Web API finishes its job (the timer hits 0, or the HTTP request returns), it pushes your callback function into this queue.
+4. **The Event Loop:** An infinite `while` loop. Its only job is to look at the Call Stack. **IF the Call Stack is completely empty**, it takes the first item from the Callback Queue and pushes it onto the Call Stack to execute.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DOMVisualizer", "state": "event-loop" }
+```
+
+## CODE
+
+### Level 1 — The Classic Interview Question
+Look at this code. What order do the logs print in?
+
+```javascript
+console.log("First");
+
+setTimeout(() => {
+  console.log("Second");
+}, 0); // Wait 0 milliseconds!
+
+console.log("Third");
+```
+**The Output:** First -> Third -> Second.
+*Why?*
+1. `console.log("First")` goes on the Call Stack. Prints. Pops off.
+2. `setTimeout` goes on the Call Stack. JS passes the callback to the Browser Timer API and instantly pops `setTimeout` off the stack.
+3. `console.log("Third")` goes on the Call Stack. Prints. Pops off.
+4. Meanwhile, the Browser Timer finishes instantly (0ms) and puts the callback in the Task Queue.
+5. The Event Loop sees the Call Stack is finally empty. It moves the callback from the Queue to the Stack.
+6. `console.log("Second")` prints!
+
+*Even with a 0ms delay, `setTimeout` guarantees the code will run AFTER all synchronous code has finished executing!*
+
+### Level 2 — Macrotasks vs. Microtasks
+The reality is slightly more complex. There isn't just one Queue. There are two!
+1. **Macrotask Queue:** `setTimeout`, `setInterval`, DOM Events (clicks).
+2. **Microtask Queue:** Promises (`.then()`, `await`), `MutationObserver`.
+
+**The Golden Rule:** The Event Loop prioritizes the Microtask Queue over the Macrotask Queue! It will completely drain the Microtask Queue before it even looks at a Macrotask.
+
+```javascript
+console.log("1. Start");
+
+setTimeout(() => console.log("2. Timeout (Macrotask)"), 0);
+
+Promise.resolve().then(() => console.log("3. Promise (Microtask)"));
+
+console.log("4. End");
+```
+**The Output:** 
+`1. Start`
+`4. End`
+`3. Promise (Microtask)`
+`2. Timeout (Macrotask)`
+
+Even though the Timeout and the Promise were scheduled at the exact same time, the Promise executes first because it is placed in the VIP line (the Microtask Queue)!
+
+### Level 3 — Blocking the Event Loop (The Fatal Mistake)
+If the Event Loop's rule is *"I can only move items from the Queue to the Stack if the Stack is empty"*, what happens if the Stack is NEVER empty?
+
+```javascript
+function freezeBrowser() {
+  // A synchronous infinite loop stays on the Call Stack forever!
+  while(true) {
+    // ... do heavy math
+  }
+}
+
+document.getElementById('btn').addEventListener('click', () => {
+  console.log("Button Clicked!");
+});
+
+// If you call this function, the Call Stack locks up.
+freezeBrowser(); 
+```
+If `freezeBrowser` is running, the Call Stack is full.
+If the user furiously clicks the button 50 times, the Browser API registers the clicks and puts 50 `console.log` callbacks into the Task Queue.
+But the Event Loop can never move them! The Call Stack never empties. The browser UI completely freezes, animated GIFs stop spinning, and eventually, the browser prompts the user to "Kill Page".
+
+### Level 4 — Yielding to the Main Thread
+How do you process a massive array of 10 million items without blocking the main thread?
+You intentionally chop the work into small chunks and use `setTimeout(..., 0)` to place each chunk at the back of the Macrotask Queue. This gives the browser a chance to render UI updates and process user clicks between chunks!
+
+```javascript
+const massiveData = new Array(10000000).fill(1);
+
+function processInChunks(index = 0) {
+  // Process 50,000 items at a time
+  const chunkSize = 50000;
+  for (let i = 0; i < chunkSize && index < massiveData.length; i++) {
+    // Math logic...
+    massiveData[index]++;
+    index++;
+  }
+
+  if (index < massiveData.length) {
+    // YIELD to the Event Loop! 
+    // Put the next chunk at the back of the line!
+    setTimeout(() => processInChunks(index), 0);
+  } else {
+    console.log("Done processing 10M items!");
+  }
+}
+```
+
+## REAL_WORLD
+**Node.js vs Browser Event Loop**
+The concepts (Call Stack, Micro/Macrotasks) are identical in Node.js, but the underlying C++ libraries are different.
+Browsers use the Web APIs (DOM, XMLHTTPRequest). Node.js uses `libuv` to handle file system (`fs`) and network (`http`) operations.
+Node.js also introduces a special Microtask: `process.nextTick()`. It is even higher priority than Promises! If you use `process.nextTick()`, it jumps to the absolute very front of the Microtask Queue. 
+
+## INTERVIEW
+**Q: You write a recursive function that returns a Promise: `function recursive() { return Promise.resolve().then(recursive); }`. You execute it. Will it throw a "Maximum Call Stack Size Exceeded" error (Stack Overflow), or will it freeze the browser tab?**
+A: **It freezes the browser tab!**
+If you wrote a normal synchronous recursive function (`function rec() { rec(); }`), it would immediately blow up the Call Stack, and JavaScript would throw a Stack Overflow error and terminate the script, saving the browser.
+However, with `Promise.resolve().then(recursive)`, you are pushing the recursion into the **Microtask Queue**. 
+The Event Loop executes the Promise, pops it off the Stack (Stack size returns to 0), and then immediately queues up another Microtask. 
+Because the Event Loop *must* drain the Microtask Queue before doing anything else (like UI rendering), it gets trapped in an infinite loop of executing Microtasks. The Call Stack never overflows (because it empties after every step), but the browser tab is permanently frozen!

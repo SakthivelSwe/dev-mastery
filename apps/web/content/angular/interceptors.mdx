@@ -1,0 +1,180 @@
+---
+slug: "interceptors"
+title: "Angular Interceptors"
+level: 3
+---
+
+## WHY
+In any modern web application, you will make hundreds of HTTP requests to your backend server.
+Imagine having to manually attach the exact same `Authorization: Bearer <token>` header to every single one of those 500 requests. Imagine having to write `try/catch` logic 500 times to check if the server returned a `401 Unauthorized` so you can redirect the user to the login page.
+**HTTP Interceptors** solve this by sitting exactly between your application code and the network. They allow you to intercept, inspect, and modify *every single outgoing request* and *every single incoming response* globally from a single file!
+
+## THEORY
+### The Interceptor Pipeline
+When a component calls `this.http.get('/api/users')`, the request doesn't immediately go to the internet. 
+It enters an array of Interceptors. 
+- **Request Interceptors:** Can modify headers, attach tokens, or even cancel the request.
+- **Response Interceptors:** Can parse data, handle global error codes (like 401s or 500s), or show global "Loading" spinners.
+
+*Note: In modern Angular (v15+ with Standalone Components), Interceptors have moved away from being Classes towards being functional closures, making them significantly easier to write.*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "interceptors" }
+```
+
+## CODE
+
+### Level 1 — The Classic Auth Interceptor (Class-based)
+For years, Angular interceptors were Classes that implemented the `HttpInterceptor` interface. You will see this pattern in almost every enterprise Angular codebase built before 2023.
+
+```typescript
+import { Injectable } from '@angular/core';
+import { HttpRequest, HttpHandler, HttpEvent, HttpInterceptor } from '@angular/common/http';
+import { Observable } from 'rxjs';
+
+@Injectable()
+export class AuthInterceptor implements HttpInterceptor {
+  
+  // The 'intercept' method is the heart of the Interceptor
+  intercept(request: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    
+    // 1. Get the token from local storage
+    const token = localStorage.getItem('auth_token');
+
+    // 2. HTTP Requests are IMMUTABLE in Angular! 
+    // You cannot modify 'request' directly. You MUST clone it!
+    if (token) {
+      const clonedRequest = request.clone({
+        headers: request.headers.set('Authorization', `Bearer ${token}`)
+      });
+      
+      // 3. Pass the CLONED request to the next interceptor in the chain
+      return next.handle(clonedRequest);
+    }
+
+    // If no token, just pass the original request untouched
+    return next.handle(request);
+  }
+}
+```
+
+To activate it, you had to register it in `app.module.ts`:
+```typescript
+providers: [
+  { provide: HTTP_INTERCEPTORS, useClass: AuthInterceptor, multi: true }
+]
+```
+
+### Level 2 — Modern Functional Interceptors (Angular 15+)
+Angular 15 introduced Functional Interceptors. They are vastly simpler, reducing boilerplate and removing the need for Classes entirely.
+
+```typescript
+// auth.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { AuthService } from './auth.service';
+
+export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  // We use the modern 'inject' function to grab our services!
+  const authService = inject(AuthService);
+  const token = authService.getToken();
+
+  if (token) {
+    // Clone and attach the header
+    const authReq = req.clone({
+      setHeaders: { Authorization: `Bearer ${token}` }
+    });
+    return next(authReq); // Pass it down the chain!
+  }
+
+  return next(req);
+};
+```
+
+To activate functional interceptors, you register them when providing the HttpClient in `app.config.ts`:
+```typescript
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideHttpClient(
+      withInterceptors([authInterceptor, loggingInterceptor]) // Register them here!
+    )
+  ]
+};
+```
+
+### Level 3 — Response Interception (Global Error Handling)
+Interceptors don't just modify outgoing requests; they can monitor the incoming response stream using RxJS operators!
+
+```typescript
+import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { Router } from '@angular/router';
+import { catchError, throwError } from 'rxjs';
+
+export const errorInterceptor: HttpInterceptorFn = (req, next) => {
+  const router = inject(Router);
+
+  // We pass the request to 'next', but we pipe into the response Observable!
+  return next(req).pipe(
+    catchError((error: HttpErrorResponse) => {
+      
+      // If the server says we are unauthorized...
+      if (error.status === 401) {
+        console.warn("Unauthorized! Redirecting to login...");
+        // Automatically kick the user to the login screen!
+        router.navigate(['/login']);
+      }
+      
+      // If the server crashed...
+      if (error.status === 500) {
+        console.error("Server crashed!", error.message);
+        // Show a global toast notification here!
+      }
+
+      // Re-throw the error so individual components can still handle it if they want to
+      return throwError(() => error); 
+    })
+  );
+};
+```
+
+### Level 4 — Bypassing Interceptors (The `HttpContext` API)
+What if you have a global Auth Interceptor, but you need to make *one* specific request to a public, third-party weather API that will reject the request if an `Authorization` header is present?
+You use `HttpContext` to pass "secret messages" from your Component directly to the Interceptor!
+
+```typescript
+// 1. Define a global token (a flag)
+import { HttpContextToken } from '@angular/common/http';
+export const BYPASS_AUTH = new HttpContextToken(() => false);
+
+// 2. In your Interceptor, check for the flag!
+export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  // If the component set the flag to true, skip the interceptor!
+  if (req.context.get(BYPASS_AUTH) === true) {
+    return next(req);
+  }
+  // ... attach auth headers
+};
+
+// 3. In your Component, attach the flag to the specific request!
+import { HttpContext } from '@angular/common/http';
+
+this.http.get('https://public-weather-api.com/today', {
+  context: new HttpContext().set(BYPASS_AUTH, true) // Tell the interceptor to back off!
+}).subscribe();
+```
+
+## REAL_WORLD
+**The Silent Token Refresh (The Ultimate Interceptor)**
+The most complex and common use case for Interceptors is the "Silent Token Refresh".
+JWT Access Tokens usually expire every 15 minutes. When a user clicks a button and gets a `401 Unauthorized` error, you shouldn't instantly log them out! 
+Instead, the Interceptor catches the `401`, *pauses* the user's original request, makes a background API call using a long-lived "Refresh Token" to get a brand new Access Token, attaches the new token to the user's original request, and *resends* it.
+The user never saw an error, they never knew their token expired, and the UI never blinked. This is the hallmark of enterprise-grade security and UX, handled entirely within a 50-line RxJS Interceptor!
+
+## INTERVIEW
+**Q: You register two interceptors in your `app.config.ts`: `withInterceptors([LoggingInterceptor, AuthInterceptor])`. Does the order in which you define them in the array matter?**
+A: **Yes, order is strictly chronological!**
+Interceptors form a pipeline (a chain of responsibility). The request passes through them in the exact order they are defined in the array.
+If the `LoggingInterceptor` is first, it will log the request *before* the `AuthInterceptor` has a chance to attach the JWT token. The log will show a request with no Authorization header.
+Conversely, on the way *back* (the response), the pipeline executes in reverse! The `AuthInterceptor` will see the response first, and the `LoggingInterceptor` will see the response last. Understanding this bidirectional execution order is critical for debugging complex network issues.

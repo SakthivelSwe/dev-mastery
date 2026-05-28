@@ -1,0 +1,142 @@
+---
+slug: "docker-logging"
+title: "Docker Logging"
+level: 4
+---
+
+## WHY
+When containers crash or behave unexpectedly, logs are your primary diagnostic tool. But containerized logging has unique challenges: containers are ephemeral (their logs disappear when deleted), multiple container instances all produce logs simultaneously, and logs need to be collected and indexed centrally for searching.
+**Docker Logging** covers how to configure where Docker sends container output, how to prevent logs from filling up your disk, and how to integrate with centralized logging platforms like the ELK Stack (Elasticsearch, Logstash, Kibana) or cloud-native solutions.
+
+## THEORY
+### Docker Logging Drivers
+Docker supports multiple logging backends (drivers). The driver controls where `docker logs` output goes:
+- **json-file** (default): Writes JSON to `/var/lib/docker/containers/<id>/<id>-json.log` on the host. The only driver that supports `docker logs`.
+- **none**: Discard all output. No logging.
+- **syslog**: Send to the host syslog daemon
+- **journald**: Send to systemd's journal (Linux)
+- **awslogs**: Send directly to AWS CloudWatch Logs
+- **fluentd**: Send to a Fluentd aggregator
+- **splunk**: Send to Splunk HTTP Event Collector
+- **gelf**: Send to Graylog
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-logging" }
+```
+
+## CODE
+
+### Configuring Log Rotation (Critical for Production!)
+Without log rotation, container logs grow indefinitely and fill your disk!
+```bash
+# Set log limits when running a container
+docker run -d \
+  --name api \
+  --log-driver json-file \
+  --log-opt max-size=10m \   # Rotate at 10MB
+  --log-opt max-file=3 \     # Keep last 3 rotated files (30MB total max)
+  my-app
+
+# Or configure globally in /etc/docker/daemon.json (applies to all containers!)
+```
+
+```json
+// /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+### Viewing Logs
+```bash
+# View all logs
+docker logs api
+
+# Follow in real-time (like tail -f)
+docker logs -f api
+
+# Last 100 lines
+docker logs --tail=100 api
+
+# Logs since timestamp
+docker logs --since="2024-01-28T15:00:00" api
+docker logs --since="1h" api          # Last hour
+docker logs --since="30m" api         # Last 30 minutes
+
+# Include timestamps
+docker logs -t api
+# 2024-01-28T15:00:01.234Z INFO: Server started on port 3000
+```
+
+### Shipping Logs to AWS CloudWatch
+```bash
+# Run container with awslogs driver
+docker run -d \
+  --name api \
+  --log-driver=awslogs \
+  --log-opt awslogs-region=us-east-1 \
+  --log-opt awslogs-group=/myapp/production \
+  --log-opt awslogs-stream=api-instance-1 \
+  my-app
+```
+
+### The Fluentd Sidecar Pattern (Kubernetes-Style)
+```yaml
+# docker-compose.yml with Fluentd for log aggregation
+services:
+  api:
+    image: my-api:1.0
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "fluentd:24224"
+        tag: "api"
+
+  fluentd:
+    image: fluent/fluentd:v1.16
+    volumes:
+      - ./fluentd.conf:/fluentd/etc/fluent.conf
+    ports:
+      - "24224:24224"
+```
+
+## REAL_WORLD
+**Structured Logging (JSON Logs)**
+Plain text logs are hard to search and analyze. Modern applications write **structured JSON logs**:
+
+```javascript
+// Instead of:
+console.log("User alice logged in from 192.168.1.1 at 2024-01-28")
+
+// Write structured JSON:
+console.log(JSON.stringify({
+  level: "INFO",
+  event: "user_login",
+  userId: "alice",
+  ip: "192.168.1.1",
+  timestamp: new Date().toISOString()
+}))
+```
+
+When shipped to Elasticsearch/Kibana, structured logs allow powerful queries:
+```
+level:ERROR AND service:api AND error.type:DatabaseConnectionError
+```
+
+## INTERVIEW
+**Q: In production, you're running 50 containers across 10 servers. A user reports an error at 3:00 PM. How do you find the relevant logs across all containers and servers?**
+A: With 50 containers, `docker logs` is impractical — you'd need to SSH into 10 servers and check 50 containers manually.
+
+The solution is **centralized log aggregation:**
+1. Configure all containers to use a log driver that ships logs to a central system (e.g., `awslogs` for CloudWatch, `fluentd` for ELK, or a Fluentd/Filebeat sidecar)
+2. Each log entry includes metadata: container name, host, timestamp, service version
+3. Use Kibana, CloudWatch Insights, or Grafana Loki to query across ALL containers simultaneously:
+```
+service_name:api AND timestamp:[2024-01-28T15:00:00 TO 2024-01-28T15:01:00] AND level:ERROR
+```
+This returns all errors across all 50 containers in that one-minute window, with microsecond timestamps. In Kubernetes, this is handled by the logging infrastructure automatically; in Docker, you must configure it explicitly.

@@ -1,0 +1,141 @@
+---
+slug: "oauth2-spring"
+title: "OAuth2 and OIDC in Spring Security"
+level: 4
+---
+
+## WHY
+In the "JWT Authentication" module, you learned how to verify a username and password against a database and issue a token.
+But modern users hate creating new accounts. They want to click **"Log in with Google"** or **"Log in with GitHub"**.
+Furthermore, in Enterprise environments, hundreds of internal microservices shouldn't each manage their own user databases. They should delegate authentication to a centralized Identity Provider (IdP) like Okta, Auth0, or Keycloak.
+**OAuth2** and **OpenID Connect (OIDC)** are the industry standard protocols for delegated authorization and authentication. Spring Security provides world-class, automated support for these protocols, allowing you to integrate Google Login into your application with literally zero Java code!
+
+## THEORY
+### OAuth2 vs OpenID Connect (OIDC)
+These two protocols are often confused, but they serve entirely different purposes:
+1. **OAuth2 is for AUTHORIZATION:** It allows an application to access a user's data on another server. (e.g., "Allow MyApp to read your Google Calendar"). It does *not* technically prove the user's identity.
+2. **OIDC is for AUTHENTICATION:** It is built *on top* of OAuth2. It provides a standardized JWT called an **ID Token** that mathematically proves: *"This user is Alice, her email is alice@example.com, and Google verified her identity at 2:00 PM."*
+
+### The OAuth2 Dance (Authorization Code Flow)
+1. User clicks "Login with Google".
+2. Spring redirects the browser to `accounts.google.com`.
+3. User logs into Google and clicks "Approve".
+4. Google redirects the browser back to Spring with a temporary, one-time `code`.
+5. Spring takes this `code`, secretly contacts Google backend-to-backend, and exchanges the code for the final Access/ID Tokens!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SecurityVisualizer", "state": "oauth2-flow" }
+```
+
+## CODE
+
+Spring Security makes OIDC integration shockingly easy.
+
+### 1. The Dependencies
+You need the OAuth2 Client starter.
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+```
+
+### 2. The Configuration (Zero Java Code)
+To enable "Login with Google" or "Login with GitHub", Spring Boot relies heavily on auto-configuration. You just need to provide your exact Client ID and Secret in the `application.yml` file.
+
+```yaml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          # Spring has built-in defaults for Google, GitHub, Facebook, and Okta!
+          google:
+            client-id: "YOUR_GOOGLE_CLIENT_ID"
+            client-secret: "YOUR_GOOGLE_CLIENT_SECRET"
+            scope: openid, profile, email
+          github:
+            client-id: "YOUR_GITHUB_CLIENT_ID"
+            client-secret: "YOUR_GITHUB_CLIENT_SECRET"
+```
+
+### 3. The Security Filter Chain
+You must tell Spring Security to actually use the OAuth2 Login system.
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/", "/public/**").permitAll() // Public pages
+                .anyRequest().authenticated() // Everything else requires login
+            )
+            // The Magic Line! Enables the OAuth2 Dance!
+            // If an unauthenticated user hits a protected page, 
+            // Spring will auto-generate a login page with buttons for Google/GitHub!
+            .oauth2Login(oauth2 -> oauth2
+                .defaultSuccessUrl("/dashboard")
+            );
+
+        return http.build();
+    }
+}
+```
+
+### 4. Accessing the Logged-In User Data
+Once Google redirects back to your app, Spring automatically parses the JWT ID Token, extracts the user's name and email, and stores it in the `SecurityContext`.
+
+```java
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.core.user.OAuth2User;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class UserController {
+
+    @GetMapping("/api/me")
+    public String getProfile(
+        // Inject the magic OIDC User object directly into your controller!
+        @AuthenticationPrincipal OAuth2User principal
+    ) {
+        // The principal contains all the data Google sent us!
+        String name = principal.getAttribute("name");
+        String email = principal.getAttribute("email");
+        
+        return "Hello, " + name + "! Your Google email is: " + email;
+    }
+}
+```
+
+## REAL_WORLD
+**OAuth2 Resource Server (Microservices)**
+The code above is for an OAuth2 **Client** (an application with a frontend that redirects users to Google).
+But what if you are building a backend Microservice architecture? You have a dedicated Authentication Server (like Keycloak), and 5 distinct Spring Boot APIs.
+The APIs don't redirect users. They just receive HTTP requests containing an `Authorization: Bearer <token>` header from an Angular/React frontend.
+In this case, your Spring Boot app acts as an **OAuth2 Resource Server**.
+You change the dependency to `spring-boot-starter-oauth2-resource-server`.
+In `application.yml`, you provide the URL of your Keycloak server:
+`spring.security.oauth2.resourceserver.jwt.issuer-uri=https://my-keycloak.com/realms/myapp`
+When a request arrives, Spring automatically downloads the public cryptographic keys from Keycloak, mathematically verifies the signature on the incoming JWT, and grants or denies access instantly!
+
+## INTERVIEW
+**Q: You implement "Login with Google" using Spring Security. It works perfectly. However, your application has a strict authorization model based on roles (e.g., `ROLE_ADMIN`, `ROLE_USER`). You have a method annotated with `@PreAuthorize("hasRole('ADMIN')")`. How do you map the generic data coming from Google into the specific Spring Security `GrantedAuthority` roles your application requires?**
+A: **By implementing a custom `OAuth2UserService` (or mapping the authorities via the `GrantedAuthoritiesMapper`).**
+By default, when a user logs in via Google, Spring Security grants them a single, generic authority called `OAUTH2_USER` (or `SCOPE_email`). It has no idea who is an "Admin" in your specific business logic.
+To fix this, you must intercept the authentication flow right after Google returns the user data but before Spring saves it to the SecurityContext.
+You implement the `OAuth2UserService<OidcUserRequest, OidcUser>` interface. Inside the `loadUser` method, you take the email address Google provided (`alice@example.com`), execute a database query to check your local `users` table to see if Alice is an Admin, and then manually attach the `SimpleGrantedAuthority("ROLE_ADMIN")` to the final `OidcUser` object returned to Spring Security. Now your `@PreAuthorize` annotations will work perfectly with external Google users!

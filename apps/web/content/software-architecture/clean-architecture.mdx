@@ -1,0 +1,169 @@
+---
+slug: "clean-architecture"
+title: "Clean Architecture"
+level: 4
+---
+
+## WHY
+Have you ever worked on a codebase where changing a database from MySQL to PostgreSQL required modifications in 50 different files? Or where writing a unit test was impossible without starting a real HTTP server and connecting to a live database?
+
+These are symptoms of **Architectural Dependency Problems** — the business logic is tightly coupled to frameworks, databases, and external services. Clean Architecture (by Robert C. Martin) solves this by enforcing a strict **Dependency Rule** that keeps business logic completely isolated from technical implementation details.
+
+## THEORY
+### The Dependency Rule
+The core law of Clean Architecture: **Source code dependencies MUST point inward** (toward the center). Inner circles know nothing about outer circles.
+
+The layers from inside out:
+1. **Entities:** Core business rules (domain objects) — pure Java/TypeScript classes, no frameworks.
+2. **Use Cases (Application layer):** Application-specific business rules — orchestrate entities.
+3. **Interface Adapters:** Converters that translate between Use Cases and external formats (Controllers, Presenters, Repositories).
+4. **Frameworks & Drivers:** The outer ring — databases, web frameworks, UI, external services.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "clean-architecture" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Problem with Layered Architecture)
+```java
+// Traditional Layered Architecture (Controllers → Services → Repositories)
+// Problem: Business logic DEPENDS on the database layer!
+
+@Service
+public class OrderService {
+    
+    @Autowired
+    private OrderRepository orderRepository; // Directly depends on Spring Data JPA!
+    
+    public Order createOrder(Long userId, Long productId) {
+        Product product = productRepository.findById(productId).orElseThrow();
+        // Business rule: can't order out-of-stock items
+        if (product.getStockCount() < 1) throw new InsufficientStockException();
+        
+        return orderRepository.save(new Order(userId, productId)); // Saves to DB!
+    }
+}
+
+// To test createOrder(), you MUST have a real database!
+// If you switch from MySQL to MongoDB, you must rewrite this service!
+```
+
+### Level 2 — Building Blocks (Inverting Dependencies with Interfaces)
+```java
+// STEP 1: Define the Repository as an INTERFACE in the business layer
+// (The Use Case layer depends on an abstraction, NOT an implementation!)
+
+package com.devmastery.domain.repository; // Inner layer!
+
+public interface OrderRepository {
+    Order save(Order order);
+    Optional<Order> findById(Long id);
+}
+
+// STEP 2: The Use Case only depends on the interface!
+package com.devmastery.usecase;
+
+public class CreateOrderUseCase {
+    
+    private final OrderRepository orderRepository;  // Interface!
+    private final ProductRepository productRepository; // Interface!
+    
+    public CreateOrderUseCase(OrderRepository orderRepository, 
+                              ProductRepository productRepository) {
+        this.orderRepository = orderRepository;
+        this.productRepository = productRepository;
+    }
+    
+    public Order execute(Long userId, Long productId) {
+        // Pure business logic — no framework annotations!
+        Product product = productRepository.findById(productId)
+                .orElseThrow(ProductNotFoundException::new);
+        if (product.getStockCount() < 1) throw new InsufficientStockException();
+        return orderRepository.save(new Order(userId, productId));
+    }
+}
+```
+
+### Level 3 — Intermediate (The Adapter Layer)
+```java
+// STEP 3: The outer layer provides the IMPLEMENTATION of the inner layer's interface
+
+package com.devmastery.infrastructure.db; // Outer layer!
+
+// This class IMPLEMENTS the inner layer's interface using Spring Data JPA!
+// The business layer (inner) knows nothing about JPA, Spring, or SQL!
+@Repository
+public class JpaOrderRepository implements OrderRepository {
+    
+    @Autowired
+    private JpaOrderEntityRepository jpaRepository; // Spring Data JPA
+    
+    @Override
+    public Order save(Order order) {
+        OrderEntity entity = OrderMapper.toEntity(order);
+        OrderEntity saved = jpaRepository.save(entity); // Spring JPA!
+        return OrderMapper.toDomain(saved);
+    }
+    
+    @Override
+    public Optional<Order> findById(Long id) {
+        return jpaRepository.findById(id).map(OrderMapper::toDomain);
+    }
+}
+
+// For UNIT TESTING: Just create an in-memory implementation!
+// No database needed!
+public class InMemoryOrderRepository implements OrderRepository {
+    private final Map<Long, Order> store = new HashMap<>();
+    
+    @Override
+    public Order save(Order order) { store.put(order.getId(), order); return order; }
+    
+    @Override
+    public Optional<Order> findById(Long id) { return Optional.ofNullable(store.get(id)); }
+}
+```
+
+### Level 4 — Advanced (Project Structure)
+```
+src/main/java/com/devmastery/
+├── domain/                           ← INNERMOST LAYER (Entities)
+│   ├── model/
+│   │   ├── Order.java                 (Pure POJO, no annotations!)
+│   │   └── Product.java
+│   └── repository/
+│       ├── OrderRepository.java       (Interface only!)
+│       └── ProductRepository.java
+│
+├── application/                      ← USE CASES LAYER
+│   └── usecase/
+│       ├── CreateOrderUseCase.java
+│       └── GetOrderUseCase.java
+│
+├── adapter/                          ← INTERFACE ADAPTERS LAYER
+│   ├── web/
+│   │   └── OrderController.java       (Spring @RestController — only HTTP logic!)
+│   └── mapper/
+│       └── OrderMapper.java           (Maps between domain and persistence models)
+│
+└── infrastructure/                   ← FRAMEWORKS & DRIVERS LAYER
+    ├── db/
+    │   ├── JpaOrderRepository.java    (Spring Data JPA implementation)
+    │   └── OrderEntity.java           (@Entity with JPA annotations)
+    └── config/
+        └── ApplicationConfig.java     (Spring @Configuration — wires everything!)
+```
+
+## REAL_WORLD
+The major benefit is **testability**. Because the business logic (Use Cases) only depends on interfaces, you can unit test 100% of business logic using simple in-memory implementations — no database, no HTTP server, no Redis. Tests run in milliseconds!
+
+When a customer asks you to switch from PostgreSQL to MongoDB, only the `infrastructure/db/` layer needs to change. Zero changes to `domain/` or `application/`. You can even run both implementations simultaneously and switch with a configuration flag.
+
+## INTERVIEW
+**Q: What is the difference between Clean Architecture and Hexagonal Architecture?**
+A: They share the same core idea — isolate business logic from external concerns using the Dependency Inversion Principle. **Hexagonal Architecture** (Ports & Adapters) uses "Ports" (interfaces) and "Adapters" (implementations) terminology. **Clean Architecture** uses "Use Cases," "Entities," and concentric ring layers. Clean Architecture is more prescriptive about the number of layers and naming conventions. Both achieve the same goal.
+
+**Q: Is Clean Architecture over-engineering for small projects?**
+A: Yes — absolutely. For a 2-week MVP or a simple CRUD API, Clean Architecture's strict layer separation adds significant boilerplate with minimal benefit. Apply it when: the project will be maintained for years; there's a team of 5+ engineers; the business logic is genuinely complex; or you expect to change databases or frameworks in the future.

@@ -156,6 +156,100 @@ public class AdminTopicService {
     }
 
     @Transactional
+    public void importSections(String slug, AdminTopicSectionsImportRequest request) {
+        Topic topic = topicRepository.findBySlug(slug)
+                .orElseThrow(() -> new TopicNotFoundException(slug));
+
+        updateOrCreateLesson(topic, Lesson.SectionType.why, request.why());
+        updateOrCreateLesson(topic, Lesson.SectionType.theory, request.theory());
+        updateOrCreateLesson(topic, Lesson.SectionType.visual, request.visual());
+        updateOrCreateLesson(topic, Lesson.SectionType.code, request.code());
+        updateOrCreateLesson(topic, Lesson.SectionType.realworld, request.realWorld());
+        updateOrCreateLesson(topic, Lesson.SectionType.interview, request.interview());
+        updateOrCreateLesson(topic, Lesson.SectionType.feynman, request.feynman());
+        updateOrCreateLesson(topic, Lesson.SectionType.build, request.build());
+        updateOrCreateLesson(topic, Lesson.SectionType.spacedreview, request.spacedReview());
+
+        topicRepository.save(topic);
+    }
+
+    private void updateOrCreateLesson(Topic topic, Lesson.SectionType type, String content) {
+        if (content == null || content.trim().isEmpty()) {
+            return;
+        }
+        Lesson lesson = topic.getLessons().stream()
+                .filter(l -> l.getSectionType() == type)
+                .findFirst()
+                .orElseGet(() -> {
+                    Lesson newLesson = new Lesson();
+                    newLesson.setTopic(topic);
+                    newLesson.setSectionType(type);
+                    newLesson.setTitle(type.name().toUpperCase());
+                    newLesson.setOrderIndex(type.ordinal());
+                    topic.getLessons().add(newLesson);
+                    return newLesson;
+                });
+        lesson.setContentMdx(content);
+        lessonRepository.save(lesson);
+    }
+
+    @Transactional
+    public void batchImport(AdminTopicBatchImportRequest request) {
+        for (AdminTopicBatchImportRequest.TopicImport topicImport : request.topics()) {
+            try {
+                importSections(topicImport.slug(), topicImport.layers());
+            } catch (TopicNotFoundException e) {
+                // Log and continue
+                System.err.println("Batch import warning: Topic not found for slug: " + topicImport.slug());
+            }
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public ValidationReport validateSections(String slug, AdminTopicSectionsImportRequest request) {
+        Topic topic = topicRepository.findBySlug(slug)
+                .orElseThrow(() -> new TopicNotFoundException(slug));
+
+        java.util.Map<String, ValidationReport.SectionValidation> sectionsMap = new java.util.HashMap<>();
+        int totalWordCount = 0;
+        boolean allValid = true;
+
+        totalWordCount += validateSectionContent("why", request.why(), 100, sectionsMap);
+        totalWordCount += validateSectionContent("theory", request.theory(), 300, sectionsMap);
+        totalWordCount += validateSectionContent("visual", request.visual(), 0, sectionsMap); // Visualizer config can be short
+        totalWordCount += validateSectionContent("code", request.code(), 200, sectionsMap);
+        totalWordCount += validateSectionContent("realworld", request.realWorld(), 150, sectionsMap);
+        totalWordCount += validateSectionContent("interview", request.interview(), 200, sectionsMap);
+        totalWordCount += validateSectionContent("feynman", request.feynman(), 50, sectionsMap);
+        totalWordCount += validateSectionContent("build", request.build(), 50, sectionsMap);
+        totalWordCount += validateSectionContent("spacedreview", request.spacedReview(), 50, sectionsMap);
+
+        for (ValidationReport.SectionValidation validation : sectionsMap.values()) {
+            if (!validation.warnings().isEmpty()) {
+                allValid = false;
+            }
+        }
+
+        return new ValidationReport(slug, allValid, totalWordCount, sectionsMap);
+    }
+
+    private int validateSectionContent(String name, String content, int minWords, java.util.Map<String, ValidationReport.SectionValidation> map) {
+        if (content == null || content.trim().isEmpty()) {
+            map.put(name, new ValidationReport.SectionValidation(0, false, List.of("Missing content")));
+            return 0;
+        }
+
+        int wordCount = content.split("\\s+").length;
+        List<String> warnings = new ArrayList<>();
+        if (wordCount < minWords) {
+            warnings.add("Word count too low. Found " + wordCount + ", expected at least " + minWords);
+        }
+
+        map.put(name, new ValidationReport.SectionValidation(wordCount, true, warnings));
+        return wordCount;
+    }
+
+    @Transactional
     public void publishTopic(String slug) {
         Topic topic = topicRepository.findBySlug(slug)
                 .orElseThrow(() -> new TopicNotFoundException(slug));

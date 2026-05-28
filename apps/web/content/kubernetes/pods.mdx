@@ -1,0 +1,167 @@
+---
+slug: "pods"
+title: "Pods"
+level: 3
+---
+
+## WHY
+In Docker, the atomic unit is a **container**. In Kubernetes, the atomic unit is a **Pod**.
+A Pod wraps one or more containers that must be scheduled together, share the same network, and share storage. Understanding Pods is foundational — every other Kubernetes object (Deployments, StatefulSets, DaemonSets) ultimately creates and manages Pods.
+
+## THEORY
+### What is a Pod?
+A Pod is the smallest deployable unit in Kubernetes. It represents a running process on the cluster. Key characteristics:
+- Every container in a Pod shares the same **IP address** and **port space**
+- Containers in the same Pod can communicate via `localhost`
+- Pods are **ephemeral** — if a Pod crashes, Kubernetes creates a NEW Pod (with a new IP!)
+- You rarely create Pods directly — you use Deployments which manage Pods
+
+### Multi-Container Pods (Sidecar Pattern)
+Most Pods run a single container. But some patterns use multiple containers:
+- **Sidecar:** Helper container that enhances the main container (e.g., log shipper, service mesh proxy)
+- **Init containers:** Run to completion before the main container starts (e.g., wait for database, run migrations)
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "pod-anatomy" }
+```
+
+## CODE
+
+### Pod YAML Manifest
+```yaml
+# pod.yml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-api-pod
+  labels:
+    app: api
+    version: "1.0"
+spec:
+  containers:
+    - name: api
+      image: my-api:1.0.0
+      ports:
+        - containerPort: 3000
+      env:
+        - name: NODE_ENV
+          value: production
+        - name: DB_PASSWORD
+          valueFrom:                      # Read from a Secret!
+            secretKeyRef:
+              name: db-secrets
+              key: password
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "250m"
+        limits:
+          memory: "256Mi"
+          cpu: "500m"
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 3000
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 3000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+```
+
+### Pod with Sidecar (Log Shipping)
+```yaml
+spec:
+  containers:
+    # Main application container
+    - name: api
+      image: my-api:1.0.0
+      volumeMounts:
+        - name: log-volume
+          mountPath: /var/log/app
+
+    # Sidecar: Fluentd log shipper reads app logs and sends to Elasticsearch
+    - name: log-shipper
+      image: fluentd:v1.16
+      volumeMounts:
+        - name: log-volume
+          mountPath: /var/log/app    # Same volume! Sidecar reads what api writes
+
+  volumes:
+    - name: log-volume
+      emptyDir: {}  # Shared temporary storage between containers in the Pod
+```
+
+### Pod with Init Container
+```yaml
+spec:
+  initContainers:
+    # This runs FIRST and must complete before the main container starts!
+    - name: wait-for-database
+      image: busybox:1.36
+      command: ['sh', '-c', 'until nslookup db-service; do sleep 2; done']
+      # Loops until DNS resolves 'db-service' — database is ready!
+
+  containers:
+    - name: api
+      image: my-api:1.0.0  # Only starts AFTER init container finishes!
+```
+
+### Essential kubectl Pod Commands
+```bash
+# Create from YAML
+kubectl apply -f pod.yml
+
+# List pods
+kubectl get pods
+kubectl get pods -o wide   # Show more info including node and IP
+
+# Describe a pod (events, conditions, resource usage)
+kubectl describe pod my-api-pod
+
+# View logs
+kubectl logs my-api-pod
+kubectl logs my-api-pod -c api       # Specify container name in multi-container pod
+kubectl logs -f my-api-pod           # Follow logs
+
+# Execute a command inside the pod
+kubectl exec -it my-api-pod -- bash
+kubectl exec -it my-api-pod -c api -- sh  # Specific container
+
+# Delete a pod
+kubectl delete pod my-api-pod
+
+# Get pod YAML (see what K8s actually has stored)
+kubectl get pod my-api-pod -o yaml
+```
+
+## REAL_WORLD
+**Pods are Ephemeral — This is by Design**
+When a Pod crashes, Kubernetes creates a NEW Pod. The new Pod gets a new IP address. This means you can NEVER rely on a Pod's IP address to communicate with it — it will change.
+This is why Services exist: they provide a stable DNS name and IP that always routes to healthy Pods, regardless of how many times they've been recreated.
+
+## INTERVIEW
+**Q: You have two containers that need to share a file system and communicate over localhost. Would you run them in separate Pods or the same Pod? What are the tradeoffs?**
+A: **Same Pod** — if they must share a filesystem (via `emptyDir` volume) and communicate over localhost, they should be in the same Pod.
+
+Kubernetes containers in the same Pod:
+- Share the same network namespace (same IP, communicate via localhost)
+- Can share volumes (emptyDir mounts)
+- Are always scheduled together on the same Node
+- Are started and stopped together
+
+**Tradeoffs of same Pod:**
+- They scale together (can't scale one independently)
+- They're tightly coupled — must be deployed together
+- If one container is CPU-intensive, it competes with the other
+
+**When to use separate Pods:**
+- Independent scaling requirements
+- Different update lifecycles
+- Loose coupling is desired
+
+The sidecar pattern is a legitimate use case for multi-container Pods: a log shipper or service mesh proxy (like Envoy in Istio) needs to share the network namespace and possibly a volume with the main application container. These have the same lifecycle and always scale together, making the same-Pod model appropriate.

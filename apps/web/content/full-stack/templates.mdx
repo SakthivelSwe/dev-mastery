@@ -1,0 +1,266 @@
+---
+title: templates
+slug: templates
+---
+
+# Angular Templates: Control Flow, Deferrable Views, and Compiler Internals
+
+Angular's template engine bridges declarative UI markup with highly optimized JavaScript instructions. With the introduction of the modern Control Flow syntax and Deferrable Views in Angular 17, the compilation strategy has moved away from structural directives like `*ngIf` and `*ngFor` toward native, compiler-level statements.
+
+---
+
+## 1. Modern Control Flow Syntax
+
+Angular 17 introduces a built-in control flow syntax. It is more performant than legacy structural directives, does not require importing `CommonModule`, and features type-narrowing capabilities within the template.
+
+### `@if`, `@else if`, `@else`
+These directives compile directly into conditional blocks in the Ivy rendering engine, reducing the overhead of creating additional DOM nodes or template helper classes (`TemplateRef`).
+
+### `@for` and the Critical `track` Expression
+The `@for` block requires a `track` expression. Unlike the legacy `trackBy` function, tracking is mandatory and uses a highly optimized tracking algorithm. This expression informs Angular how to uniquely identify items in a collection, preventing unnecessary DOM recreations when the dataset changes.
+
+```typescript
+import { Component, signal } from '@angular/core';
+
+interface Product {
+  id: string;
+  name: string;
+  category: string;
+  stock: number;
+}
+
+@Component({
+  selector: 'app-template-control-flow',
+  standalone: true,
+  template: `
+    <div class="container">
+      <h2>Product Catalog</h2>
+
+      <!-- Conditional Blocks -->
+      @if (isLoading()) {
+        <p class="loading">Fetching products...</p>
+      } @else if (products().length === 0) {
+        <p class="empty-state">No products available.</p>
+      } @else {
+        <div class="grid">
+          <!-- Loop Block with Tracking -->
+          @for (product of products(); track product.id; let index = $index; let count = $count) {
+            <div class="product-card" [class.low-stock]="product.stock < 5">
+              <h3>{{ index + 1 }}. {{ product.name }}</h3>
+              <p>Category: {{ product.category }}</p>
+              <p>Inventory: {{ product.stock }} units</p>
+              
+              <!-- Switch Case Blocks -->
+              @switch (product.category) {
+                @case ('Electronics') { <span class="badge elec">⚡ Tech</span> }
+                @case ('Apparel') { <span class="badge cloth">👕 Style</span> }
+                @default { <span class="badge gen">📦 Item</span> }
+              }
+            </div>
+          } @empty {
+            <p>No catalog items matched your query.</p>
+          }
+        </div>
+      }
+    </div>
+  `,
+  styles: [`
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
+    .product-card { padding: 1rem; border: 1px solid #eee; border-radius: 8px; }
+    .low-stock { border-color: red; background-color: #fff5f5; }
+    .badge { display: inline-block; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.8rem; }
+  `]
+})
+export class TemplateControlFlowComponent {
+  isLoading = signal<boolean>(false);
+  products = signal<Product[]>([
+    { id: 'p1', name: 'MacBook Pro', category: 'Electronics', stock: 12 },
+    { id: 'p2', name: 'Leather Jacket', category: 'Apparel', stock: 2 },
+    { id: 'p3', name: 'Coffee Mug', category: 'Kitchen', stock: 45 }
+  ]);
+}
+```
+
+---
+
+## 2. Deferrable Views (`@defer`)
+
+Deferrable Views are a powerful feature in Angular 17. They allow developers to lazy-load components, directives, and pipes within a template using declarative triggers. This significantly reduces initial bundle sizes by splitting the application into separate chunks.
+
+### Triggers and Prefetching
+*   **`on idle` (default)**: Loads the chunk when the browser reaches an idle state (via `requestIdleCallback`).
+*   **`on viewport`**: Loads the chunk when the placeholder enters the browser viewport.
+*   **`on interaction`**: Loads when the user clicks or focuses on the placeholder.
+*   **`on hover`**: Loads when the mouse hovers over the placeholder.
+*   **`on immediate`**: Begins fetching immediately after the host view is rendered.
+*   **`on timer(duration)`**: Loads after a specified delay.
+
+```typescript
+// Heavy chart component to be deferred
+@Component({
+  selector: 'app-heavy-chart',
+  standalone: true,
+  template: `<div class="chart">📊 Highcharts rendering data...</div>`,
+  styles: ['.chart { height: 300px; background: #222; color: #fff; }']
+})
+export class HeavyChartComponent {}
+```
+
+```typescript
+import { Component } from '@angular/core';
+import { HeavyChartComponent } from './heavy-chart.component';
+
+@Component({
+  selector: 'app-defer-demo',
+  standalone: true,
+  imports: [HeavyChartComponent],
+  template: `
+    <div class="dashboard">
+      <h1>Dashboard Metrics</h1>
+      
+      <!-- Defer block with conditions and triggers -->
+      @defer (on viewport; prefetch on idle) {
+        <app-heavy-chart />
+      } @placeholder (minimum 500ms) {
+        <div class="placeholder">Scroll down to load heavy analytics...</div>
+      } @loading (after 100ms; minimum 1s) {
+        <div class="spinner">Fetching chart assets...</div>
+      } @error {
+        <div class="error-state">Failed to download dashboard dependencies.</div>
+      }
+    </div>
+  `,
+  styles: [`
+    .placeholder, .spinner { height: 300px; display: flex; align-items: center; justify-content: center; background: #fafafa; border: 2px dashed #ccc; }
+    .error-state { color: red; height: 300px; }
+  `]
+})
+export class DeferDemoComponent {}
+```
+
+Under the hood, the Angular compiler extracts all components inside the `@defer` block into a separate dynamic ES module import.
+
+---
+
+## 3. Template Reference Variables & Micro-syntax
+
+Template reference variables (declared with `#varName`) export references to DOM elements, directives, or components, making them accessible throughout the template.
+
+```typescript
+import { Component, Directive, Input } from '@angular/core';
+
+@Directive({
+  selector: '[appFormValidator]',
+  standalone: true,
+  exportAs: 'validator' // Exposes directive instance to template variables
+})
+export class FormValidatorDirective {
+  @Input() rules: string[] = [];
+  
+  isValid(): boolean {
+    return this.rules.length > 0;
+  }
+}
+
+@Component({
+  selector: 'app-ref-variables',
+  standalone: true,
+  imports: [FormValidatorDirective],
+  template: `
+    <div>
+      <!-- Reference to raw HTML Input Element -->
+      <input #usernameInput type="text" placeholder="Enter username" />
+      <button (click)="logValue(usernameInput.value)">Log Raw Value</button>
+
+      <!-- Reference to Custom Directive Instance via exportAs -->
+      <div appFormValidator [rules]="['required', 'minLength']" #val="validator">
+        Status: {{ val.isValid() ? 'Valid Config' : 'Invalid Config' }}
+      </div>
+    </div>
+  `
+})
+export class RefVariablesComponent {
+  logValue(val: string): void {
+    console.log('Input value extracted directly from template variable:', val);
+  }
+}
+```
+
+---
+
+## 4. Binding Types: Properties, Attributes, Classes, and Styles
+
+Angular template syntax distinguishes between DOM properties and HTML attributes:
+*   **Property Binding `[property]`**: Modifies the DOM element's property directly.
+*   **Attribute Binding `[attr.name]`**: Modifies the HTML attribute (essential for ARIA attributes and accessibility).
+*   **Class Binding `[class.name]`**: Programmatically toggles single or multiple CSS classes.
+*   **Style Binding `[style.property]`**: Binds inline CSS styles with optional units (e.g., `[style.width.px]`).
+
+```typescript
+@Component({
+  selector: 'app-bindings-demo',
+  standalone: true,
+  template: `
+    <!-- Property vs Attribute -->
+    <input [disabled]="isDisabled" />
+    <button [attr.aria-label]="ariaLabel">Accessible Action</button>
+
+    <!-- Dynamic Class and Style Binding -->
+    <div 
+      [class.active-state]="isActive" 
+      [style.font-size.rem]="fontSize"
+      [style.color]="statusColor()"
+    >
+      Styling Sandbox
+    </div>
+  `,
+  styles: ['.active-state { border: 2px solid green; }']
+})
+export class BindingsDemoComponent {
+  isDisabled = true;
+  ariaLabel = 'Submit the registration form';
+  isActive = true;
+  fontSize = 1.5;
+  
+  statusColor(): string {
+    return '#ff0055';
+  }
+}
+```
+
+---
+
+## 5. Custom Structural Directives Under the Hood
+
+To understand how templates compile, we can build a custom structural directive that replicates conditional rendering. This requires injection of `TemplateRef` (the blueprint) and `ViewContainerRef` (the location where the view will be rendered).
+
+```typescript
+import { Directive, Input, TemplateRef, ViewContainerRef, inject } from '@angular/core';
+
+@Directive({
+  selector: '[appRenderDelay]',
+  standalone: true
+})
+export class RenderDelayDirective {
+  private templateRef = inject(TemplateRef<any>);
+  private viewContainer = inject(ViewContainerRef);
+
+  @Input() set appRenderDelay(delayMs: number) {
+    this.viewContainer.clear();
+    setTimeout(() => {
+      this.viewContainer.createEmbeddedView(this.templateRef);
+    }, delayMs);
+  }
+}
+```
+
+Usage in template:
+```html
+<div *appRenderDelay="2000">
+  This content appeared after a 2-second delay.
+</div>
+```
+
+This dynamic view manipulation demonstrates how Angular's compiler manages views using `ViewContainerRef` under the hood.
+
+---

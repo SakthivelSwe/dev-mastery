@@ -1,0 +1,88 @@
+---
+slug: "caching-strategies"
+title: "Caching Strategies (Redis)"
+level: 5
+---
+
+## WHY
+You build a sports website. Your backend queries the database for "Tonight's Game Scores". 
+The database uses B-Trees, scans physical hard drives, joins tables, and calculates the results. It takes 200 milliseconds.
+This is fine for 1 user. But if 100,000 users check the scores simultaneously, the database performs that exact same 200ms hard drive operation 100,000 times. The database CPU hits 100%, and the server completely crashes.
+Why ask the slow hard drive the exact same question 100,000 times if the game score hasn't changed?
+**Caching** solves this. The very first user triggers the slow database query. The server takes the result and saves it in a **Cache** (a hyper-fast RAM database like Redis). The next 99,999 users never touch the database! They instantly pull the answer directly from the RAM cache in 1 millisecond, reducing database load by 99.9% and saving the website from crashing!
+
+## THEORY
+### Memory vs. Disk
+- **PostgreSQL / MySQL:** Store data permanently on a physical Hard Disk Drive (SSD). Hard drives are non-volatile (data survives a reboot) but physically slow to read.
+- **Redis / Memcached:** Store data purely in volatile RAM (Random Access Memory). RAM is lightning fast (microseconds), but if the server loses power, all data in RAM is instantly erased. Caches are strictly for temporary performance optimization!
+
+### Cache Invalidation (The Hardest Problem in Computer Science)
+There is a famous saying: *"There are only two hard things in Computer Science: cache invalidation and naming things."*
+If the score changes from 0-0 to 1-0, the real database is updated. But the Cache still holds the old 0-0 score in RAM! All your users are now seeing stale, incorrect data. You must architect a strategy to "Invalidate" (delete or update) the cache whenever the underlying truth changes.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "redis-caching-layer" }
+```
+
+## CODE
+
+Let's look at how to implement the most common pattern: **Cache-Aside**, using Redis in a Node.js Express server.
+
+### The Cache-Aside Pattern
+1. **Check Cache:** Does the data exist in Redis?
+2. **Hit:** If Yes, return it instantly! (Done).
+3. **Miss:** If No, query the slow PostgreSQL database.
+4. **Populate:** Save the result into Redis so the next user gets a Hit.
+5. **Return:** Send the data to the user.
+
+```javascript
+// npm install redis
+const redis = require('redis');
+const redisClient = redis.createClient({ url: 'redis://localhost:6379' });
+redisClient.connect();
+
+app.get('/api/scores', async (req, res) => {
+    const CACHE_KEY = "sports:tonights_scores";
+
+    // 1. CHECK THE CACHE
+    const cachedData = await redisClient.get(CACHE_KEY);
+
+    if (cachedData) {
+        console.log("CACHE HIT! Blazing fast return!");
+        // Redis strictly stores Strings. We must parse it back into JSON!
+        return res.status(200).json(JSON.parse(cachedData));
+    }
+
+    console.log("CACHE MISS! Asking the slow database...");
+    
+    // 3. QUERY SLOW DATABASE
+    const liveScores = await db.scores.findMany(); 
+
+    // 4. POPULATE THE CACHE for the next user!
+    // We MUST specify an expiration time (TTL - Time to Live). 
+    // e.g., 'EX', 60 tells Redis to automatically delete this cache in 60 seconds!
+    await redisClient.set(CACHE_KEY, JSON.stringify(liveScores), {
+        EX: 60 
+    });
+
+    // 5. Return data to the original user
+    res.status(200).json(liveScores);
+});
+```
+Notice the `EX: 60`. By setting a **Time to Live (TTL)**, we gracefully solve Cache Invalidation! We accept that users might see stale data for exactly 60 seconds. When the 60 seconds expire, Redis automatically deletes the data, forcing the very next user to trigger a Cache Miss and fetch the newest, most accurate data from the database!
+
+## REAL_WORLD
+**Global CDNs (Caching at the Edge)**
+Caching doesn't just happen in your backend server's RAM. The most powerful cache in the world is a **Content Delivery Network (CDN)** like Cloudflare or AWS CloudFront.
+If a user in Tokyo requests your company's logo (`logo.png`), and your server is in New York, the image data has to physically travel through fiber-optic cables under the Pacific Ocean, taking 250 milliseconds. 
+A CDN fixes this by placing hundreds of cache servers ("Edge Nodes") in every major city on Earth. When the Tokyo user requests the logo, the CDN server *in Tokyo* intercepts the request, checks its cache, and serves the image in 5 milliseconds! The request never even crosses the ocean. CDNs are the reason the modern internet feels incredibly fast regardless of where a website is hosted.
+
+## INTERVIEW
+**Q: An interviewer asks: "Our Cache-Aside pattern works perfectly. But we are worried about a 'Cache Stampede' (or Thundering Herd) problem on Black Friday. What is a Cache Stampede, and how does it crash our database despite having a Redis cache?"**
+A: **It happens when a highly concurrent cache expires.**
+Imagine 10,000 users are on your homepage hitting the `/api/products` endpoint every second.
+The data is cached in Redis with a 60-second TTL. For 60 seconds, everything is perfectly fine. The database is resting.
+At exactly second 61, the cache expires and disappears.
+In that exact millisecond, 1,000 users simultaneously request the page. All 1,000 users experience a "Cache Miss" at the exact same time! All 1,000 Node.js threads immediately pivot and fire the massive `SELECT * FROM products` query against the database simultaneously. The database goes from 0 CPU to 100% CPU in one millisecond and crashes instantly. 
+*The Fix:* You must implement **Mutex Locks (Distributed Locking)** or **Debouncing** in your cache logic. When a Cache Miss occurs, the very first Node.js thread must instantly grab a Redis "Lock". The other 999 threads check for the Lock and are forced to simply *wait* in a holding pattern. The first thread safely queries the database, repopulates the cache, releases the lock, and the 999 waiting threads instantly read from the newly populated cache!

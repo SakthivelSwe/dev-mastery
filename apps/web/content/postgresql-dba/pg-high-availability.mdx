@@ -1,0 +1,95 @@
+---
+slug: "pg-high-availability"
+title: "PostgreSQL High Availability (HA)"
+level: 4
+---
+
+## WHY
+You have successfully set up a Primary database and a Standby replica. 
+At 3:00 AM, the Primary server's power supply fails. The server goes dark.
+Because you have a Standby, the data is safe. But your web application is currently configured to connect to the Primary's IP address (`10.0.0.1`). Your website is completely down. 
+To fix it, a human DBA must wake up, SSH into the Standby, run a command to "Promote" it to become the new Primary, and then reconfigure the web app to point to the new IP address. That takes 30 minutes of downtime.
+
+**High Availability (HA)** systems automate this entirely. When the Primary dies, an HA cluster detects the failure, promotes the Standby, and routes the application traffic seamlessly in seconds, allowing you to sleep through the night.
+
+## THEORY
+### The Split-Brain Problem
+Automating failover is extremely dangerous. 
+Imagine the network cable between the Primary and Standby is temporarily cut, but both servers are still running perfectly. 
+The HA software on the Standby says: *"I can't reach the Primary! It must be dead! I will promote myself to Primary!"*
+Now you have TWO Primary databases accepting writes from different parts of the application. The data completely diverges. When the network cable is plugged back in, it is mathematically impossible to merge the databases back together without massive data loss. This is called **Split-Brain**.
+
+To prevent Split-Brain, HA systems require **Quorum (Consensus)**. You cannot have just 2 nodes. You must have at least 3 nodes (e.g., Primary, Standby, and a tiny "Witness" node). If a node cannot talk to the Primary, it asks the Witness: *"Is the Primary actually dead, or is it just my network cable?"* Only if a majority (>50%) of nodes agree the Primary is dead will a failover occur.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-ha" }
+```
+
+## CODE
+
+### Level 1 — The Promotion Command
+Before automating it, you must understand how a Standby physically becomes a Primary. 
+A Standby runs in a special "Recovery Mode" where it is strictly read-only and constantly replaying WAL.
+
+To promote it, you run this command on the Standby:
+```bash
+pg_ctl promote -D /var/lib/postgresql/data
+```
+The Postgres engine instantly stops accepting WAL from the old Primary, exits Recovery Mode, and begins accepting `INSERT/UPDATE` queries!
+
+### Level 2 — Patroni (The Industry Standard HA)
+PostgreSQL does *not* have built-in automated failover. The industry standard tool (built by Zalando) is **Patroni**.
+Patroni is a Python daemon that runs alongside Postgres on every node. 
+Patroni relies on a Distributed Consensus Store (usually **etcd** or **Consul** or **ZooKeeper**) to maintain the Quorum and prevent Split-Brain.
+
+**How Patroni Works:**
+1. All Patroni nodes connect to `etcd`.
+2. The Primary node acquires a "Leader Lock" in `etcd`. It must renew this lock every 10 seconds (a Heartbeat).
+3. If the Primary crashes, it fails to renew the lock in `etcd`.
+4. The `etcd` cluster expires the lock. The Standby Patroni nodes instantly see the lock is gone.
+5. The Standbys race to acquire the lock. The one that wins automatically runs `pg_ctl promote` on itself and becomes the new Primary!
+
+### Level 3 — Routing the Application (HAProxy / PgBouncer)
+Okay, Patroni successfully promoted Node B to be the new Primary. But your web app is still trying to connect to the IP of the dead Node A! How does the app know about the failover?
+
+**The Solution: A Proxy Layer.**
+The web application never connects directly to a Postgres IP. It connects to a highly available Proxy (like **HAProxy**).
+HAProxy is configured to monitor the Patroni cluster using Patroni's built-in REST API.
+
+```cfg
+# haproxy.cfg
+# HAProxy asks Patroni's API: "Are you the Primary?"
+# Patroni returns HTTP 200 ONLY if the node is the Primary!
+
+backend postgres_primary
+    option httpchk GET /master
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2
+    
+    server pg1 10.0.0.1:5432 check port 8008
+    server pg2 10.0.0.2:5432 check port 8008
+```
+When Node A dies, Patroni's API on Node A stops returning HTTP 200. HAProxy instantly kicks Node A out of the pool. Node B becomes the Primary, its API starts returning HTTP 200, and HAProxy seamlessly begins routing all the web app's SQL queries to Node B! The web app experiences a 3-second blip and then continues working flawlessly.
+
+### Level 4 — Fencing (STONITH)
+What if Node A isn't actually dead, it's just a "Zombie"? It's trapped in a massive CPU spike, responding so slowly that Patroni assumes it's dead and promotes Node B. 
+Suddenly, the CPU spike ends, and Node A wakes up. It still thinks it is the Primary! It might try to accept rogue writes from a lingering application connection, causing Split-Brain.
+
+Enterprise HA systems use **Fencing** (also known as STONITH: Shoot The Other Node In The Head).
+When Patroni decides to promote Node B, before it does *anything*, it reaches out to the physical hardware (e.g., the AWS EC2 API, or the physical Server Power Switch) and forcefully kills the power to Node A. It literally pulls the plug to absolutely guarantee Node A is dead before Node B takes over.
+
+## REAL_WORLD
+**AWS Aurora (Storage-Level HA)**
+Setting up Patroni + etcd + HAProxy is incredibly complex. Managing a 5-node cluster requires deep DevOps expertise.
+This is why companies pay massive premiums for managed databases like **Amazon Aurora PostgreSQL**.
+Aurora completely rewrites how PostgreSQL handles storage. Instead of relying on standard Streaming Replication and Patroni, Aurora separates the Compute engine from the Storage engine. 
+The Storage engine automatically replicates your data across 6 different physical hard drives in 3 different Availability Zones. If the Primary Compute node dies, Aurora simply spins up a new Compute node and attaches it to the shared Storage engine. Failover happens in milliseconds, and Split-Brain is impossible because there is only one shared disk!
+
+## INTERVIEW
+**Q: During an automated failover, the old Primary (Node A) dies, and Node B is promoted. 30 minutes later, the hardware on Node A is fixed, and you boot it back up. Node A still contains the data from 30 minutes ago. How do you reattach Node A to the cluster as a new Standby without manually copying 500GB of data via `pg_basebackup`?**
+A: **pg_rewind.**
+When Node B was promoted, the timelines of the two databases diverged. Node A has a few milliseconds of transaction history that never made it to Node B before the crash. Node B has 30 minutes of new history. They are incompatible.
+Historically, you had to wipe Node A completely and run a 10-hour `pg_basebackup`. 
+Today, you use `pg_rewind`. 
+`pg_rewind` scans the WAL files, figures out exactly where the timelines diverged, and essentially "rewinds" Node A's data blocks back in time to the exact microsecond of the crash. It then syncs only the blocks that changed on Node B during the last 30 minutes. What used to take 10 hours now takes 5 seconds, and Node A instantly rejoins the cluster as a healthy Standby! *(Note: Patroni handles `pg_rewind` automatically!).*

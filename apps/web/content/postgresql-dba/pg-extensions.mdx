@@ -1,0 +1,147 @@
+---
+slug: "pg-extensions"
+title: "PostgreSQL Extensions (PostGIS, pgvector)"
+level: 3
+---
+
+## WHY
+MySQL and SQL Server are monolithic blocks. What you install is what you get. 
+PostgreSQL is different. It was explicitly designed as an extensible framework. You can inject custom C code directly into the database engine to add new data types, new index structures, and entirely new querying capabilities without ever modifying the core Postgres source code.
+
+This architecture is why PostgreSQL is dominating the modern data landscape. Need geospatial routing for Uber? Install PostGIS. Need an AI Vector database for ChatGPT embeddings? Install pgvector. You don't need 5 different specialized databases; Postgres can be all of them.
+
+## THEORY
+### The Shared Preload Library
+An extension usually consists of two parts:
+1. **The C Binary (`.so` file):** The compiled code that runs deep inside the Postgres engine. Sometimes this must be loaded at boot time via `shared_preload_libraries` in `postgresql.conf`.
+2. **The SQL Wrapper:** The SQL functions, types, and operators that expose the C code to the user. You activate this per-database by running `CREATE EXTENSION extension_name;`.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-extensions" }
+```
+
+## CODE
+
+### Level 1 — Everyday Built-in Extensions (uuid & crypto)
+Some extensions are so common they ship with Postgres by default, but you still have to manually activate them!
+
+```sql
+-- Adds the ability to generate V4 UUIDs natively!
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE users (
+    -- Now you can use uuid_generate_v4() as a default value!
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name TEXT
+);
+
+-- Adds massive cryptographic functions (hashing, encryption)
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- You can now hash passwords directly in the database (though backend hashing is preferred)
+INSERT INTO users (name, password_hash) 
+VALUES ('John', crypt('mypassword', gen_salt('bf')));
+```
+
+### Level 2 — PostGIS (The Geospatial King)
+**PostGIS** is arguably the most famous Postgres extension. It turns Postgres into a full-fledged Geographic Information System (GIS). It allows you to store Earth coordinates, calculate distances, find intersections, and index geographic boundaries.
+
+```sql
+-- Requires installing the PostGIS OS packages first!
+CREATE EXTENSION postgis;
+
+CREATE TABLE restaurants (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    -- A special PostGIS data type representing a point on Earth (SRID 4326 is WGS 84 / GPS)
+    location GEOMETRY(Point, 4326) 
+);
+
+-- Insert a restaurant in New York (Longitude, Latitude)
+INSERT INTO restaurants (name, location) 
+VALUES ('Joe''s Pizza', ST_SetSRID(ST_MakePoint(-74.002, 40.730), 4326));
+
+-- The Magic: Find all restaurants within 1000 meters of the user!
+-- This uses a massive PostGIS GiST index to do this instantly without scanning the table!
+SELECT name 
+FROM restaurants 
+WHERE ST_DWithin(
+    location, 
+    ST_SetSRID(ST_MakePoint(-73.999, 40.732), 4326), 
+    1000 -- meters
+);
+```
+
+### Level 3 — pgvector (The AI Revolution)
+With the rise of Large Language Models (LLMs) like OpenAI, developers need "Vector Databases" to store embeddings (massive arrays of floating-point numbers representing text meaning).
+Instead of buying an expensive, dedicated vector database (like Pinecone or Milvus), you just install `pgvector` into Postgres!
+
+```sql
+CREATE EXTENSION vector;
+
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    -- Store a 1536-dimensional vector (OpenAI's embedding size)
+    embedding VECTOR(1536) 
+);
+
+-- Find the 5 documents most "semantically similar" to the user's search!
+-- The `<->` operator is custom C code provided by pgvector that calculates Euclidean distance!
+SELECT content 
+FROM documents 
+ORDER BY embedding <-> '[0.123, -0.456, 0.789, ...]' 
+LIMIT 5;
+```
+
+### Level 4 — Foreign Data Wrappers (postgres_fdw)
+What if you have two completely separate PostgreSQL servers (e.g., `Server A: Sales` and `Server B: HR`) and you need to join tables across them?
+You use a **Foreign Data Wrapper (FDW)**. FDWs allow Postgres to reach across the network, query another database, and present the results *as if the table existed locally!*
+
+```sql
+CREATE EXTENSION postgres_fdw;
+
+-- Tell Server A how to connect to Server B
+CREATE SERVER hr_server 
+    FOREIGN DATA WRAPPER postgres_fdw 
+    OPTIONS (host '10.0.0.5', dbname 'hr_db', port '5432');
+
+-- Tell Server A what credentials to use
+CREATE USER MAPPING FOR current_user 
+    SERVER hr_server 
+    OPTIONS (user 'fdw_user', password 'secret');
+
+-- Create a "Ghost" table on Server A that points to Server B!
+CREATE FOREIGN TABLE remote_employees (
+    id INT,
+    name TEXT,
+    salary INT
+) SERVER hr_server OPTIONS (table_name 'employees');
+
+-- You can now join local Sales data with remote HR data in a single query!
+SELECT s.amount, e.name 
+FROM local_sales s 
+JOIN remote_employees e ON s.employee_id = e.id;
+```
+
+## REAL_WORLD
+**The Danger of Extensions (AWS RDS vs. Self-Hosted)**
+A massive architectural decision when choosing a cloud provider is Extension support.
+If you host Postgres yourself (on EC2), you can compile and install any C extension in the world (e.g., `pg_cron` for background jobs, `timescaledb` for IoT data).
+If you use a Managed Database like Amazon RDS or Google Cloud SQL, **you are strictly limited to the extensions AWS explicitly allows.** You cannot SSH into an RDS instance to run `apt-get install` or compile C code. 
+If your startup's core feature relies on an obscure open-source Postgres extension, you literally cannot use AWS RDS; you must self-host or use a specialized provider (like Supabase or Timescale Cloud).
+
+## INTERVIEW
+**Q: Our application needs to run a background job every night at midnight to delete expired sessions from the `sessions` table. How would you architect this using only PostgreSQL?**
+A: **The pg_cron Extension.**
+Historically, you would have to write a Node.js cron job, deploy it to a server, and have it connect to Postgres over the network to execute the `DELETE` query. This adds another point of failure (the Node server).
+With Postgres, you simply install the `pg_cron` extension. It runs a cron daemon entirely inside the Postgres background worker processes!
+```sql
+CREATE EXTENSION pg_cron;
+
+-- Schedule the job directly in the database!
+-- Using standard cron syntax (Minute, Hour, Day, Month, Day of Week)
+SELECT cron.schedule('0 0 * * *', $$ DELETE FROM sessions WHERE expires_at < NOW(); $$);
+```
+This is incredibly robust because the database itself guarantees the execution of the cleanup logic, entirely independent of the application layer.

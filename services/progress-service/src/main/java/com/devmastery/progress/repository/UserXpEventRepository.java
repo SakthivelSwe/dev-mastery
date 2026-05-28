@@ -8,4 +8,5 @@ import java.util.UUID;
 
 public interface UserXpEventRepository extends JpaRepository<UserXpEvent, UUID> {
     List<UserXpEvent> findByUserIdOrderByEarnedAtDesc(UUID userId);
+    long countByUserIdAndEventType(UUID userId, String eventType);
 }

@@ -1,0 +1,156 @@
+---
+slug: "graphql-advanced"
+title: "Advanced GraphQL"
+level: 4
+---
+
+## WHY
+REST APIs suffer from two massive problems: **Over-fetching** and **Under-fetching**.
+If a mobile app needs a user's name, it calls `GET /users/1`. But the REST API returns the entire user object (with 50 fields, including addresses and preferences). This wastes mobile data (Over-fetching).
+If the app also needs the user's latest 5 posts, it has to make a second network request to `GET /users/1/posts`. (Under-fetching).
+
+**GraphQL** solves this by flipping the control to the Client. The frontend sends a single query specifying *exactly* which fields it wants, and the backend returns a JSON payload perfectly shaped to match that request. 
+
+## THEORY
+### The Schema is the Contract
+Unlike REST (which relies on loosely defined URLs and HTTP verbs), GraphQL is strongly typed. 
+The backend defines a strict **Schema** (using the Schema Definition Language - SDL). It defines exact Types (`User`, `Post`), exact Queries (Read data), and exact Mutations (Write data). 
+Because the schema is strongly typed, GraphQL tools can automatically generate frontend TypeScript interfaces, ensuring perfect type safety between the frontend and backend.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "graphql-architecture" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Queries and Fragments)
+The frontend asks exactly for what it wants.
+
+```graphql
+# The Client's Query
+query GetUserProfile {
+  user(id: "123") {
+    name
+    email
+    # We can fetch relational data in the EXACT SAME REQUEST!
+    posts(limit: 2) {
+      title
+      createdAt
+    }
+  }
+}
+```
+
+```json
+// The Backend's Response (Matches the shape perfectly!)
+{
+  "data": {
+    "user": {
+      "name": "John Doe",
+      "email": "john@example.com",
+      "posts": [
+        { "title": "Hello World", "createdAt": "2023-10-01" },
+        { "title": "Learning GraphQL", "createdAt": "2023-10-05" }
+      ]
+    }
+  }
+}
+```
+
+### Level 2 — Building Blocks (Resolvers)
+How does the backend actually fetch the data? Through **Resolvers**.
+For every field in the Schema, there is a Resolver function. The GraphQL engine executes these functions sequentially to build the final JSON tree.
+
+```javascript
+// Node.js Apollo Server Example
+const resolvers = {
+  Query: {
+    // Top-level resolver: Fetches the User from the DB
+    user: async (parent, args, context) => {
+      return await db.users.findById(args.id);
+    }
+  },
+  
+  // Field-level resolver!
+  // If (and ONLY if) the client asks for "posts", this function runs!
+  User: {
+    posts: async (parent, args, context) => {
+      // The 'parent' object is the User data returned from the Query resolver above!
+      return await db.posts.find({ authorId: parent.id }).limit(args.limit);
+    }
+  }
+};
+```
+
+### Level 3 — Intermediate (The N+1 Problem and DataLoader)
+*The Dark Side of GraphQL:* Because Resolvers execute independently, they cause horrific database performance issues known as the **N+1 Problem**.
+
+Imagine querying 50 Users, and asking for their Company.
+1. The `users` query runs once (1 Query, fetching 50 users).
+2. For *every single user*, the `User.company` resolver runs independently.
+3. The database receives 50 separate `SELECT * FROM companies WHERE id = ?` queries! (1 + 50 = 51 Queries total!).
+
+**The Solution: DataLoader.**
+DataLoader is a utility that batches and caches database requests within a single GraphQL request.
+
+```javascript
+const DataLoader = require('dataloader');
+
+// 1. Create a DataLoader. Instead of fetching 1 ID, it expects an ARRAY of IDs.
+const companyLoader = new DataLoader(async (companyIds) => {
+  // We execute exactly ONE database query using a SQL "IN" clause!
+  // SELECT * FROM companies WHERE id IN (1, 2, 3, 4...)
+  const companies = await db.companies.find({ id: { $in: companyIds } });
+  
+  // Return the data sorted to match the requested IDs
+  return companyIds.map(id => companies.find(c => c.id === id));
+});
+
+const resolvers = {
+  User: {
+    company: async (parent) => {
+      // 2. Instead of calling the DB, we pass the ID to DataLoader.
+      // DataLoader waits 1 millisecond, gathers all the IDs requested by all 50 resolvers,
+      // deduplicates them, and executes the batch function above!
+      return await companyLoader.load(parent.companyId);
+    }
+  }
+};
+```
+
+### Level 4 — Advanced (Federation)
+In a Microservices architecture, you might have a User Service, an Order Service, and an Inventory Service. 
+If the frontend has to query 3 different GraphQL APIs, it defeats the purpose of GraphQL (a single unified endpoint).
+
+**Apollo Federation** allows you to stitch multiple independent GraphQL APIs together into a single, massive **Supergraph**.
+
+```graphql
+# 1. The User Service Schema
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+}
+
+# 2. The Order Service Schema
+# The Order service doesn't own the User, but it can EXTEND it!
+extend type User @key(fields: "id") {
+  id: ID! @external
+  # It adds the "orders" field to the User object!
+  orders: [Order]
+}
+```
+*The Magic:* The frontend sends a single query to the Apollo Gateway asking for a User and their Orders. The Gateway intelligently splits the query, asks the User Service for the name, asks the Order Service for the orders, merges the JSON together, and returns it to the client!
+
+## REAL_WORLD
+**GitHub's V4 API**
+When GitHub analyzed their v3 REST API, they found massive inefficiencies. To render an issue page, a client had to make an API call to get the issue, another call to get the comments, another call to get the commit statuses, and another call to get the PR links.
+They completely migrated to GraphQL for their v4 API. Now, third-party developers can fetch incredibly complex webs of repositories, pull requests, authors, and CI/CD statuses in a single network request. 
+However, to protect their database from infinite nested queries (e.g., `user -> posts -> comments -> author -> posts...`), GitHub enforces strict **Query Complexity Limits**. They assign a mathematical "cost" to every requested field and reject the query if the total cost exceeds the limit.
+
+## INTERVIEW
+**Q: I built a GraphQL API. I noticed that when I update a user's profile, I have to send an HTTP POST, but when I fetch a user, I also have to send an HTTP POST. Doesn't GraphQL use GET requests for fetching data like REST?**
+A: **No, GraphQL almost exclusively uses HTTP POST.**
+In REST, the URL defines the resource (`GET /users/1`). In GraphQL, there is only one URL (`POST /graphql`). The actual query is a massive String sent in the *body* of the HTTP request. 
+Because HTTP `GET` requests technically should not contain a request body, and putting massive queries in the URL Query Parameters breaks URL length limits, GraphQL wraps the read-query into a JSON payload and sends it via `POST`. 
+*(Note: Because of this, traditional CDN caching mechanisms like Varnish or Cloudflare that cache based on the URL fail completely with GraphQL. You must use specialized GraphQL caching tools like Apollo Router).*

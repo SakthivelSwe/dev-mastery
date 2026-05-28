@@ -1,0 +1,135 @@
+---
+slug: "performance-angular"
+title: "Angular Performance Optimization"
+level: 4
+---
+
+## WHY
+Angular is incredibly fast, but in massive enterprise applications (e.g., a dashboard rendering a table with 5,000 rows, complex nested forms, and real-time WebSocket data), the framework can begin to stutter. Typing into an input field might feel sluggish, and battery drain on mobile devices becomes severe.
+Understanding Angular's specific performance bottlenecks—specifically around Change Detection and Bundle Size—allows you to build complex, data-heavy applications that maintain a flawless 60 Frames-Per-Second (FPS).
+
+## THEORY
+### The Change Detection Bottleneck
+By default, Angular uses the `Default` Change Detection Strategy. 
+When *anything* happens in the application—a mouse click, a `setTimeout`, or an HTTP response—Angular checks **every single component in the entire component tree**, from the root down to the deepest leaf, to see if any data changed.
+If your application has 2,000 components on the screen, Angular executes 2,000 checks every time the user hits a key on their keyboard. This is the primary cause of Angular performance issues.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "angular-performance" }
+```
+
+## CODE
+
+### Level 1 — `OnPush` Change Detection
+The absolute easiest and most powerful performance optimization is switching to the `OnPush` strategy.
+When you set a component to `OnPush`, you tell Angular: *"Stop checking me on every global event! ONLY check me if my `@Input()` properties physically change (reference change) or if an event is fired directly from my own HTML template!"*
+
+```typescript
+import { Component, ChangeDetectionStrategy, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-heavy-chart',
+  // MAGIC: This component is now immune to global Change Detection cycles!
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `<div>Rendering complex data: {{ data.value }}</div>`
+})
+export class HeavyChartComponent {
+  @Input() data: { value: string };
+}
+```
+*The Trap:* Because `OnPush` relies on reference equality, if the parent component mutates the data (`this.data.value = 'new'`), the memory reference of the `data` object hasn't changed. Angular will completely ignore the update and the UI will not re-render! You MUST use Immutable Data (`this.data = { value: 'new' }`) with `OnPush`!
+
+### Level 2 — The `trackBy` Function (or `@for` track)
+When you render a list using `*ngFor` (or the modern `@for`), and the underlying array updates (e.g., you fetch new data from the API), Angular deletes ALL the physical DOM elements and recreates them from scratch. This causes a massive layout thrashing.
+You must provide a `trackBy` function (or `track` in Angular 17+) to tell Angular how to uniquely identify items. Angular will then surgically move existing DOM elements instead of destroying them!
+
+```html
+<!-- The Modern Angular 17+ Way (Built-in track!) -->
+@for (user of users; track user.id) {
+  <div class="user-card">{{ user.name }}</div>
+}
+
+<!-- The Legacy *ngFor Way -->
+<div *ngFor="let user of users; trackBy: trackById">
+  {{ user.name }}
+</div>
+```
+```typescript
+// Required for legacy *ngFor
+trackById(index: number, user: User) {
+  return user.id; // Tell Angular the unique identifier!
+}
+```
+
+### Level 3 — Running Outside Angular (Zone.js)
+If you build a complex drag-and-drop interface, or an animation using `requestAnimationFrame`, those events fire 60 times a second.
+Because Angular's `Zone.js` intercepts all events, it will trigger a global Change Detection cycle 60 times a second, instantly freezing the browser.
+You must use `NgZone` to run this heavy logic *outside* of Angular's visibility!
+
+```typescript
+import { Component, NgZone, ElementRef, OnInit } from '@angular/core';
+
+export class AnimationComponent implements OnInit {
+  constructor(private ngZone: NgZone, private el: ElementRef) {}
+
+  ngOnInit() {
+    // We tell Zone.js to ignore everything inside this block!
+    this.ngZone.runOutsideAngular(() => {
+      
+      // This mousemove event fires hundreds of times. 
+      // Because it's outside Angular, NO change detection cycles are triggered!
+      this.el.nativeElement.addEventListener('mousemove', (e) => {
+        // ... perform complex math and update raw DOM styles
+        this.el.nativeElement.style.left = `${e.clientX}px`;
+      });
+
+    });
+  }
+}
+```
+
+### Level 4 — Pure Pipes vs. Functions in Templates
+This is the most common mistake Junior Angular developers make.
+If you call a function inside your HTML template (`{{ calculateTotal() }}`), Angular executes that function on *every single change detection cycle*. If the user moves their mouse, the function executes. If it's a heavy mathematical calculation, the app crawls to a halt.
+
+```html
+<!-- BAD: Executes hundreds of times a second! -->
+<h2>Total: {{ calculateHeavyMath(cart) }}</h2>
+
+<!-- GOOD: Use a Pure Pipe! -->
+<h2>Total: {{ cart | calculateHeavyMathPipe }}</h2>
+```
+
+```typescript
+import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({
+  name: 'calculateHeavyMathPipe',
+  standalone: true,
+  pure: true // This is true by default!
+})
+export class MathPipe implements PipeTransform {
+  transform(cart: any[]): number {
+    // Pure Pipes are magically CACHED by Angular.
+    // This math will ONLY execute if the 'cart' array reference physically changes!
+    // It completely ignores all other change detection cycles!
+    return cart.reduce(...);
+  }
+}
+```
+
+## REAL_WORLD
+**Bundle Optimization and Lazy Loading**
+Performance isn't just about rendering; it's about network load time. If your `main.js` bundle is 5 Megabytes, users on 3G connections will stare at a white screen for 10 seconds.
+1. **Lazy Loading Routes:** Never import everything into `app.routes.ts`. Always use `loadComponent: () => import(...)` for routes so they are split into separate JS chunks.
+2. **Deferrable Views (`@defer`):** In Angular 17+, you can lazy load components *within the same page*. If a massive Video Player component is below the fold (user has to scroll down to see it), wrap it in `@defer (on viewport)`. Angular won't even download the JavaScript for the Video Player until the user physically scrolls down to it!
+3. **Source-Map-Explorer:** Run `npx source-map-explorer dist/**/*.js` to generate a visual treemap of your compiled bundle. It will expose massive third-party libraries (like `moment.js` or `lodash`) that are bloating your app, allowing you to rip them out.
+
+## INTERVIEW
+**Q: You switch your entire application to `ChangeDetectionStrategy.OnPush`. You have an RxJS `Observable` providing data from the NgRx Store. You update the Store, the Observable emits new data, but the Component UI does not update. Why?**
+A: **Observables do not trigger `OnPush` components natively.**
+An `OnPush` component only checks for updates if an `@Input()` reference changes or an HTML event fires. An Observable emitting a value deep inside the TypeScript file is *neither* of those things. The component receives the new data from the subscription, but Angular doesn't know it needs to re-render the HTML template!
+*The Fix:* 
+Option A (Best): Use the `| async` pipe in the HTML template (`{{ data$ | async }}`). The `async` pipe internally calls `markForCheck()`, specifically telling Angular to wake up the `OnPush` component!
+Option B: If you must subscribe in TypeScript, you must inject the `ChangeDetectorRef` service, and manually call `this.cdr.markForCheck()` inside the `.subscribe()` block to tell Angular the data changed!

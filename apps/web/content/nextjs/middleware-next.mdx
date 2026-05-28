@@ -1,0 +1,164 @@
+---
+slug: "middleware-next"
+title: "Next.js Middleware"
+level: 4
+---
+
+## WHY
+Some logic must run before every request reaches a page or API route — authentication checks, redirects, request rewriting, geolocation-based routing, A/B testing, rate limiting. Without middleware, you'd have to duplicate this logic in every page component.
+**Next.js Middleware** runs at the Edge (before the request hits the server) and can transform the request, add headers, redirect, or rewrite the URL.
+
+## THEORY
+### Where Middleware Runs
+Middleware runs in the **Edge Runtime** — ultra-low latency, globally distributed. It executes before caching and routing, meaning you can personalize or protect routes before any server-side code runs.
+
+This is why middleware is ideal for:
+- Authentication/authorization (redirect before seeing any protected content)
+- Internationalization (detect language, redirect to correct locale)
+- A/B testing (rewrite to different page versions)
+- Request logging/analytics
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-middleware" }
+```
+
+## CODE
+
+### Middleware File Location
+```typescript
+// middleware.ts — MUST be in the project ROOT (same level as app/)
+// Applies to all routes by default, use `config.matcher` to filter
+```
+
+### Authentication Middleware
+```typescript
+// middleware.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { auth } from '@/auth';
+
+export default auth((request) => {
+  const isLoggedIn = !!request.auth;
+  const pathname = request.nextUrl.pathname;
+  
+  // Protected routes
+  const isProtectedRoute = pathname.startsWith('/dashboard') || 
+                           pathname.startsWith('/profile');
+  const isAuthRoute = pathname === '/login' || pathname === '/register';
+  
+  // Redirect unauthenticated users to login
+  if (isProtectedRoute && !isLoggedIn) {
+    const loginUrl = new URL('/login', request.url);
+    loginUrl.searchParams.set('callbackUrl', pathname);  // Redirect back after login!
+    return NextResponse.redirect(loginUrl);
+  }
+  
+  // Redirect logged-in users away from auth pages
+  if (isAuthRoute && isLoggedIn) {
+    return NextResponse.redirect(new URL('/dashboard', request.url));
+  }
+  
+  return NextResponse.next();
+});
+
+export const config = {
+  matcher: [
+    // Match all pages except static files and Next.js internals
+    '/((?!_next/static|_next/image|favicon.ico|public/).*)',
+  ],
+};
+```
+
+### Internationalization Middleware
+```typescript
+// middleware.ts — Detect language and redirect
+export function middleware(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  
+  // Already has locale prefix (/en/... or /fr/...)?
+  const hasLocale = ['en', 'fr', 'de', 'es'].some(
+    locale => pathname.startsWith(`/${locale}/`) || pathname === `/${locale}`
+  );
+  
+  if (!hasLocale) {
+    // Detect from Accept-Language header
+    const acceptLanguage = request.headers.get('accept-language') ?? 'en';
+    const locale = acceptLanguage.split(',')[0].split('-')[0];
+    const supportedLocale = ['en', 'fr', 'de', 'es'].includes(locale) ? locale : 'en';
+    
+    // Rewrite /about → /en/about (user sees /about in browser, gets /en/about content)
+    return NextResponse.redirect(new URL(`/${supportedLocale}${pathname}`, request.url));
+  }
+  
+  return NextResponse.next();
+}
+```
+
+### Request/Response Modification
+```typescript
+export function middleware(request: NextRequest) {
+  // Clone the response
+  const response = NextResponse.next();
+  
+  // Add security headers to EVERY response
+  response.headers.set('X-Frame-Options', 'DENY');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+  response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  response.headers.set('Content-Security-Policy', "default-src 'self'");
+  
+  // Add request ID for tracing
+  const requestId = crypto.randomUUID();
+  response.headers.set('X-Request-Id', requestId);
+  
+  return response;
+}
+```
+
+## REAL_WORLD
+**A/B Testing with Middleware**
+```typescript
+export function middleware(request: NextRequest) {
+  // A/B test the homepage — show Version A to 50% of users
+  if (request.nextUrl.pathname === '/') {
+    const bucket = request.cookies.get('ab-bucket')?.value;
+    
+    // Assign bucket if not assigned yet
+    const assignedBucket = bucket ?? (Math.random() < 0.5 ? 'a' : 'b');
+    
+    // Rewrite to different page version
+    const response = NextResponse.rewrite(
+      new URL(assignedBucket === 'a' ? '/home-variant-a' : '/home-variant-b', request.url)
+    );
+    
+    // Save bucket in cookie
+    if (!bucket) {
+      response.cookies.set('ab-bucket', assignedBucket, { maxAge: 30 * 24 * 60 * 60 });
+    }
+    
+    return response;
+  }
+}
+```
+
+## INTERVIEW
+**Q: What's the difference between using `NextResponse.redirect()` and `NextResponse.rewrite()` in middleware?**
+
+A:
+- **`NextResponse.redirect(url)`:** The browser makes a new request to the new URL. The user's browser address bar changes. HTTP status 307/308. Two round-trips.
+
+- **`NextResponse.rewrite(url)`:** The server fetches content from the new URL but serves it as if it came from the ORIGINAL URL. The browser's address bar stays the same. One round-trip.
+
+**When to use each:**
+
+**Redirect:** User-visible URL changes expected (auth → login page, outdated URL → new URL, wrong locale → correct locale)
+```typescript
+// User goes to /dashboard without auth → browser navigates to /login
+return NextResponse.redirect(new URL('/login', request.url));
+```
+
+**Rewrite:** URL stays the same but content is different (A/B testing, feature flags, multi-tenant routing)
+```typescript
+// Company A visits example.com → gets company-a's data; URL stays example.com
+const tenant = request.headers.get('host').split('.')[0];
+return NextResponse.rewrite(new URL(`/tenants/${tenant}`, request.url));
+```

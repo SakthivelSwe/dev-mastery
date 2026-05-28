@@ -1,0 +1,139 @@
+---
+slug: "docker-security"
+title: "Docker Security"
+level: 4
+---
+
+## WHY
+Docker containers share the host OS kernel. If an attacker compromises a container and exploits a vulnerability to escape it, they could gain access to the host system and every other container running on it.
+Many developers run containers with the default settings (as root, with all Linux capabilities, with no resource limits) in production. This is a serious security risk.
+**Docker Security** is a collection of practices and configurations that harden your containers against exploitation, limit blast radius if a breach occurs, and prevent common attack vectors.
+
+## THEORY
+### The Principle of Least Privilege
+Every container should have only the minimum permissions it needs to function. Nothing more. This limits the damage if the container is compromised.
+
+### Key Security Concerns
+1. **Running as root:** Most base images run processes as root by default. Root inside a container maps to root on the host in some scenarios.
+2. **Linux Capabilities:** The root user inside a container has a set of Linux capabilities (like modifying network settings, mounting filesystems). Most apps don't need these.
+3. **Image vulnerabilities:** Base images contain OS packages that may have CVEs.
+4. **Secrets in images:** ENV vars or COPY'd files containing secrets are baked into image layers permanently.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SecurityVisualizer", "state": "docker-security" }
+```
+
+## CODE
+
+### Running as Non-Root
+```dockerfile
+# BAD: Default — runs as root
+FROM node:20-alpine
+WORKDIR /app
+COPY . .
+CMD ["node", "server.js"]
+# Container runs as root — if hacked, attacker has root privileges!
+
+# GOOD: Create and use a non-root user
+FROM node:20-alpine
+WORKDIR /app
+
+# Create a non-privileged user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+COPY --chown=appuser:appgroup . .
+
+# Switch to non-root user BEFORE CMD
+USER appuser
+
+CMD ["node", "server.js"]
+# Now even if hacked, attacker is unprivileged user 'appuser'!
+```
+
+### Dropping Linux Capabilities
+```bash
+# By default, Docker gives containers a subset of Linux capabilities
+# Drop ALL capabilities, then add back only what's needed
+
+docker run \
+  --cap-drop=ALL \               # Drop ALL capabilities
+  --cap-add=NET_BIND_SERVICE \   # Only add capability to bind ports < 1024
+  my-web-server
+
+# For most applications, you need NO capabilities:
+docker run --cap-drop=ALL my-app
+```
+
+### Read-Only Filesystems
+```bash
+# Prevent the container from writing to its own filesystem
+docker run --read-only my-app
+
+# If the app needs to write temporary files, allow specific writable paths:
+docker run \
+  --read-only \
+  --tmpfs /tmp \           # Allow writing to /tmp in RAM
+  --tmpfs /var/cache \     # Allow /var/cache in RAM
+  my-app
+```
+
+### Secrets Management
+```bash
+# WRONG: Secrets in environment variables (visible in docker inspect!)
+docker run -e DB_PASSWORD=secret my-app
+
+# BETTER: Use Docker Secrets (in Swarm mode)
+echo "my-super-secret" | docker secret create db_password -
+docker service create \
+  --secret db_password \  # Secret mounted as file at /run/secrets/db_password
+  my-app
+
+# Read from /run/secrets/db_password instead of env vars
+```
+
+### Image Scanning
+```bash
+# Scan your image for known CVEs using Trivy (free, open source)
+# Install: brew install trivy
+trivy image my-app:1.0
+
+# Results example:
+# CRITICAL: 2, HIGH: 5, MEDIUM: 12, LOW: 3
+# CVE-2024-1234: OpenSSL vulnerability (CRITICAL) — update your base image!
+
+# Integrate into CI (fail build if CRITICAL vulnerabilities found)
+trivy image --exit-code 1 --severity CRITICAL my-app:1.0
+```
+
+## REAL_WORLD
+**Security Checklist for Production Containers**
+1. ✅ Run as non-root user
+2. ✅ Use `--read-only` filesystem where possible
+3. ✅ Drop all Linux capabilities (`--cap-drop=ALL`)
+4. ✅ Set memory and CPU limits (`--memory=256m --cpus=0.5`)
+5. ✅ Scan images for CVEs (Trivy, Snyk) in CI
+6. ✅ Use specific image tags (not `latest`)
+7. ✅ Never store secrets in environment variables or image layers
+8. ✅ Use Docker Content Trust to verify image signatures
+9. ✅ Enable seccomp profiles (restrict system calls)
+10. ✅ Use network policies to limit container communication
+
+## INTERVIEW
+**Q: A developer asks: "I run my containers as non-root, but I still need to bind to port 80 (a privileged port). If I use USER to run as non-root, the container fails to start because only root can bind to ports below 1024. How do I solve this?"**
+A: There are two clean solutions:
+
+1. **Add only the `NET_BIND_SERVICE` capability:**
+```bash
+docker run --cap-add=NET_BIND_SERVICE --user=myuser my-app
+```
+This grants only the specific capability to bind privileged ports, without running as root.
+
+2. **(Better) Run on a non-privileged port and use a reverse proxy:**
+Run your app internally on port 3000, and have Nginx or a load balancer (running with the necessary privileges) forward external port 80 traffic to port 3000.
+```bash
+# App runs on 3000 as non-root — no special capabilities needed
+docker run --user=appuser -p 3000:3000 my-app
+# Nginx (or the cloud load balancer) handles port 80 → 3000 forwarding
+```
+This is the preferred production architecture. The application container never needs privileged capabilities.

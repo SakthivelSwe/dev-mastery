@@ -1,0 +1,83 @@
+---
+slug: "sd-database-replication"
+title: "Database Replication"
+level: 4
+---
+
+## WHY
+If your entire startup is running on a single database server, and that server's hard drive physically catches fire, your company is dead. You have permanently lost all user data, billing history, and passwords.
+
+To prevent catastrophic data loss, and to increase the speed at which users can read data, we use **Database Replication**. Replication simply means copying data from one database server to another database server over a network, so that multiple machines hold the exact same data.
+
+## THEORY
+### Master-Slave (Leader-Follower) Architecture
+The absolute industry standard for Relational Databases (SQL) is the **Primary-Replica** (formerly Master-Slave) architecture.
+
+1. **The Primary Node (Leader):** There is exactly ONE Primary node. It is the only node in the entire cluster that is allowed to accept `INSERT`, `UPDATE`, or `DELETE` commands. If a user tries to write data to a Replica, the Replica rejects it.
+2. **The Replica Nodes (Followers):** There can be many Replica nodes. They are strictly **Read-Only**. They constantly listen to the Primary node, download its transaction logs, and update their own local hard drives to match the Primary.
+3. **The Traffic Split:** Web servers send all Write requests (10%) to the Primary, and distribute all Read requests (90%) across the Replicas using a Load Balancer.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sd-replication" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Synchronous vs Asynchronous Replication)
+When the Primary node receives a Write request, how does it update the Replicas?
+
+**Synchronous Replication:**
+The Primary writes the data to its disk, immediately pauses, sends the data over the network to the Replica, waits for the Replica to confirm it saved the data, and *then* tells the user "Success."
+- *Pros:* Zero data loss. Perfect consistency.
+- *Cons:* Extremely slow. If the Replica goes offline, the Primary is paralyzed and cannot accept any writes!
+
+**Asynchronous Replication (Industry Default):**
+The Primary writes the data to its disk, instantly tells the user "Success!", and then copies the data to the Replicas in the background.
+- *Pros:* Blazing fast writes. The Primary doesn't care if the Replicas are offline.
+- *Cons:* **Replication Lag**. If a user updates their profile picture (hits the Primary), and instantly refreshes the page (reads from a Replica), the background copy might not have finished yet! The user sees their old profile picture and thinks the app is broken.
+
+### Level 2 — Building Blocks (Solving Replication Lag)
+How do we solve the "User sees stale data" problem caused by Asynchronous Replication Lag?
+
+1. **Read-After-Write Consistency:** 
+If the application knows the User *just* modified their own profile, it routes that specific user's read requests directly to the Primary node for the next 5 seconds. All other users continue reading from the Replicas.
+
+2. **Wait for Replication:** 
+If the application is a banking app, you cannot tolerate stale data. You must use Synchronous Replication (or a hybrid "Semi-Synchronous" model where the Primary waits for at least ONE replica to confirm before returning success).
+
+### Level 3 — Intermediate (Failover and High Availability)
+What happens when the Primary node catches fire and dies? 
+All Replicas are Read-Only. If the Primary dies, the application can no longer accept writes. The system is broken.
+
+To fix this, we use an automated **Failover Protocol**:
+1. A monitoring system (like ZooKeeper) constantly pings the Primary node.
+2. If the Primary fails to respond after X seconds, ZooKeeper declares the Primary dead.
+3. ZooKeeper initiates an **Election**. It looks at all the Replicas, finds the one with the most up-to-date data, and automatically promotes it to be the new Primary Node!
+4. ZooKeeper updates the DNS/Routing tables so the web servers instantly start sending writes to the newly promoted Primary.
+
+### Level 4 — Advanced (Multi-Leader and Leaderless Replication)
+If you have users in New York and users in Tokyo, having a single Primary node in New York means the Tokyo users will experience 200ms of latency every time they try to `INSERT` data. 
+
+**Multi-Leader (Multi-Master) Replication:**
+You set up one Primary in New York, and a second Primary in Tokyo. Both can accept Writes! 
+- *The Nightmare:* What happens if Alice (in NY) and Bob (in Tokyo) try to claim the exact same username at the exact same millisecond? Both Primaries accept the write, tell the user "Success," and then try to synchronize with each other. They detect a **Write Conflict**. Resolving Write Conflicts requires complex algorithms (like CRDTs - Conflict-Free Replicated Data Types) and often results in data loss.
+
+**Leaderless Replication (Cassandra / DynamoDB):**
+There are no Primaries and no Replicas. Every single node in the cluster is identical and can accept Writes and Reads. 
+To ensure data isn't lost, the client sends the Write to Node A. Node A automatically acts as a coordinator and forwards the Write to Node B and Node C. This provides extreme High Availability and Write Scalability, at the cost of strict Consistency.
+
+## REAL_WORLD
+Setting up Primary-Replica failover in raw PostgreSQL is a massive DevOps headache requiring tools like `repmgr` or `Patroni`, combined with `PgBouncer` for connection pooling.
+
+In modern Enterprise architecture, nobody manages database replication manually. 
+We use Managed Cloud Services like **Amazon Aurora** or **Google Cloud Spanner**. 
+
+Amazon Aurora abstracts the entire replication process away. It natively stores 6 copies of your data across 3 distinct Availability Zones (Data Centers). If the Primary node dies, Aurora automatically promotes a Replica in under 30 seconds, with zero data loss, without you touching a single configuration file.
+
+## INTERVIEW
+**Q: Can Replication help scale a Write-Heavy application?**
+A: **No.** The Primary-Replica architecture only scales *Reads* (because you can add 50 Read Replicas). However, because there is only ONE Primary node, your Write Capacity is strictly limited to the CPU and Disk speed of that single machine. To scale Writes, you must use **Sharding**.
+
+**Q: What is a Split-Brain scenario?**
+A: A catastrophic failure in a Failover system. A temporary network glitch causes the Replicas to think the Primary is dead (even though it's perfectly fine). The Replicas elect a *New* Primary. Now you have TWO Primary nodes in the cluster simultaneously accepting writes! When the network glitch resolves, the two Primaries try to sync, resulting in massive data corruption. Systems prevent this using "Fencing Tokens" or "Quorum" voting.

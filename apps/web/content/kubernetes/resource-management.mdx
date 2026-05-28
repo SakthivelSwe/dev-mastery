@@ -1,0 +1,143 @@
+---
+slug: "resource-management"
+title: "Kubernetes Resource Management"
+level: 4
+---
+
+## WHY
+Without resource limits, one runaway container can consume all CPU or RAM on a Node, causing every other Pod on that Node to crash. Without resource requests, the scheduler has no information to make intelligent placement decisions.
+Proper resource management is essential for cluster stability, predictable performance, and cost optimization.
+
+## THEORY
+### Requests vs Limits
+- **Request:** The minimum resources a container is guaranteed. The scheduler uses requests to decide which Node can fit the Pod. Set conservatively.
+- **Limit:** The maximum a container is allowed to use. Enforced by the Linux cgroup. Exceeding CPU limit = throttling. Exceeding Memory limit = OOM kill.
+
+### Quality of Service Classes
+Kubernetes assigns QoS classes based on requests/limits:
+- **Guaranteed:** Requests == Limits for all containers. Highest priority, last to be evicted.
+- **Burstable:** Requests < Limits. Middle priority.
+- **BestEffort:** No requests or limits set. Lowest priority, first to be evicted under memory pressure.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "resource-management" }
+```
+
+## CODE
+
+### Setting Resource Requests and Limits
+```yaml
+# deployment.yml
+spec:
+  containers:
+    - name: api
+      image: my-api:1.0.0
+      resources:
+        requests:
+          memory: "256Mi"    # Guaranteed 256MB RAM
+          cpu: "250m"        # Guaranteed 0.25 CPU cores (250 millicores)
+        limits:
+          memory: "512Mi"    # Max 512MB RAM (OOM kill if exceeded!)
+          cpu: "500m"        # Max 0.5 CPU cores (throttled if exceeded)
+```
+
+### Understanding CPU Units
+```yaml
+# CPU is measured in millicores (m) or cores
+# 1000m = 1 full CPU core = 1 vCPU
+# 250m = 0.25 cores (one quarter of a CPU)
+
+# Examples:
+cpu: "0.5"      # 500 millicores = half a CPU
+cpu: "500m"     # Same as above (preferred format)
+cpu: "1"        # 1 full CPU core
+cpu: "2"        # 2 CPU cores
+```
+
+### Understanding Memory Units
+```yaml
+# Memory uses binary units:
+# Ki = kibibytes (1024 bytes)
+# Mi = mebibytes (1024 KiB)
+# Gi = gibibytes (1024 MiB)
+
+memory: "128Mi"   # 128 Mebibytes (~134 MB)
+memory: "512Mi"   # 512 Mebibytes (~537 MB)
+memory: "2Gi"     # 2 Gibibytes (~2.15 GB)
+```
+
+### Monitoring Resource Usage
+```bash
+# Install Metrics Server first (required!)
+# kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/...
+
+# Node resource usage
+kubectl top nodes
+# NAME         CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+# worker-01    850m         85%    3840Mi          96%  ← Near memory limit!
+# worker-02    210m         21%    1920Mi          48%
+
+# Pod resource usage
+kubectl top pods
+# NAME                   CPU(cores)   MEMORY(bytes)
+# api-deployment-abc     450m         312Mi
+# api-deployment-def     380m         298Mi
+
+# Pod resource REQUESTS and LIMITS (vs actual usage)
+kubectl get pods -o custom-columns=\
+NAME:.metadata.name,\
+CPU_REQ:.spec.containers[0].resources.requests.cpu,\
+MEM_REQ:.spec.containers[0].resources.requests.memory,\
+CPU_LIM:.spec.containers[0].resources.limits.cpu,\
+MEM_LIM:.spec.containers[0].resources.limits.memory
+```
+
+## REAL_WORLD
+**Vertical Pod Autoscaler (VPA) for Right-Sizing**
+Manually setting resource requests/limits is guesswork. VPA observes actual usage over time and recommends (or automatically adjusts) requests/limits:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: api-deployment
+  updatePolicy:
+    updateMode: "Off"  # Recommendation only — don't auto-update
+```
+
+```bash
+kubectl describe vpa api-vpa
+# Recommendations:
+#   Container: api
+#     Lower Bound: 150m CPU, 200Mi RAM
+#     Target:      280m CPU, 340Mi RAM  ← VPA recommends setting requests to this
+#     Upper Bound: 500m CPU, 512Mi RAM
+```
+
+## INTERVIEW
+**Q: Your Pod has `requests.memory: 256Mi` and `limits.memory: 512Mi`. The application's memory usage grows to 600MB. What happens?**
+
+A: The container is **OOM killed (Out of Memory killed)** by the Linux kernel.
+
+Here's the exact sequence:
+1. Container memory usage reaches 512Mi (the limit)
+2. The next memory allocation attempt fails (cgroups reject it)
+3. The Linux OOM killer is invoked and terminates the container process with SIGKILL
+4. Kubernetes detects the container exited (exit code 137 = OOM)
+5. If `restartPolicy: Always` (the default for Deployments), Kubernetes restarts the container
+
+You'll see:
+```bash
+kubectl describe pod <pod-name>
+# Last State: Terminated
+# Reason: OOMKilled   ← Clear indicator!
+# Exit Code: 137
+```
+
+**How to fix:** Either increase the memory limit if the app legitimately needs more, or investigate a memory leak in the application code (the most common cause of growing memory usage).

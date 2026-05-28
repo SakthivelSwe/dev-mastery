@@ -1,0 +1,111 @@
+---
+slug: "nextjs-database"
+title: "Databases in Next.js"
+level: 4
+---
+
+## WHY
+Because Next.js has a built-in Node.js server (via Server Components and API Routes), you do not need a separate backend to connect to a database. You can query your database directly from your Next.js application. However, connecting to a database in a Serverless or Edge environment introduces unique challenges regarding connection pooling and cold starts.
+
+## THEORY
+### ORMs and Database Clients
+You can use any Node.js database client in Next.js:
+- **Prisma:** The most popular ORM for Next.js. Type-safe, great developer experience.
+- **Drizzle ORM:** A newer, lightweight, SQL-like ORM that is heavily optimized for Serverless and Edge.
+- **Raw SQL Clients:** `pg` (PostgreSQL), `mysql2`.
+
+### The Serverless Connection Problem
+In a traditional server (like Express), you open one database connection pool on startup. In Serverless architectures (like Vercel), a new Serverless Function spins up, connects to the database, handles the request, and spins down. If 1,000 users visit at once, 1,000 functions spin up and create 1,000 connections, instantly crashing the database ("connection exhaustion").
+
+**The Solution:** Connection Pooling via an external service (like PgBouncer, Prisma Accelerate, or Supabase connection pooling).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-database" }
+```
+
+## CODE
+
+### Setting up Prisma in Next.js
+Because of Next.js's Fast Refresh in development, it will constantly reload the code, creating hundreds of Prisma instances and crashing your local DB. You must use a global singleton pattern to prevent this.
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from '@prisma/client'
+
+// Prevent multiple instances of Prisma Client in development
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined
+}
+
+export const db = globalForPrisma.prisma ?? new PrismaClient()
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = db
+}
+```
+
+### Querying in a Server Component
+You can query the database directly inside the React component! No API route needed.
+
+```tsx
+// app/users/page.tsx
+import { db } from '@/lib/db';
+
+// This component runs on the server!
+export default async function UsersPage() {
+  // Direct database query!
+  const users = await db.user.findMany({
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, name: true, email: true }
+  });
+
+  return (
+    <ul>
+      {users.map(user => (
+        <li key={user.id}>{user.name} - {user.email}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### Mutating Data with Server Actions
+```tsx
+// app/users/actions.ts
+'use server'
+import { db } from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+
+export async function createUser(formData: FormData) {
+  const name = formData.get('name') as string;
+  const email = formData.get('email') as string;
+
+  // Direct database mutation!
+  await db.user.create({
+    data: { name, email }
+  });
+
+  // Tell Next.js to purge the cache so the UI updates
+  revalidatePath('/users');
+}
+```
+
+## REAL_WORLD
+**Drizzle ORM for Edge Environments**
+Prisma relies on a Rust binary engine under the hood. This binary is too large to run on the Vercel Edge Runtime or Cloudflare Workers. If you are building an ultra-low latency app deployed to the Edge, developers are flocking to Drizzle ORM.
+
+Drizzle is purely JavaScript/TypeScript, extremely lightweight, and connects seamlessly to Edge databases like PlanetScale (MySQL) or Neon (Serverless Postgres) over HTTP instead of traditional TCP socket connections.
+
+## INTERVIEW
+**Q: You are building a Next.js App Router application. Should you create an API route (`/api/users`) to fetch data from your database to display on the `/users` page?**
+
+A: **No, you shouldn't.**
+
+In the Pages Router, you had to use `getServerSideProps`. In a traditional SPA (React + Express), you had to create an API route and `fetch()` it from the client.
+
+In the Next.js App Router, the `/users` page is a Server Component. It runs securely on the backend. You can import your database client directly into the page component and query the database right there. Creating an API route just for your own Server Component to fetch from adds unnecessary network overhead, complexity, and duplicate code.
+
+You only need API Routes if:
+1. You are fetching data from a Client Component (`'use client'`).
+2. You are exposing an API to an external consumer (like a mobile app or a webhook).

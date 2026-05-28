@@ -1,0 +1,155 @@
+---
+slug: "guards"
+title: "Angular Route Guards"
+level: 3
+---
+
+## WHY
+In a Single Page Application (SPA), clicking a link to navigate to `/dashboard` does not ask the server for a new HTML file. The browser simply destroys the current component and mounts the Dashboard component.
+But what if the user isn't logged in? What if they haven't paid for a premium subscription? If you don't protect the route, Angular will happily render the Dashboard, exposing private UIs or crashing because the user data is missing.
+**Route Guards** are security checkpoints embedded directly into the Angular Router. They intercept the navigation *before* the component is even loaded, allowing you to instantly cancel the navigation or redirect the user to a login page.
+
+## THEORY
+### The Five Guard Types
+Angular provides 5 distinct hooks into the routing lifecycle:
+1. **`CanActivate`:** Can the user navigate *to* this route? (e.g., Auth Guards).
+2. **`CanActivateChild`:** Can the user navigate to a child route of this route?
+3. **`CanDeactivate`:** Can the user navigate *away* from this route? (e.g., "You have unsaved changes!").
+4. **`CanMatch` (Modern):** Replaces `CanLoad`. Should the router even pretend this route exists when evaluating URLs? Perfect for Feature Flags.
+5. **`Resolve`:** Not technically a security guard. It pauses navigation until data is fetched from the API, preventing UI flickering.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "angular-guards" }
+```
+
+## CODE
+
+### Level 1 — The Modern Functional Guard
+Historically, Guards were massive Classes implementing interfaces. In modern Angular (v15+), Guards are just simple functions!
+A `CanActivate` guard must return a `boolean` (true to allow, false to block), a `Promise<boolean>`, or an `Observable<boolean>`.
+
+```typescript
+// auth.guard.ts
+import { CanActivateFn, Router } from '@angular/router';
+import { inject } from '@angular/core';
+import { AuthService } from './auth.service';
+
+// It's just an exported arrow function!
+export const authGuard: CanActivateFn = (route, state) => {
+  const authService = inject(AuthService); // Grab the service
+  const router = inject(Router);
+
+  if (authService.isLoggedIn()) {
+    return true; // Allow navigation!
+  } else {
+    // Kick them out!
+    // Returning a UrlTree is better than returning 'false', 
+    // because it instantly redirects them instead of just freezing the app.
+    return router.parseUrl('/login');
+  }
+};
+```
+
+To apply it, you simply attach it to the route definition:
+```typescript
+// app.routes.ts
+import { Routes } from '@angular/router';
+import { authGuard } from './auth.guard';
+
+export const routes: Routes = [
+  { path: 'login', component: LoginComponent },
+  { 
+    path: 'dashboard', 
+    component: DashboardComponent,
+    // Attach the guard here!
+    canActivate: [authGuard] 
+  }
+];
+```
+
+### Level 2 — `CanDeactivate` (Unsaved Changes)
+If a user spends 20 minutes filling out a massive form and accidentally clicks the "Home" button, the router will instantly destroy the component and the data is lost forever.
+A `CanDeactivate` guard intercepts the user *leaving* the route.
+
+```typescript
+// unsaved-changes.guard.ts
+import { CanDeactivateFn } from '@angular/router';
+
+// The guard needs to know what component it is protecting!
+// We assume the component implements a specific method: hasUnsavedChanges()
+export interface HasUnsavedChanges {
+  hasUnsavedChanges: () => boolean;
+}
+
+export const unsavedChangesGuard: CanDeactivateFn<HasUnsavedChanges> = (component) => {
+  // If the component says it has changes, show a browser confirmation popup!
+  if (component.hasUnsavedChanges()) {
+    return confirm('You have unsaved changes! Are you sure you want to leave?');
+  }
+  // Otherwise, allow them to leave immediately.
+  return true; 
+};
+```
+
+### Level 3 — `CanMatch` (Feature Toggles and Admin Routes)
+Imagine you have an Admin dashboard at `/admin`, and it is a massive 5MB Lazy-Loaded chunk of JavaScript.
+If you use `CanActivate`, the router *downloads the 5MB chunk*, instantiates it, executes the guard, realizes the user is not an Admin, and kicks them out. You just wasted 5MB of the user's data!
+`CanMatch` executes *before* the route is even matched or downloaded!
+
+```typescript
+export const adminGuard: CanMatchFn = (route, segments) => {
+  const auth = inject(AuthService);
+  return auth.isAdmin(); // If false, the Router completely ignores this route!
+};
+
+// app.routes.ts
+export const routes: Routes = [
+  {
+    path: 'settings',
+    // If CanMatch fails, this Lazy Module is NEVER downloaded!
+    loadChildren: () => import('./admin/admin.module').then(m => m.AdminModule),
+    canMatch: [adminGuard]
+  },
+  {
+    path: 'settings', // The EXACT SAME PATH!
+    component: StandardUserSettingsComponent // Fallback if the user is not an Admin!
+  }
+];
+```
+
+### Level 4 — Asynchronous Guards (Checking the DB)
+Often, your Guard needs to check with the backend server before allowing navigation. Because Guards natively understand RxJS Observables, you can return an HTTP request directly!
+
+```typescript
+export const premiumGuard: CanActivateFn = () => {
+  const http = inject(HttpClient);
+  const router = inject(Router);
+
+  // The Router will pause the screen and wait for this Observable to resolve!
+  return http.get<{isPremium: boolean}>('/api/user/status').pipe(
+    map(response => {
+      if (response.isPremium) return true;
+      return router.parseUrl('/upgrade-plan');
+    }),
+    // If the server crashes, fail securely by rejecting the navigation
+    catchError(() => of(router.parseUrl('/error'))) 
+  );
+};
+```
+
+## REAL_WORLD
+**UI Security vs. API Security**
+A common misconception among Junior Developers is that Route Guards actually secure the application. 
+**Route Guards provide ZERO cryptographic security.** 
+A Route Guard simply hides the UI. Because the entire Angular application (including the Route Guards) is downloaded and executed on the user's physical computer, a determined hacker can open Chrome DevTools, modify the compiled JavaScript to change `return false` to `return true`, and bypass your Guard instantly.
+Route Guards exist purely for User Experience (UX)—preventing users from seeing broken UI screens.
+True security exists exclusively on the Backend API. If a hacker bypasses your Guard and views the `/admin` UI, the backend server must still verify their JWT token and return a `403 Forbidden` when the UI attempts to fetch the secure data!
+
+## INTERVIEW
+**Q: You implemented an asynchronous `CanActivate` guard that checks the user's role by making an HTTP request. The guard works perfectly, but users are complaining that when they click the "Dashboard" button, the app completely freezes for 2 seconds with no indication that anything is happening, and *then* the page transitions. How do you fix this UX nightmare?**
+A: **Router Events and Loading Spinners.**
+When the Router encounters an asynchronous Guard or a `Resolve` guard, it intentionally pauses the navigation sequence while waiting for the Observable to complete. During this pause, the original component remains on the screen, frozen.
+*The Fix:* You must listen to the Angular Router's global event stream in your `app.component.ts`.
+When the router emits the `NavigationStart` event, you instantly display a global Loading Spinner on the screen.
+When the router emits `NavigationEnd`, `NavigationCancel` (if the guard rejected them), or `NavigationError`, you hide the Loading Spinner. This provides immediate visual feedback to the user that their click was registered and the application is "thinking"!

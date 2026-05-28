@@ -1,0 +1,87 @@
+---
+slug: "design-payment-system"
+title: "Design a Payment System (Stripe/Paypal)"
+level: 5
+---
+
+## WHY
+Designing a Payment System is the ultimate test of **Data Consistency** and **Fault Tolerance**. 
+If a photo upload fails in Instagram, the user tries again. If a $500 payment fails, and you accidentally charge the user's credit card twice, or if you charge the card but fail to credit the merchant, the company faces massive legal liability.
+
+A Payment System interview tests your knowledge of **Idempotency**, **Distributed Transactions (Sagas)**, and **Reconciliation**.
+
+## THEORY
+### The Core Rule: Money is State
+You must abandon the concept of "Eventual Consistency" for financial ledgers. 
+A financial transaction must be **ACID** (Atomic, Consistent, Isolated, Durable). 
+To achieve this, the entire architecture must be designed around **Idempotency** (the mathematical property that an operation can be applied multiple times without changing the result beyond the initial application).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "payment-system" }
+```
+
+## CODE
+
+*(In a System Design interview, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — The Happy Path
+**The Explanation:**
+1. "The User clicks Checkout. The Frontend sends a request to the **Payment Gateway API**."
+2. "The API validates the request and generates a unique `Payment_Intent_ID`."
+3. "The API calls the internal **Ledger Service** to record a 'Pending' transaction in the database."
+4. "The API securely calls the external **Payment Service Provider (PSP)** (e.g., Stripe, Visa, Chase) with the credit card details."
+5. "The PSP replies with `Success`."
+6. "The API updates the Ledger Service to 'Completed' and returns 200 OK to the frontend."
+
+### Level 2 — The Network Failure (Idempotency)
+*The Interviewer Trap:* "Step 4 succeeds. The PSP charged the card. But exactly as the PSP sends the 'Success' packet back to your API, the network cable is cut. Your API throws a Timeout error. The frontend retries the payment. Do you charge the user twice?"
+
+**The Solution: The Idempotency Key.**
+1. "No, we never charge the user twice."
+2. "When the frontend initiates the checkout, it generates a unique UUID (the `Idempotency_Key`)."
+3. "When the API receives the request, it checks the database: *Have I seen this key before?*"
+4. "If it's a new key, we insert it into the database and proceed."
+5. "Crucially, when we call the external PSP, we pass this exact `Idempotency_Key` in the HTTP headers (Stripe natively supports this)."
+6. "When the frontend retries the request with the same key, our API simply looks at the database, sees the transaction, and returns the previous state. Even if we accidentally call the PSP again, the PSP sees the duplicate key and refuses to charge the card twice!"
+
+### Level 3 — Distributed Consistency (The Saga)
+*The Interviewer Trap:* "Okay, the payment succeeded. Now you need to update the Inventory Service to deduct the item, and the Loyalty Service to add reward points. How do you ensure all three databases stay in sync?"
+
+**The Solution: The Saga Pattern with Outbox.**
+1. "We cannot use a standard SQL transaction across three different microservices."
+2. "We use an **Orchestration Saga**."
+3. "When the Ledger Service marks the payment as 'Completed', it uses the **Transactional Outbox Pattern** to write an `OrderConfirmed` event into the database alongside the payment, guaranteeing atomicity."
+4. "A background worker reads the outbox and publishes the event to Kafka."
+5. "The Orchestrator Service reads the event, calls the Inventory Service, and then calls the Loyalty Service."
+6. "If the Inventory Service returns 'Out of Stock', the Orchestrator executes a **Compensating Transaction**. It explicitly calls the Payment API to issue a Refund, ensuring the system eventually returns to a consistent state."
+
+### Level 4 — The Ultimate Safety Net (Reconciliation)
+*The Interviewer Trap:* "Bugs happen. What if a developer writes bad code, and the Idempotency check fails, and we somehow charge the user but our database says the payment is 'Pending'? How do we catch this?"
+
+**The Solution: The Reconciliation Engine.**
+"Every night at 2:00 AM, our system downloads the official **Settlement File** from the PSP (e.g., Chase Bank). This file is the absolute, unalterable truth of what actually happened."
+"We have a dedicated **Reconciliation Batch Job**."
+1. It compares every transaction in our internal Ledger against every transaction in the Bank's Settlement File.
+2. If our database says `Status: Pending` but the Bank file says `Status: Paid`, we have a discrepancy!
+3. The system automatically flags the transaction, triggers an alert in PagerDuty for the financial engineering team, and automatically pushes an adjustment to the ledger to fix the missing funds.
+
+## REAL_WORLD
+**Double-Entry Bookkeeping**
+When designing the database schema for the Ledger Service, you cannot simply have a column `balance = 500`. 
+If you write `UPDATE accounts SET balance = 400`, you lose the history of *why* the balance changed. This is illegal in financial systems.
+You must design an immutable, append-only **Double-Entry Ledger**.
+Every transaction creates TWO rows in the database:
+1. `Account: User, Amount: -100` (Debit)
+2. `Account: Merchant, Amount: +100` (Credit)
+The sum of all entries in a double-entry ledger must always exactly equal zero! To find a user's balance, you do not read a `balance` column; you `SUM()` all the entries associated with their account. If an auditor ever needs to verify the data, the entire mathematical history is perfectly preserved and immutable.
+
+## INTERVIEW
+**Q: During checkout, the Payment API must talk to the external Bank API. The Bank API is notoriously slow, sometimes taking 10 seconds to process a charge. If we leave the HTTP connection open for 10 seconds, our web servers will run out of threads and crash. How do you handle a slow external dependency?**
+A: **Asynchronous Processing and Webhooks.**
+You should not hold the HTTP request open synchronously. 
+1. When the user clicks Checkout, the API immediately creates a `Pending` transaction in the database and returns a `202 Accepted` to the frontend. (The frontend shows a loading spinner).
+2. The API drops a message into a Kafka queue.
+3. A background Worker pulls the message and initiates the slow 10-second HTTP call to the Bank API.
+4. When the Bank finally succeeds, it sends an asynchronous **Webhook** (an HTTP POST) back to our API.
+5. Our Webhook endpoint receives the success, updates the database to `Completed`, and pushes a WebSocket message down to the user's browser, replacing the loading spinner with a green Checkmark!

@@ -1,0 +1,101 @@
+---
+slug: "mongodb-performance"
+title: "MongoDB Performance & Tuning"
+level: 4
+---
+
+## WHY
+If your application works perfectly with 100 users, but crashes instantly when 10,000 users log in, you don't have a code problem; you have a database performance problem. MongoDB is incredibly fast, but only if you design your schemas correctly, utilize indexes efficiently, and understand how the underlying storage engine works. Knowing how to diagnose and fix a slow query is the difference between a Junior Developer and a Senior Architect.
+
+## THEORY
+### The Working Set and RAM
+MongoDB's performance is entirely dictated by **RAM (Random Access Memory)**.
+MongoDB attempts to keep all frequently accessed data and indexes inside RAM (known as the "Working Set"). Reading data from RAM takes nanoseconds. Reading data from a physical SSD hard drive takes milliseconds (thousands of times slower). 
+
+If your Working Set is larger than the amount of RAM available on your server, MongoDB is forced to constantly swap data back and forth between RAM and the hard drive. This is called **Thrashing**, and it will destroy your database performance instantly.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-performance" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Explain Plan)
+How do you know if a query is slow? You ask MongoDB to explain it!
+Appending `.explain("executionStats")` to any query tells MongoDB to execute the query, but instead of returning the documents, it returns a massive JSON diagnostic report.
+
+```javascript
+db.users.find({ age: { $gt: 30 } }).explain("executionStats");
+```
+
+When you read the Explain Output, you are looking for three specific fields:
+1. **`totalDocsExamined`**: How many documents did MongoDB pull from the hard drive?
+2. **`nReturned`**: How many documents actually matched the filter and were returned to the user?
+3. **`executionTimeMillis`**: How long did it take?
+
+**The Golden Rule:** `totalDocsExamined` should ideally be exactly equal to `nReturned`. If `nReturned` is 5, but `totalDocsExamined` is 1,000,000, you have a massive index missing! The database had to scan a million documents on the hard drive just to find the 5 you wanted.
+
+### Level 2 — Building Blocks (Index Types)
+To fix a slow query, you must create an Index.
+```javascript
+// A standard Single Field Index (Optimizes exact matches and range queries)
+db.users.createIndex({ age: 1 }); // 1 for Ascending, -1 for Descending
+
+// A Compound Index (Optimizes queries that filter on multiple fields)
+db.users.createIndex({ status: 1, age: 1 });
+```
+
+**The ESR Rule for Compound Indexes:**
+When creating a Compound Index, the order of the fields matters immensely. You must follow the ESR Rule:
+1. **E (Equality):** Put fields you query with exact matches (`=`) first.
+2. **S (Sort):** Put fields you sort by second.
+3. **R (Range):** Put fields you use range operators on (`$gt`, `$lt`) last.
+
+If you query `db.users.find({ status: "active", age: { $gt: 30 } }).sort({ lastName: 1 })`, the perfect index is: `{ status: 1, lastName: 1, age: 1 }`.
+
+### Level 3 — Intermediate (Collation and Case Sensitivity)
+Imagine you have an index on `{ email: 1 }`.
+A user registers with `Alice@Test.com`. 
+Later, they try to log in with `alice@test.com`. Your `findOne({ email: "alice@test.com" })` query will fail because string matching in MongoDB is case-sensitive!
+
+Historically, developers fixed this by saving a second field (`lowercaseEmail`), or forcing the input to lowercase in Node.js before querying. 
+Modern MongoDB provides **Collation**, allowing you to create Case-Insensitive Indexes!
+
+```javascript
+// Create an index with a Collation strength of 2 (ignores case!)
+db.users.createIndex(
+    { email: 1 }, 
+    { collation: { locale: 'en', strength: 2 } }
+);
+
+// You MUST pass the exact same collation in the query for it to use the index!
+db.users.find({ email: "ALICE@test.com" }).collation({ locale: 'en', strength: 2 });
+```
+
+### Level 4 — Advanced (The Profiler)
+How do you find slow queries in a production database processing 10,000 queries a second? You can't run `.explain()` on all of them manually!
+
+You enable the **Database Profiler**.
+The Profiler continuously monitors all traffic and logs queries that take longer than a specified threshold (e.g., 100 milliseconds) into a special system collection called `system.profile`.
+
+```javascript
+// Set profiling level to 1 (Only log slow operations)
+// Set the threshold to 100 milliseconds
+db.setProfilingLevel(1, { slowms: 100 });
+
+// Later, you can query the system.profile collection just like any other collection!
+// Find the top 5 slowest queries today:
+db.system.profile.find().sort({ millis: -1 }).limit(5);
+```
+
+## REAL_WORLD
+**Connection Pooling**
+A common reason for terrible performance in Node.js applications is bad connection management. 
+Creating a new TCP network connection to MongoDB takes time (handshakes, TLS encryption, authentication). If your API creates a brand new connection inside every single HTTP route (`app.get('/users', () => { MongoClient.connect(...) })`), your API will be agonizingly slow.
+
+You must use a **Connection Pool**. You establish the connection *once* when the Node.js server boots up. The driver automatically opens a pool of sockets (e.g., 100 open connections) and keeps them alive in the background. When an HTTP request comes in, it instantly grabs an open socket from the pool, executes the query, and returns the socket to the pool for the next request. (Mongoose does this automatically under the hood).
+
+## INTERVIEW
+**Q: I ran an `.explain()` and saw `COLLSCAN` in the output. What does this mean?**
+A: `COLLSCAN` stands for Collection Scan. It is the most dreaded word in database performance. It means MongoDB could not find a suitable index to satisfy the query, so it was forced to start at the very beginning of the physical hard drive file and read every single document in the entire collection one by one until it reached the end. If your collection has 10 million documents, a `COLLSCAN` will crash your CPU and completely lock up the database. You must immediately identify the query and build an appropriate index to convert the `COLLSCAN` into an `IXSCAN` (Index Scan).

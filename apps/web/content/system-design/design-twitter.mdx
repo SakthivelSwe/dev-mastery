@@ -1,0 +1,151 @@
+---
+slug: "design-twitter"
+title: "Design: Twitter / X"
+level: 5
+---
+
+## WHY
+Designing Twitter is one of the most comprehensive system design challenges. It tests your understanding of the full spectrum: massive-scale databases, distributed caching, asynchronous messaging, the Fan-Out Problem, and how to serve personalized feeds to 300 million users in under 100ms.
+
+Twitter is the canonical example of a **write-once, read-many-times** system. Users tweet rarely but read their feeds constantly. The entire architecture is optimized for the read path.
+
+## THEORY
+### The Core Challenge: The Fan-Out Problem
+When Lady Gaga (with 100 million followers) posts a tweet, how do you make that tweet appear on all 100 million followers' feeds? 
+
+If you compute the feed at read time (query all tweets from followed accounts) — it requires massive JOINs across tables for every feed request. With 300k reads/second, this is impossible.
+
+Twitter's solution: **Pre-compute** the feeds! When a tweet is posted, push it to every follower's "home timeline" cache immediately. Reading the feed is then a simple O(1) cache lookup.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "design-twitter" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Estimation)
+```
+SCALE ASSUMPTIONS:
+- 300M Daily Active Users (DAU)
+- 600M tweets per day (~7,000 tweets/second, peak ~15,000/sec)
+- Average user follows 200 accounts
+- 100B timeline reads per day (~1.15M reads/second, peak ~2.3M/sec)
+
+READ-TO-WRITE RATIO: ~1:150 (heavily read-dominant!)
+
+STORAGE:
+- Tweet metadata: 280 chars + metadata = ~500 bytes per tweet
+- 600M * 500B = 300 GB of tweet data per day
+- 5-Year Storage: 300GB * 365 * 5 = ~550 Terabytes (just for tweets)
+- Media (photos/videos): ~500x more storage → need dedicated Object Storage (S3)
+
+CONCLUSION: Must aggressively cache. A database cannot serve 1M reads/second.
+```
+
+### Level 2 — Building Blocks (Data Model)
+```sql
+-- Users table
+CREATE TABLE users (
+    id        BIGINT PRIMARY KEY,    -- Snowflake ID
+    username  VARCHAR(15) UNIQUE,
+    email     VARCHAR(255) UNIQUE,
+    bio       TEXT,
+    followers_count INT DEFAULT 0,
+    following_count INT DEFAULT 0
+);
+
+-- Tweets table
+CREATE TABLE tweets (
+    id          BIGINT PRIMARY KEY,  -- Snowflake ID (encodes timestamp!)
+    author_id   BIGINT REFERENCES users(id),
+    content     VARCHAR(280),
+    media_urls  TEXT[],              -- Array of S3 URLs
+    created_at  TIMESTAMP DEFAULT NOW(),
+    -- Denormalized for read performance:
+    likes_count    INT DEFAULT 0,
+    retweet_count  INT DEFAULT 0
+);
+
+-- Social Graph (follow relationships)
+-- This is queried EXTREMELY frequently. Must be indexed heavily!
+CREATE TABLE followers (
+    follower_id  BIGINT,
+    following_id BIGINT,
+    PRIMARY KEY (follower_id, following_id)
+);
+CREATE INDEX idx_followers_following ON followers(following_id);
+```
+
+### Level 3 — Intermediate (The Fan-Out Architecture)
+```
+WRITE PATH (Posting a Tweet):
+1. User posts tweet
+2. Tweet is written to the Tweets DB (PostgreSQL/Cassandra)
+3. Tweet is published to a Kafka Topic ("new-tweet")
+4. Fan-Out Service reads from Kafka and:
+   a. Fetches all follower IDs of the author from the Social Graph DB
+   b. For EACH follower: pushes the tweet ID into their "Home Timeline" cache (Redis)
+
+HYBRID FAN-OUT (Twitter's actual approach):
+- For regular users (<1000 followers): Fan-Out on WRITE (pre-compute)
+- For celebrities (>1M followers): Fan-Out on READ (compute at read time)
+  → Pushing to 100M caches on every Lady Gaga tweet would take too long!
+  
+READ PATH (Loading Home Timeline):
+1. User opens app
+2. Timeline Service reads tweet IDs from the user's Redis Timeline Cache
+3. For celebrity accounts the user follows, it MERGES their recent tweets on the fly
+4. Batch-fetches the full tweet content from the Tweet Cache (Redis)
+5. Returns assembled timeline (total latency: ~50ms)
+```
+
+### Level 4 — Advanced (System Architecture Diagram)
+```
+                        ┌──────────────────────────────┐
+                        │         API Gateway           │
+                        │     (Rate Limiting, Auth)     │
+                        └──────────┬───────────────────-┘
+                    ┌──────────────┼────────────────┐
+                    ▼              ▼                 ▼
+             ┌──────────┐  ┌──────────┐     ┌──────────────┐
+             │  Write   │  │  Read    │     │  Search      │
+             │  Service │  │  Service │     │  Service     │
+             └────┬─────┘  └────┬─────┘     └──────────────┘
+                  │             │                  │
+                  ▼             ▼              (Elasticsearch)
+           ┌────────────┐  ┌─────────────┐
+           │   Kafka    │  │    Redis    │
+           │ (new-tweet │  │  (Timeline  │
+           │   topic)   │  │   Cache)    │
+           └────┬───────┘  └─────────────┘
+                │
+          ┌─────▼──────────────────────────┐
+          │         Fan-Out Service         │
+          │ (Reads followers → pushes to    │
+          │  Redis timeline caches)         │
+          └─────────────┬──────────────────┘
+                        ▼
+               ┌────────────────┐
+               │  Social Graph  │
+               │  DB (follows)  │
+               └────────────────┘
+```
+
+## REAL_WORLD
+Twitter's actual infrastructure (as revealed by various engineering blog posts):
+- **Tweet Storage:** MySQL (billions of rows, sharded by user ID) + Manhattan (Twitter's custom distributed key-value store).
+- **Timeline Cache:** Redis clusters storing serialized lists of tweet IDs per user.
+- **Media Storage:** Custom Blob storage (now partially migrated to cloud).
+- **Search:** Earlybird (a customized Apache Lucene cluster for real-time tweet search).
+- **Fan-Out:** Multiple tiers — immediate fan-out for regular users, delayed fan-out for viral tweets.
+
+## INTERVIEW
+**Q: How do you handle the case where a user is offline when a tweet is posted?**
+A: The Redis timeline cache stores the N most recent tweet IDs (e.g., last 800). When an offline user comes back, their cache has the recent tweets. For older tweets, the Read Service performs an on-demand "fan-in" query, fetching tweets from all followed accounts in the Tweets DB, sorted by time, and merges them with the cached timeline.
+
+**Q: How would you design the "Trending Topics" feature?**
+A: Use a sliding window counter in Redis. Each time a hashtag appears in a tweet, increment a `ZINCRBY` in a Redis Sorted Set with a time-windowed key (e.g., `trending:2025-05-28:14`). Every 5 minutes, `ZREVRANGE` the top N hashtags. Age-weight older windows by multiplying their scores by a decay factor. This gives you real-time trending without any SQL aggregations.
+
+**Q: What is the N+1 problem in the context of a Twitter feed?**
+A: When rendering a feed of 50 tweets, a naive implementation fetches the tweet data (1 query), then fetches each author's profile separately (50 queries) — total 51 queries! Solution: Batch-fetch all unique author IDs in one cache lookup using Redis MGET or a SQL `WHERE id IN (...)` query.

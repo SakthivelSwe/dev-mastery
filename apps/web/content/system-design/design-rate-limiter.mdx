@@ -1,0 +1,172 @@
+---
+slug: "design-rate-limiter"
+title: "Design: Rate Limiter"
+level: 5
+---
+
+## WHY
+Without rate limiting, a single malicious or malfunctioning client can send 1 million API requests per minute, overwhelming your servers and making the service unavailable for all other users (a DoS attack). Rate limiting is a fundamental protection mechanism for every production API.
+
+Rate limiters solve three problems:
+1. **Security:** Prevent brute-force password attacks and credential stuffing.
+2. **Availability:** Prevent a single client from consuming all server resources.
+3. **Cost Control:** In APIs with per-request costs (AI APIs, payment processors), prevent clients from accidentally generating astronomical bills.
+
+## THEORY
+### Where to Implement Rate Limiting
+Rate limiting can be implemented at different layers:
+- **API Gateway Level:** Best for global limits (e.g., AWS API Gateway, Kong, Nginx).
+- **Application Level:** Best for fine-grained, user/endpoint-specific limits.
+- **Network Level:** Best for IP-based blocking (using firewall rules).
+
+For distributed systems with multiple API servers, rate limiting state MUST be stored in a centralized store (Redis), NOT in the API server's local memory.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "design-rate-limiter" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Algorithms)
+There are five main rate-limiting algorithms. Know the trade-offs!
+
+```
+1. FIXED WINDOW COUNTER
+   - Divide time into fixed windows (e.g., every minute).
+   - Count requests within the current window.
+   - Reject if count > limit.
+   - FLAW: "Boundary Attack" — a user can send 100 requests at 00:59 and 100 
+     more at 01:01. They sent 200 requests in 2 seconds but "followed the rules"!
+
+2. SLIDING WINDOW LOG
+   - Store a timestamp for every request in a sorted set.
+   - Count requests within the last N seconds.
+   - No boundary attack vulnerability!
+   - FLAW: Storing every timestamp is memory-intensive for high-traffic APIs.
+
+3. SLIDING WINDOW COUNTER (Hybrid — Industry Standard!)
+   - Combine the fixed window's efficiency with the sliding window's accuracy.
+   - count = (current_window_count) + (prev_window_count * overlap_percentage)
+   - Uses ~2 integers per user. Very memory efficient!
+
+4. TOKEN BUCKET
+   - Each user has a "bucket" of N tokens. Tokens refill at a fixed rate.
+   - Each request consumes 1 token. If empty, reject the request.
+   - Allows short bursts (use accumulated tokens) while enforcing sustained rates.
+   - Used by: AWS, Stripe.
+
+5. LEAKY BUCKET
+   - Requests enter a fixed-size queue (the "bucket").
+   - Requests are processed at a fixed rate (the "leak").
+   - Smooths out traffic bursts — the output rate is constant.
+   - Used for: Payment processing where a steady output rate is critical.
+```
+
+### Level 2 — Building Blocks (Token Bucket in Redis)
+```python
+import redis
+import time
+
+r = redis.Redis()
+
+def is_allowed(user_id: str, limit: int = 100, window_seconds: int = 60) -> bool:
+    """Sliding Window Counter implementation using Redis."""
+    
+    key = f"rate_limit:{user_id}"
+    now = int(time.time())
+    window_start = now - window_seconds
+    
+    pipe = r.pipeline()
+    
+    # 1. Remove timestamps older than our window
+    pipe.zremrangebyscore(key, 0, window_start)
+    
+    # 2. Count remaining (valid) requests in the window
+    pipe.zcard(key)
+    
+    # 3. Add the current request timestamp
+    pipe.zadd(key, {str(now) + str(time.time_ns()): now}) # unique member
+    
+    # 4. Set expiry so Redis auto-cleans the key
+    pipe.expire(key, window_seconds)
+    
+    results = pipe.execute()
+    request_count = results[1]
+    
+    if request_count >= limit:
+        return False  # Rate limit exceeded!
+    
+    return True
+
+# Usage in an API endpoint
+def api_endpoint(user_id: str):
+    if not is_allowed(user_id):
+        return {"error": "Rate limit exceeded"}, 429  # HTTP 429 Too Many Requests
+    
+    return {"data": "..."}, 200
+```
+
+### Level 3 — Intermediate (Distributed Rate Limiter Architecture)
+```
+When you have 20 API servers, each server cannot maintain its own in-memory counter.
+Server A might see 50 requests from User X, Server B sees 50 more = 100 total.
+But each server thinks the user only made 50 requests!
+
+SOLUTION: Centralized Redis Cluster
+
+User X → Load Balancer
+              ├── API Server 1 → Redis Cluster ("user_x" counter: 87 of 100)
+              ├── API Server 2 → Redis Cluster (same key, consistent!)
+              └── API Server 3 → Redis Cluster (same key, consistent!)
+
+Rate limit checks are O(1) operations on Redis, adding < 1ms of latency.
+Redis can handle millions of rate limit checks per second.
+
+RESPONSE HEADERS (best practice):
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 13
+X-RateLimit-Reset: 1717000060
+Retry-After: 45  (seconds until reset — only included on 429 responses)
+```
+
+### Level 4 — Advanced (Rate Limiting at Multiple Levels)
+```
+A production system needs TIERED rate limits:
+
+LEVEL 1 — IP-based (Nginx/CloudFlare)
+  - 1000 requests per minute per IP address
+  - Prevents DDoS and anonymous abuse
+
+LEVEL 2 — API Key / User-based
+  - Free tier: 100 requests per minute
+  - Pro tier: 10,000 requests per minute
+  - Enterprise tier: 1,000,000 requests per minute
+
+LEVEL 3 — Endpoint-based
+  - POST /api/auth/login: 5 attempts per 15 minutes (brute force protection!)
+  - POST /api/messages: 100 messages per minute
+  - GET /api/feed: 500 requests per minute
+
+LEVEL 4 — Cost-based (for AI APIs)
+  - Not request count, but TOKEN count consumed per billing period
+  - GPT-4 API rate limits by tokens per minute, not requests per minute
+```
+
+## REAL_WORLD
+Stripe's rate limiting system is one of the most sophisticated in the industry:
+- Every API key has rate limits based on the account tier.
+- Limits are set on requests per second (RPS), not per minute.
+- They use a custom token bucket implementation on Redis.
+- Critical: They apply rate limiting BEFORE authentication to prevent database load from brute-force attacks.
+- They return detailed `X-RateLimit-*` headers on EVERY response (not just rejections), so developers can monitor their usage in real-time.
+
+## INTERVIEW
+**Q: What HTTP status code does a rate-limited response return?**
+A: **429 Too Many Requests** (defined in RFC 6585). Always include a `Retry-After` header indicating how many seconds until the limit resets.
+
+**Q: How do you rate limit across multiple geographic regions?**
+A: This is extremely hard. A user in the US and the same user in Europe can simultaneously bypass independent regional rate limiters. Solutions: (1) Geo-based routing that always routes a specific user to the same region's Redis. (2) A globally distributed cache like **Redis Enterprise GEO** that synchronizes rate limit counters across data centers with millisecond replication. (3) Accept slightly imprecise rate limiting at regional boundaries as an acceptable trade-off.
+
+**Q: What happens if the Redis rate limiter goes down?**
+A: You have two options: (1) **Fail Open:** If Redis is unavailable, allow all requests through (the rate limiter is bypassed). You may get a traffic spike, but you maintain availability. (2) **Fail Closed:** If Redis is unavailable, reject all requests. You maintain protection, but your API is down. For most public APIs, Fail Open is the right choice — brief rate limiter downtime is acceptable; total API downtime is not.

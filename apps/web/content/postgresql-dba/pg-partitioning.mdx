@@ -1,0 +1,110 @@
+---
+slug: "pg-partitioning-advanced"
+title: "PostgreSQL Table Partitioning"
+level: 4
+---
+
+## WHY
+If your `orders` table has 10 million rows, Postgres handles it perfectly. If it has 5 Billion rows (e.g., IoT sensor data or financial logs), you hit a physical wall.
+1. The table becomes too large to fit in memory (RAM).
+2. The B-Tree indexes become so massive and deep that traversing them slows down every query.
+3. If you want to delete data older than 5 years, running `DELETE FROM orders WHERE created_at < '2019-01-01'` will take days, consume massive amounts of CPU, bloat the WAL, and require aggressive Vacuuming.
+
+**Table Partitioning** solves this by physically splitting one massive table into dozens of smaller, manageable tables, while presenting a single, unified "Virtual" table to the application.
+
+## THEORY
+### The Partitioning Strategies
+1. **Range Partitioning (The most common):** Split the table by time (e.g., one partition per month or per year). Perfect for time-series data or logs.
+2. **List Partitioning:** Split the table by a specific categorical value (e.g., `region = 'US'`, `region = 'EU'`).
+3. **Hash Partitioning:** Split the data mathematically evenly across $N$ partitions using a hash function. Perfect when you just need to break up a massive table but don't have a logical time/category split.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-partitioning" }
+```
+
+## CODE
+
+### Level 1 — Declarative Range Partitioning
+Introduced in Postgres 10, Declarative Partitioning makes creating and managing partitions incredibly easy compared to the old trigger-based methods.
+
+```sql
+-- 1. Create the MASTER table. 
+-- Notice you MUST define the Partition Key (e.g., created_at)
+CREATE TABLE logs (
+    id SERIAL,
+    message TEXT,
+    created_at TIMESTAMP NOT NULL
+) PARTITION BY RANGE (created_at);
+
+-- 2. Create the PHYSICAL partitions (Children)
+-- The Master table stores NO data. It all goes into the children!
+CREATE TABLE logs_2023 
+    PARTITION OF logs 
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+CREATE TABLE logs_2024 
+    PARTITION OF logs 
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+-- You should always create a default partition for data that falls outside the ranges!
+CREATE TABLE logs_default PARTITION OF logs DEFAULT;
+```
+
+### Level 2 — Partition Pruning (The Performance Magic)
+If the application queries the master table:
+`SELECT * FROM logs WHERE created_at = '2024-05-15';`
+How does Postgres find the data? Does it search all 3 tables?
+
+**No. Partition Pruning!**
+Because the query includes the partition key (`created_at`), the Postgres Query Planner looks at the `WHERE` clause, realizes the date falls perfectly inside `logs_2024`, and completely ignores (`prunes`) the `logs_2023` and `logs_default` tables! 
+It only searches the smaller, faster `logs_2024` table. This drastically reduces CPU and IO usage.
+
+### Level 3 — Data Retention (The O(1) Delete)
+Deleting 100 million old records using a standard `DELETE` command is an operational nightmare. It locks rows, bloats indexes, and generates massive amounts of WAL data.
+
+With Partitioning, dropping old data takes **milliseconds** and consumes **zero** database resources.
+
+```sql
+-- To delete all data from 2023, you don't use DELETE. 
+-- You simply detach or drop the physical table!
+DROP TABLE logs_2023;
+
+-- OR, if you want to archive it to cheaper storage before deleting:
+ALTER TABLE logs DETACH PARTITION logs_2023;
+-- (Now logs_2023 is just a normal, independent table! The Master table no longer searches it).
+```
+
+### Level 4 — Automated Partition Management (pg_partman)
+*The Trap:* What happens on January 1st, 2025, if you forgot to run `CREATE TABLE logs_2025`? All new inserts will suddenly route to the `logs_default` partition. `logs_default` will grow infinitely, completely destroying the performance benefits of your partitioning scheme!
+
+Managing partitions manually is dangerous. Professional DBAs use the **pg_partman** extension to automate this.
+
+```sql
+-- Tell pg_partman to manage the 'logs' table
+-- Create new partitions MONTHLY, and always keep 4 future partitions ready!
+SELECT partman.create_parent(
+    p_parent_table => 'public.logs',
+    p_control => 'created_at',
+    p_type => 'native',
+    p_interval=> '1 month',
+    p_premake => 4
+);
+
+-- pg_partman sets up a background worker (or cron job) that runs daily,
+-- automatically generating future partitions so you never run out!
+```
+
+## REAL_WORLD
+**Global Indexes vs. Local Indexes**
+When you create an index on the Master table, Postgres actually creates a separate physical index on *every single child partition*. (These are called Local Indexes).
+*The Constraint:* If you want a `UNIQUE` or `PRIMARY KEY` constraint on a partitioned table, the constraint **MUST include the partition key**.
+You cannot have `PRIMARY KEY (id)`. You MUST have `PRIMARY KEY (id, created_at)`.
+Why? Because Postgres does not support Global Indexes (an index that spans all partitions). To guarantee a value is truly unique across 5 Billion rows without scanning all 50 partitions simultaneously, the partition key must be part of the uniqueness check. This is a massive architectural limitation you must plan for!
+
+## INTERVIEW
+**Q: You have a massive `users` table partitioned by `region` (US, EU, ASIA). A user originally signed up in the US. They execute an `UPDATE users SET region = 'EU' WHERE id = 123`. What happens under the hood?**
+A: **Row Movement (Delete + Insert).**
+Before Postgres 11, this query would throw a fatal error. You could not update a partition key if it meant the row had to move to a different table.
+In modern Postgres, it handles **Row Movement** automatically. However, it is an extremely expensive operation! Under the hood, Postgres physically executes a `DELETE` on the US partition, and an `INSERT` on the EU partition. 
+If your application frequently updates the partition key, partitioning will actually *degrade* your database performance due to the massive overhead of constantly migrating rows between physical files! You should only partition by columns that are immutable (like `created_at`).

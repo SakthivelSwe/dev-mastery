@@ -1,0 +1,148 @@
+---
+slug: "gitops"
+title: "GitOps"
+level: 4
+---
+
+## WHY
+Traditional deployment: someone runs `kubectl apply` or clicks "Deploy" in a CI/CD tool. If they make a mistake, there's no audit trail, no review process, and reverting requires running another command manually.
+**GitOps** is a deployment model where Git is the **single source of truth** for your infrastructure and application state. Instead of imperative commands, you declare the desired state in Git. A reconciliation agent (ArgoCD, Flux) continuously ensures the cluster matches what's in Git.
+
+## THEORY
+### GitOps Principles
+1. **Declarative:** The entire system (infrastructure + applications) is described declaratively in Git
+2. **Versioned and immutable:** Git's history serves as the audit log
+3. **Pulled automatically:** A software agent pulls changes from Git (not push from CI)
+4. **Continuously reconciled:** The agent continuously ensures the actual state matches the desired state
+
+### Push-Based vs Pull-Based
+- **Traditional CI/CD (Push):** CI pipeline pushes changes to the cluster. CI needs cluster credentials. If cluster drifts from desired state, nobody notices.
+- **GitOps (Pull):** Agent inside the cluster watches Git. Cluster credentials never leave the cluster. Drift is automatically detected and corrected!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "gitops" }
+```
+
+## CODE
+
+### ArgoCD: The Most Popular GitOps Tool
+```bash
+# Install ArgoCD
+kubectl create namespace argocd
+kubectl apply -n argocd -f \
+  https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Access the ArgoCD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+# Open http://localhost:8080
+
+# Get initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+```
+
+### ArgoCD Application: Connect a Git Repo to a K8s Cluster
+```yaml
+# argocd-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-api
+  namespace: argocd
+spec:
+  project: default
+  
+  # The Git repository with K8s manifests
+  source:
+    repoURL: https://github.com/mycompany/k8s-manifests.git
+    targetRevision: main          # Branch to watch
+    path: apps/production/api     # Path within the repo
+  
+  # Where to deploy
+  destination:
+    server: https://kubernetes.default.svc  # Same cluster as ArgoCD
+    namespace: production
+  
+  # Automatically sync when Git changes
+  syncPolicy:
+    automated:
+      prune: true          # Delete resources removed from Git
+      selfHeal: true       # Revert manual kubectl changes that diverge from Git!
+    syncOptions:
+      - CreateNamespace=true
+```
+
+### GitOps Workflow in Practice
+```bash
+# Developer wants to update the API image from v1.5 to v1.6:
+
+# WRONG (old way): Direct kubectl apply
+kubectl set image deployment/api api=my-api:v1.6 -n production
+# ← No review, no audit trail, ArgoCD will REVERT this! (selfHeal=true)
+
+# RIGHT (GitOps way):
+# 1. Update the Deployment YAML in the Git repo
+# apps/production/api/deployment.yaml:
+#   image: my-api:v1.6  ← Change this line
+
+# 2. Create a PR (code review for production changes!)
+git checkout -b deploy/api-v1.6
+git commit -m "chore: deploy api v1.6 to production"
+git push origin deploy/api-v1.6
+gh pr create --title "Deploy API v1.6 to Production"
+
+# 3. PR is approved, merged to main
+# 4. ArgoCD detects the change in Git within 3 minutes
+# 5. ArgoCD applies the updated Deployment to the cluster
+# 6. ArgoCD shows "Synced" — cluster matches Git!
+
+# Full audit trail: WHO changed WHAT, WHEN, and WHY (PR description)
+```
+
+## REAL_WORLD
+**GitOps Repository Structure**
+```
+k8s-manifests-repo/
+├── apps/
+│   ├── production/
+│   │   ├── api/
+│   │   │   ├── deployment.yaml
+│   │   │   ├── service.yaml
+│   │   │   └── ingress.yaml
+│   │   └── database/
+│   │       └── statefulset.yaml
+│   └── staging/
+│       └── api/
+│           └── deployment.yaml
+├── infrastructure/
+│   ├── monitoring/
+│   │   └── prometheus/
+│   └── cert-manager/
+└── argocd/
+    ├── production.yaml  # ArgoCD Application pointing to apps/production/
+    └── staging.yaml
+```
+
+## INTERVIEW
+**Q: An engineer directly ran `kubectl scale deployment/api --replicas=1 -n production` during an outage to reduce traffic. With GitOps and ArgoCD (selfHeal=true), what happens?**
+
+A: **Within minutes, ArgoCD reverts the change!**
+
+Here's why: With `selfHeal: true`, ArgoCD continuously compares the cluster state against what's in Git. Git says `replicas: 3`. The cluster now says `replicas: 1` (due to the manual kubectl command). ArgoCD detects this drift and automatically applies the Git state — scaling back to 3 replicas.
+
+This is intentional! GitOps enforces that Git is the only source of truth. Manual `kubectl` changes are effectively "illegal" — they'll be overwritten.
+
+**The correct procedure during an outage:**
+1. Immediately update the Git repo (commit and merge or push directly to main if emergency)
+2. ArgoCD will apply the change within minutes, OR manually trigger sync: `argocd app sync my-api`
+
+**The exception:** You can temporarily disable sync for emergency manual changes:
+```bash
+argocd app set my-api --sync-policy none  # Disable auto-sync
+kubectl scale deployment/api --replicas=1  # Manual change
+# ... investigate and fix ...
+# Update Git with the correct state
+argocd app set my-api --sync-policy automated  # Re-enable
+```
+This way, the manual change sticks until you re-enable sync and update Git.

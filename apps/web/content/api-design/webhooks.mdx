@@ -1,0 +1,162 @@
+---
+slug: "webhooks"
+title: "Webhooks (Reverse APIs)"
+level: 3
+---
+
+## WHY
+If your application uses Stripe to process payments, a payment doesn't always succeed instantly. Sometimes, it takes a bank 3 days to verify a transfer. 
+How does your Node.js server know when the payment finally succeeds? 
+You could write a `setInterval` loop that calls `GET /stripe/payment/status` every 5 minutes for 3 days. This is called **Polling**. It is a catastrophic waste of network bandwidth, CPU cycles, and API rate limits. 99.9% of the time, the answer is "Still Pending."
+
+**Webhooks** are "Reverse APIs" (or User-Defined HTTP Callbacks). Instead of you asking Stripe for the status, Stripe asks YOU. You give Stripe a URL on your server. When the payment finally succeeds 3 days later, Stripe's servers actively send an HTTP POST request *to your server* to tell you it happened.
+
+## THEORY
+### The Webhook Flow
+1. **Registration:** You log into the Third-Party Provider (e.g., Stripe, GitHub, Twilio) and register an Endpoint URL (e.g., `https://api.mycompany.com/webhooks/stripe`).
+2. **Event Occurs:** A user pays, or a Git commit is pushed.
+3. **The Payload:** The Third-Party server constructs a JSON payload containing the event data.
+4. **The Callback:** The Third-Party server sends an HTTP POST request to your registered URL. Your server receives it, processes it, and returns an HTTP `200 OK` to acknowledge receipt.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "webhooks" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Receiving a Webhook)
+Building an endpoint to receive a webhook is identical to building a standard POST route.
+
+```javascript
+// Express.js Example
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+// This is the URL you registered in the GitHub Dashboard!
+app.post('/webhooks/github', (req, res) => {
+    const eventType = req.headers['x-github-event'];
+    const payload = req.body;
+
+    // Handle different types of events
+    if (eventType === 'push') {
+        console.log(`New code pushed by ${payload.pusher.name}`);
+        triggerCiCdPipeline(payload.repository.name);
+    } 
+    else if (eventType === 'issues') {
+        console.log(`Issue ${payload.issue.number} was ${payload.action}`);
+    }
+
+    // CRITICAL: You MUST return a 2xx status code quickly!
+    // If you don't, GitHub thinks your server is dead and will aggressively retry.
+    res.status(200).send('Webhook received!');
+});
+```
+
+### Level 2 — Building Blocks (Security & HMAC Signatures)
+Because Webhooks are public URLs, what stops a malicious hacker from sending a fake POST request to your `/webhooks/stripe` endpoint saying "Payment Success!", causing you to ship them a free laptop?
+
+You must cryptographically verify that the payload *actually* came from Stripe! Stripe does this by signing the payload using a secret key, and sending the signature in the HTTP headers (`Stripe-Signature`).
+
+```javascript
+// Using Stripe's official library to verify the signature
+const stripe = require('stripe')('sk_test_123');
+const endpointSecret = "whsec_abc123"; // The secret you got from the Stripe Dashboard!
+
+// Note: Stripe requires the RAW body string to compute the signature, not parsed JSON!
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+    
+    // Extract the signature from the headers
+    const signature = req.headers['stripe-signature'];
+
+    let event;
+    try {
+        // This function hashes the raw body using your secret key.
+        // If the resulting hash matches the header signature, it is 100% authentic!
+        event = stripe.webhooks.constructEvent(req.body, signature, endpointSecret);
+    } catch (err) {
+        // Someone is trying to hack us! Drop the request immediately.
+        console.error('Webhook signature verification failed!');
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Safe to process the event!
+    if (event.type === 'payment_intent.succeeded') {
+        const paymentIntent = event.data.object;
+        fulfillOrder(paymentIntent.metadata.order_id);
+    }
+
+    res.json({received: true});
+});
+```
+
+### Level 3 — Intermediate (Handling Retries & Idempotency)
+If your server goes down for 5 minutes, Stripe's webhook request will fail. Stripe will automatically retry sending the webhook 1 hour later. 
+But what if your server received the webhook, fulfilled the order, but crashed *before* sending the `200 OK` response? Stripe thinks it failed, and will retry 1 hour later!
+If you process it again, you will fulfill the order twice!
+
+Your webhook handlers MUST be **Idempotent**. If the same webhook is received 10 times, the outcome must be the same as receiving it once.
+
+```javascript
+app.post('/webhooks/stripe', async (req, res) => {
+    // 1. Verify Signature (Code omitted for brevity)
+    const event = verifiedEvent;
+    
+    // 2. Check the Database BEFORE processing!
+    // Every webhook has a unique ID (e.g., evt_12345). We use this as the Idempotency Key!
+    const existingEvent = await db.processed_webhooks.find(event.id);
+    
+    if (existingEvent) {
+        // We already processed this! Do not fulfill the order again.
+        // Just return 200 OK to tell Stripe to stop retrying.
+        return res.status(200).send('Already processed');
+    }
+
+    // 3. Process the business logic
+    await fulfillOrder(event.data.object.order_id);
+    
+    // 4. Save the Event ID to the database so we never process it again!
+    await db.processed_webhooks.insert({ event_id: event.id, processed_at: new Date() });
+
+    res.status(200).send('Success');
+});
+```
+
+### Level 4 — Advanced (Asynchronous Processing)
+If your business logic takes 15 seconds to run (e.g., generating a massive PDF invoice), you cannot run it synchronously inside the webhook handler.
+Webhook providers (like Slack or Stripe) usually enforce a strict **3-second timeout**. If you don't return a `200 OK` within 3 seconds, they kill the connection and mark it as a failure.
+
+You must accept the webhook, instantly dump it into a background queue (like RabbitMQ or AWS SQS), and return `200 OK`. A separate worker process handles the slow PDF generation asynchronously.
+
+```javascript
+app.post('/webhooks/slack', async (req, res) => {
+    const event = req.body;
+    
+    // 1. Instantly dump the payload into a Redis Queue
+    await messageQueue.add('slack-events', event);
+    
+    // 2. Return 200 OK immediately! (Takes < 50 milliseconds)
+    res.status(200).send('Received');
+});
+
+// A completely separate Background Worker Server:
+messageQueue.process('slack-events', async (job) => {
+    // 3. Take 15 seconds to generate the PDF and send it back to Slack
+    await generateComplexReport(job.data);
+});
+```
+
+## REAL_WORLD
+**Localhost Tunneling (Ngrok)**
+When developing a webhook integration, you face a massive networking problem: How does Stripe (on the public internet) send an HTTP POST request to your Node.js server running on `localhost:3000`? Your laptop is hiding behind a home router/NAT and doesn't have a public IP address!
+
+Developers use **Tunneling Tools** like **Ngrok**. 
+You run `ngrok http 3000` in your terminal. Ngrok spins up a random public URL (e.g., `https://a1b2.ngrok.io`). This public URL tunnels straight through your router, directly to `localhost:3000`. You paste that Ngrok URL into the Stripe Dashboard, allowing you to test real live webhooks directly on your local machine!
+
+## INTERVIEW
+**Q: We have a microservice architecture. Service A creates a user. Service B needs to know when a user is created. Should Service A trigger a Webhook to notify Service B?**
+A: **No, you should use an internal Message Broker (Kafka/RabbitMQ) or Pub/Sub system.**
+Webhooks are designed for *cross-organization* communication (over the public internet, between entirely different companies). Using HTTP Webhooks for internal microservice communication is an anti-pattern. 
+HTTP is point-to-point and synchronous. If Service A uses an HTTP webhook to tell Service B, but Service B is down, the HTTP request fails. Service A now has to write complex retry logic. 
+If Service A publishes an event to Kafka (Pub/Sub), the message is safely stored. When Service B comes back online, it reads the message from Kafka. Message Brokers provide native internal buffering, fan-out, and guaranteed delivery without the fragility of HTTP Webhooks.

@@ -1,0 +1,118 @@
+---
+slug: "performance-tuning"
+title: "Java Performance Tuning"
+level: 5
+---
+
+## WHY
+You built a Spring Boot application, and it works perfectly on your local machine. But when deployed to production under a load of 10,000 concurrent users, the response times spike to 5 seconds, CPU usage hits 100%, and the application eventually crashes with an `OutOfMemoryError`.
+
+**Performance Tuning** is the dark art of profiling the JVM, identifying bottlenecks, and optimizing resource usage. Without these skills, you cannot scale a Java application. You will simply be throwing more money at AWS servers to mask underlying architectural inefficiencies.
+
+## THEORY
+### The Three Pillars of Tuning
+1. **Garbage Collection (GC) Tuning:** The JVM pauses your application to clean up memory (Stop-The-World events). If your app is constantly pausing, performance dies.
+2. **Memory Leaks:** Unlike C++, Java has a Garbage Collector, but you can still "leak" memory if you keep references to objects you no longer need, eventually crashing the JVM.
+3. **Thread Contention:** When multiple threads fight for the same lock (`synchronized` blocks or database connections), they block each other, wasting CPU cycles and destroying throughput.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "performance-tuning" }
+```
+
+## CODE
+
+### Level 1 — Beginner (String Concatenation in Loops)
+The most common beginner performance mistake in Java is ignoring String immutability. Every time you modify a String, Java creates a brand new Object in memory.
+
+```java
+// THE TERRIBLE WAY
+// This creates 10,000 separate String objects in memory!
+// The Garbage Collector will go into overdrive trying to clean them up.
+public String buildReport(List<String> data) {
+    String report = "";
+    for (String line : data) {
+        report += line + "\n"; 
+    }
+    return report;
+}
+
+// THE PERFORMANT WAY
+// StringBuilder modifies a single underlying character array.
+// It is vastly faster and creates almost zero garbage!
+public String buildReportOptimized(List<String> data) {
+    StringBuilder report = new StringBuilder();
+    for (String line : data) {
+        report.append(line).append("\n");
+    }
+    return report.toString();
+}
+```
+
+### Level 2 — Building Blocks (Identifying Memory Leaks)
+How does a language with an automatic Garbage Collector (GC) leak memory? 
+By putting objects into a static collection and forgetting to remove them!
+
+```java
+public class CacheManager {
+    // A static map lives for the entire lifecycle of the application!
+    private static final Map<String, UserSession> cache = new HashMap<>();
+
+    public void loginUser(String sessionId, UserSession session) {
+        cache.put(sessionId, session);
+    }
+
+    public void logoutUser(String sessionId) {
+        // DANGER! If we forget to call this method, or if an Exception occurs 
+        // before this is called, the session lives in the HashMap forever!
+        // The GC cannot delete it because the Map still holds a strong reference to it!
+        cache.remove(sessionId);
+    }
+}
+```
+
+*The Fix:* Use proper eviction strategies like **WeakHashMap** (which allows the GC to delete keys if no one else is using them), or use a professional caching library like Caffeine/Redis with Time-To-Live (TTL) expirations.
+
+### Level 3 — Intermediate (Profiling with JFR)
+You cannot tune what you cannot measure. Guessing where the bottleneck is will waste weeks of your time. 
+**Java Flight Recorder (JFR)** is a profiling tool built directly into the JVM. It has almost zero overhead (< 1%), meaning you can run it safely in Production!
+
+You start a recording via the command line on your production server:
+```bash
+# Start a 60-second recording of the running JVM (PID 12345)
+jcmd 12345 JFR.start duration=60s filename=recording.jfr
+```
+
+You then open the `recording.jfr` file in **Java Mission Control (JMC)** on your laptop. It provides a visual dashboard showing exactly which Methods took the most CPU time, how many Objects were allocated, and exactly how long the Garbage Collector paused your app!
+
+### Level 4 — Advanced (Tuning the Garbage Collector)
+If JFR shows that your application is spending 20% of its time paused for Garbage Collection, you must tune the JVM flags.
+
+There are different Garbage Collectors for different use cases:
+1. **G1GC (Garbage-First):** The default since Java 9. Great balance of throughput and latency.
+2. **ZGC (Z Garbage Collector):** Introduced in Java 15. Designed for massive heaps (Terabytes). Guarantees pause times under 1 millisecond!
+3. **Parallel GC:** Maximizes raw throughput at the expense of longer pause times (great for offline batch processing).
+
+You configure these via command-line flags when starting the application:
+
+```bash
+# Start the app with optimized GC settings
+java -server \
+     -Xms4G -Xmx4G \                  # Lock initial and max heap to 4GB to prevent resizing overhead
+     -XX:+UseZGC \                    # Use the ultra-low latency ZGC
+     -XX:+HeapDumpOnOutOfMemoryError \# Generate a heap dump if the app crashes for debugging!
+     -XX:HeapDumpPath=/logs/ \
+     -jar my-application.jar
+```
+
+## REAL_WORLD
+**Database Connection Pools**
+The #1 bottleneck in enterprise Java applications is rarely the CPU; it is the Database. 
+Opening a new TCP connection to a PostgreSQL database takes several milliseconds. If 1,000 users hit your API, and your app tries to open 1,000 separate DB connections simultaneously, the database will crash.
+Performance tuning absolutely requires a **Connection Pool** (like HikariCP, the default in Spring Boot). The pool keeps a small set of connections open permanently (e.g., 20 connections). When a thread needs the DB, it borrows a connection, runs the query, and instantly returns it to the pool. Properly sizing this pool (usually between 10-50, counterintuitively *smaller* than you think) is the most critical tuning step for backend applications.
+
+## INTERVIEW
+**Q: My application is running slowly. I looked at the code and realized we are creating thousands of short-lived objects inside a loop. I want to optimize this by creating an "Object Pool" to reuse the objects instead of letting the Garbage Collector deal with them. Is this a good idea?**
+A: **No, this is an infamous anti-pattern in modern Java.** 
+In the late 1990s, Object Pooling was a valid optimization because object creation was expensive. In modern JVMs, allocating a new object in the Eden space is incredibly cheap (it just bumps a pointer). The Garbage Collector is heavily optimized to clean up millions of short-lived, unreachable objects almost instantly with zero overhead. 
+If you implement an Object Pool, you are forcing those objects to stay alive permanently. This promotes them to the "Old Generation" memory space, forcing the JVM to run massive, expensive "Full GC" sweeps, completely destroying your performance. Always let the GC handle short-lived objects.

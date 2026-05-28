@@ -1,0 +1,86 @@
+---
+slug: "sd-consistent-hashing"
+title: "Consistent Hashing"
+level: 5
+---
+
+## WHY
+Imagine you are building a distributed cache (like Memcached or Redis) to store user session data. You have 10 million users, so one server isn't enough. You buy 4 servers.
+How do you decide which server stores User A's data?
+The naive approach is **Modulo Hashing**: `hash(user_id) % 4`. 
+If `user_id = 10`, `10 % 4 = 2`. User 10 goes to Server 2.
+
+This works perfectly... until Black Friday. Traffic spikes, and you need to add a 5th server.
+Now the formula is `hash(user_id) % 5`.
+If `user_id = 10`, `10 % 5 = 0`. User 10 is suddenly expected to be on Server 0!
+Because the denominator changed, **almost every single user in the entire system is mapped to a different server.** When the frontend asks Server 0 for User 10's session, it gets a Cache Miss. The cache hit rate drops to 0%, the backend database gets slammed with 10 million simultaneous queries, and the entire company goes offline.
+
+**Consistent Hashing** is the mathematical algorithm that solves this. It allows you to add or remove servers with minimal disruption to the existing data mapping.
+
+## THEORY
+### The Hash Ring
+Instead of using a modulo operator based on the *number* of servers, Consistent Hashing places both the **Data** AND the **Servers** onto a circular conceptual ring (a Hash Ring).
+
+1. The hash function outputs a massive range (e.g., $0$ to $2^{32} - 1$). Imagine this line bent into a circle.
+2. We hash the Server IPs (e.g., `hash(192.168.1.1)`) and place the Servers on the ring.
+3. We hash the Data Keys (e.g., `hash(user_10)`) and place the Data on the same ring.
+4. To find which server holds the data, we start at the Data's position and walk clockwise around the ring until we hit the first Server.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "consistent-hashing" }
+```
+
+## CODE
+
+*(In a System Design interview, you don't write the algorithm, you draw the ring and explain the mechanics!)*
+
+### Level 1 — The Benefit of the Ring
+**The Interview Explanation:**
+"Let's say we have Servers A, B, and C placed on the ring. The data keys are distributed among them by walking clockwise."
+"If traffic spikes and we add Server D between B and C:"
+- Server A's data is completely unaffected.
+- Server B's data is completely unaffected.
+- Only the data that falls physically *between* Server B and Server D has to move from Server C to Server D!
+"Unlike modulo hashing (which redistributes 100% of the data), Consistent Hashing only redistributes $\frac{1}{N}$ of the data, where $N$ is the number of servers! The cache survives the scale-up."
+
+### Level 2 — The Problem with the Ring (Non-Uniform Distribution)
+*The Interviewer Trap:* "Okay, but what if the hash function happens to place Server A, Server B, and Server C right next to each other on the top of the ring, leaving the entire bottom of the ring empty?"
+
+**The Explanation:**
+"This is a massive problem called **Data Skew**. Because the bottom of the ring is empty, any data that hashes to the bottom will walk clockwise a massive distance until it hits Server A. Server A will end up holding 90% of the data, while B and C sit idle. Furthermore, if Server A crashes, all 90% of that data shifts to Server B, immediately crushing Server B and causing a cascading failure."
+
+### Level 3 — The Solution (Virtual Nodes)
+*The Interviewer:* "How do you fix Data Skew?"
+
+**The Solution:**
+1. "We don't put Server A on the ring once. We create **Virtual Nodes**."
+2. "We hash Server A 100 times using different labels: `hash('Server_A_1')`, `hash('Server_A_2')`, etc."
+3. "We do this for all servers. Now, instead of 3 physical nodes on the ring, we have 300 virtual nodes perfectly scattered and interleaved across the entire circle."
+4. "If a data key hits `Server_B_47`, it physically routes to Server B."
+
+*Benefits of Virtual Nodes:*
+- **Perfect Distribution:** It mathematically eliminates Data Skew. Every physical server holds roughly 33% of the data.
+- **Graceful Failures:** If Server A crashes, its 100 virtual nodes disappear from the ring. The data they held is now gracefully distributed to the *next* virtual node clockwise. Because the virtual nodes are perfectly interleaved, the load is evenly shared between Server B and Server C, preventing cascading failures!
+- **Heterogeneous Scaling:** If Server A is a massive 64-core machine, and Server B is a tiny 8-core machine, we simply assign Server A 800 virtual nodes and Server B 100 virtual nodes, forcing the heavy lifting to the larger machine automatically!
+
+### Level 4 — Consistent Hashing in Data Partitioning
+Consistent Hashing isn't just for Caching; it is the fundamental routing algorithm for almost every major NoSQL database (Cassandra, DynamoDB, Riak).
+
+When a client wants to write data to Cassandra:
+1. The client connects to any random node (the Coordinator Node).
+2. The Coordinator hashes the Primary Key (e.g., `user_id`) to find its location on the Hash Ring.
+3. The Coordinator finds the physical node responsible for that slice of the ring.
+4. *Replication:* The Coordinator also sends the data to the next 2 physical nodes clockwise around the ring (assuming a Replication Factor of 3). This guarantees that if one node explodes, two other distinct physical machines have a copy of the data!
+
+## REAL_WORLD
+**Discord and Consistent Hashing**
+Discord handles billions of messages a day. Every time you connect to Discord, your WebSocket connection must be routed to the specific internal server that is currently managing the specific Voice/Text Channel you are in.
+They use a massive Consistent Hashing ring to route traffic. When a guild (server) spins up, its ID is hashed onto the ring to find its responsible server. Because they use Consistent Hashing, Discord can constantly auto-scale their backend clusters up during prime time gaming hours, and down during the morning, seamlessly shuffling channels between servers without dropping the entire platform offline.
+
+## INTERVIEW
+**Q: I have a Memcached cluster. I implemented Consistent Hashing using Virtual Nodes. I added a new server to the ring. Everything worked perfectly, only a small fraction of keys were remapped. However, those remapped keys resulted in cache misses, which hammered the database anyway. How can I prevent the database from getting hit during the rebalancing phase?**
+A: **Cache Warming / Dual Reads.**
+When Server D joins the ring, it suddenly claims ownership of a slice of the ring. But its physical RAM is completely empty (a Cold Cache). 
+When a request comes in for that data, Server D misses and hits the database.
+To prevent this, you can implement a short "Warm-up" phase. When Server D joins the ring, for the first 5 minutes, if Server D receives a Cache Miss, instead of hitting the Database, it acts as a proxy and quietly asks the *previous* owner (Server C) for the data! Server C still has it in RAM. Server D returns it to the user and saves it locally. After 5 minutes, Server D is fully "warmed up," and we sever the connection to Server C.

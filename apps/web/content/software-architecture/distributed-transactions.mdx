@@ -1,0 +1,167 @@
+---
+slug: "distributed-transactions"
+title: "Distributed Transactions (Saga Pattern)"
+level: 5
+---
+
+## WHY
+In a Monolithic application with a single PostgreSQL database, if a user buys an item, you wrap the payment deduction and the inventory reduction inside a standard SQL Transaction (`BEGIN; UPDATE... UPDATE... COMMIT;`). If the inventory update fails, the entire transaction rolls back instantly.
+
+But what happens in a Microservices Architecture?
+The **Payment Service** has its own database. The **Inventory Service** has its own database. You cannot use a standard SQL `COMMIT` across two different databases on two different physical servers. If the Payment succeeds, but the Inventory service crashes before updating, the user loses their money and gets nothing.
+
+**Distributed Transactions** are the architectural patterns required to guarantee data consistency across multiple independent microservices.
+
+## THEORY
+### The Two-Phase Commit (2PC) vs. Saga Pattern
+Historically, enterprises used **2PC (Two-Phase Commit)**. A central coordinator asks every database: "Are you ready to commit?" If they all say yes, it sends a final "Commit" command. **Do not use 2PC in modern systems.** It holds massive database locks across the network, scaling horribly and causing catastrophic bottlenecks.
+
+Modern microservices use the **Saga Pattern**. 
+A Saga is a sequence of local transactions. Each service updates its own database and immediately publishes an Event (via Kafka or RabbitMQ) to trigger the next service. 
+If a step fails, you cannot "rollback" the previous databases (because they already committed their local transactions). Instead, you must run **Compensating Transactions**—a specific function designed to reverse the previous action (e.g., if Inventory fails, explicitly trigger a "Refund Payment" function).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "saga-pattern" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Choreography Saga)
+In Choreography, there is no central boss. Every service listens to events and reacts independently.
+
+**Step 1: Order Service**
+```javascript
+// 1. User clicks "Checkout". We save the order as PENDING in our local DB.
+await db.orders.insert({ id: 123, status: 'PENDING' });
+
+// 2. We shout into the void (Kafka) that an order was created.
+await kafka.publish('OrderCreated', { orderId: 123, amount: 50.00 });
+```
+
+**Step 2: Payment Service**
+```javascript
+// 1. Payment service listens for 'OrderCreated'
+kafka.subscribe('OrderCreated', async (event) => {
+    try {
+        // Attempt to charge the credit card
+        await stripe.charge(event.amount);
+        
+        // 2a. If successful, publish a Success event!
+        await kafka.publish('PaymentSucceeded', { orderId: event.orderId });
+    } catch (error) {
+        // 2b. If failed, publish a Failure event!
+        await kafka.publish('PaymentFailed', { orderId: event.orderId, reason: error.message });
+    }
+});
+```
+
+**Step 3: Order Service Reacts to the Outcome**
+```javascript
+// Listen for Payment Success
+kafka.subscribe('PaymentSucceeded', async (event) => {
+    await db.orders.update({ id: event.orderId, status: 'CONFIRMED' });
+});
+
+// Listen for Payment Failure
+kafka.subscribe('PaymentFailed', async (event) => {
+    await db.orders.update({ id: event.orderId, status: 'CANCELLED_PAYMENT_FAILED' });
+});
+```
+*Pros: Very fast, perfectly decoupled.*
+*Cons: If you have 10 steps, visualizing the flow is impossible. It becomes "Event Spaghetti."*
+
+### Level 2 — Building Blocks (The Orchestration Saga)
+In Orchestration, there is a central "Boss" microservice (The Orchestrator) that explicitly tells everyone what to do.
+
+```javascript
+// The Order Orchestrator Service
+async function executeCheckoutSaga(orderRequest) {
+    const orderId = await createPendingOrder(orderRequest);
+
+    try {
+        // The orchestrator explicitly CALLS the payment service
+        await paymentClient.chargeUser(orderRequest.userId, orderRequest.amount);
+        
+        // If it succeeds, it explicitly CALLS the inventory service
+        await inventoryClient.reserveItem(orderRequest.itemId);
+        
+        // If both succeed, mark order confirmed!
+        await markOrderConfirmed(orderId);
+        
+    } catch (error) {
+        if (error.source === 'INVENTORY_FAILED') {
+            // THE COMPENSATING TRANSACTION!
+            // Because inventory failed, we MUST explicitly refund the payment!
+            await paymentClient.refundUser(orderRequest.userId, orderRequest.amount);
+            await markOrderCancelled(orderId);
+        }
+    }
+}
+```
+*Pros: The entire business flow is visible in one file.*
+*Cons: The Orchestrator can become a god-service that knows too much about the system.*
+
+### Level 3 — Intermediate (Idempotency)
+What happens if the network glitches, and the Order Service publishes the `OrderCreated` event *twice*? The Payment Service might charge the user's credit card twice!
+
+In a distributed system, **Idempotency** is mandatory. A function is idempotent if calling it 100 times has the exact same effect as calling it once.
+
+```javascript
+// Payment Service
+async function processPayment(event) {
+    // 1. Check if we ALREADY processed this exact event!
+    // (This requires an Idempotency Key, usually the unique event ID or Order ID)
+    const existingTransaction = await db.transactions.findByIdempotencyKey(event.orderId);
+    
+    if (existingTransaction) {
+        // We already did this! Do not charge the card again. 
+        // Just return Success silently.
+        return { status: 'SUCCESS', message: 'Already processed' };
+    }
+
+    // 2. Safe to charge!
+    const result = await stripe.charge(event.amount);
+    
+    // 3. Save the key so we never do it again!
+    await db.transactions.insert({ idempotencyKey: event.orderId, status: 'SUCCESS' });
+}
+```
+
+### Level 4 — Advanced (The Outbox Pattern)
+There is a massive flaw in our Level 1 code:
+```javascript
+await db.orders.insert({ id: 123, status: 'PENDING' }); // <--- What if this succeeds...
+await kafka.publish('OrderCreated', { id: 123 });       // <--- ...but the server crashes EXACTLY here?
+```
+The database saved the order, but Kafka never received the event! The system is now permanently stuck. The user's order sits in `PENDING` forever.
+
+**The Outbox Pattern** guarantees reliable event delivery. Instead of publishing to Kafka directly, you save the Event *inside the same database transaction* as the order!
+
+```javascript
+// 1. Use a standard SQL Transaction for the LOCAL database
+await db.transaction(async (trx) => {
+    // Insert the order
+    await trx.orders.insert({ id: 123, status: 'PENDING' });
+    
+    // Insert the EVENT into an 'outbox' table in the SAME database!
+    // If the DB crashes, both fail together. Guaranteed atomicity!
+    await trx.outbox.insert({ eventType: 'OrderCreated', payload: { id: 123 } });
+});
+
+// 2. A separate background worker constantly scans the Outbox table.
+// It grabs pending events, publishes them to Kafka, and then deletes them from the Outbox!
+```
+
+## REAL_WORLD
+**Uber & Temporal**
+Writing Orchestrator logic with dozens of `try/catch` blocks and manual retry loops for compensating transactions is incredibly difficult. What if the Orchestrator itself crashes in the middle of the saga?
+Modern engineering teams at Uber, Netflix, and Stripe use frameworks like **Temporal** or **AWS Step Functions**. 
+Temporal allows you to write workflow code as if it were a single, synchronous function. Under the hood, it persists the exact state of your variables into a database after every single line of code executes. If the server explodes halfway through the `executeCheckoutSaga` function, Temporal will instantly spin it up on another server, read the database, and resume execution from the exact line of code where it died.
+
+## INTERVIEW
+**Q: My microservices use the Choreography Saga pattern. A user places an order. While the services are passing events around in the background, the user immediately refreshes their browser and looks at their profile. They don't see the order. Why?**
+A: **Eventual Consistency.** 
+Because a Saga executes asynchronously over a message broker (Kafka), it might take 500 milliseconds (or 5 seconds if a service is retrying) for the final database to update. 
+When the user refreshes, they are querying a database that hasn't received the event yet! 
+To solve this from a UX perspective, the frontend should not rely on immediate database reads. It should aggressively use Optimistic UI (faking the success on the screen immediately), or it should establish a WebSocket connection to listen for the final `SagaCompleted` event before redirecting the user to their order history page.

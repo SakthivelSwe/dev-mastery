@@ -1,0 +1,236 @@
+---
+title: crud-operations
+slug: crud-operations
+---
+
+# MongoDB CRUD Operations | Level: 2
+
+### Layer 1: Deep Dive / Architectural Core
+Understanding the mechanics of MongoDB's write and read paths is essential for optimizing CRUD operations.
+
+```
++-----------------------------------------------------------------------------------+
+|                                 Write Path Flow                                   |
+|                                                                                   |
+|  [Client App]                                                                     |
+|       |                                                                           |
+|       v (Write Request)                                                           |
+|  [Primary Node]                                                                   |
+|       |---> Write to Memory (WiredTiger Cache)                                    |
+|       |---> Write to Journal Buffer (Flushed to disk every 100ms or on j:true)    |
+|       |---> Write to Oplog (Capped collection)                                    |
+|       |                                                                           |
+|       +---> [Replication Engine]                                                  |
+|                   |                                                               |
+|                   v (Async Oplog Pull)                                            |
+|             [Secondary Nodes]                                                     |
++-----------------------------------------------------------------------------------+
+```
+
+#### Write Path & Durability
+1.  **Client Request**: The client sends a write operation (e.g., `insertOne`) with a specified **Write Concern**.
+2.  **Primary Node Interception**: The primary node writes the raw operation into the WiredTiger cache and records the operation in the **Oplog** (operations log).
+3.  **Journaling**: The operation is written to the journal buffer. It is flushed to disk based on the configuration or when `j: true` is requested.
+4.  **Replication**: Secondary nodes pull the oplog asynchronously and replay the changes to stay in sync.
+
+#### Write Concerns Explained
+*   `w: 1`: Returns success immediately after the primary has written to memory/journal buffer. Fast, but risk of data loss if the primary crashes before replication.
+*   `w: majority`: Returns success only after a majority of replica set members have acknowledged the write in memory. Protects against rollbacks during primary failovers.
+*   `j: true`: Forces the primary to flush the journal buffer to disk *before* acknowledging the write. Guarantees durability on disk.
+
+#### Read Path & Read Concerns
+*   **`local` / `available`**: Returns the node's current state. No guarantee that the read data has been written to a majority of nodes (may be rolled back).
+*   **`majority`**: Returns data acknowledged by a majority of nodes. Prevents dirty reads of data that might be rolled back.
+*   **`linearizable`**: Reads from the primary, enforcing concurrent checks with other members to guarantee the primary is still the actual primary at the time of the read. Prevents stale reads during network partitions.
+
+---
+
+### Layer 2: Real-World Use Cases & Schema Design
+#### Scenario: High-Throughput Inventory Reservation System
+In a flash sale or e-commerce system, inventory must be updated safely under extreme concurrency. We must ensure:
+1.  We never oversell (atomic decrement with condition).
+2.  We record reservation transactions in bulk to maximize throughput.
+3.  We use idempotent writes.
+
+---
+
+### Layer 3: Code Examples (`mongosh` vs Spring Data)
+
+#### 1. Advanced CRUD Operations (`mongosh`)
+
+```javascript
+// 1. Insert with custom write concern and journaling
+db.inventory.insertOne(
+  {
+    sku: "MAC-M3-001",
+    qty: 150,
+    reserved: 0,
+    status: "ACTIVE"
+  },
+  { writeConcern: { w: "majority", j: true, wtimeout: 5000 } }
+);
+
+// 2. Atomic update: Reserve inventory safely (only if sufficient qty exists)
+db.inventory.updateOne(
+  { sku: "MAC-M3-001", qty: { $gte: 5 } },
+  { 
+    $inc: { qty: -5, reserved: 5 },
+    $set: { last_updated: new Date() }
+  }
+);
+
+// 3. Complex Find with projection, sort, skip, and limit
+db.inventory.find(
+  { status: "ACTIVE", qty: { $gt: 0 } },
+  { sku: 1, qty: 1, _id: 0 }
+)
+.sort({ qty: -1 })
+.skip(0)
+.limit(50);
+
+// 4. BulkWrite: Execute multiple operations atomically on the server
+db.inventory.bulkWrite([
+  {
+    insertOne: {
+      document: { sku: "IPHONE-15", qty: 200, reserved: 0, status: "ACTIVE" }
+    }
+  },
+  {
+    updateOne: {
+      filter: { sku: "MAC-M3-001" },
+      update: { $set: { status: "RESTOCKING" } }
+    }
+  },
+  {
+    deleteOne: {
+      filter: { sku: "OLD-SKU-999" }
+    }
+  }
+], { ordered: true }); // Ordered: true stops execution on first failure
+```
+
+#### 2. Spring Data MongoDB Equivalents
+Below is the equivalent implementation using `MongoTemplate` and `BulkOperations` to perform high-performance, atomic, and bulk CRUD operations.
+
+```java
+package com.devmastery.mongodb.service;
+
+import com.devmastery.mongodb.model.Inventory;
+import com.mongodb.WriteConcern;
+import com.mongodb.bulk.BulkWriteResult;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.BulkOperations;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.stereotype.Service;
+
+import java.util.Date;
+import java.util.List;
+
+@Service
+public class InventoryService {
+
+    @ final MongoTemplate mongoTemplate;
+
+    @Autowired
+    public InventoryService(MongoTemplate mongoTemplate) {
+        this.mongoTemplate = mongoTemplate;
+    }
+
+    // 1. Insert with Custom Write Concern
+    public Inventory createInventory(Inventory inventory) {
+        MongoTemplate templateWithWC = new MongoTemplate(
+            mongoTemplate.getMongoDatabaseFactory(), 
+            mongoTemplate.getConverter()
+        );
+        templateWithWC.setWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        return templateWithWC.insert(inventory);
+    }
+
+    // 2. Atomic Conditional Update
+    public boolean reserveInventory(String sku, int quantityToReserve) {
+        Query query = new Query(
+            Criteria.where("sku").is(sku)
+                    .and("qty").gte(quantityToReserve)
+        );
+        Update update = new Update()
+            .inc("qty", -quantityToReserve)
+            .inc("reserved", quantityToReserve)
+            .set("last_updated", new Date());
+
+        return mongoTemplate.updateFirst(query, update, Inventory.class).getModifiedCount() > 0;
+    }
+
+    // 3. Find with Pagination, Sort & Projection
+    public List<Inventory> findActiveInventory(int page, int size) {
+        Query query = new Query(
+            Criteria.where("status").is("ACTIVE")
+                    .and("qty").gt(0)
+        );
+        query.fields().include("sku").include("qty").exclude("id");
+        query.with(Sort.by(Sort.Direction.DESC, "qty"));
+        query.skip((long) page * size);
+        query.limit(size);
+
+        return mongoTemplate.find(query, Inventory.class);
+    }
+
+    // 4. Bulk Write Operations
+    public BulkWriteResult executeBulkInventoryOperations() {
+        BulkOperations bulkOps = mongoTemplate.bulkOps(
+            BulkOperations.BulkMode.ORDERED, 
+            Inventory.class
+        );
+
+        // Insert
+        Inventory newInv = new Inventory("IPHONE-15", 200, 0, "ACTIVE");
+        bulkOps.insert(newInv);
+
+        // Update
+        Query updateQuery = new Query(Criteria.where("sku").is("MAC-M3-001"));
+        Update update = new Update().set("status", "RESTOCKING");
+        bulkOps.updateOne(updateQuery, update);
+
+        // Delete
+        Query deleteQuery = new Query(Criteria.where("sku").is("OLD-SKU-999"));
+        bulkOps.remove(deleteQuery);
+
+        return bulkOps.execute();
+    }
+}
+```
+
+---
+
+### Layer 4: Advanced Patterns & Optimization
+#### Optimizing Pagination: Skip/Limit vs Keyset Pagination (Seek Method)
+Using `.skip(100000).limit(10)` requires MongoDB to scan and discard 100,000 index entries, resulting in severe performance degradation.
+
+*Instead, use Keyset Pagination (Seek Method)*:
+```javascript
+// Page 1: Fetch initial page
+let page1 = db.inventory.find({ status: "ACTIVE" }).sort({ _id: 1 }).limit(10).toArray();
+let lastId = page1[page1.length - 1]._id;
+
+// Page 2: Fetch next page using the last ID (Constant Time O(1) index seek)
+let page2 = db.inventory.find({ status: "ACTIVE", _id: { $gt: lastId } }).sort({ _id: 1 }).limit(10).toArray();
+```
+
+---
+
+### Layer 5: PostgreSQL Comparison Matrix
+
+| Architectural Vector | MongoDB (7.x) CRUD | PostgreSQL (16+) CRUD |
+| :--- | :--- | :--- |
+| **Write Isolation** | Document-level locking (WiredTiger). | Row-level locking (MVCC). |
+| **Bulk Writes** | Native `bulkWrite` API (ordered/unordered). | `COPY` command or multi-row `INSERT`. |
+| **Upsert Mechanics** | Native `upsert: true` on update queries. | `INSERT ... ON CONFLICT DO UPDATE`. |
+| **Concurrency Control** | Optimistic (via application-level versioning or `$inc`). | Pessimistic (`SELECT ... FOR UPDATE`) or MVCC Optimistic. |
+| **Write Amplification** | Low (updates alter specific fields in place within page). | High (updates write a new row version to the heap - HOT optimization mitigates this). |
+
+---
+
+### Layer 6: Production Gotchas &

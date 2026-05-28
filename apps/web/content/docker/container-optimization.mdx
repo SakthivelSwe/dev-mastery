@@ -1,0 +1,140 @@
+---
+slug: "container-optimization"
+title: "Container Optimization"
+level: 4
+---
+
+## WHY
+Unoptimized containers consume excessive CPU, memory, and startup time. In production, every millisecond of startup time matters (especially with auto-scaling), and every megabyte of memory saves money at scale.
+This module covers advanced techniques to squeeze maximum performance and minimal footprint out of your containers.
+
+## THEORY
+### Three Dimensions of Optimization
+1. **Image Size:** Smaller images pull faster, start faster, cost less storage, have fewer vulnerabilities
+2. **Build Speed:** Faster CI/CD — maximize Docker layer cache effectiveness
+3. **Runtime Performance:** CPU, memory, and startup time optimization
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "container-optimization" }
+```
+
+## CODE
+
+### Image Size Optimization Techniques
+```dockerfile
+# TECHNIQUE 1: Alpine base images
+# Before: node:20 = 1.1 GB
+# After:  node:20-alpine = 126 MB → 89% reduction!
+FROM node:20-alpine
+
+# TECHNIQUE 2: Combine RUN commands to reduce layers
+# BAD: 3 separate layers = 3 intermediate filesystems
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get clean
+
+# GOOD: 1 layer, and cleanup in the same step (cleanup actually removes files!)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# TECHNIQUE 3: Don't copy unnecessary files (.dockerignore)
+# See the .dockerignore file in the best practices topic
+
+# TECHNIQUE 4: Multi-stage builds (biggest impact — see multi-stage topic)
+```
+
+### Startup Time Optimization (JVM Applications)
+```dockerfile
+# Spring Boot: Use layered JARs for faster startup
+# Build the layered jar:
+# RUN java -Djarmode=layertools -jar app.jar extract
+
+# Better: Use Spring's Buildpacks or CDS (Class Data Sharing)
+FROM eclipse-temurin:21-jre-alpine
+
+# Create CDS archive during build (speeds up JVM startup by ~20-40%)
+RUN java -XX:ArchiveClassesAtExit=/app/app.jsa -jar /app/app.jar --spring.context.active=false; true
+
+CMD ["java", "-XX:SharedArchiveFile=/app/app.jsa", "-jar", "/app/app.jar"]
+```
+
+### Resource Limit Tuning
+```bash
+# Set BOTH hard (limit) and soft (reservation) limits
+# Limit: container is OOM-killed if exceeded
+# Reservation: soft target for scheduler placement
+
+docker run \
+  --memory=512m \              # Hard limit: OOM kill if exceeded
+  --memory-reservation=256m \  # Soft limit: scheduler preference
+  --memory-swap=512m \         # Equal to memory = disable swap
+  --cpus=0.5 \                 # Half a CPU core
+  --cpu-shares=512 \           # Relative CPU weight (default=1024)
+  my-app
+
+# For JVM: Set heap based on container memory!
+# Bad: JVM doesn't know it's in a container by default
+# JVM takes 25% of detected RAM, but in container that's the HOST RAM!
+
+# Good: Use container-aware JVM flags
+docker run \
+  --memory=512m \
+  -e JAVA_OPTS="-XX:MaxRAMPercentage=75.0" \  # Use 75% of container memory for heap
+  my-java-app
+```
+
+### Node.js Memory Optimization
+```dockerfile
+# Set Node.js heap size relative to container memory
+ENV NODE_OPTIONS="--max-old-space-size=384"  # For 512MB container
+
+# Use tini as PID 1 for proper signal handling
+RUN apk add --no-cache tini
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+## REAL_WORLD
+**Benchmarking Container Sizes**
+Run this script to compare your containers:
+```bash
+#!/bin/bash
+echo "=== Docker Image Sizes ==="
+docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}" | \
+  sort -k2 -h | head -20
+
+echo ""
+echo "=== Layer Analysis ==="
+docker history --no-trunc my-app:latest | head -10
+```
+
+Aim for:
+- Node.js apps: < 150 MB
+- Java apps: < 200 MB (with Alpine JRE)
+- Go apps: < 20 MB (with distroless or scratch)
+- Python apps: < 200 MB
+
+## INTERVIEW
+**Q: Your Java Spring Boot container starts in 45 seconds, which is too slow for auto-scaling during traffic spikes. What strategies can you use to reduce startup time?**
+A: Multiple approaches to reduce JVM startup time:
+
+1. **Class Data Sharing (CDS):** Pre-process class metadata into an archive at build time. JVM loads classes from the archive instead of parsing bytecode. Saves 15-30% startup time.
+
+2. **Spring Boot Layered JARs + BuildKit cache:** Structure the Docker layers so Spring's class loading cache is preserved between deployments.
+
+3. **GraalVM Native Image:** Compile the Spring Boot application to a native binary at build time. Startup time drops from 45 seconds to ~100 milliseconds! Tradeoffs: longer build time, some reflection-based features need configuration.
+```dockerfile
+FROM ghcr.io/graalvm/native-image:21 AS builder
+# ... build native binary ...
+FROM alpine:3.19
+COPY --from=builder /app/app-native /app/app
+CMD ["/app/app"]
+# Startup time: ~50ms!
+```
+
+4. **Kubernetes Readiness vs Liveness probes:** Configure a `readinessProbe` with a generous `initialDelaySeconds` so Kubernetes doesn't route traffic until the app is truly ready, and doesn't restart it prematurely.
+
+5. **Connection pooling warm-up:** If startup is slow due to database connection establishment, use connection pool pre-warming.

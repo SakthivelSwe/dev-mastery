@@ -1,0 +1,131 @@
+---
+slug: "nextjs-caching"
+title: "Next.js Caching"
+level: 4
+---
+
+## WHY
+Next.js is obsessed with performance, and caching is the #1 performance optimization. But Next.js caching is famously complex — there are 4 separate caching layers that interact with each other.
+Understanding Next.js caching is essential because incorrect cache configuration leads to users seeing stale data (your changes don't appear) or no caching at all (every request hits the database, making the app slow).
+
+## THEORY
+### The Four Caching Mechanisms
+1. **Request Memoization:** During a single render, duplicate `fetch()` calls to the same URL are deduplicated.
+2. **Data Cache:** Persists `fetch()` responses across requests (default: cached forever). The file system cache.
+3. **Full Route Cache:** Caches the rendered HTML of Static Routes on the server.
+4. **Router Cache:** Browser-side cache of visited pages. Kept in memory for the session.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-caching" }
+```
+
+## CODE
+
+### Data Cache: Controlling fetch() Caching
+```typescript
+// CACHED FOREVER (default) — great for rarely-changing data
+const posts = await fetch('https://api.example.com/posts');
+
+// NEVER CACHED — always fresh from origin
+const livePrice = await fetch('https://api.example.com/price', {
+  cache: 'no-store'  // Dynamic — fetches on every request
+});
+
+// REVALIDATE every 60 seconds (ISR)
+const products = await fetch('https://api.example.com/products', {
+  next: { revalidate: 60 }
+});
+
+// Revalidate by TAG (on-demand — refresh when data changes)
+const posts = await fetch('https://api.example.com/posts', {
+  next: { tags: ['posts'] }
+});
+```
+
+### revalidatePath and revalidateTag
+```typescript
+// Server Action: after creating a new post, refresh the cache
+'use server';
+import { revalidatePath, revalidateTag } from 'next/cache';
+
+export async function createPost(formData: FormData) {
+  await db.posts.create({ data: { title: formData.get('title') as string } });
+  
+  // Option 1: Revalidate a specific path
+  revalidatePath('/blog');               // Re-render /blog page
+  revalidatePath('/blog/[slug]', 'page');  // Re-render all [slug] pages
+  
+  // Option 2: Revalidate by tag (more targeted)
+  revalidateTag('posts');               // Invalidate all fetches tagged with 'posts'
+}
+```
+
+### Route Segment Configuration
+```typescript
+// app/products/page.tsx
+
+// Force the entire page to be STATIC (cached at build time)
+export const dynamic = 'force-static';
+
+// Force the page to be DYNAMIC (never cached)
+export const dynamic = 'force-dynamic';
+
+// Revalidate the page every 30 minutes
+export const revalidate = 1800;
+
+// Don't cache at all
+export const revalidate = 0;
+
+export default async function ProductsPage() {
+  const products = await db.products.findMany();
+  return <ProductList products={products} />;
+}
+```
+
+### Caching with Prisma/Database Calls (Unstable Cache)
+```typescript
+// For non-fetch data sources (databases, ORMs), use unstable_cache
+import { unstable_cache } from 'next/cache';
+
+const getCachedProducts = unstable_cache(
+  async () => {
+    return await prisma.product.findMany();  // Database call!
+  },
+  ['products'],                             // Cache key
+  {
+    revalidate: 3600,                       // Cache for 1 hour
+    tags: ['products'],                     // Tag for invalidation
+  }
+);
+
+export default async function ProductsPage() {
+  const products = await getCachedProducts();  // Cached!
+  return <ProductList products={products} />;
+}
+```
+
+## REAL_WORLD
+**The Right Caching Strategy Per Data Type**
+
+| Data Type | Strategy | Implementation |
+|---|---|---|
+| Blog posts | Cache, revalidate on publish | `tags: ['posts']` + `revalidateTag('posts')` in action |
+| Product catalog | Revalidate periodically | `next: { revalidate: 3600 }` |
+| User profile | Never cache (personal data) | `cache: 'no-store'` |
+| Live stock prices | Never cache | `cache: 'no-store'` |
+| Static legal pages | Forever | Default (no option needed) |
+| Shopping cart | Server-side session | Server Actions with cookies |
+
+## INTERVIEW
+**Q: A user updates their profile name. They refresh the page 5 seconds later and still see the old name. Where is the stale data coming from and how do you fix it?**
+
+A: Three possible caching layers could be showing stale data:
+
+1. **Data Cache:** If the profile fetch is cached with `next: { revalidate: 3600 }` or default caching, the response is stored in Next.js's file-system cache. Fix: After the update Server Action completes, call `revalidatePath('/profile')` or `revalidateTag('user-profile')` to purge the cached response.
+
+2. **Router Cache:** The browser stores previously visited pages in memory for instant back-navigation. Fix: The Router Cache is automatically invalidated when a Server Action calls `revalidatePath()`. Or use `router.refresh()` in a Client Component.
+
+3. **Full Route Cache:** If the profile page is statically generated, it's cached as HTML. Fix: Either make the page dynamic (`export const dynamic = 'force-dynamic'`) or use ISR with short revalidation periods.
+
+The correct fix for user-specific data like profiles is to use `cache: 'no-store'` or mark the route as `dynamic = 'force-dynamic'` so it always reads fresh from the database. Personal, user-specific data should never be cached at the route level — only shared, public data benefits from route-level caching.

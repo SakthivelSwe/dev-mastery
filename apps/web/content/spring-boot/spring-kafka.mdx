@@ -1,0 +1,158 @@
+---
+slug: "spring-kafka"
+title: "Spring Kafka & Message Queues"
+level: 5
+---
+
+## WHY
+Imagine you have an E-commerce platform. When a user places an order, you need to:
+1. Charge the payment.
+2. Reserve inventory.
+3. Send an email confirmation.
+4. Update the analytics dashboard.
+5. Notify the warehouse for shipping.
+
+If you call all 5 services synchronously, the user waits 8 seconds for the page to load. If the email service is down, the entire order fails.
+
+**Apache Kafka** solves this with Asynchronous Messaging. The `OrderService` publishes an `order-placed` event to a Kafka Topic and instantly returns success to the user. The Payment Service, Email Service, Inventory Service, and Analytics Service all independently subscribe to the topic and process the event in their own time, completely decoupled from each other!
+
+## THEORY
+### Core Kafka Concepts
+- **Producer:** Publishes messages to a Topic.
+- **Topic:** A named, ordered, append-only log of events (like a superfast database table). Data is permanently retained (not deleted after consumption).
+- **Consumer:** Subscribes to a Topic and processes messages. Multiple consumers can read from the same Topic independently at their own offset.
+- **Consumer Group:** Multiple instances of the same service sharing the work of consuming a Topic. Each partition is assigned to exactly one consumer in the group.
+- **Partition:** A Topic is split into partitions for horizontal scaling. Each partition is an independent ordered log, assigned to one Broker server.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "kafka-architecture" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Setup & Configuration)
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+```
+
+```yaml
+# application.yml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: order-processing-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.example.events"
+```
+
+### Level 2 — Building Blocks (Producer)
+```java
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+// The Event record
+public record OrderPlacedEvent(Long orderId, Long userId, double totalAmount) {}
+
+@Service
+public class OrderService {
+    
+    private static final String TOPIC_NAME = "order-placed";
+    private final KafkaTemplate<String, OrderPlacedEvent> kafkaTemplate;
+
+    public void placeOrder(Long userId, double amount) {
+        // Process the order in DB...
+        OrderPlacedEvent event = new OrderPlacedEvent(1L, userId, amount);
+
+        // Publish the event! This returns immediately.
+        // The key (userId.toString()) determines which partition it goes to,
+        // ensuring all events for the same user go to the same partition (ordering!)
+        kafkaTemplate.send(TOPIC_NAME, userId.toString(), event);
+        
+        System.out.println("Order placed! Event published to Kafka.");
+    }
+}
+```
+
+### Level 3 — Intermediate (Consumer)
+```java
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EmailNotificationConsumer {
+
+    // This method is called automatically every time an event appears on the topic!
+    @KafkaListener(
+        topics = "order-placed",       // Subscribe to this topic
+        groupId = "email-service"      // This service's Consumer Group
+    )
+    public void handleOrderPlaced(OrderPlacedEvent event) {
+        System.out.println("Sending email for Order: " + event.orderId());
+        emailService.sendOrderConfirmation(event.userId(), event.orderId());
+    }
+}
+
+// A SECOND independent consumer for the SAME topic!
+@Component
+public class InventoryConsumer {
+
+    @KafkaListener(topics = "order-placed", groupId = "inventory-service")
+    public void handleOrderPlaced(OrderPlacedEvent event) {
+        System.out.println("Reserving inventory for Order: " + event.orderId());
+        inventoryService.reserve(event.orderId());
+    }
+}
+```
+
+### Level 4 — Advanced (Error Handling & Dead Letter Topics)
+What if the EmailConsumer crashes while processing a message? By default, Kafka won't move to the next message. Your consumer will be stuck forever on the failed message.
+
+Spring Kafka provides a **Dead Letter Topic (DLT)** pattern. After N retries, failed messages are automatically routed to a `<topic-name>.DLT` topic for manual inspection and reprocessing.
+
+```java
+@Configuration
+public class KafkaErrorConfig {
+
+    @Bean
+    public DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> kafkaTemplate) {
+        // Retry up to 3 times with exponential backoff (1s, 2s, 4s)
+        ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(3);
+        backOff.setInitialInterval(1000L);
+        backOff.setMultiplier(2.0);
+
+        // After 3 retries, publish the failed message to the DLT!
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);
+
+        return new DefaultErrorHandler(recoverer, backOff);
+    }
+}
+```
+
+## REAL_WORLD
+**Kafka vs RabbitMQ:**
+- **RabbitMQ** is a traditional Message Queue. Once a Consumer reads and acknowledges a message, it is deleted. Best for Task Queues (fire-and-forget work items).
+- **Kafka** is an immutable Event Log. Messages are retained forever (configurable). Any new consumer can replay the entire history from the beginning. Best for Event Sourcing, real-time data pipelines, and audit logs.
+
+For an Enterprise E-commerce system, Kafka is almost always the right choice because it allows you to add new downstream services (like a new Analytics service) that can replay all historical order events without any changes to the producer.
+
+## INTERVIEW
+**Q: How does Kafka guarantee message ordering?**
+A: Kafka only guarantees ordering within a single Partition. If you use the same Partition Key (e.g., `userId`), all events for the same user will always land in the same partition, guaranteeing they are processed in order. Events across different partitions may be processed out of order.
+
+**Q: What is "exactly-once delivery" in Kafka?**
+A: Kafka provides three delivery guarantees: **At-most-once** (might lose messages), **At-least-once** (might duplicate messages), and **Exactly-once** (guaranteed delivery without duplicates — enabled via idempotent producers and transactional APIs). "Exactly-once" is the hardest to achieve and has a performance overhead, but is mandatory for financial transaction systems.
+
+**Q: What is a Consumer Group Offset?**
+A: Each Consumer Group tracks its "offset" — the position (sequence number) of the last message it successfully consumed in each Partition. If a Consumer crashes and restarts, it resumes from where it left off using the stored offset, ensuring no message is skipped.

@@ -1,0 +1,124 @@
+---
+slug: "sd-caching-intro"
+title: "Caching Architecture"
+level: 3
+---
+
+## WHY
+Reading data from a physical Hard Drive (where Databases live) is excruciatingly slow in the context of computer processing. It involves physical disks spinning and mechanical arms seeking data, taking roughly 1-10 milliseconds. 
+Reading data from RAM (Random Access Memory) is completely electronic and takes nanoseconds. **RAM is 100,000 times faster than a Hard Drive.**
+
+If your website homepage queries the database for the "Top 10 News Articles of the Day", and you get 10,000 visitors per second, querying the database 10,000 times for the exact same 10 articles will instantly crash the database. 
+
+We solve this using a **Cache**. A cache is simply a server that stores temporary data exclusively in RAM. We query the database once, store the result in the Cache, and serve the next 9,999 users directly from the blazing-fast RAM, completely protecting the database from collapse.
+
+## THEORY
+### The Cache Flow (Cache-Aside Pattern)
+The standard industry pattern is called **Cache-Aside**.
+1. The application receives a request for User #123.
+2. The application checks the Cache first.
+3. If the data is in the cache (**Cache Hit**), it returns it instantly.
+4. If the data is NOT in the cache (**Cache Miss**), it queries the slow Database.
+5. It then takes the database result, writes it into the Cache for the next person, and returns the data.
+
+### Redis vs Memcached
+The two undisputed kings of caching are **Redis** and **Memcached**. 
+Memcached is a pure, ultra-simple Key-Value string store. 
+**Redis** is the absolute industry standard. It is a Key-Value store, but it natively understands complex Data Structures (Lists, Sets, Hashes), supports data persistence to disk (so you don't lose the cache if the server restarts), and supports Pub/Sub messaging.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sd-caching" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Implementing Cache-Aside)
+Here is exactly what the Cache-Aside pattern looks like in Node.js using Redis.
+
+```javascript
+import Redis from 'ioredis';
+import db from './my-database-driver';
+
+const redis = new Redis();
+
+async function getUserProfile(userId) {
+  // 1. Check the Cache First!
+  const cacheKey = `user:profile:${userId}`;
+  const cachedData = await redis.get(cacheKey);
+
+  // 2. CACHE HIT! Return instantly!
+  if (cachedData) {
+    console.log("Served from blazing fast Redis RAM!");
+    return JSON.parse(cachedData); 
+  }
+
+  // 3. CACHE MISS! Hit the slow database...
+  console.log("Cache miss. Querying slow database...");
+  const dbData = await db.query('SELECT * FROM users WHERE id = ?', [userId]);
+
+  // 4. Save to Cache for the next time!
+  // We MUST stringify it because Redis fundamentally stores Strings.
+  // We use EX (Expire) to set a TTL (Time To Live) of 3600 seconds (1 Hour).
+  await redis.set(cacheKey, JSON.stringify(dbData), 'EX', 3600);
+
+  return dbData;
+}
+```
+
+### Level 2 — Building Blocks (Cache Invalidation)
+Caching introduces the hardest problem in computer science: **Cache Invalidation**.
+
+If Alice updates her username to "Alicia" in the Database, but the Cache still holds "Alice" for the next 1 Hour, Alice will see her old name on the screen and assume the website is broken. **The data is Stale.**
+
+To fix this, whenever you UPDATE the database, you must aggressively delete the old data from the Cache!
+
+```javascript
+async function updateUsername(userId, newName) {
+  // 1. Update the Source of Truth (Database)
+  await db.query('UPDATE users SET name = ? WHERE id = ?', [newName, userId]);
+
+  // 2. INVALIDATE THE CACHE!
+  // The next time getUserProfile is called, it will be a Cache Miss, 
+  // forcing the system to pull the fresh data from the database!
+  const cacheKey = `user:profile:${userId}`;
+  await redis.del(cacheKey);
+  
+  return true;
+}
+```
+
+### Level 3 — Intermediate (The Thundering Herd Problem)
+Imagine a viral celebrity posts a tweet. The tweet is cached for 60 seconds. 100,000 people are viewing the tweet simultaneously.
+
+Exactly at the 60-second mark, the cache expires (TTL).
+In that exact millisecond, 10,000 requests hit the server. The server checks the cache. The cache is empty! 
+Because the cache is empty, **all 10,000 requests hit the slow Database at the exact same millisecond to fetch the tweet.** The database instantly crashes.
+
+This is called the **Thundering Herd** (or Cache Stampede).
+
+To solve this, we use **Mutex Locks**. When the first request gets a Cache Miss, it acquires a "Lock" in Redis. The other 9,999 requests see the Lock, and instead of hitting the database, they pause and wait 50ms. When the first request finishes saving the fresh data to the cache, it releases the lock, and the 9,999 waiting requests instantly read from the fresh cache!
+
+### Level 4 — Advanced (Eviction Policies)
+RAM is incredibly expensive. A database might have 10 Terabytes of data on cheap hard drives, but your Redis Cache might only have 16 Gigabytes of RAM. 
+You cannot fit the whole database into the cache.
+
+When the 16GB is 100% full, and you try to add a new item, what does Redis do? It uses an **Eviction Policy**.
+
+The industry standard policy is **LRU (Least Recently Used)**. 
+Redis looks at its memory, finds the specific piece of data that hasn't been requested in the longest amount of time (e.g., an old news article from 2012), deletes it to free up space, and inserts the new data. This guarantees that your 16GB of RAM is strictly dedicated to holding only the most "hot" and popular data.
+
+## REAL_WORLD
+While Cache-Aside is the most common pattern, Enterprise architectures also use:
+- **Write-Through Cache**: When updating data, you write it to the Cache and the Database *simultaneously* in a single transaction. This guarantees the cache is never stale, but adds latency to every write operation.
+- **Write-Back Cache**: You write data ONLY to the blazing-fast Cache and return success to the user instantly. Later, an asynchronous background worker slowly persists the data from the Cache to the slow Database. This makes writes lightning-fast, but if the Cache server loses power before the background worker runs, the data is permanently lost.
+
+## INTERVIEW
+**Q: Why don't we just cache absolutely everything?**
+A: Two reasons. First, RAM is astronomically more expensive than Disk storage. Second, Cache Invalidation is incredibly complex. The more data you cache, the higher the risk of serving stale, inconsistent data to the user. You only cache data that is read frequently and updated rarely (High Read/Write Ratio).
+
+**Q: What is a Cache Penetration attack?**
+A: A hacker intentionally requests User ID `-999999` over and over again. Because this user doesn't exist, it is a Cache Miss. The system hits the database, finds nothing, and returns an error. Because nothing was found, *nothing is saved to the cache*. Therefore, every single malicious request bypasses the cache and directly hammers the database, eventually crashing it. You solve this by **Caching Nulls** (caching the fact that the user doesn't exist!).
+
+**Q: Where should the Cache sit physically?**
+A: In a distributed system, you don't put the cache inside the local memory of the Web Server (because it's horizontally scaled and stateless). You deploy a completely separate cluster of dedicated Redis servers. All 50 Web Servers connect to this centralized Redis cluster over the internal network.

@@ -1,0 +1,153 @@
+---
+slug: "java-modules"
+title: "Java Modules (Project Jigsaw)"
+level: 4
+---
+
+## WHY
+For 20 years, Java applications were packaged into `.jar` files and dumped onto the classpath. The classpath is essentially a massive, flat playground. Every class can see every other public class. 
+If a library developer created a class called `InternalPasswordHasher` and marked it `public` (so they could use it across their own packages), any developer using that library could accidentally (or maliciously) access it. Furthermore, if you built a tiny "Hello World" app, you were forced to bundle the entire 200MB Java Runtime Environment (JRE) because the JVM didn't know which parts of Java you actually needed.
+
+In Java 9, **Project Jigsaw (The Java Module System)** was introduced to solve these structural nightmares. It provides strict encapsulation, strong boundaries, and allows you to strip the JVM down to a tiny, customized footprint.
+
+## THEORY
+### Modules vs. Packages
+A **Package** organizes classes (`java.util`). 
+A **Module** organizes packages. It is a group of related packages combined with a specific configuration file called `module-info.java`.
+
+The `module-info.java` file does two critical things:
+1. **Requires:** It explicitly lists which *other* modules this module depends on. (If you don't list it, the compiler blocks you).
+2. **Exports:** It explicitly lists which of its *own* packages are allowed to be seen by the outside world. (If you don't export a package, it is strictly sealed inside the module, even if the classes inside are `public`!).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "java-modules" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating a Module)
+Imagine we are building a payment processing library. We want developers to use our `PaymentProcessor`, but we absolutely do not want them touching our `PaymentValidator` or `CryptoUtils`.
+
+Our directory structure:
+```text
+src/
+└── com.mycompany.payment/
+    ├── module-info.java
+    ├── com/mycompany/payment/api/
+    │   └── PaymentProcessor.java
+    └── com/mycompany/payment/internal/
+        ├── PaymentValidator.java
+        └── CryptoUtils.java
+```
+
+The `module-info.java` file:
+```java
+module com.mycompany.payment {
+    // We EXPORT the api package. 
+    // Anyone using this module can import PaymentProcessor.
+    exports com.mycompany.payment.api;
+    
+    // We DO NOT export the internal package.
+    // CryptoUtils is strictly invisible to the outside world, 
+    // even if the class is marked 'public'!
+}
+```
+
+### Level 2 — Building Blocks (Consuming a Module)
+Now, imagine an e-commerce application that wants to use our payment module.
+
+Their directory structure:
+```text
+src/
+└── com.mycompany.store/
+    ├── module-info.java
+    └── com/mycompany/store/
+        └── Main.java
+```
+
+Their `module-info.java` file:
+```java
+module com.mycompany.store {
+    // We declare a STRICT DEPENDENCY on the payment module.
+    // Without this line, the compiler will error out if we try to import it!
+    requires com.mycompany.payment;
+}
+```
+
+Their `Main.java` file:
+```java
+package com.mycompany.store;
+
+// This works perfectly because the payment module 'exports' the api package!
+import com.mycompany.payment.api.PaymentProcessor;
+
+// ERROR! The compiler strictly blocks this! 
+// "package com.mycompany.payment.internal is not visible"
+// import com.mycompany.payment.internal.CryptoUtils;
+
+public class Main {
+    public static void main(String[] args) {
+        PaymentProcessor processor = new PaymentProcessor();
+        processor.process();
+    }
+}
+```
+
+### Level 3 — Intermediate (Transitive Dependencies)
+What if Module A requires Module B, and Module B requires Module C? Does A automatically get access to C?
+**No.** By default, dependencies are strictly isolated. If A wants to use C, A must explicitly `require` C in its own `module-info.java`.
+
+However, if Module B's public API *returns* objects from Module C, Module B can declare a **Transitive** dependency to gracefully pass the access along!
+
+```java
+module com.mycompany.database {
+    // The 'transitive' keyword means: 
+    // "Anyone who requires ME, automatically gets access to java.sql as well!"
+    requires transitive java.sql;
+    
+    exports com.mycompany.database.api;
+}
+```
+
+### Level 4 — Advanced (jlink - Custom JVM Runtimes)
+The true superpower of the Module System is `jlink`. 
+Because the Java standard library itself was broken into modules (e.g., `java.base`, `java.sql`, `java.desktop`), the JVM now knows exactly what parts of Java you actually use!
+
+You can run the `jlink` command-line tool to strip away 90% of the Java Runtime Environment, generating a hyper-optimized, tiny custom JVM just for your app.
+
+```bash
+# We tell jlink to look at our compiled modules and the JDK modules
+# It generates a custom runtime image in the "my-custom-jre" folder
+jlink \
+  --module-path compiled_mods/:$JAVA_HOME/jmods \
+  --add-modules com.mycompany.store \
+  --output my-custom-jre \
+  --strip-debug \
+  --compress 2 \
+  --no-header-files \
+  --no-man-pages
+```
+
+*Result:* Instead of forcing users to install a 200MB JVM, you can ship your application bundled with a custom 25MB JVM that contains *only* `java.base` and your specific code. This is revolutionary for Docker containers and cloud microservices!
+
+## REAL_WORLD
+**Spring Boot and The Unnamed Module**
+If modules are so powerful, why do so many modern Spring Boot applications ignore them?
+When you put a standard `.jar` file on the classpath (the old way) instead of the module-path (the new way), Java automatically drops it into the "Unnamed Module". The Unnamed Module acts exactly like Java 8: it exports everything and can read everything.
+Because enterprise apps depend on hundreds of third-party libraries (many of which haven't been updated to support `module-info.java`), adopting strict Modules requires a massive refactoring effort. Most developers rely on build tools (Maven/Gradle) to handle dependencies, and completely ignore Java Modules unless they are building strict low-level libraries or optimizing Docker footprints with `jlink`.
+
+## INTERVIEW
+**Q: My class `User` has `private` fields. A third-party library uses Reflection (`Field.setAccessible(true)`) to forcibly change the private fields. Does the Java Module System prevent this?**
+A: **Yes, absolutely!** This is called "Deep Reflection." 
+Before Java 9, Reflection could easily bypass `private` modifiers. With the Module System, strict encapsulation prevents modules from using Deep Reflection on other modules by default. 
+If you want to allow a framework (like Hibernate or Jackson) to use Reflection on your private fields, you must explicitly "open" your module to them in the `module-info.java`:
+```java
+module com.mycompany.models {
+    // Open the entire module to everyone for reflection
+    opens com.mycompany.models;
+    
+    // OR, selectively open it ONLY to Jackson!
+    opens com.mycompany.models to com.fasterxml.jackson.databind;
+}
+```

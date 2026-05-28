@@ -1,0 +1,167 @@
+---
+slug: "cte"
+title: "Common Table Expressions (CTEs)"
+level: 3
+---
+
+## WHY
+Complex SQL queries often require nested sub-queries inside sub-queries, resulting in code that is impossibly difficult to read, debug, and maintain. A query with 5 levels of nesting looks like the closing parentheses of a Lisp program.
+
+**CTEs (Common Table Expressions)**, defined with the `WITH` keyword, solve this by letting you assign a name to a sub-query and then reference it by name in the main query — just like naming a variable in code. This transforms a deeply nested one-liner into a series of clean, named, readable steps.
+
+## THEORY
+### How CTEs Work
+A CTE is a temporary, named result set that exists only for the duration of a single query. It does not save data to disk or create a database object. It is simply syntactic sugar — a way to organize complex logic into readable, sequential building blocks.
+
+You can define multiple CTEs in a single query, each one building on the previous, creating a data pipeline.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "sql-cte" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Basic CTE)
+```sql
+-- ❌ WITHOUT CTE: Deeply nested, impossible to read
+SELECT username, total_spend
+FROM (
+    SELECT user_id, SUM(amount) AS total_spend
+    FROM (
+        SELECT * FROM orders WHERE status = 'completed'
+    ) completed_orders
+    GROUP BY user_id
+) spending
+JOIN users ON spending.user_id = users.id
+WHERE total_spend > 1000;
+
+-- ✅ WITH CTE: Each step is clear and named!
+WITH completed_orders AS (
+    -- Step 1: Filter to only completed orders
+    SELECT * FROM orders WHERE status = 'completed'
+),
+
+user_spending AS (
+    -- Step 2: Sum the spending per user (references the CTE above!)
+    SELECT user_id, SUM(amount) AS total_spend
+    FROM completed_orders
+    GROUP BY user_id
+)
+
+-- Step 3: Join to users and filter
+SELECT u.username, us.total_spend
+FROM user_spending us
+JOIN users u ON us.user_id = u.id
+WHERE us.total_spend > 1000
+ORDER BY us.total_spend DESC;
+```
+
+### Level 2 — Building Blocks (Multiple CTEs in a Pipeline)
+```sql
+-- Sales performance analysis pipeline
+WITH 
+-- Step 1: Aggregate daily sales by product
+daily_product_sales AS (
+    SELECT
+        product_id,
+        DATE(order_date) AS sale_date,
+        SUM(quantity * unit_price) AS daily_revenue
+    FROM order_items
+    GROUP BY product_id, DATE(order_date)
+),
+
+-- Step 2: Calculate 7-day moving average
+product_trends AS (
+    SELECT
+        product_id,
+        sale_date,
+        daily_revenue,
+        AVG(daily_revenue) OVER (
+            PARTITION BY product_id
+            ORDER BY sale_date
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        ) AS moving_avg_7day
+    FROM daily_product_sales
+),
+
+-- Step 3: Identify high-performing days (above 120% of moving average)
+high_performing_days AS (
+    SELECT *
+    FROM product_trends
+    WHERE daily_revenue > (moving_avg_7day * 1.2)
+)
+
+-- Final result
+SELECT p.name AS product_name, hpd.sale_date, hpd.daily_revenue
+FROM high_performing_days hpd
+JOIN products p ON hpd.product_id = p.id
+ORDER BY hpd.daily_revenue DESC;
+```
+
+### Level 3 — Intermediate (Recursive CTEs)
+Recursive CTEs allow a CTE to reference itself, enabling traversal of hierarchical or graph data structures.
+
+```sql
+-- Find the complete organizational hierarchy under a given manager
+WITH RECURSIVE org_chart AS (
+    -- ANCHOR MEMBER (non-recursive base case): Start with the CEO
+    SELECT id, name, manager_id, 0 AS depth, name AS hierarchy_path
+    FROM employees
+    WHERE id = 1  -- CEO's ID
+
+    UNION ALL
+
+    -- RECURSIVE MEMBER: Find employees who report to the previous level
+    SELECT
+        e.id,
+        e.name,
+        e.manager_id,
+        oc.depth + 1,
+        oc.hierarchy_path || ' > ' || e.name
+    FROM employees e
+    INNER JOIN org_chart oc ON e.manager_id = oc.id  -- Self-reference!
+)
+
+SELECT
+    LPAD('', depth * 4, ' ') || name AS display_name,
+    depth AS org_level,
+    hierarchy_path
+FROM org_chart
+ORDER BY hierarchy_path;
+```
+
+### Level 4 — Advanced (Upsert with CTE)
+CTEs can be combined with DML statements for powerful data manipulation patterns.
+
+```sql
+-- Upsert pattern: Insert if new, update if exists
+WITH new_data (user_id, last_login) AS (
+    VALUES (123, NOW()), (456, NOW())
+)
+
+INSERT INTO user_sessions (user_id, last_login, login_count)
+SELECT nd.user_id, nd.last_login, 1
+FROM new_data nd
+
+ON CONFLICT (user_id) 
+DO UPDATE SET
+    last_login  = EXCLUDED.last_login,
+    login_count = user_sessions.login_count + 1;
+```
+
+## REAL_WORLD
+Recursive CTEs are the standard SQL approach for querying hierarchical data like:
+- **Organizational charts** (employees and managers)
+- **Bill of Materials** (a product contains sub-components, which contain sub-sub-components)
+- **Category trees** (Electronics > Laptops > Gaming Laptops)
+- **Comment threads** (a comment can have replies, which can have replies)
+
+The alternative to recursive CTEs is the **Closure Table** or **Nested Set** pattern — denormalized data structures that pre-compute ancestry relationships for faster reads but more expensive writes.
+
+## INTERVIEW
+**Q: What is the difference between a CTE and a View?**
+A: A **View** is a saved, named query that persists in the database schema permanently. Other queries can reference it anytime. A **CTE** is temporary, exists only for the duration of the single query that defines it, and is not saved to the database schema. You create a CTE when you need a throwaway building block for one complex query. You create a View when you need the same complex query to be reusable across many different queries and applications.
+
+**Q: What is the performance difference between a CTE and a subquery?**
+A: In most modern databases (PostgreSQL 12+), PostgreSQL automatically decides whether to "materialize" (cache) the CTE or "inline" (treat it as a subquery). In PostgreSQL 12+, by default CTEs are inlined (NOT materialized), so they are generally equivalent in performance. You can force materialization with `WITH cte AS MATERIALIZED (...)` if you specifically need the CTE to be computed only once.

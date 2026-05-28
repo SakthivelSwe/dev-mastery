@@ -1,0 +1,117 @@
+---
+slug: "monorepo-git"
+title: "Monorepo Git Workflows"
+level: 4
+---
+
+## WHY
+As a company grows, splitting every microservice and UI package into its own repository (Polyrepo) creates massive overhead. Sharing code requires publishing npm/maven packages, coordinating PRs across 5 repositories is a nightmare, and version mismatches cause production outages.
+A **Monorepo** places all projects into a single Git repository. This solves the sharing and versioning problems but introduces new challenges for Git performance and CI/CD.
+
+## THEORY
+### Polyrepo vs Monorepo
+- **Polyrepo:** `repo-api`, `repo-frontend`, `repo-shared-ui`. Easy Git performance, hard code sharing.
+- **Monorepo:** One repo containing `apps/api`, `apps/frontend`, `packages/shared-ui`. Easy code sharing, atomic commits (one commit updates the API and the UI simultaneously).
+
+### The Monorepo Tooling
+Git alone isn't enough for a large monorepo. You need build systems (Turborepo, Nx, Bazel) to:
+1. Only run tests for the apps that actually changed.
+2. Manage internal dependencies (linking `shared-ui` into `frontend` without publishing to npm).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "monorepo" }
+```
+
+## CODE
+
+### Typical Monorepo Structure
+```
+my-company-monorepo/
+├── apps/
+│   ├── web-client/        (Next.js)
+│   ├── admin-dashboard/   (React)
+│   └── payment-api/       (Node.js)
+├── packages/
+│   ├── ui-components/     (Shared React components)
+│   ├── database-client/   (Prisma/Typescript models)
+│   └── eslint-config/     (Shared linting rules)
+├── package.json           (Workspaces defined here)
+└── turbo.json             (Build pipeline definition)
+```
+
+### NPM/Yarn Workspaces
+Workspaces tell the package manager to link local folders together instead of downloading them from the internet.
+
+```json
+// package.json at the root of the monorepo
+{
+  "name": "my-company-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
+```
+
+Now, inside `apps/web-client/package.json`:
+```json
+{
+  "dependencies": {
+    "ui-components": "*",
+    "database-client": "*"
+  }
+}
+```
+When you run `npm install`, npm creates symlinks in `apps/web-client/node_modules/` pointing directly to the `packages/` folders!
+
+### Smart CI with Turborepo
+If you change a file in `apps/web-client`, you don't want CI to run tests for `payment-api`.
+
+```bash
+# Run tests only for projects that changed compared to the 'main' branch
+npx turbo run test --filter="...[origin/main]"
+```
+This is the secret to monorepo scalability: executing tasks *only* on the affected dependency graph.
+
+### Git Sparse Checkout
+If the monorepo gets truly massive (gigabytes of history), cloning the whole thing is too slow.
+
+```bash
+# Clone the repo but don't download any files yet
+git clone --filter=blob:none --no-checkout https://github.com/myorg/massive-repo.git
+cd massive-repo
+
+# Initialize sparse checkout
+git sparse-checkout init --cone
+
+# Tell Git to ONLY populate the 'apps/payment-api' folder (and root files)
+git sparse-checkout set apps/payment-api
+
+# Check out the files
+git checkout main
+```
+This keeps your local machine fast even if the repository contains 100 other apps!
+
+## REAL_WORLD
+**Atomic Commits**
+The biggest advantage of a monorepo is the **atomic commit**.
+Suppose you rename a column in the database from `userId` to `customer_id`.
+In a Polyrepo, you have to:
+1. PR to the DB schema repo. Wait for CI. Publish package.
+2. PR to the API repo using the new package. Wait for CI. Deploy.
+3. PR to the Frontend repo to handle the new API response.
+
+In a Monorepo:
+You change the database schema, the API code, and the Frontend code in exactly ONE commit and ONE Pull Request. They are tested together and merged together. There is no possibility of version mismatch.
+
+## INTERVIEW
+**Q: Your company is considering moving 20 microservices into a single monorepo. What are the major drawbacks or challenges they need to prepare for?**
+
+A: While monorepos solve code sharing, they introduce significant tooling and scaling challenges:
+
+1. **CI Pipeline Complexity:** You can no longer just run `npm test` on push. You *must* implement tooling (like Nx or Turborepo) to detect which apps were affected by a commit and only test/build those. Otherwise, CI will take hours.
+2. **Access Control:** GitHub's granular permissions (read/write access) are per-repository. In a monorepo, if a developer needs write access to the UI, they inherently get write access to the API and infrastructure code too. You must rely heavily on branch protection and `CODEOWNERS` files to enforce review requirements.
+3. **Git Performance:** Over time, as thousands of commits touch the repo daily, `git status` and `git clone` become slow. Teams may need to adopt Git sparse-checkout and partial clones.
+4. **Deploy Coordination:** Since everything merges to one `main` branch, you need advanced deployment scripts to figure out which specific microservices actually need to be redeployed to Kubernetes based on the commit diff.

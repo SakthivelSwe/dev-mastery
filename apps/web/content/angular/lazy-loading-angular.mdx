@@ -1,0 +1,161 @@
+---
+slug: "lazy-loading-angular"
+title: "Lazy Loading"
+level: 3
+---
+
+## WHY
+If your application has 500 components, an Admin Dashboard, a User Settings page, and a complex Billing interface, bundling all of that into a single `main.js` file will result in a 10MB download. When a user navigates to your site, they will stare at a blank white screen for 8 seconds while their phone downloads 10MB of JavaScript for pages they haven't even visited yet.
+
+Angular solves this using **Lazy Loading**. The AOT Compiler splits your application into dozens of smaller "chunks." When the user visits `/home`, they only download the 50KB chunk required for the Home page. The Admin Dashboard code is never downloaded. Only when the user physically clicks the "Admin" button does Angular seamlessly reach out to the server, download the specific Admin chunk in the background, and render it.
+
+## THEORY
+### Code Splitting
+Lazy Loading is entirely dependent on the Angular Router. You tell the Router: *"When the user hits this URL, do NOT load a component. Instead, `loadComponent` or `loadChildren` from an entirely different file over the network."* 
+
+Webpack/Esbuild intercepts this command during `ng build` and physically cuts that file (and all its dependencies) out of the `main.js` bundle, placing it in a separate file (e.g., `chunk-4X92Z.js`).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "angular-lazy-loading" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Lazy Loading a Single Standalone Component)
+In modern Angular (14+), you can lazy load a single Standalone Component with one line of code.
+
+```typescript
+import { Routes } from '@angular/router';
+import { HomeComponent } from './home/home.component';
+// We DO NOT import the AdminComponent at the top of the file! 
+// If we did, the compiler would bundle it immediately!
+
+export const routes: Routes = [
+  // Eagerly Loaded (Bundled in main.js)
+  { path: 'home', component: HomeComponent },
+  
+  // Lazily Loaded!
+  { 
+    path: 'admin', 
+    // We use a dynamic import() statement!
+    loadComponent: () => import('./admin/admin.component').then(m => m.AdminComponent)
+  }
+];
+```
+That's it! When the user hits `/admin`, Angular triggers the dynamic import, downloads `admin.component.js` over the network, and renders it.
+
+### Level 2 — Building Blocks (Lazy Loading a Nested Route Tree)
+Usually, you don't just lazy load one component. You lazy load an entire feature area (like `/settings`, which has its own child routes `/settings/profile` and `/settings/billing`).
+
+```typescript
+// 1. We create a SEPARATE routing file just for the Settings feature!
+// settings.routes.ts
+import { Routes } from '@angular/router';
+import { ProfileComponent } from './profile.component';
+import { BillingComponent } from './billing.component';
+
+export const settingsRoutes: Routes = [
+  { path: 'profile', component: ProfileComponent },
+  { path: 'billing', component: BillingComponent }
+];
+```
+
+```typescript
+// 2. In the MAIN app.routes.ts
+import { Routes } from '@angular/router';
+
+export const routes: Routes = [
+  { 
+    path: 'settings', 
+    // We load the ENTIRE child route tree dynamically!
+    loadChildren: () => import('./settings/settings.routes').then(m => m.settingsRoutes)
+  }
+];
+```
+
+### Level 3 — Intermediate (Preloading Strategies)
+Lazy loading creates a slight problem: When the user clicks the "Admin" button, they have to wait 200ms for the network to download the chunk before the page renders. This can feel sluggish.
+
+Angular provides a brilliant solution: **Preloading**.
+You can tell the Router: *"Render the Home page immediately. Once the Home page is fully loaded and the CPU is idle, secretly start downloading the Lazy Loaded chunks in the background before the user even clicks the button!"*
+
+```typescript
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideRouter, PreloadAllModules } from '@angular/router';
+import { routes } from './app.routes';
+import { AppComponent } from './app.component';
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    // We provide the router, and pass in the PreloadAllModules strategy!
+    provideRouter(routes, withPreloading(PreloadAllModules))
+  ]
+});
+```
+Now, the initial load is blazing fast (because the bundle is tiny), but subsequent navigations are instant (because the chunks were downloaded in the background)!
+
+### Level 4 — Advanced (Custom Preloading Strategies)
+`PreloadAllModules` is great, but if you have 50 lazy routes, downloading all of them in the background might crush the user's mobile data plan. 
+
+You can write a Custom Preloading Strategy to only preload *specific* high-priority routes!
+
+```typescript
+import { Injectable } from '@angular/core';
+import { PreloadingStrategy, Route } from '@angular/router';
+import { Observable, of } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class CustomPreloadStrategy implements PreloadingStrategy {
+  
+  // This method intercepts every lazy route in the application
+  preload(route: Route, load: () => Observable<any>): Observable<any> {
+    
+    // We check the custom 'data' object on the route configuration
+    if (route.data && route.data['preloadMe']) {
+      return load(); // Trigger the download!
+    }
+    
+    return of(null); // Do not download!
+  }
+}
+```
+
+```typescript
+// In app.routes.ts
+export const routes: Routes = [
+  { 
+    path: 'admin', 
+    loadChildren: () => import('./admin.routes').then(m => m.routes),
+    // We tag this route to be preloaded!
+    data: { preloadMe: true } 
+  },
+  { 
+    path: 'obscure-feature', 
+    loadChildren: () => import('./obscure.routes').then(m => m.routes)
+    // No tag, so it will NOT be preloaded!
+  }
+];
+```
+
+## REAL_WORLD
+Before Angular 14 Standalone Components, Lazy Loading was vastly more complicated. You couldn't lazy load a Component or a Routes Array. You were forced to lazy load `NgModules`. 
+
+You will see this legacy syntax in millions of older enterprise codebases:
+```typescript
+// LEGACY ANGULAR (Do not write new code like this)
+const routes: Routes = [
+  {
+    path: 'admin',
+    loadChildren: () => import('./admin/admin.module').then(m => m.AdminModule)
+  }
+];
+```
+This required creating massive boilerplate `NgModules` purely for the purpose of tricking Webpack into code-splitting the application. Standalone Components eliminated this entirely.
+
+## INTERVIEW
+**Q: How does the Angular compiler know exactly which files to put into a separate chunk?**
+A: Webpack/Esbuild performs Static Analysis. When it sees the dynamic `import('./admin/admin.component')` statement, it parses `admin.component.ts`. It then parses every single file that `admin.component.ts` imports, recursively. All of those files are gathered up and bundled into `chunk-XYZ.js`.
+
+**Q: Can you apply a Route Guard (like `canActivate`) to a Lazy Loaded route?**
+A: Yes, but you must be careful. If you use `canActivate`, Angular will *download the chunk over the network first*, and then run the guard to see if the user is allowed to view it. If they aren't, you just wasted their bandwidth. Instead, use the `canMatch` (or legacy `canLoad`) guard! `canMatch` evaluates the rules *before* downloading the chunk. If the guard returns false, Angular cancels the network request!

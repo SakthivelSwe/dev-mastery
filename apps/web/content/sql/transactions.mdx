@@ -1,0 +1,120 @@
+---
+slug: "transactions"
+title: "SQL Transactions (ACID)"
+level: 3
+---
+
+## WHY
+Imagine you are building a banking application. Alice wants to transfer $100 to Bob. The logic requires two SQL queries:
+1. Deduct $100 from Alice's account.
+2. Add $100 to Bob's account.
+
+What happens if the database crashes exactly after step 1 finishes, but before step 2 starts? Alice lost $100, but Bob never received it. The money evaporated. 
+
+**Database Transactions** solve this. A transaction groups multiple SQL operations into a single, indivisible unit of work. It guarantees that either *all* the operations succeed, or *none* of them do.
+
+## THEORY
+### The ACID Properties
+Relational databases guarantee reliability through ACID:
+- **Atomicity:** The "All or Nothing" rule. If a transaction fails halfway through, all previous steps are rolled back.
+- **Consistency:** The database transitions from one valid state to another valid state, never breaking constraints (like Foreign Keys or checks).
+- **Isolation:** Concurrent transactions running at the same time do not interfere with each other. They behave as if they were running sequentially.
+- **Durability:** Once a transaction is "Committed", the data is permanently saved to the hard drive. Even if you pull the power cord out of the server 1 millisecond later, the data is safe.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "sql-transactions" }
+```
+
+## CODE
+
+### Level 1 — Beginner (BEGIN, COMMIT, ROLLBACK)
+By default, every single SQL statement you run is treated as its own transaction (Autocommit). To group them, you must explicitly start a transaction block.
+
+```sql
+-- 1. Start the transaction block
+BEGIN; 
+
+-- 2. Execute operations
+UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
+UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
+
+-- At this exact moment, Alice and Bob CANNOT see the updated balances yet!
+-- The changes are isolated inside this transaction.
+
+-- 3. Save the changes permanently to the database
+COMMIT; 
+```
+
+What if something goes wrong?
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
+-- Oh no, we realized Bob's account is closed!
+
+-- Discard all changes made since the BEGIN statement!
+-- Alice's balance reverts back to its original state instantly.
+ROLLBACK;
+```
+
+### Level 2 — Building Blocks (Savepoints)
+Sometimes you don't want to rollback the entire transaction, just a specific part of it. You can use Savepoints.
+
+```sql
+BEGIN;
+
+INSERT INTO orders (id, user_id) VALUES (1, 99);
+
+-- Create a checkpoint
+SAVEPOINT before_item;
+
+INSERT INTO order_items (order_id, product_id) VALUES (1, 'OUT_OF_STOCK_ITEM');
+-- Error! Product doesn't exist.
+
+-- Rollback ONLY the order_item insert, keep the main order insert!
+ROLLBACK TO SAVEPOINT before_item;
+
+-- Try a different item instead
+INSERT INTO order_items (order_id, product_id) VALUES (1, 'IN_STOCK_ITEM');
+
+COMMIT;
+```
+
+### Level 3 — Intermediate (Isolation Levels and Race Conditions)
+If Alice and Charlie both try to send $100 to Bob at the exact same millisecond, what happens? 
+SQL provides 4 Isolation Levels to handle concurrent access:
+
+1. **Read Uncommitted (Lowest):** Transactions can read uncommitted data from other transactions. Causes "Dirty Reads". (Almost never used).
+2. **Read Committed (Default in Postgres):** A query only sees data that was committed before the query began. 
+3. **Repeatable Read:** Guarantees that if you read a row twice inside a transaction, the data won't change, even if another transaction committed an update in the meantime.
+4. **Serializable (Highest):** Guarantees that concurrent transactions execute as if they were running one after another in a straight line. Perfectly safe, but very slow.
+
+### Level 4 — Advanced (Row-Level Locking / SELECT FOR UPDATE)
+To prevent race conditions without using slow Serializable isolation, you can manually lock specific rows during a transaction!
+
+```sql
+BEGIN;
+
+-- Lock Bob's row so NO ONE ELSE can read or update it until this transaction finishes!
+-- If Charlie tries to update Bob's account right now, Charlie's query will FREEZE 
+-- and wait until our transaction commits.
+SELECT balance FROM accounts WHERE name = 'Bob' FOR UPDATE;
+
+-- Application logic calculates new balance in code...
+UPDATE accounts SET balance = 600 WHERE name = 'Bob';
+
+-- The lock is released! Now Charlie's frozen query will unfreeze and execute.
+COMMIT;
+```
+This is how e-commerce sites prevent selling the last concert ticket to two different people at the exact same time.
+
+## REAL_WORLD
+**Deadlocks**
+A deadlock happens when two transactions are waiting for each other to release locks, causing an infinite standoff.
+- Transaction A locks Row 1, and needs Row 2.
+- Transaction B locks Row 2, and needs Row 1.
+Neither can proceed. Modern databases detect deadlocks automatically, kill one of the transactions (throwing an error to the application), and let the other proceed. Your backend code (Node, Java, etc.) must be designed to catch Deadlock Exceptions and automatically retry the transaction!
+
+## INTERVIEW
+**Q: How does a database guarantee Durability if it writes to RAM (buffer) first for performance?**
+A: **The Write-Ahead Log (WAL)**. Before a transaction is allowed to return a `COMMIT SUCCESS` to the user, the database engine sequentially appends the raw bytes of the change to an append-only file on the hard drive (the WAL). Sequential writes to disk are blazing fast. The actual main database table files (which require slow random I/O) are updated later asynchronously in the background. If the power fails, upon reboot, the database reads the WAL and replays any changes that hadn't yet been written to the main tables.

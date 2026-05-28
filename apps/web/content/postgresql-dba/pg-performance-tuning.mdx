@@ -1,0 +1,93 @@
+---
+slug: "pg-performance-tuning"
+title: "PostgreSQL Performance Tuning (postgresql.conf)"
+level: 5
+---
+
+## WHY
+When you install PostgreSQL on a massive $10,000 server with 128GB of RAM and 32 CPU cores, it will still perform like it is running on a Raspberry Pi. 
+Why? Because the default `postgresql.conf` file is intentionally tuned to use almost zero resources so that it can run on any machine without crashing the OS.
+As a DBA, you must immediately tune the Postgres memory, disk, and connection settings to actually utilize the hardware you paid for.
+
+## THEORY
+### The PostgreSQL Memory Model
+PostgreSQL manages memory in two completely distinct ways:
+1. **Shared Memory (`shared_buffers`):** A massive chunk of RAM reserved globally for the entire database. It acts as the primary cache for all data pages read from the disk. All connections share this pool.
+2. **Local Memory (`work_mem` & `maintenance_work_mem`):** Tiny chunks of RAM allocated dynamically to *each individual connection* to perform specific tasks (like sorting, hashing, or building indexes).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-tuning" }
+```
+
+## CODE
+
+### Level 1 — Tuning Shared Memory (`shared_buffers`)
+If data is not in `shared_buffers`, Postgres must physically read it from the hard drive (Disk IO), which is incredibly slow.
+You must tell Postgres to use a large portion of the server's RAM for caching.
+
+```ini
+# postgresql.conf
+
+# The Default is 128MB. Completely useless for production.
+# The Rule of Thumb: Set this to 25% of the server's total RAM.
+# If the server has 128GB of RAM:
+shared_buffers = 32GB
+```
+*Why only 25%? Why not 80%?*
+Because PostgreSQL relies heavily on the **Linux Kernel Page Cache** (the OS's own file cache). If you give Postgres 80% of the RAM, Linux has no RAM left to cache the actual file system, leading to double-buffering and terrible performance. 25-40% is the mathematical sweet spot.
+
+### Level 2 — Tuning Local Memory (`work_mem`)
+This is the most dangerous setting in PostgreSQL.
+`work_mem` dictates how much RAM a *single query* can use for sorting (`ORDER BY`) or Hash Joins before it spills to the slow hard drive.
+
+```ini
+# The Default is 4MB. 
+# A massive Hash Join will spill to disk and take minutes.
+work_mem = 64MB
+```
+*The Trap:* `work_mem` is NOT a global limit. It is a per-operation limit! 
+If `work_mem = 64MB`, and a complex query executes 3 Hash Joins and 2 Sorts, that SINGLE query might consume $5 \times 64 = 320MB$ of RAM. 
+If 100 users run that query simultaneously... $100 \times 320MB = 32GB$ of RAM consumed instantly! 
+If you set `work_mem` too high, your database will run out of memory and the Linux OOM Killer will forcefully terminate the PostgreSQL process. 
+**Rule:** `work_mem` = (Total RAM - `shared_buffers`) / (Max Connections * 3).
+
+### Level 3 — Disk Tuning (WAL Settings)
+Writing the Write-Ahead Log (WAL) to disk is the primary bottleneck for `INSERT/UPDATE` performance. Postgres tries to balance data safety (flushing to disk immediately) with speed.
+
+```ini
+# The default checkpoint timeout is 5 minutes.
+# This forces Postgres to aggressively flush dirty data from RAM to Disk too often, causing massive IO spikes.
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9
+
+# Allow the WAL to grow larger between checkpoints so Postgres can batch writes!
+max_wal_size = 4GB 
+min_wal_size = 1GB
+```
+*(The `checkpoint_completion_target = 0.9` is critical. It tells Postgres to spread the massive disk writes slowly over 90% of the 15-minute window, instead of dumping 4GB of data to the hard drive all at once and causing a 10-second lag spike for all users).*
+
+### Level 4 — Parallel Queries
+Modern servers have 32 or 64 CPU cores. By default, a single Postgres query will only ever use exactly **ONE** CPU core. If a data scientist runs a massive `SELECT COUNT(*)`, 31 cores sit completely idle while 1 core does all the work!
+
+```ini
+# Enable Parallel Query Execution!
+max_worker_processes = 8
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 8
+```
+With these settings, if Postgres detects a massive query that scans a huge table, it will spin up 4 separate background workers to scan the table simultaneously across 4 CPU cores, drastically reducing the execution time!
+
+## REAL_WORLD
+**pgtune (The Easy Button)**
+Nobody memorizes the math to calculate `work_mem` or `checkpoint_segments`. 
+In the real world, DBAs use **pgtune** (available as a web tool at pgtune.leopard.in.ua). 
+You input your OS, Total RAM, Total CPUs, and Workload Type (Web, Data Warehouse, Mixed). Pgtune outputs the mathematically optimal `postgresql.conf` parameters instantly. It is the industry standard starting point for tuning any new server.
+
+## INTERVIEW
+**Q: A developer runs a massive `CREATE INDEX` on a 500GB table. It is taking 6 hours. CPU is low, Disk IO is moderate. How do you tune the server specifically to speed up index creation and vacuuming without affecting `work_mem` for normal users?**
+A: **maintenance_work_mem.**
+Routine maintenance tasks like `CREATE INDEX`, `VACUUM`, and `ALTER TABLE` do not use the tiny `work_mem` setting. They use a dedicated setting called `maintenance_work_mem`.
+Because these tasks are run infrequently by DBAs (not 1,000 times a second by web users), you can safely allocate massive amounts of RAM to them!
+The default is 64MB. If you are building an index on a 500GB table, Postgres will hit that 64MB limit instantly and write temporary sorting files to the hard drive for 6 hours.
+You should set `maintenance_work_mem = 2GB` (or even higher on a large server). When you run `CREATE INDEX`, Postgres will sort the B-Tree entirely in RAM, reducing the 6-hour index creation down to 15 minutes!

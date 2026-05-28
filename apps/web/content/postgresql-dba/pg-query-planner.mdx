@@ -1,0 +1,106 @@
+---
+slug: "pg-query-planner"
+title: "PostgreSQL Query Planner (EXPLAIN)"
+level: 5
+---
+
+## WHY
+When you write `SELECT * FROM users WHERE age > 25`, PostgreSQL does not just magically grab the data. 
+The database engine must mathematically decide the absolute fastest way to get that data. Should it use the B-Tree index? Should it just scan the entire table? Should it sort the data in RAM, or write it to a temporary file on disk?
+This decision engine is the **Query Planner**. If the Query Planner makes a mistake, a query that should take 5 milliseconds might take 5 hours. To fix slow queries, you must learn how to read the Planner's mind using the `EXPLAIN` command.
+
+## THEORY
+### Cost-Based Optimization
+The PostgreSQL Query Planner is Cost-Based. It evaluates dozens of different Execution Plans, assigns a mathematical "Cost" to each one, and executes the plan with the lowest cost.
+- **Cost** is an arbitrary unit representing CPU cycles and Disk I/O.
+- To calculate the cost, the planner relies entirely on **Table Statistics** (e.g., how many rows are in the table? How many unique values are in the `age` column? Are they evenly distributed?).
+
+If the Table Statistics are out of date, the Planner will make terrible decisions!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-explain" }
+```
+
+## CODE
+
+### Level 1 — EXPLAIN vs. EXPLAIN ANALYZE
+Never run `EXPLAIN` by itself to debug a performance issue.
+
+```sql
+-- BAD: This only shows you what Postgres THINKS will happen (The Plan).
+EXPLAIN SELECT * FROM orders WHERE user_id = 123;
+
+-- GOOD: This forces Postgres to actually EXECUTE the query, 
+-- and compares its guesses against reality!
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;
+```
+
+### Level 2 — Reading the Output (Bottom-Up)
+The output of `EXPLAIN ANALYZE` is a tree of nodes. You must read it from the **Bottom-Up** or **Inside-Out**. The most deeply indented node is the first operation executed.
+
+```text
+Limit  (cost=0.43..3.45 rows=10 width=80) (actual time=0.035..0.040 rows=10 loops=1)
+  ->  Index Scan using idx_orders_user on orders  (cost=0.43..302.12 rows=1000 width=80) (actual time=0.034..0.038 rows=10 loops=1)
+        Index Cond: (user_id = 123)
+Planning Time: 0.150 ms
+Execution Time: 0.065 ms
+```
+
+**How to decipher this:**
+1. **The Node Type:** `Index Scan` (It used the index! Good!)
+2. **The Guess (cost/rows):** `(cost=0.43..302.12 rows=1000)` Postgres guessed this would cost 302 units, and guessed it would find 1,000 rows matching the user_id.
+3. **The Reality (actual time/rows):** `(actual time=0.034..0.038 rows=10)` It actually took 0.038 milliseconds, and it only found 10 rows!
+4. **The Disconnect:** Postgres guessed 1,000 rows, but only found 10. The statistics are slightly wrong!
+
+### Level 3 — The Three Scan Types
+When debugging, you are primarily looking for how Postgres accesses the raw tables.
+1. **Seq Scan (Sequential Scan):** Reads every single block of the table file. 
+   - *Good:* If the table is tiny (100 rows), or if you are `SELECT *` without a WHERE clause.
+   - *Bad:* If the table has 10 million rows and you only want 1 row. You are missing an index!
+2. **Index Scan:** Traverses the B-Tree, reads the TID, and fetches the row from the table.
+   - *Good:* Fetching a small percentage of rows.
+3. **Index Only Scan:** The absolute fastest. The data was found entirely inside the Index Leaf Node. No table fetching required!
+
+### Level 4 — The Three Join Algorithms
+When you `JOIN` two tables, the Planner has three algorithms to choose from. This is where most performance issues hide.
+
+1. **Nested Loop Join:** 
+   - *How:* Loops over Table A, and for every row, runs an Index Scan on Table B. 
+   - *Good:* If Table A is very small (e.g., 5 rows).
+   - *Bad:* If Table A has 100,000 rows, it will execute 100,000 separate index scans!
+2. **Hash Join:** 
+   - *How:* Reads Table A completely into RAM, builds a Hash Table. Then reads Table B, hashes the join column, and instantly checks the Hash Table for a match.
+   - *Good:* Incredibly fast for joining two massive tables!
+   - *Bad:* If Table A is too big to fit in RAM (exceeds `work_mem`), it spills to the hard drive, destroying performance.
+3. **Merge Join:** 
+   - *How:* Requires both tables to be pre-sorted. It zips them together in a single pass.
+   - *Good:* Fast for massive tables if the join columns are already indexed (sorted).
+
+## REAL_WORLD
+**Fixing Bad Statistics (`ANALYZE`)**
+If the Query Planner thinks a query will return 5 rows, it chooses a **Nested Loop Join**. 
+If reality hits and the query actually returns 500,000 rows, the Nested Loop Join will take hours to complete! 
+
+Why did the planner guess 5 instead of 500,000? Because the internal statistics are outdated.
+Normally, the Autovacuum daemon updates statistics in the background. But if you just inserted 5 million rows in a massive batch script, Autovacuum might not have run yet!
+
+If you see a massive discrepancy between `rows=5` (the guess) and `actual rows=500000` (reality) in your `EXPLAIN ANALYZE` output, the immediate fix is to manually run:
+```sql
+-- This scans the table and updates the mathematical statistics instantly!
+ANALYZE my_table;
+```
+Then run the query again. The planner will see the new statistics, realize a Nested Loop is a terrible idea, switch to a Hash Join, and the query will finish in 2 seconds!
+
+## INTERVIEW
+**Q: You run `EXPLAIN ANALYZE` and notice a step called `Sort  (cost=... actual time=...)`. Right beneath it, there is a warning: `Sort Method: external merge Disk: 500MB`. The query takes 15 seconds. How do you fix this?**
+A: **Increase `work_mem`.**
+When you use `ORDER BY` or execute a Hash Join, Postgres attempts to perform the sorting/hashing entirely in RAM for maximum speed. 
+The amount of RAM Postgres is allowed to use *per query operation* is defined by the `work_mem` setting in `postgresql.conf` (default is a measly 4MB!).
+If the data you are trying to sort requires 500MB, Postgres hits the 4MB limit and panics. It spills the sorting operation to the physical hard drive (creating temporary files). Disk is thousands of times slower than RAM, causing the 15-second delay.
+By temporarily increasing `work_mem` for that specific query (or globally if your server has enough RAM), the sort will happen entirely in memory and finish in milliseconds.
+```sql
+-- Fix the query at the session level!
+SET work_mem = '1GB';
+SELECT * FROM massive_table ORDER BY date DESC;
+```

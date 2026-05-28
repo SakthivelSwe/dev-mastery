@@ -1,0 +1,125 @@
+---
+slug: "indexes-mongodb"
+title: "MongoDB Indexing"
+level: 3
+---
+
+## WHY
+If you have a collection of 5 million users and run `db.users.find({ age: 30 })`, MongoDB must load all 5 million documents from the hard drive into RAM, deserialize the BSON, and check the `age` field of every single one. This is called a **Collection Scan** (COLLSCAN), and it will completely destroy your database performance.
+
+An **Index** is a highly optimized data structure (a B-Tree) that stores a small portion of the collection's data set in an easy to traverse form. It allows MongoDB to find the matching documents in milliseconds without scanning the entire collection.
+
+## THEORY
+### How Indexes Work in MongoDB
+Indexes in MongoDB function almost exactly like indexes in a relational SQL database. They store the value of a specific field (or set of fields) ordered by the value. 
+Because the data is ordered, MongoDB can use algorithms like Binary Search to find the exact entry extremely quickly. Once it finds the index entry, it uses the embedded pointer to jump straight to the full document on disk.
+
+Every MongoDB collection automatically has an index on the `_id` field. You cannot delete this index.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-indexes" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Single Field Indexes)
+```javascript
+// A standard query that causes a slow COLLSCAN
+db.users.find({ email: "alice@example.com" })
+
+// Create an index on the 'email' field. 
+// The '1' specifies ascending order. '-1' specifies descending order.
+db.users.createIndex({ email: 1 })
+
+// Now the exact same query is blazing fast! (IXSCAN)
+
+// You can also enforce uniqueness at the database level!
+db.users.createIndex({ email: 1 }, { unique: true })
+// If you try to insert a duplicate email, MongoDB will throw an error.
+```
+
+### Level 2 — Building Blocks (Compound Indexes)
+Often, you query on multiple fields simultaneously.
+
+```javascript
+// We want to find active users sorted by their creation date
+db.users.find({ status: "active" }).sort({ createdAt: -1 })
+
+// A single-field index on 'status' helps find active users, but MongoDB 
+// still has to pull them into memory and sort them manually (In-Memory Sort).
+// In-Memory sorts are slow and will fail if they use more than 32MB of RAM!
+
+// Solution: A Compound Index
+db.users.createIndex({ status: 1, createdAt: -1 })
+```
+
+**The ESR Rule (Equality, Sort, Range)**
+When designing a compound index, field order matters immensely!
+1. **[E]quality:** Fields that are checked for an exact match (`status: "active"`) should come FIRST.
+2. **[S]ort:** Fields used to determine the order (`sort({ createdAt: -1 })`) should come SECOND.
+3. **[R]ange:** Fields used for ranges (`age: { $gt: 18 }`) should come LAST.
+
+### Level 3 — Intermediate (Multikey Indexes for Arrays)
+One of MongoDB's most powerful features is the ability to index arrays!
+
+```javascript
+// Document structure:
+{ title: "MongoDB Guide", tags: ["database", "nosql", "programming"] }
+
+// Create an index on the array field
+db.articles.createIndex({ tags: 1 })
+
+// MongoDB automatically creates a "Multikey Index". 
+// Behind the scenes, it creates THREE separate index entries for this one document, 
+// allowing you to instantly search for any article containing the tag "nosql"!
+db.articles.find({ tags: "nosql" })
+```
+*Note: You cannot create a compound index where TWO fields are arrays. It would cause an explosion of permutations (a Cartesian product of the index keys).*
+
+### Level 4 — Advanced (Text and Geospatial Indexes)
+MongoDB provides specialized indexes for complex data types.
+
+**Text Indexes (Basic Search Engine)**
+Instead of using slow `$regex` queries, you can create a Text Index to perform Google-style keyword searches across strings.
+```javascript
+db.articles.createIndex({ content: "text", title: "text" })
+
+// Search for articles containing "database" OR "nosql"
+db.articles.find({ $text: { $search: "database nosql" } })
+```
+
+**2dsphere Indexes (Location Data)**
+If you are building an Uber clone, you need to find the closest drivers.
+```javascript
+// Document with GeoJSON point data
+{ name: "Central Park", location: { type: "Point", coordinates: [-73.97, 40.78] } }
+
+db.places.createIndex({ location: "2dsphere" })
+
+// Find places within 500 meters!
+db.places.find({
+  location: {
+    $near: {
+      $geometry: { type: "Point", coordinates: [-73.98, 40.77] },
+      $maxDistance: 500
+    }
+  }
+})
+```
+
+## REAL_WORLD
+**The TTL (Time-To-Live) Index**
+Need to automatically delete session tokens after 24 hours? Or delete log entries after 30 days? You don't need to write a cron job. You can use a TTL index!
+
+```javascript
+// Tell MongoDB to automatically delete documents 3600 seconds (1 hour) 
+// after the timestamp stored in the 'createdAt' field!
+db.sessions.createIndex({ "createdAt": 1 }, { expireAfterSeconds: 3600 })
+```
+MongoDB runs a background thread every 60 seconds that sweeps through TTL indexes and deletes expired documents automatically.
+
+## INTERVIEW
+**Q: How do you verify if MongoDB is actually using your index?**
+A: You append `.explain("executionStats")` to your query. 
+If the output says `"stage": "COLLSCAN"`, it missed the index and scanned the whole collection. If it says `"stage": "IXSCAN"`, it successfully used an index. Furthermore, look at `"totalDocsExamined"`. If the query returned 5 documents, but `totalDocsExamined` is 500,000, your index is poorly designed (likely violating the ESR rule) because the database still had to pull half a million documents off the disk to filter them.

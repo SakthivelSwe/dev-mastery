@@ -1,0 +1,123 @@
+---
+slug: "spring-cloud-gateway"
+title: "Spring Cloud Gateway"
+level: 5
+---
+
+## WHY
+In a Microservices architecture, you don't have one backend. You have 20. 
+You have an `InventoryService` on port 8081, an `OrderService` on 8082, and a `UserService` on 8083.
+If the React Frontend needs to communicate with all three, managing 20 different IP addresses, handling CORS for 20 domains, and writing Authentication code 20 times is an architectural nightmare.
+You need a single entry point. A bouncer at the door of your architecture.
+**Spring Cloud Gateway** is exactly that. It is a highly optimized, non-blocking API Gateway built on Spring WebFlux. It provides a single, unified URL for your entire system, routing incoming frontend requests to the correct internal microservice, while centralizing cross-cutting concerns like Security, Rate Limiting, and Analytics in one place!
+
+## THEORY
+### The Three Pillars of the Gateway
+1. **Route:** The fundamental building block. It is defined by an ID, a destination URI, and a collection of Predicates and Filters.
+2. **Predicate:** A Java 8 Predicate (a matching rule). E.g., *"If the incoming URL path starts with `/api/orders`, then this route matches!"*
+3. **Filter:** A piece of logic that intercepts the request before or after it is routed. E.g., *"Before routing, add a specific HTTP Header"* or *"After routing, modify the JSON response."*
+
+### Non-Blocking Architecture
+Spring Cloud Gateway does NOT use Tomcat. It uses Netty and Project Reactor (WebFlux).
+If a Gateway used Tomcat (which assigns 1 Thread per Request), and 1,000 requests arrived simultaneously, the Gateway would freeze waiting for the internal microservices to respond.
+Netty is asynchronous. A single thread can handle thousands of simultaneous connections, making Spring Cloud Gateway incredibly fast and perfectly suited for heavy network routing.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-gateway" }
+```
+
+## CODE
+
+You create a brand new, empty Spring Boot project solely dedicated to being the Gateway.
+
+### 1. The Dependency
+Notice we use `spring-cloud-starter-gateway`. (Do NOT include `spring-boot-starter-web` (Tomcat), or it will crash!).
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+```
+
+### 2. Configuration via YAML
+The most common way to define routes is simply writing YAML configuration. No Java code required!
+
+```yaml
+server:
+  port: 8080 # The single public port the Frontend talks to!
+
+spring:
+  cloud:
+    gateway:
+      routes:
+        # Route 1: Order Service
+        - id: order-service
+          # Where should the traffic go?
+          uri: http://localhost:8082 
+          # When does this rule apply?
+          predicates:
+            - Path=/orders/**
+          # Modify the request on the fly!
+          filters:
+            - AddRequestHeader=X-Tenant-ID, MyEnterpriseApp
+
+        # Route 2: Inventory Service
+        - id: inventory-service
+          uri: http://localhost:8081
+          predicates:
+            - Path=/inventory/**
+            # Advanced Predicate: Only route if the HTTP method is GET!
+            - Method=GET
+```
+*How it works:* If the React app sends a `GET` request to `http://localhost:8080/inventory/laptop`, the Gateway matches the predicate, acts as a proxy, and secretly forwards the request to `http://localhost:8081/inventory/laptop`. The React app has no idea port 8081 even exists!
+
+### 3. Dynamic Configuration via Java (Fluent API)
+You can also define routes programmatically in Java. This is powerful if you need to fetch routes dynamically from a database!
+
+```java
+import org.springframework.cloud.gateway.route.RouteLocator;
+import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class GatewayConfig {
+
+    @Bean
+    public RouteLocator customRouteLocator(RouteLocatorBuilder builder) {
+        return builder.routes()
+            .route("user-service", r -> r
+                .path("/users/**")
+                .filters(f -> f
+                    .addResponseHeader("X-Powered-By", "Spring Cloud Gateway")
+                    .stripPrefix(1) // Strips '/users' off the URL before forwarding!
+                )
+                .uri("http://localhost:8083")
+            )
+            .build();
+    }
+}
+```
+
+## REAL_WORLD
+**Service Discovery Integration (Eureka)**
+In a real microservices cluster, the `OrderService` doesn't live on `localhost:8082`. It lives dynamically on IP `10.0.4.15` in an AWS container, and its IP changes every time it reboots!
+Hardcoding URLs in the Gateway YAML is impossible.
+Instead, you integrate the Gateway with a **Service Discovery Registry** like Netflix Eureka or Consul.
+Instead of `uri: http://localhost:8082`, you configure the Gateway to use `uri: lb://ORDER-SERVICE`.
+The `lb://` prefix tells the Gateway: *"Go ask the Eureka server for the current live IPs of the ORDER-SERVICE. If there are 3 instances running, use a Load Balancer (Round Robin) to pick one, and forward the request there!"*
+This creates a self-healing, massively scalable routing mesh!
+
+## INTERVIEW
+**Q: You want to implement a Global Rate Limiter (e.g., maximum 10 requests per second per IP address) in your Spring Cloud Gateway to protect your microservices from DDoS attacks. How do you implement this efficiently without causing massive performance bottlenecks across multiple Gateway instances?**
+A: **By using the built-in Redis Rate Limiter Filter (`RequestRateLimiter`).**
+You cannot store rate limit counters in local Java RAM. If you have 3 Load-Balanced Gateway instances, a hacker could hit Instance A 10 times, Instance B 10 times, and Instance C 10 times, bypassing your strict limit!
+The counters must be stored in a centralized, blazing-fast data store: **Redis**.
+Spring Cloud Gateway provides a built-in filter that integrates flawlessly with Redis via Lua scripts.
+1. You add the `spring-boot-starter-data-redis-reactive` dependency.
+2. In your YAML, you add the `RequestRateLimiter` filter to your route.
+3. You configure two properties: `replenishRate` (how many tokens a user gets per second) and `burstCapacity` (the maximum spike allowed).
+4. Finally, you write a `KeyResolver` bean in Java to tell the Gateway *what* to limit by (e.g., extracting the client's IP address from the incoming request).
+The Gateway will now automatically check Redis in milliseconds before routing. If the limit is exceeded, it instantly intercepts the request and returns a `429 Too Many Requests` status code to the attacker, completely shielding the downstream microservices!

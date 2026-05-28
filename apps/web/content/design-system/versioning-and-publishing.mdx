@@ -1,0 +1,114 @@
+---
+title: Versioning & Publishing (Lerna / Changesets)
+slug: versioning-and-publishing
+---
+
+## WHY
+
+If you build a gorgeous Design System but copy-paste the React components directly into your main application's repository, you have fundamentally failed to build a "System".
+
+A true Design System is an independent product consumed by multiple applications across an organization. If App A needs the `v1.0` Button, and App B needs the new `v2.0` Button (which has breaking API changes), copy-pasting code creates an unmaintainable nightmare.
+
+To scale across an enterprise, your Design System must be packaged, versioned according to Semantic Versioning (SemVer), and published to a package registry (like NPM or GitHub Packages). Furthermore, managing 50 different packages (Icons, Tokens, React Components, Utilities) requires a Monorepo architecture using tools like Turborepo, Lerna, or Changesets.
+
+---
+
+## THEORY
+
+### Semantic Versioning (SemVer)
+SemVer is the universal contract between the Design System team and the consuming applications. The version number is `MAJOR.MINOR.PATCH` (e.g., `v2.4.1`).
+
+1. **PATCH (`v2.4.1` → `v2.4.2`):** Bug fixes. No API changes. Consumers can auto-upgrade safely. (e.g., Fixed a focus ring glitch on the Button).
+2. **MINOR (`v2.4.1` → `v2.5.0`):** New features that are fully backwards compatible. (e.g., Added a new `SkeletonLoader` component).
+3. **MAJOR (`v2.4.1` → `v3.0.0`):** Breaking changes. Existing code will break if upgraded. (e.g., Renamed the `<Button isPrimary>` prop to `<Button variant="primary">`).
+
+### Monorepo Architecture
+Instead of having 50 separate GitHub repositories for each piece of the Design System, enterprise teams use a Monorepo. All packages live in one repository under a `/packages` directory.
+
+However, publishing 50 packages manually is impossible. We use tools to orchestrate the publishing process:
+- **Turborepo / Nx:** Orchestrates the build process (compiling TypeScript to JavaScript blazingly fast in parallel).
+- **Changesets:** Tracks what packages changed in a Pull Request, computes the new SemVer bumps, and automatically publishes them to NPM.
+
+---
+
+## IMPLEMENTATION
+
+Let's set up an automated versioning and publishing pipeline using **Changesets** inside a Turborepo monorepo.
+
+### 1. The Monorepo Structure
+```text
+design-system-repo/
+├── apps/
+│   └── docs/                  # Storybook or Next.js documentation site
+├── packages/
+│   ├── tokens/                # CSS Variables from Figma
+│   ├── icons/                 # SVG React Components
+│   └── react-components/      # The Buttons, Inputs, Modals
+├── package.json
+└── turbo.json
+```
+
+### 2. Using Changesets
+When a developer modifies the `react-components` package (e.g., adding a new `<Card>` component), they do not manually edit the `package.json` version. Instead, they run:
+
+```bash
+npx changeset
+```
+The CLI prompts the developer:
+1. "Which packages did you change?" → Selects `@my-system/react-components`.
+2. "Is this a Major, Minor, or Patch?" → Selects `Minor`.
+3. "Provide a summary" → "Added new composable Card component".
+
+This generates a `.md` file inside the `.changeset` folder. The developer commits this file along with their code.
+
+### 3. Automated CI/CD Publishing
+When the Pull Request is merged into the `main` branch, a GitHub Action automatically consumes the `.changeset` file, updates all `package.json` files, creates a GitHub Release, and publishes to NPM.
+
+```yaml
+# .github/workflows/publish.yml
+name: Publish Design System
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: pnpm/action-setup@v2
+        with:
+          version: 8
+      
+      - name: Install dependencies
+        run: pnpm install
+        
+      - name: Build all packages (Turborepo)
+        run: pnpm build
+
+      - name: Create Release Pull Request or Publish to NPM
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          # This command automatically consumes the markdown files, bumps package.json, 
+          # updates CHANGELOG.md, and runs `npm publish`
+          publish: pnpm changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+---
+
+## SYSTEM_DESIGN
+
+### The Dependency Graph Problem
+Monorepos introduce a complex dependency graph. For example, `@my-system/react-components` depends on `@my-system/tokens`. 
+
+If the Design team changes a color token (triggering a Patch release for `tokens`), the publishing tool (Changesets) is smart enough to detect that `react-components` consumes `tokens`. It will automatically trigger a Patch release for `react-components` as well, ensuring that the entire ecosystem stays perfectly in sync without human intervention. 
+
+### Pre-Releases and Canaries
+Before publishing a breaking `v3.0.0` to the entire company, you must test it. Changesets allows you to publish a "snapshot" or "canary" release from any Pull Request.
+When a developer opens a PR, a GitHub Action publishes `@my-system/react-components@0.0.0-snapshot-pr123`. The consuming application developers can install this exact PR version into their apps to test the changes before they are ever merged to `main`!

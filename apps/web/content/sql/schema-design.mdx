@@ -1,0 +1,159 @@
+---
+slug: "schema-design"
+title: "Database Schema Design"
+level: 5
+---
+
+## WHY
+You can write the most beautiful, optimized React frontend and Java backend in the world, but if your underlying database schema is flawed, your application will eventually fail. 
+A bad schema leads to data corruption, horrific query performance, and architectural dead-ends where adding a single new feature requires rewriting the entire database layer. 
+
+**Schema Design** is the architectural process of translating real-world business requirements into a strict, relational database model using Tables, Constraints, and Relationships. It is arguably the most important step in the entire software engineering lifecycle.
+
+## THEORY
+### The Three Types of Relationships
+1. **One-to-One (1:1):** A user has one profile. A profile belongs to one user.
+2. **One-to-Many (1:N):** A user has many orders. An order belongs to one user. (The most common relationship).
+3. **Many-to-Many (M:N):** A student takes many classes. A class has many students. (Requires a junction/join table).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "schema-design" }
+```
+
+## CODE
+
+### Level 1 — Beginner (One-to-Many Relationships)
+The backbone of relational databases. The "Many" side ALWAYS holds the Foreign Key.
+
+```sql
+-- 1. Create the "One" side first (The Parent)
+CREATE TABLE authors (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    bio TEXT
+);
+
+-- 2. Create the "Many" side (The Child)
+CREATE TABLE books (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    published_year INT,
+    
+    -- The Foreign Key points back to the Parent!
+    author_id INT NOT NULL,
+    
+    -- The Constraint enforces Referential Integrity. 
+    -- You CANNOT insert a book if the author_id doesn't exist in the authors table!
+    CONSTRAINT fk_author FOREIGN KEY (author_id) REFERENCES authors(id)
+);
+```
+
+### Level 2 — Building Blocks (Many-to-Many Relationships)
+Relational databases cannot natively store Many-to-Many relationships. If a Post has many Tags, and a Tag has many Posts, you cannot put an array of `tag_ids` inside the Post table. 
+You MUST create a third table, known as a **Junction Table** (or Pivot Table).
+
+```sql
+CREATE TABLE posts (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(200)
+);
+
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE
+);
+
+-- The Junction Table!
+CREATE TABLE post_tags (
+    post_id INT REFERENCES posts(id) ON DELETE CASCADE,
+    tag_id INT REFERENCES tags(id) ON DELETE CASCADE,
+    
+    -- The Primary Key is a "Composite Key" made of both IDs!
+    -- This guarantees a specific post can only have a specific tag ONCE.
+    PRIMARY KEY (post_id, tag_id)
+);
+
+-- To find all tags for Post #1, we must JOIN through the junction table:
+SELECT t.name 
+FROM tags t
+JOIN post_tags pt ON t.id = pt.tag_id
+WHERE pt.post_id = 1;
+```
+
+### Level 3 — Intermediate (Polymorphic Associations vs. Exclusive Arcs)
+*The Problem:* You want to build a "Comments" system. Users can leave comments on `Videos`, `Articles`, and `Photos`. 
+Junior developers often build a "Polymorphic" table: `comments(id, text, commentable_id, commentable_type)`. 
+**This is a massive anti-pattern in strict SQL** because `commentable_id` cannot be a true Foreign Key (it doesn't know which table to point to!), meaning the database cannot enforce Referential Integrity.
+
+*The Solution:* **Exclusive Arcs** (or Supertype/Subtype).
+
+```sql
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    text TEXT NOT NULL,
+    
+    -- We create a dedicated column for EVERY possible parent type!
+    video_id INT REFERENCES videos(id),
+    article_id INT REFERENCES articles(id),
+    photo_id INT REFERENCES photos(id),
+    
+    -- The Exclusive Arc Constraint!
+    -- This mathematical check guarantees that EXACTLY ONE of these foreign keys is NOT NULL.
+    -- A comment cannot belong to a video AND a photo at the same time!
+    CONSTRAINT exclusive_comment_target CHECK (
+        (video_id IS NOT NULL)::INTEGER +
+        (article_id IS NOT NULL)::INTEGER +
+        (photo_id IS NOT NULL)::INTEGER = 1
+    )
+);
+```
+
+### Level 4 — Advanced (Entity-Attribute-Value / EAV Anti-Pattern)
+*The Problem:* You are building an E-Commerce store. A `T-Shirt` has attributes `Size` and `Color`. A `Laptop` has attributes `RAM` and `CPU`. You don't know what attributes a product will have until the user creates it. 
+Junior developers often build an **EAV (Entity-Attribute-Value)** table: `product_attributes(product_id, attribute_name, attribute_value)`. 
+This requires horrific 15-way `JOIN` queries just to construct a single Product on the screen.
+
+*The Solution:* **JSONB (Document Storage inside SQL).**
+Modern SQL databases (PostgreSQL/MySQL) have native support for JSON. You keep your strict relational schema for core data, but use a JSON column for dynamic, unpredictable schema extensions!
+
+```sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(200) NOT NULL,
+    price NUMERIC NOT NULL,
+    category VARCHAR(50),
+    
+    -- The JSONB column stores dynamic, schemaless data!
+    attributes JSONB
+);
+
+-- Insert a Laptop
+INSERT INTO products (name, price, attributes) 
+VALUES ('MacBook Pro', 1999.99, '{"ram": "16GB", "cpu": "M2", "storage": "512GB"}');
+
+-- Insert a T-Shirt
+INSERT INTO products (name, price, attributes) 
+VALUES ('Graphic Tee', 25.00, '{"size": "XL", "color": "Blue"}');
+
+-- You can even query and filter directly inside the JSON!
+-- Find all products where the RAM is 16GB:
+SELECT name FROM products WHERE attributes->>'ram' = '16GB';
+```
+
+## REAL_WORLD
+**UUIDs vs. Auto-Incrementing Integers**
+Historically, Primary Keys were always `SERIAL INT` (1, 2, 3). 
+In modern distributed systems, we almost exclusively use **UUIDs (Universally Unique Identifiers)**. 
+Why?
+1. **Security:** If your user profile URL is `/users/5`, a hacker can write a script to scrape `/users/1` through `/users/10000`. If your URL is `/users/a3f9...`, guessing other IDs is mathematically impossible.
+2. **Distributed Systems:** If you have multiple database servers accepting writes simultaneously (Multi-Master replication), auto-incrementing integers will collide (Server A and Server B both create an order #5). A UUID is randomly generated and globally unique, guaranteeing no collisions across the entire planet.
+
+*(Tradeoff: UUIDs are 128-bit strings. They take up 4x more disk space than Integers, and because they are random, they severely fragment B-Tree Indexes. Modern systems often use ULIDs or UUIDv7, which combine a timestamp with randomness to keep the B-Tree index sorted and fast!)*
+
+## INTERVIEW
+**Q: I deleted a User from the database, but it threw a `foreign_key_violation` error saying the user is still referenced in the `orders` table. Should I just change the constraint to `ON DELETE CASCADE` so it automatically deletes their orders too?**
+A: **Absolutely not (for financial/critical data).** 
+`ON DELETE CASCADE` is incredibly dangerous. If you delete a user, it will silently cascade and delete all their orders, their invoices, and their payment history. If an auditor asks where that revenue came from, the data is gone forever!
+For non-critical data (like a User's "Likes" on a post), `CASCADE` is fine. 
+For critical business data, you should never delete the user in the first place (use a Soft Delete `is_active = false`), or you should use `ON DELETE RESTRICT` (the default) which acts as a safety mechanism, forcing the developer to intentionally decide what to do with the orphaned financial records.

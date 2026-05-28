@@ -1,0 +1,115 @@
+---
+slug: "insert-update-delete-advanced"
+title: "Advanced Data Manipulation"
+level: 2
+---
+
+## WHY
+Running basic `INSERT` and `UPDATE` statements is easy when dealing with single rows. But what happens when you need to copy 10 million rows from a staging table to a production table? What happens if you need to update a user's status based on data calculated from a completely different table? To handle enterprise workloads, you must learn the advanced mechanisms of Data Manipulation Language (DML).
+
+## THEORY
+### Set-Based Processing
+Database engines are optimized for **Set-Based Processing**. They are designed to grab a massive block of rows and operate on them simultaneously. If you write a Node.js `for` loop that iterates 10,000 times, sending 10,000 separate `UPDATE` queries to the database over the network (Row-By-Row processing), your application will be devastatingly slow. You must write SQL that pushes the loop down into the database engine.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "sql-dml-advanced" }
+```
+
+## CODE
+
+### Level 1 — Beginner (INSERT INTO ... SELECT)
+Imagine you have an `active_users` table and an `archived_users` table. At the end of the year, you want to move 50,000 inactive users into the archive table.
+You do not download them to Node.js! You pipe a `SELECT` statement directly into an `INSERT` statement!
+
+```sql
+-- 1. Mass insert 50,000 rows in a single, blazing-fast transaction!
+INSERT INTO archived_users (id, username, email, archived_at)
+SELECT 
+    id, 
+    username, 
+    email, 
+    CURRENT_TIMESTAMP 
+FROM active_users 
+WHERE last_login < '2023-01-01';
+
+-- 2. Once safely copied, mass delete them from the active table.
+DELETE FROM active_users WHERE last_login < '2023-01-01';
+```
+
+### Level 2 — Building Blocks (RETURNING Clause)
+When you insert a new row, the database automatically generates the Primary Key (`id`). Your Node.js backend needs that new ID so it can redirect the user to their new profile page. 
+Historically, developers had to run an `INSERT`, and then immediately run a `SELECT MAX(id)` to find the new row (which caused massive race conditions).
+
+Modern databases provide the `RETURNING` clause (Postgres) or `OUTPUT` clause (SQL Server).
+
+```sql
+-- Insert the user and instantly return the auto-generated ID!
+INSERT INTO users (username, email) 
+VALUES ('alice', 'alice@test.com')
+RETURNING id, created_at;
+
+-- You can also use this with UPDATE or DELETE!
+-- Delete the user, but return their email so we can send a "Goodbye" message.
+DELETE FROM users WHERE id = 5
+RETURNING email;
+```
+*(Note: MySQL does not support `RETURNING`. Node.js MySQL drivers handle this by returning an `insertId` property on the raw driver response object).*
+
+### Level 3 — Intermediate (UPDATE with JOINs)
+What if you need to update an employee's salary, but the logic depends on the budget of their specific department? The budget data is in a completely different table!
+
+You must `JOIN` the tables inside the `UPDATE` statement!
+*(Note: The syntax for this varies wildly by dialect. Below is the PostgreSQL syntax).*
+
+```sql
+-- Update employees based on data from the departments table!
+UPDATE employees e
+SET salary = salary * 1.05
+FROM departments d
+WHERE e.department_id = d.id
+  AND d.name = 'Engineering'
+  AND d.budget > 1000000;
+```
+
+### Level 4 — Advanced (UPSERT / MERGE)
+The "Update or Insert" problem. You receive an Excel file of 1,000 users to import. If the user's email already exists in the database, you want to update their age. If it doesn't exist, you want to insert them as a brand new user.
+
+In **PostgreSQL / SQLite**, you use `ON CONFLICT`:
+```sql
+INSERT INTO users (email, age, status) 
+VALUES ('alice@test.com', 29, 'active')
+
+-- If the UNIQUE index on 'email' throws a conflict...
+ON CONFLICT (email) 
+-- ...intercept the error, and UPDATE the existing row instead!
+DO UPDATE SET 
+    age = EXCLUDED.age,     -- 'EXCLUDED' refers to the new value we tried to insert (29)
+    status = EXCLUDED.status;
+```
+
+In **MySQL**, you use `ON DUPLICATE KEY UPDATE`:
+```sql
+INSERT INTO users (email, age, status) 
+VALUES ('alice@test.com', 29, 'active')
+ON DUPLICATE KEY UPDATE 
+    age = VALUES(age), 
+    status = VALUES(status);
+```
+
+## REAL_WORLD
+**The Danger of Correlated Updates**
+If you write an `UPDATE` statement that uses a Correlated Subquery (a subquery that references the outer table), be incredibly careful!
+
+```sql
+-- ❌ DANGEROUS!
+UPDATE orders o
+SET total_items = (
+    SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id
+);
+```
+If an order has NO items in the `order_items` table, the subquery returns `NULL`! It will wipe out the `total_items` value for that order! You must either wrap the subquery in `COALESCE`, or strictly filter the update to only affect rows that have matches.
+
+## INTERVIEW
+**Q: I have a massive table with 100 million rows. I need to run a `DELETE` statement that will remove 10 million rows. My DBA told me absolutely not to run this query during business hours. Why?**
+A: Because `DELETE` is a fully transactional DML operation. The database must physically locate all 10 million rows, lock them, delete them, and write 10 million individual "Undo" records to the Transaction Log so the operation can be rolled back if it fails. This massive write operation will completely saturate the server's I/O (hard drive bandwidth) and lock up the table, causing every other query from normal users to timeout and crash. Massive deletes must be performed in tiny batches (e.g., deleting 10,000 rows in a `WHILE` loop, committing each time) to allow normal traffic to breathe between batches.

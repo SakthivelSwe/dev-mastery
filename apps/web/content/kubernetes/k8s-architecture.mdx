@@ -1,0 +1,116 @@
+---
+slug: "k8s-architecture"
+title: "Kubernetes Architecture"
+level: 3
+---
+
+## WHY
+To debug issues in Kubernetes effectively, you need to understand what components are running and what they do. When a Pod fails to schedule, or a Service doesn't route traffic, knowing the architecture tells you exactly where to look.
+Kubernetes is distributed — its components run across multiple machines, each with a distinct responsibility.
+
+## THEORY
+### Control Plane (Brain of the Cluster)
+The control plane manages the entire cluster. In managed K8s (EKS, GKE), the cloud provider runs these for you.
+
+- **kube-apiserver:** The front door of Kubernetes. Every `kubectl` command, every internal component — all communicate via the API server.
+- **etcd:** The distributed key-value store that holds ALL cluster state (Pod definitions, Service configs, etc.). The source of truth.
+- **kube-scheduler:** Decides which Node to place a new Pod on (based on resource requirements, node capacity, affinity rules).
+- **kube-controller-manager:** Runs controllers (background loops) that watch the API server and reconcile actual state to desired state (e.g., ReplicaSet controller ensures 3 Pods are always running).
+
+### Worker Nodes (Where Apps Run)
+- **kubelet:** Agent on every Node. Ensures containers are running and healthy. Talks to the API server.
+- **kube-proxy:** Manages network rules on each Node to route Service traffic to the right Pods.
+- **Container Runtime:** Runs containers (Docker, containerd, CRI-O).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-architecture" }
+```
+
+## CODE
+
+### Inspecting the Cluster Architecture
+```bash
+# View all nodes and their roles
+kubectl get nodes
+# NAME           STATUS   ROLES           AGE   VERSION
+# master-01      Ready    control-plane   30d   v1.28.0
+# worker-01      Ready    <none>          30d   v1.28.0
+# worker-02      Ready    <none>          30d   v1.28.0
+
+# View control plane components
+kubectl get pods -n kube-system
+# NAME                               READY   STATUS    RESTARTS
+# etcd-master-01                     1/1     Running   0
+# kube-apiserver-master-01           1/1     Running   0
+# kube-controller-manager-master-01  1/1     Running   0
+# kube-scheduler-master-01           1/1     Running   0
+# kube-proxy-abc123                  1/1     Running   0  ← One per node!
+# coredns-def456                     1/1     Running   0  ← DNS
+
+# View API server events (what's happening in the cluster)
+kubectl get events --sort-by='.lastTimestamp' -n default
+
+# View cluster info
+kubectl cluster-info
+
+# View component statuses
+kubectl get componentstatuses
+```
+
+### The Reconciliation Loop
+The entire Kubernetes control loop works on one principle:
+```
+while True:
+    desired_state = read_from_etcd()
+    actual_state  = observe_cluster()
+    
+    if actual_state != desired_state:
+        reconcile(desired_state, actual_state)
+```
+
+```bash
+# Example: If you have replicas=3 but only 2 Pods are running:
+# 1. ReplicaSet controller detects actual (2) != desired (3)
+# 2. Controller creates a new Pod manifest
+# 3. Scheduler assigns it to a Node
+# 4. kubelet on that Node pulls the image and starts the container
+# 5. Actual state = desired state! ✅
+```
+
+## REAL_WORLD
+**What Happens When You Run kubectl apply?**
+```
+kubectl apply -f deployment.yml
+           ↓
+    kube-apiserver validates YAML and stores in etcd
+           ↓
+    Deployment controller detects new Deployment in etcd
+           ↓
+    Creates ReplicaSet in etcd
+           ↓
+    ReplicaSet controller detects 0 Pods exist, needs 3
+           ↓
+    Creates 3 Pod specs in etcd
+           ↓
+    Scheduler assigns each Pod to a Node
+           ↓
+    kubelet on each Node pulls Docker image
+           ↓
+    kubelet starts containers
+           ↓
+    kubelet reports Pod as Running to API server
+           ↓
+    etcd updated with Running status
+```
+
+## INTERVIEW
+**Q: etcd is called the "heart" of Kubernetes. What happens if etcd becomes unavailable?**
+A: If etcd becomes unavailable, the Kubernetes control plane enters a **read-only, frozen state**:
+
+- **Existing Pods keep running** — kubelet on each Node continues managing its Pods independently without needing etcd. Running workloads are unaffected.
+- **No new changes can be accepted** — `kubectl apply`, `kubectl delete`, scaling events — all fail because the API server can't read or write to etcd.
+- **No reconciliation** — If a Pod crashes while etcd is down, it WON'T be automatically recreated, because the ReplicaSet controller can't read the desired state or create new Pods.
+- **Cluster healing is paused** — Any failures during the outage accumulate and are resolved once etcd recovers.
+
+This is why etcd must be **highly available** in production: minimum 3 nodes in an etcd cluster (requires quorum = majority). AWS EKS, Google GKE, and Azure AKS manage a 3-node etcd cluster automatically for managed Kubernetes control planes.

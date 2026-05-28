@@ -1,0 +1,129 @@
+---
+slug: "sd-database-indexing"
+title: "Database Indexing"
+level: 4
+---
+
+## WHY
+You have a `users` table with 50 million rows. A user searches for a friend by email: `SELECT * FROM users WHERE email = 'alice@example.com'`. 
+
+Without an index, the database engine reads every single one of 50 million rows, checks if the email matches, and returns the result. This is called a **Full Table Scan** and it takes several seconds. With 1,000 users making this query simultaneously, your database server will completely saturate its I/O and CPU.
+
+An **Index** creates a separate, highly-optimized data structure that allows the database to find the row in milliseconds, using only a handful of comparisons — regardless of whether the table has 10 rows or 10 billion rows.
+
+## THEORY
+### The B-Tree Index
+The industry standard database index is the **B-Tree (Balanced Tree)**. It is a self-balancing tree that maintains sorted order of all indexed values. Finding a value requires traversing from the root to a leaf — this is always `O(log N)` regardless of N.
+
+For a table with 1 billion rows, a B-Tree index finds the value in `log2(1,000,000,000) ≈ 30 comparisons`. A Full Table Scan requires up to 1 billion comparisons. The difference is catastrophic.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sd-indexing" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating Indexes in PostgreSQL)
+```sql
+-- Check if your query uses an index with EXPLAIN ANALYZE!
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'alice@example.com';
+-- Seq Scan = Bad! (Full Table Scan)
+-- Index Scan = Good!
+
+-- Create a simple index on the email column
+CREATE INDEX idx_users_email ON users(email);
+
+-- The query now uses the index automatically!
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'alice@example.com';
+-- Before index: Seq Scan, cost ~500ms
+-- After  index: Index Scan, cost ~1ms
+
+-- Create a UNIQUE index (also enforces data integrity!)
+CREATE UNIQUE INDEX idx_users_username ON users(username);
+```
+
+### Level 2 — Building Blocks (Composite Indexes)
+When you frequently filter by multiple columns together, a single composite index on both columns is vastly more efficient than two separate single-column indexes.
+
+```sql
+-- A query that filters by BOTH user_id AND created_at
+SELECT * FROM orders WHERE user_id = 123 AND created_at >= '2025-01-01';
+
+-- ❌ BAD: Two separate indexes — PostgreSQL can only efficiently use ONE!
+CREATE INDEX idx_orders_user ON orders(user_id);
+CREATE INDEX idx_orders_date ON orders(created_at);
+
+-- ✅ GOOD: One composite index that covers both columns!
+-- COLUMN ORDER MATTERS: Put the most selective filter first!
+CREATE INDEX idx_orders_user_date ON orders(user_id, created_at DESC);
+
+-- CRITICAL RULE — The "Left-Prefix Rule":
+-- This composite index CAN efficiently serve:
+--   WHERE user_id = 123
+--   WHERE user_id = 123 AND created_at >= '2025-01-01'
+-- 
+-- This composite index CANNOT efficiently serve:
+--   WHERE created_at >= '2025-01-01'  (missing the left prefix!)
+```
+
+### Level 3 — Intermediate (Index Types)
+Beyond the standard B-Tree, databases offer specialized index types for specific data patterns.
+
+```sql
+-- HASH INDEX: Perfect for exact-match equality (=) only, NOT ranges (>, <)
+-- Even faster than B-Tree for equality but useless for ORDER BY or BETWEEN
+CREATE INDEX idx_sessions_token ON sessions USING HASH (token);
+
+-- GIN Index (Generalized Inverted Index): For Full-Text Search and JSON!
+-- Essential for searching text documents or querying JSONB fields
+CREATE INDEX idx_articles_content ON articles USING GIN (to_tsvector('english', content));
+
+-- Full-text search using the GIN index
+SELECT title FROM articles
+WHERE to_tsvector('english', content) @@ to_tsquery('database & performance');
+
+-- GIN for JSONB column querying
+CREATE INDEX idx_products_attributes ON products USING GIN (attributes);
+SELECT * FROM products WHERE attributes @> '{"color": "red"}';
+
+-- BRIN Index (Block Range Index): For naturally-ordered, append-only data (IoT, logs)
+-- Extremely compact — just stores min/max per block range!
+CREATE INDEX idx_logs_created ON access_logs USING BRIN (created_at);
+```
+
+### Level 4 — Advanced (Partial & Covering Indexes)
+```sql
+-- PARTIAL INDEX: Only indexes rows matching a condition!
+-- Perfect for queries that almost always include a specific filter.
+CREATE INDEX idx_orders_pending ON orders(user_id, created_at)
+WHERE status = 'PENDING';
+-- This index is tiny (only indexes PENDING orders) and blazing fast!
+
+-- COVERING INDEX (INDEX-ONLY SCAN):
+-- If the index contains ALL the columns the query needs,
+-- PostgreSQL can satisfy the query from the index ALONE without touching the table!
+CREATE INDEX idx_users_email_name ON users(email) INCLUDE (username, avatar_url);
+
+-- This query can now run entirely from the index — zero table reads!
+SELECT username, avatar_url FROM users WHERE email = 'alice@example.com';
+```
+
+## REAL_WORLD
+**The Index Trade-Off in System Design:**
+
+Indexes dramatically speed up Reads but slow down Writes. Every `INSERT`, `UPDATE`, or `DELETE` must update every index defined on that table. 
+
+For a table with 10 indexes, a single `INSERT` becomes 11 write operations. For a Write-Heavy application (like an IoT sensor logging 50,000 readings per second), adding too many indexes will cause write latency to skyrocket.
+
+**The Golden Rule:** Only add indexes for queries that have been proven (with `EXPLAIN ANALYZE`) to be bottlenecks. Never add "precautionary" indexes — each one has a real cost.
+
+## INTERVIEW
+**Q: If you have a `WHERE age > 25 AND city = 'NYC'` query, which column should be first in the composite index?**
+A: You should put the more **selective** column first — the one that eliminates the most rows. If there are 100 distinct cities but only 3 age ranges in your data, `city` is more selective. Put `city` first: `CREATE INDEX idx ON users(city, age)`. However, for range conditions (`>`), the column with the range must come AFTER the equality columns.
+
+**Q: What is an "Index Bloat" problem?**
+A: In PostgreSQL, when rows are deleted or updated, the old index entries are not immediately removed. They are marked as "dead" and only reclaimed during a VACUUM operation. If your table has very high update/delete frequency and VACUUM is not running frequently enough, the index grows to several times its optimal size with dead entries, causing slower scans. Monitor index bloat with `pg_catalog.pg_stat_user_indexes`.
+
+**Q: Can you over-index a table?**
+A: Absolutely, and it's a common mistake. Every index needs to be updated on every write, and indexes consume disk space and RAM (PostgreSQL caches frequently-used indexes in the `shared_buffers` memory pool). A table with 20 indexes on a Write-Heavy workload will perform dramatically worse than the same table with 5 targeted indexes.

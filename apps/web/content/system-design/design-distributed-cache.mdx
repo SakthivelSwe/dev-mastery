@@ -1,0 +1,82 @@
+---
+slug: "design-distributed-cache"
+title: "Design a Distributed Cache (Redis)"
+level: 5
+---
+
+## WHY
+If your application queries the database for the exact same data 1,000 times a second, the database will eventually crash under the load. 
+A Cache sits between the application and the database. It stores the results of expensive queries in RAM, returning them in microseconds instead of milliseconds.
+
+However, a single server only has so much RAM. When you need to cache 5 Terabytes of data, you must design a **Distributed Cache** (like Memcached or Redis Cluster) that seamlessly spans across dozens of independent servers while presenting a unified interface to the application.
+
+## THEORY
+### Cache Eviction Policies
+If you have 10GB of RAM, and you try to write the 11th Gigabyte, the cache must delete old data to make room. How does it decide what to delete?
+1. **LRU (Least Recently Used):** The industry standard. Evicts the data that hasn't been requested in the longest amount of time.
+2. **LFU (Least Frequently Used):** Evicts data that has the lowest total access count. (Complex to implement efficiently).
+3. **FIFO (First In, First Out):** Evicts the oldest data, regardless of how popular it is. (Rarely used in production).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "distributed-cache" }
+```
+
+## CODE
+
+*(In a System Design interview, you don't write code, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — The Data Structure (LRU Cache)
+*The Interviewer:* "How do you implement an LRU cache efficiently on a single machine?"
+
+**Your Answer:** "We need $O(1)$ lookups and $O(1)$ evictions. We combine two data structures: a **Hash Map** and a **Doubly Linked List**."
+1. "The Hash Map stores the `Key` mapped to the specific Node in the Linked List. This gives us $O(1)$ lookups."
+2. "The Doubly Linked List tracks the recency. The 'Head' of the list is the most recently used item. The 'Tail' is the oldest."
+3. "When a user requests a Key, we find it in the Hash Map, remove the node from the middle of the Linked List, and move it to the Head. This takes $O(1)$ time."
+4. "When the cache is full, we simply delete the node at the Tail of the Linked List and remove it from the Hash Map."
+
+### Level 2 — Distributing the Data (Consistent Hashing)
+*The Interviewer:* "Great, but our data is 5 Terabytes. We need 10 cache servers. How does the application know which server holds the data?"
+
+**The Explanation:**
+1. "We use **Consistent Hashing**. We conceptually place our 10 cache servers onto a Hash Ring."
+2. "When the application wants to read or write `user:123`, the Cache Client library hashes the string `user:123`."
+3. "It walks clockwise on the Hash Ring to find the responsible server (e.g., Server 3)."
+4. "The client opens a TCP connection directly to Server 3 and reads/writes the data."
+*(Crucially: There is no central routing server. The application clients do the math themselves, eliminating any Single Point of Failure or network bottleneck).*
+
+### Level 3 — High Availability (Replication)
+*The Interviewer Trap:* "Server 3's motherboard burns out. It crashes. All the cache data on Server 3 is gone. Suddenly, all the traffic destined for Server 3 misses the cache and hits the database, causing a Thundering Herd that crashes our primary PostgreSQL database. How do we prevent this?"
+
+**The Solution: Master-Slave Replication within the Ring.**
+1. "We cannot rely on a single physical node. We modify our Hash Ring so that every position on the ring is a **Replica Set**."
+2. "Server 3 is actually a Master node and two Slave (Read Replica) nodes."
+3. "When the client writes to Server 3 (Master), it asynchronously replicates that data to the two Slaves."
+4. "If Server 3 (Master) explodes, an automated monitoring system (like Redis Sentinel or Zookeeper) detects the heartbeat failure."
+5. "The Sentinel promotes one of the Slaves to become the new Master and updates the routing table. The cache data survives, and the database is protected!"
+
+### Level 4 — Cache Invalidation Patterns
+The hardest problem in computer science is Cache Invalidation. If the data in PostgreSQL changes, how do we update the cache?
+
+1. **Cache-Aside (The Standard):** 
+   - The application reads from the Cache. 
+   - If miss, it reads from the DB, saves to the Cache, and returns.
+   - When *writing* data, the application updates the DB, and then explicitly deletes the key from the Cache. The next read will naturally pull the fresh data.
+2. **Write-Through:**
+   - The application writes directly to the Cache. The Cache then synchronously writes to the DB. It guarantees consistency but slows down writes.
+3. **Write-Behind (Write-Back):**
+   - The application writes ONLY to the Cache and returns to the user instantly. 
+   - The Cache asynchronously writes batches of data to the DB in the background. Incredible write speed, but extreme risk of data loss if the cache crashes before syncing.
+
+## REAL_WORLD
+**Redis vs. Memcached**
+Historically, Memcached was the king of distributed caching. It is a pure, multi-threaded, in-memory key-value store. It is incredibly fast but completely volatile (if the server restarts, the RAM is wiped).
+Today, **Redis** is the industry standard.
+Redis is single-threaded (which mathematically eliminates race conditions and complex locking mechanisms), making it blisteringly fast for its operations. More importantly, Redis supports complex data structures (Lists, Sets, Sorted Sets, Hashes) and offers **Persistence**. Redis can save snapshots (RDB) or append-only logs (AOF) to the hard drive, allowing the cache to survive a server restart!
+
+## INTERVIEW
+**Q: A celebrity tweets, and 5 million users simultaneously request the exact same cache key: `tweet:999`. The Consistent Hash ring routes all 5 million requests to a single cache server (Server 4). Server 4's CPU hits 100% and it crashes (The Hot Key Problem). How do you solve this?**
+A: **Local In-Memory Caching and Randomization.**
+You cannot solve a Hot Key problem by simply adding more servers to the ring, because the hash function will always route `tweet:999` to the exact same server.
+1. **Local Caching (L1 Cache):** We add a tiny, 5-second LRU cache directly inside the memory of the Node.js application servers (using a library like `node-cache`). When the 5 million requests hit the 1,000 Node.js servers, the Node servers only ask Redis for the tweet *once every 5 seconds*. The other 4.9 million requests are served instantly from the Node server's local RAM!
+2. **Key Duplication:** If we must serve it from Redis, we dynamically append a random number to the key (`tweet:999#1`, `tweet:999#2`, up to `#10`). We replicate the exact same tweet data across 10 different keys. The application randomly picks a number 1-10 when requesting the tweet, perfectly distributing the read load for that single hot item across 10 different Redis servers on the Hash Ring!

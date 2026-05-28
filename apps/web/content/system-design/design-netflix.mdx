@@ -1,0 +1,84 @@
+---
+slug: "design-netflix"
+title: "Design Netflix (Video Streaming)"
+level: 5
+---
+
+## WHY
+"Design Netflix" (or YouTube) is the ultimate test of your understanding of **Network Bandwidth**, **CDNs**, and **Data Storage**. 
+Streaming high-definition video to 100 million concurrent users requires pushing Exabytes of data across the internet. If you try to serve video files directly from a central AWS S3 bucket, the latency will be horrific, and AWS egress fees will bankrupt the company in 24 hours.
+
+This problem is divided into two distinct parts:
+1. **The Control Plane:** The microservices that handle user login, recommendations, and payments (Standard API design).
+2. **The Data Plane:** The physical infrastructure that actually delivers the video files to the user's TV.
+
+## THEORY
+### The Magic of Adaptive Bitrate Streaming (ABS)
+When you watch Netflix, why does the video sometimes get blurry for 5 seconds and then become HD again, without the video ever pausing to buffer?
+
+**Adaptive Bitrate Streaming (ABS).**
+Netflix does not store "The Matrix.mp4" as a single massive 10GB file. 
+When a movie is uploaded, the **Transcoding Engine** slices it into 4-second chunks (Chunk 1, Chunk 2). 
+It then compresses *each* chunk into 5 different quality levels (4K, 1080p, 720p, 480p, 240p).
+The client (your TV) downloads a tiny Manifest file listing these chunks. 
+Your TV downloads Chunk 1 in 4K. If your WiFi suddenly drops, your TV detects the network bottleneck and instantly requests Chunk 2 in 480p! Because the chunks are only 4 seconds long, the video perfectly adapts to your network speed in real-time, preventing buffering.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "video-streaming" }
+```
+
+## CODE
+
+*(In a System Design interview, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — The Control Plane (Standard Microservices)
+**The Explanation:**
+1. "The user opens the Netflix app. The app connects to the **API Gateway** via REST/GraphQL."
+2. "The Gateway routes the request to the **User Service** (Auth/Billing) and the **Recommendation Engine**."
+3. "Because this data (Movie Titles, Thumbnails) is tiny, we can store it in a standard distributed database (like Cassandra or PostgreSQL) and cache it heavily in Redis."
+4. "The user clicks 'Play'."
+
+### Level 2 — The Transcoding Pipeline (Write Path)
+*The Interviewer Trap:* "A studio uploads a 500GB master file of a new movie. Walk me through the upload process."
+
+**The Explanation:**
+1. "The studio uploads the massive raw file into **AWS S3** via Multi-part Upload."
+2. "This triggers an Event in Kafka, waking up the **Transcoding Workers**."
+3. "Transcoding is incredibly CPU intensive. We use a Map-Reduce approach. We split the 2-hour movie into 10-minute segments."
+4. "We distribute these segments across hundreds of GPU-enabled worker nodes. They transcode the video into H.264/H.265 formats, slice it into 4-second chunks, and create the ABS Manifest files."
+5. "The finished chunks are saved back into S3 (The Master Storage)."
+
+### Level 3 — The Data Plane (Content Delivery Networks)
+*The Interviewer Trap:* "The Master Chunks are in AWS S3 in Virginia. A user in Tokyo clicks Play. How does the video get to them without stuttering?"
+
+**The Explanation:**
+1. "We absolutely do NOT serve the video from S3. The trans-pacific latency would cause constant buffering."
+2. "We use a **CDN (Content Delivery Network)**. A CDN is a massive global network of proxy servers."
+3. "When the Tokyo user clicks Play, DNS routing automatically connects them to a CDN Edge Server physically located in Tokyo."
+4. "If the Tokyo Edge Server already has 'The Matrix' in its local hard drive (Cache Hit), it streams it directly to the user over the ultra-fast local network."
+5. "If it doesn't have it (Cache Miss), the Edge Server pulls the chunks from the Master S3 bucket in Virginia, streams it to the user, and *saves a copy locally* so the next person in Tokyo gets a Cache Hit."
+
+### Level 4 — Open Connect (Netflix's Secret Weapon)
+*The Advanced Interview Move:* If you want to ace the Netflix question, you must mention **Open Connect**.
+
+"Relying on commercial CDNs (like Akamai or Cloudflare) for 15% of the world's internet traffic is too expensive. Netflix built their own custom CDN called **Open Connect**."
+"Netflix literally builds physical, custom red server boxes (Open Connect Appliances - OCAs). They mail these hardware boxes directly to local Internet Service Providers (like Comcast or AT&T) and tell them to plug them directly into their local neighborhood routers."
+"During the night (when traffic is low), Netflix pre-computes what movies will be popular the next day (using machine learning). They proactively push the video chunks from AWS directly onto the hard drives of those red boxes sitting inside the Comcast facility."
+"When you click Play, the video doesn't even travel across the public internet! It streams directly from the Comcast router down the street into your living room."
+
+## REAL_WORLD
+**The Thundering Herd Problem (Live Streaming)**
+Netflix is VOD (Video on Demand). But what if you are asked to design Twitch or YouTube Live?
+Live streaming breaks standard CDNs. If 1 million people watch the SuperBowl, they all request the exact same 4-second video chunk at the exact same millisecond. 
+If the CDN Edge Server doesn't have the chunk yet, it might panic and send 1 million simultaneous "Cache Miss" requests back to the Origin Server (AWS), instantly crashing the Origin server. This is the **Thundering Herd Problem**.
+
+*The Solution:* **Request Coalescing (Collapsing).**
+When the CDN Edge Server receives 1 million requests for the SuperBowl chunk, it intelligently pauses 999,999 of them. It sends exactly ONE request to the Origin Server. When the chunk arrives a millisecond later, the Edge Server instantly copies it and serves it to all 1 million waiting connections simultaneously, protecting the Origin server from the massive traffic spike.
+
+## INTERVIEW
+**Q: A user searches for a movie. Does the Search request go through the CDN or the API Gateway?**
+A: **The API Gateway.**
+You must fundamentally separate Static Media (Video Chunks, Image Thumbnails, JavaScript bundles) from Dynamic API requests (Search, Login, Payment). 
+CDNs are designed to cache massive, static binary files. A Search Request (`GET /search?q=matrix`) is a dynamic database query. It must bypass the CDN and hit the core API Gateway, which routes it to the Elasticsearch cluster. 
+*(Exception: API Gateways can have their own caching layers, but in a system design interview diagram, you must visually separate the CDN serving video files from the Application Load Balancer serving JSON data).*

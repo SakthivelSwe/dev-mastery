@@ -1,0 +1,181 @@
+---
+title: Modal & Overlay Architecture
+slug: modal-and-overlay
+---
+
+## WHY
+
+Modals (Dialogs), Drawers, and Popovers are the most destructive components to UI accessibility and flow. A poorly implemented Modal allows the user to tab *behind* the modal into the background page, scroll the background page while the modal is open, or fail to return focus to the trigger button when closed.
+
+Building an enterprise-grade Modal requires mastering **Focus Trapping**, **Scroll Locking**, **React Portals**, and strict ARIA guidelines. If you do not handle these correctly, your application will fail accessibility audits (WCAG 2.1) and frustrate keyboard/screen-reader users.
+
+---
+
+## THEORY
+
+### The Four Rules of Overlays
+Whenever an Overlay (Modal/Drawer) opens, you must execute these four rules immediately:
+1. **Render via Portal:** The modal DOM node must be injected at the end of the `document.body` to escape any parent `z-index` or `overflow: hidden` contexts.
+2. **Lock the Scroll:** The background `<body>` must be assigned `overflow: hidden` to prevent dual-scrolling.
+3. **Trap the Focus:** Pressing `Tab` should cycle focus *only* between the actionable elements inside the modal. It must never escape to the background.
+4. **Restore Focus:** When the modal closes, the browser focus must automatically return to the exact button that opened it.
+
+### The `<dialog>` Element
+Historically, developers built Modals using `<div>` tags heavily laden with JavaScript. Modern HTML5 introduces the `<dialog>` element. When opened via `dialogRef.current.showModal()`, the browser natively handles Focus Trapping, the Backdrop, and Esc-key closing! 
+However, integrating `<dialog>` gracefully into React's declarative state model (e.g., `<Modal isOpen={isOpen} />`) requires a `useEffect` to bridge the declarative prop with the imperative `showModal()` API.
+
+---
+
+## IMPLEMENTATION
+
+Let's build a highly accessible, animated React Modal using the native HTML5 `<dialog>` element.
+
+```tsx
+import React, { useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import styled, { keyframes } from 'styled-components';
+
+// --- STYLED COMPONENTS ---
+
+const fadeIn = keyframes`from { opacity: 0; } to { opacity: 1; }`;
+const slideUp = keyframes`from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; }`;
+
+const StyledDialog = styled.dialog`
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: var(--bg-surface);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+  width: 100%;
+  max-width: 500px;
+  
+  /* Native backdrop styling */
+  &::backdrop {
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    animation: ${fadeIn} 0.2s ease-out;
+  }
+
+  /* Animate the modal itself */
+  &[open] {
+    animation: ${slideUp} 0.3s ease-out;
+  }
+`;
+
+const Header = styled.header`
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border-subtle);
+`;
+
+const Title = styled.h2`margin: 0; font-size: 18px;`;
+
+const Content = styled.div`padding: 24px;`;
+
+const CloseButton = styled.button`
+  background: none; border: none; font-size: 24px; cursor: pointer;
+  color: var(--text-secondary);
+  &:hover { color: var(--color-danger-500); }
+`;
+
+// --- COMPONENT API ---
+
+interface ModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  title: string;
+  children: React.ReactNode;
+}
+
+export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children }) => {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const dialogNode = dialogRef.current;
+    if (!dialogNode) return;
+
+    if (isOpen) {
+      // 1. Store the element that had focus BEFORE opening
+      triggerRef.current = document.activeElement as HTMLElement;
+      
+      // 2. Lock body scroll
+      document.body.style.overflow = 'hidden';
+      
+      // 3. Open the native modal (This natively traps focus and adds the backdrop)
+      dialogNode.showModal();
+    } else {
+      // 1. Close the modal
+      dialogNode.close();
+      
+      // 2. Unlock body scroll
+      document.body.style.overflow = '';
+      
+      // 3. Restore focus to the trigger element
+      if (triggerRef.current) {
+        triggerRef.current.focus();
+      }
+    }
+
+    // Cleanup scroll lock if component unmounts suddenly
+    return () => { document.body.style.overflow = ''; };
+  }, [isOpen]);
+
+  // Handle ESC key and Backdrop Clicks natively
+  const handleCancel = (e: React.SyntheticEvent) => {
+    e.preventDefault();
+    onClose();
+  };
+
+  const handleBackdropClick = (e: React.MouseEvent<HTMLDialogElement>) => {
+    // If the click is on the dialog wrapper (backdrop), close it
+    if (e.target === dialogRef.current) {
+      onClose();
+    }
+  };
+
+  // Render via Portal to escape CSS containment
+  if (typeof document === 'undefined') return null;
+
+  return createPortal(
+    <StyledDialog 
+      ref={dialogRef} 
+      onCancel={handleCancel} 
+      onClick={handleBackdropClick}
+      aria-labelledby="modal-title"
+    >
+      <Header>
+        <Title id="modal-title">{title}</Title>
+        <CloseButton onClick={onClose} aria-label="Close modal">&times;</CloseButton>
+      </Header>
+      <Content>
+        {children}
+      </Content>
+    </StyledDialog>,
+    document.body
+  );
+};
+```
+
+---
+
+## SYSTEM_DESIGN
+
+### Z-Index Management Strategy
+In a large application, z-index wars are common (e.g., a DatePicker popover renders *behind* a Sticky Header, but *above* a Modal). 
+
+A Senior Engineer defines a strict Z-Index scale in the Design Tokens, completely banning hardcoded `z-index: 9999` in CSS files.
+
+```css
+/* tokens.css */
+:root {
+  --z-elevated: 10;     /* Dropdowns, Sticky headers */
+  --z-overlay: 100;     /* Modal Backdrops */
+  --z-modal: 110;       /* Modal Content */
+  --z-popover: 120;     /* Tooltips, DatePickers inside Modals */
+  --z-toast: 200;       /* Toasts / Notifications */
+}
+```
+If a DatePicker needs to break out of a Modal's `overflow: hidden`, the DatePicker itself must also be rendered via a React Portal and assigned `--z-popover` to ensure it floats above `--z-modal`.

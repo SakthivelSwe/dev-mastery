@@ -1,0 +1,155 @@
+---
+title: Theming Architecture & CSS Variables
+slug: theming-architecture
+---
+
+## WHY
+
+In modern web applications, theming is no longer just "Dark Mode" and "Light Mode". Enterprise SaaS platforms often require white-labeling (allowing customers to inject their own brand colors), high-contrast modes for accessibility, and dynamic theme switching on the fly.
+
+If your theming architecture relies on passing JS objects down via React Context (e.g., `styled-components` `<ThemeProvider>`), you will suffer massive performance hits. Every time the theme changes, React must recursively re-render the entire component tree to recalculate CSS strings. Furthermore, JS-based themes cause a "Flash of Incorrect Theme" (FOIT) during Server-Side Rendering (SSR) because the JS hasn't hydrated yet.
+
+The only scalable, high-performance way to build a theming architecture is using native **CSS Custom Properties (Variables)**.
+
+---
+
+## THEORY
+
+### CSS Variables vs Preprocessor Variables
+SASS/LESS variables (`$primary-color: #f00;`) are compiled away during the build step. They do not exist in the browser. 
+CSS Variables (`--primary-color: #f00;`) exist in the browser's DOM at runtime. If you change a CSS variable via JavaScript (`document.body.style.setProperty`), the browser's CSS engine instantly repaints all affected elements in microseconds, bypassing React entirely.
+
+### The Token Tiers
+A robust theming architecture organizes CSS variables into three tiers:
+1. **Global Tokens (Primitives):** Raw, semantic-free values. (e.g., `--blue-500: #3b82f6;`)
+2. **Alias Tokens (Semantic):** Define the *intent* of the color. (e.g., `--color-primary: var(--blue-500);`)
+3. **Component Tokens (Specific):** Scoped to a specific component. (e.g., `--button-bg: var(--color-primary);`)
+
+When switching from Light Mode to Dark Mode, you **never** change the Global Tokens. You only re-assign the Alias Tokens.
+
+---
+
+## IMPLEMENTATION
+
+Let's build a zero-JS, flash-free theming architecture using data-attributes and CSS variables.
+
+### 1. Define the CSS Tokens
+Create a global CSS file (`theme.css`). We bind the light theme to the `:root` and the dark theme to a specific data attribute (`data-theme="dark"`).
+
+```css
+/* theme.css */
+
+/* TIER 1: Global Primitive Tokens (Never change across themes) */
+:root {
+  --gray-50:  #f9fafb;
+  --gray-900: #111827;
+  --blue-500: #3b82f6;
+  --blue-400: #60a5fa;
+}
+
+/* TIER 2: Light Mode (Default Semantic Tokens) */
+:root,
+[data-theme="light"] {
+  --bg-surface: var(--gray-50);
+  --text-primary: var(--gray-900);
+  --color-brand: var(--blue-500);
+  
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+}
+
+/* TIER 2: Dark Mode Semantic Tokens */
+[data-theme="dark"] {
+  --bg-surface: var(--gray-900);
+  --text-primary: var(--gray-50);
+  --color-brand: var(--blue-400); /* Slightly lighter for dark backgrounds */
+  
+  --shadow-sm: 0 1px 2px rgba(255,255,255,0.05);
+}
+```
+
+### 2. Consuming Tokens in Components
+Because the tokens exist natively in CSS, any styling solution (Vanilla CSS, CSS Modules, Styled Components, or Tailwind) can consume them effortlessly.
+
+```tsx
+// Using Styled-Components
+const Card = styled.div`
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  transition: background-color 0.3s ease, color 0.3s ease;
+`;
+
+// Using TailwindCSS (tailwind.config.js)
+module.exports = {
+  theme: {
+    colors: {
+      surface: 'var(--bg-surface)',
+      brand: 'var(--color-brand)'
+    }
+  }
+}
+```
+
+### 3. Preventing the SSR Flash (Next.js / SSR)
+If a user prefers dark mode, but the server renders HTML assuming light mode, the screen will flash blindingly white before the JS hydrates and switches it to dark mode.
+To fix this, we inject a tiny, synchronous blocking script directly into the `<head>` of the HTML document. This script runs *before* the browser paints the screen.
+
+```tsx
+// app/layout.tsx (Next.js App Router)
+
+export default function RootLayout({ children }) {
+  // This script runs natively in the browser immediately, blocking the first paint
+  // until the correct theme attribute is set on the HTML tag.
+  const themeScript = `
+    (function() {
+      try {
+        var localTheme = localStorage.getItem('theme');
+        var sysTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (localTheme === 'dark' || (!localTheme && sysTheme)) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        } else {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      } catch (e) {}
+    })();
+  `;
+
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+```
+
+---
+
+## SYSTEM_DESIGN
+
+### White-Labeling (Tenant Specific Themes)
+If you build a SaaS application where Customer A wants a red brand color and Customer B wants a green brand color, CSS Variables make this trivial.
+
+When Customer A logs in, you fetch their brand configuration from the API and dynamically inject a `<style>` block at the root of their dashboard:
+
+```tsx
+// The API returns: { brandColor: "#ff0000" }
+
+function TenantThemeProvider({ tenantConfig, children }) {
+  return (
+    <>
+      <style dangerouslySetInnerHTML={{
+        __html: `
+          :root {
+            --color-brand: ${tenantConfig.brandColor};
+          }
+        `
+      }} />
+      {children}
+    </>
+  );
+}
+```
+Instantly, every button, link, and focused input in the application repaints to Red, with absolutely zero React re-renders required!

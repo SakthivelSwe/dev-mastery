@@ -1,0 +1,115 @@
+---
+slug: "sd-message-queues"
+title: "Message Queues"
+level: 4
+---
+
+## WHY
+In synchronous communication, Service A calls Service B and waits for B to respond before continuing. This works fine for simple cases, but creates critical problems at scale:
+1. **Tight Coupling:** If Service B is down, Service A fails too.
+2. **Latency Amplification:** Service A is blocked idle while waiting for B to process.
+3. **Traffic Spikes:** If 10,000 requests hit Service A simultaneously, it forwards all 10,000 simultaneously to Service B, overwhelming it.
+
+**Message Queues** decouple Services A and B entirely. A publishes a message to the queue and immediately continues. B consumes from the queue at its own pace, independently. If B crashes, the messages sit safely in the queue until B recovers.
+
+## THEORY
+### The Publish-Subscribe vs Point-to-Point Pattern
+**Point-to-Point (Queue):** A message is produced once and consumed by exactly ONE consumer. Used for Task Distribution — if you have 3 worker servers processing video encoding jobs, each job is processed by only one server.
+
+**Publish-Subscribe (Topic):** A message is produced once and consumed by MULTIPLE subscribers. Used for Event Broadcasting — when an order is placed, the Email Service, Inventory Service, and Analytics Service all receive and process the same event independently.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sd-message-queue" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Core Flow)
+```
+Producer ──► Queue/Topic ──► Consumer(s)
+
+// Point-to-Point (Queue): One consumer gets the message
+Producer ──► [Job Queue] ──► Worker A (processes job)
+                            ► Worker B (waits for next job)
+                            ► Worker C (waits for next job)
+
+// Publish-Subscribe (Topic): ALL consumers get the message
+Producer ──► [order-placed Topic]
+                             ──► Email Service (sends confirmation)
+                             ──► Inventory Service (reserves stock)
+                             ──► Analytics Service (records the event)
+```
+
+### Level 2 — Building Blocks (Popular Message Queue Systems)
+| Feature | **RabbitMQ** | **Apache Kafka** | **Amazon SQS** |
+|---|---|---|---|
+| Type | Message Broker (Queue) | Distributed Event Log | Managed Cloud Queue |
+| Retention | Deleted after ACK | Retained forever (configurable) | Retained for 14 days |
+| Ordering | Per-queue (FIFO) | Per-partition | Standard (best effort) or FIFO |
+| Scale | Millions/day | Billions/day | Millions/second |
+| Use Case | Task Queues, RPC | Event Sourcing, Streaming | Simple cloud queues |
+
+**When to Use What:**
+- **RabbitMQ:** Standard task queuing, complex routing rules, message TTL, RPC patterns.
+- **Kafka:** High-throughput event streaming, audit logs, real-time pipelines, event sourcing.
+- **SQS:** Simple, fully managed task queue in AWS with zero operational overhead.
+
+### Level 3 — Intermediate (Key Design Concepts)
+```
+// ACKNOWLEDGMENT (ACK): The safety mechanism
+// Consumer receives a message and MUST acknowledge it after processing.
+// If the consumer crashes before ACKing, the broker re-delivers the message
+// to another consumer — zero message loss!
+
+// DEAD LETTER QUEUE (DLQ): The error recovery mechanism
+// If a message fails processing N times (configurable), the broker
+// automatically moves it to a separate Dead Letter Queue for inspection.
+// Engineers can then inspect the DLQ, fix the bug, and re-process the messages.
+
+// BACKPRESSURE: The load control mechanism
+// If consumers are slower than producers, the queue acts as a buffer.
+// Producers continue at full speed; consumers drain the queue at their own pace.
+// The queue prevents the consumer from being overwhelmed by sudden traffic spikes.
+
+// Consumer Group Lag (Kafka):
+// The number of unprocessed messages in a partition.
+// If lag is growing, add more consumer instances to parallel-process the backlog!
+```
+
+### Level 4 — Advanced (The Outbox Pattern for Distributed Consistency)
+A critical challenge: How do you atomically save data to your database AND publish a message to Kafka in the same operation? If you save to DB and then the server crashes before publishing, the event is lost!
+
+```sql
+-- THE OUTBOX PATTERN:
+-- Instead of publishing directly to Kafka, write the event 
+-- to an 'outbox' table in the SAME database transaction!
+
+BEGIN;
+    -- Save the business data
+    INSERT INTO orders (id, user_id, amount) VALUES (1, 123, 99.99);
+    
+    -- Atomically save the event to the outbox table
+    INSERT INTO outbox_events (aggregate_id, event_type, payload)
+    VALUES (1, 'OrderPlaced', '{"orderId": 1, "userId": 123, "amount": 99.99}');
+COMMIT;
+
+-- A separate "CDC" (Change Data Capture) process reads the outbox table
+-- and publishes events to Kafka, then deletes them from the outbox.
+-- Tools: Debezium (reads PostgreSQL WAL logs and streams changes to Kafka)
+```
+
+## REAL_WORLD
+**The Circuit Breaker + Message Queue pattern** is the backbone of resilient microservices.
+
+When a downstream service starts failing, instead of letting requests pile up and timing out (causing cascading failures across the system), a Circuit Breaker "opens" and routes incoming requests to the Message Queue. The requests are buffered safely in the queue until the downstream service recovers, then replayed. The calling service returns a "Request Accepted, Processing" response immediately (HTTP 202 Accepted) rather than failing.
+
+## INTERVIEW
+**Q: What is the difference between a Message Queue and an Event Bus?**
+A: Both are messaging patterns. A **Message Queue** typically implies Point-to-Point delivery (one consumer per message), durable storage, and acknowledgment-based delivery for Task Distribution. An **Event Bus** typically implies Pub-Sub (many consumers per event), in-memory fast routing (often non-durable), and is used for real-time within-service communication (like an `EventEmitter` in Node.js). Kafka blurs this distinction by being both a durable queue AND a Pub-Sub event log.
+
+**Q: At-most-once vs At-least-once vs Exactly-once delivery?**
+A: **At-most-once:** Messages might be lost but never duplicated (producer doesn't retry). **At-least-once:** Messages are never lost but might be duplicated (consumer must implement idempotency). **Exactly-once:** Never lost, never duplicated — the hardest guarantee, supported by Kafka's transactional API. For most business systems, **at-least-once + idempotent consumers** is the pragmatic sweet spot.
+
+**Q: How do you ensure a consumer doesn't process the same message twice?**
+A: By making the consumer **idempotent** — meaning processing the same message twice has the same effect as processing it once. Common techniques: Store a set of processed message IDs in Redis with TTL; use `ON CONFLICT DO NOTHING` in SQL inserts; use a version number/timestamp to ignore stale updates.

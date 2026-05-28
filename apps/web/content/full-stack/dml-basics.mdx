@@ -1,0 +1,130 @@
+---
+title: dml-basics
+slug: dml-basics
+---
+
+# DML — INSERT, UPDATE, DELETE, SELECT | Level: 1
+
+Data Manipulation Language (DML) manages the retrieval, insertion, modification, and deletion of data within existing schema relations. Writing efficient DML involves minimizing round-trips to the database and understanding the physical implications of mutations.
+
+---
+
+### Core Mechanics & Advanced Mutating Features
+
+#### 1. PostgreSQL `RETURNING` Clause
+Unlike standard SQL, which requires a separate query to fetch auto-generated primary keys or default values after an insert or update, PostgreSQL supports the `RETURNING` clause. This returns the modified rows immediately within the same transaction round-trip, saving significant network overhead.
+
+#### 2. UPDATE From Subquery
+Using values from one table to update another can be achieved using the `UPDATE ... FROM` syntax. This allows complex joins directly inside the update statement.
+
+#### 3. DELETE with JOIN (The `USING` Clause)
+Standard SQL does not support direct joins in a `DELETE` statement. PostgreSQL provides the `USING` clause to join additional tables for conditional deletion.
+
+#### 4. TRUNCATE vs DELETE: Internal Mechanics
+*   **`DELETE`:**
+    *   Row-by-row operation.
+    *   Generates transaction logs (WAL) for every single deleted record.
+    *   Triggers are executed for every deleted row (if defined).
+    *   Does not release disk space immediately (it marks tuples as dead, waiting for `VACUUM`).
+*   **`TRUNCATE`:**
+    *   DDL operation under the hood.
+    *   Reclaims disk space by deallocating the entire data file (heap relation) and creating a new empty file.
+    *   Bypasses row-level triggers.
+    *   Extremely fast for large datasets.
+
+---
+
+### Database Setup and SQL DML
+
+```sql
+DROP TABLE IF EXISTS stock_inventory;
+DROP TABLE IF EXISTS products;
+
+CREATE TABLE products (
+    product_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku VARCHAR(50) UNIQUE NOT NULL,
+    title VARCHAR(150) NOT NULL,
+    price NUMERIC(12, 2) NOT NULL,
+    discontinued BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE stock_inventory (
+    product_id BIGINT PRIMARY KEY REFERENCES products(product_id) ON DELETE CASCADE,
+    quantity_available INT NOT NULL CHECK (quantity_available >= 0),
+    warehouse_code VARCHAR(10) NOT NULL
+);
+
+-- 1. INSERT with RETURNING
+INSERT INTO products (sku, title, price) 
+VALUES ('PROD-A-101', 'Enterprise Server Rack', 1200.00)
+RETURNING product_id, sku, price;
+
+-- Insert supplementary records
+INSERT INTO products (sku, title, price) VALUES 
+('PROD-B-202', 'Fiber Optic Cable 10m', 45.00),
+('PROD-C-303', 'Managed Switch 24-Port', 350.00);
+
+INSERT INTO stock_inventory (product_id, quantity_available, warehouse_code)
+VALUES 
+((SELECT product_id FROM products WHERE sku = 'PROD-A-101'), 15, 'WH-EAST'),
+((SELECT product_id FROM products WHERE sku = 'PROD-B-202'), 100, 'WH-WEST'),
+((SELECT product_id FROM products WHERE sku = 'PROD-C-303'), 0, 'WH-EAST');
+
+-- 2. UPDATE from Subquery / Join
+-- Update product price based on inventory status (e.g., discount out of stock items)
+UPDATE products p
+SET price = p.price * 0.90
+FROM stock_inventory i
+WHERE p.product_id = i.product_id
+AND i.quantity_available = 0
+RETURNING p.product_id, p.sku, p.price AS discounted_price;
+
+-- 3. DELETE with USING Clause
+-- Delete all discontinued products that have no stock in WH-EAST
+DELETE FROM products p
+USING stock_inventory i
+WHERE p.product_id = i.product_id
+AND p.discontinued = TRUE
+AND i.warehouse_code = 'WH-EAST';
+```
+
+---
+
+### Spring Data JPA & Hibernate Integration
+
+When executing bulk updates or deletes in Hibernate, the persistence context (L1 Cache) can become out-of-sync because the SQL is executed directly in the database, bypassing the entity manager's lifecycle tracking.
+
+```java
+package com.devmastery.sql.repository;
+
+import com.devmastery.sql.domain.Product;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.math.BigDecimal;
+import java.util.Optional;
+
+@Repository
+public interface ProductRepository extends JpaRepository<Product, Long> {
+
+    // Native query mapping RETURNING clause
+    @Query(value = "INSERT INTO products (sku, title, price, discontinued) " +
+                   "VALUES (:sku, :title, :price, false) " +
+                   "RETURNING product_id", nativeQuery = true)
+    Long insertProductWithReturning(@Param("sku") String sku, 
+                                    @Param("title") String title, 
+                                    @Param("price") BigDecimal price);
+
+    // Modifying query requires @Modifying to notify Hibernate of state mutation
+    // clearAutomatically clears the L1 Cache to prevent stale reads
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE Product p SET p.price = p.price * :discountFactor " +
+           "WHERE p.id IN (SELECT i.productId FROM StockInventory i WHERE i.quantityAvailable = 0)")
+    int applyDiscountToOutOfStockProducts(@Param("discountFactor") BigDecimal discountFactor);
+}
+```
+
+---

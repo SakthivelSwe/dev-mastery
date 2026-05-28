@@ -1,0 +1,86 @@
+---
+slug: "mongodb-security"
+title: "MongoDB Security Best Practices"
+level: 4
+---
+
+## WHY
+In 2017, a massive wave of ransomware attacks swept the internet. Hackers wrote automated scripts that scanned the entire web for open MongoDB ports (27017). Because early versions of MongoDB installed with Authentication disabled by default, the hackers easily connected to over 27,000 production databases, deleted all the data, and left a ransom note demanding Bitcoin to restore it. 
+
+Securing a database is not an optional afterthought. A single misconfiguration can destroy a company overnight. Understanding MongoDB's security layers is critical for any backend developer.
+
+## THEORY
+### The Security Onion
+Database security is implemented in layers (Defense in Depth). If a hacker bypasses one layer, the next layer should stop them.
+1. **Network Layer:** Who is allowed to talk to the server?
+2. **Authentication Layer:** Who is the user?
+3. **Authorization Layer:** What is the user allowed to do?
+4. **Encryption Layer:** Is the data readable if someone steals the physical hard drive?
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-security" }
+```
+
+## CODE
+
+### Layer 1 — The Network Layer (Firewalls & VPCs)
+The most effective way to secure a database is to make it invisible to the public internet.
+
+**1. IP Whitelisting (Firewalls)**
+By default, you should block ALL incoming traffic to port `27017` (the default MongoDB port). You then create an explicit "Whitelist" rule in your cloud firewall (AWS Security Groups) allowing ONLY the specific IP addresses of your backend Node.js servers to connect.
+
+**2. VPC Peering**
+If your backend is hosted in AWS, and your database is hosted in MongoDB Atlas, traffic between them technically travels over the public internet. VPC (Virtual Private Cloud) Peering creates a private, invisible tunnel between your AWS account and the Atlas account. The traffic never touches the public internet, making it immune to external interception!
+
+### Layer 2 — The Authentication Layer (SCRAM)
+Once a connection reaches the database, the user must authenticate.
+MongoDB uses **SCRAM (Salted Challenge Response Authentication Mechanism)**. 
+
+When you create a user in MongoDB (`db.createUser()`), MongoDB never stores the plaintext password. It hashes the password with a cryptographic salt. When the Node.js application tries to log in, it doesn't send the password over the network. Instead, the server sends a mathematical "Challenge", and the driver uses the password to solve the equation and send back the "Response", proving it knows the password without ever transmitting it!
+
+### Layer 3 — The Authorization Layer (RBAC)
+Never connect your Node.js application to MongoDB using the `admin` root user! 
+You must use **Role-Based Access Control (RBAC)**.
+
+You should create a specific user account just for your API, and grant it the principle of **Least Privilege**.
+```javascript
+// Switch to the admin database to create users
+use admin;
+
+db.createUser({
+  user: "api_backend_user",
+  pwd: passwordPrompt(),
+  roles: [
+    // This user is ONLY allowed to read and write to the 'ecommerce' database.
+    // They cannot drop the database, and they cannot access other databases!
+    { role: "readWrite", db: "ecommerce" }
+  ]
+})
+```
+If a hacker discovers a vulnerability in your Node.js code and extracts the connection string, they can only manipulate the `ecommerce` database. They cannot delete the users, shut down the cluster, or access the billing database!
+
+### Layer 4 — The Encryption Layer (TLS & Encryption at Rest)
+**Data In Transit (TLS/SSL):**
+When your Node.js app sends a query (`db.users.find()`), that text travels across network cables. If a hacker taps the cable (Packet Sniffing), they can read the query. You must force MongoDB to use TLS (Transport Layer Security). This encrypts the data as it flies through the network. (This is denoted by `?tls=true` in modern connection strings).
+
+**Data at Rest (Disk Encryption):**
+What if a malicious employee walks into the AWS data center, physically unplugs the hard drive from the server rack, takes it home, and plugs it into their laptop? 
+Encryption at Rest solves this. The actual `.wt` (WiredTiger) database files on the hard drive are encrypted using AES-256 military-grade encryption. Without the master decryption key (stored in a separate AWS KMS Key Management Service), the files look like absolute gibberish. 
+
+## REAL_WORLD
+**Field-Level Encryption (FLE)**
+Even with Encryption at Rest, once the database boots up, the DBA (Database Administrator) can log into the MongoDB shell and run `db.users.find()` to view every user's social security number in plain text.
+
+In highly secure applications (Healthcare/Finance), MongoDB offers **Client-Side Field-Level Encryption**. 
+Before the Node.js application sends the `insert` query to the database, the Node.js driver automatically encrypts the `ssn` field using a key stored in your backend.
+The database literally stores: `{ name: "Alice", ssn: "xYz123#@" }`. 
+The DBA can query the database all day long, but they will never see the real SSN! Only the Node.js backend has the key to decrypt the field when it pulls it back out.
+
+## INTERVIEW
+**Q: What is a NoSQL Injection attack, and how is it different from SQL Injection?**
+A: In SQL Injection, hackers manipulate the raw string concatenation of a query (e.g., `' OR 1=1 --`). Because MongoDB drivers do not use string concatenation (they build BSON objects), traditional SQL injection is impossible.
+However, **NoSQL Injection** occurs when an API blindly passes user JSON input directly into a MongoDB query!
+If your code does this: `db.users.findOne({ email: req.body.email, password: req.body.password })`
+A hacker can send this JSON payload: `{"email": "admin@test.com", "password": {"$gt": ""}}`. 
+Because `$gt` (greater than) evaluates to true for strings, the query bypasses the password check completely and logs the hacker in! Always validate and sanitize user input before passing it to MongoDB, or force the input to be parsed strictly as a string.
