@@ -3,16 +3,20 @@
 import React from 'react';
 import { Hammer, Github, Terminal, CheckCircle2 } from 'lucide-react';
 
-export default function BuildChallengePanel() {
+interface BuildChallengePanelProps {
+  buildContent: string;
+}
+
+export default function BuildChallengePanel({ buildContent }: BuildChallengePanelProps) {
   return (
     <div className="h-full flex flex-col max-w-4xl mx-auto pb-20">
-      <div className="mb-8">
-        <h2 className="font-syne text-3xl mb-4 flex items-center gap-3">
-          <Hammer className="text-accent-java" />
+      <div className="mb-6">
+        <h2 className="text-3xl font-bold font-display mb-3 flex items-center gap-3">
+          <Hammer className="text-[--accent-java]" size={28} />
           Build Challenge
         </h2>
-        <p className="text-lg text-muted-foreground">
-          True mastery comes from doing. Apply the concepts you've learned to build a real-world project.
+        <p className="text-[--text-secondary] leading-7">
+          True mastery comes from doing. Apply the concepts to build a real-world mini-project.
         </p>
       </div>
 

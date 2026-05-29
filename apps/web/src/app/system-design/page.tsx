@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from 'react';
 import SystemDesignViewer from '@/components/system-design/SystemDesignViewer';
-import { fetchAuthData } from '@/lib/api';
+// Uses direct fetch since system-design uses a different path than standard content API
 
 export default function SystemDesignPage() {
   const [architectures, setArchitectures] = useState<any[]>([]);
@@ -13,11 +13,11 @@ export default function SystemDesignPage() {
   useEffect(() => {
     async function loadArchitectures() {
       try {
-        const data = await fetchAuthData('/system-design');
+        const res = await fetch('http://localhost:8082/v1/system-design');
+        if (!res.ok) throw new Error('Failed');
+        const data = await res.json();
         setArchitectures(data);
-        if (data.length > 0) {
-          setActiveSlug(data[0].slug);
-        }
+        if (data.length > 0) setActiveSlug(data[0].slug);
       } catch (e) {
         console.error("Failed to load architectures", e);
       } finally {
@@ -31,7 +31,9 @@ export default function SystemDesignPage() {
     if (!activeSlug) return;
     async function loadDetails() {
       try {
-        const data = await fetchAuthData(`/system-design/${activeSlug}`);
+        const res = await fetch(`http://localhost:8082/v1/system-design/${activeSlug}`);
+        if (!res.ok) throw new Error('Failed');
+        const data = await res.json();
         setActiveArchitecture(data);
       } catch (e) {
         console.error("Failed to load architecture details", e);

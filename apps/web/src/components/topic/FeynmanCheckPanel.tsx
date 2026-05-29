@@ -4,7 +4,12 @@ import React, { useState } from 'react';
 import { Bot, Mic, PlaySquare } from 'lucide-react';
 import { useTopicStore } from '@/store/useTopicStore';
 
-export default function FeynmanCheckPanel() {
+interface FeynmanCheckPanelProps {
+  topicSlug:  string;
+  topicTitle: string;
+}
+
+export default function FeynmanCheckPanel({ topicSlug, topicTitle }: FeynmanCheckPanelProps) {
   const [explanation, setExplanation] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -22,21 +27,22 @@ export default function FeynmanCheckPanel() {
   return (
     <div className="h-full flex flex-col max-w-3xl pb-20">
       <div className="mb-8">
-        <h2 className="font-syne text-3xl mb-4 flex items-center gap-3">
-          <Mic className="text-accent-java" />
+        <h2 className="text-3xl font-bold font-display mb-3 flex items-center gap-3">
+          <Mic className="text-[--accent-java]" size={28} />
           Feynman Check
         </h2>
-        <p className="text-lg text-muted-foreground">
-          The ultimate test of understanding is the ability to explain it simply. 
-          Explain this topic in your own words, as if you were teaching a junior developer.
+        <p className="text-[--text-secondary] leading-7">
+          The ultimate test of understanding is the ability to explain it simply.
+          Explain <strong className="text-[--text-primary]">{topicTitle}</strong> in your own words,
+          as if you were teaching a junior developer. The AI will score your understanding from 1–10.
         </p>
       </div>
 
       <div className="flex-1 flex flex-col gap-4">
         <div className="relative flex-1 min-h-[300px]">
           <textarea
-            className="w-full h-full bg-card/50 border border-border rounded-xl p-6 text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-accent-java"
-            placeholder="Start typing your explanation here..."
+            className="w-full h-full bg-[--bg-elevated] border border-[--border-default] rounded-xl p-6 text-[--text-primary] resize-none focus:outline-none focus:ring-2 focus:ring-[--accent-java] transition-all placeholder:text-[--text-muted]"
+            placeholder={`Explain ${topicTitle} as if teaching a junior developer...`}
             value={explanation}
             onChange={(e) => setExplanation(e.target.value)}
           />
@@ -64,13 +70,13 @@ export default function FeynmanCheckPanel() {
       </div>
 
       {feedback && (
-        <div className="mt-8 p-6 bg-indigo-500/10 border border-indigo-500/20 rounded-xl flex gap-4">
-          <div className="mt-1">
-            <Bot className="text-indigo-400" size={24} />
+        <div className="mt-6 p-6 bg-indigo-500/10 border border-indigo-500/25 rounded-xl flex gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="mt-1 shrink-0">
+            <Bot className="text-indigo-400" size={22} />
           </div>
           <div>
-            <h3 className="font-semibold text-indigo-300 mb-2">AI Feedback</h3>
-            <p className="text-indigo-100/80 leading-relaxed">{feedback}</p>
+            <h3 className="font-semibold text-indigo-300 mb-2 text-sm tracking-wide uppercase">AI Feedback</h3>
+            <p className="text-indigo-100/85 leading-relaxed">{feedback}</p>
           </div>
         </div>
       )}

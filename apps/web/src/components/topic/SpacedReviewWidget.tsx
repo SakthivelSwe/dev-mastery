@@ -3,7 +3,12 @@
 import React, { useState } from 'react';
 import { Repeat, Eye, ThumbsDown, ThumbsUp, CheckCircle, Brain } from 'lucide-react';
 
-export default function SpacedReviewWidget() {
+interface SpacedReviewWidgetProps {
+  topicSlug:           string;
+  spacedReviewContent: string;
+}
+
+export default function SpacedReviewWidget({ topicSlug, spacedReviewContent }: SpacedReviewWidgetProps) {
   const [showAnswer, setShowAnswer] = useState(false);
   const [completed, setCompleted] = useState(false);
 
@@ -27,12 +32,13 @@ export default function SpacedReviewWidget() {
   return (
     <div className="h-full flex flex-col max-w-3xl mx-auto pb-20">
       <div className="mb-8">
-        <h2 className="font-syne text-3xl mb-4 flex items-center gap-3">
-          <Repeat className="text-accent-java" />
+        <h2 className="text-3xl font-bold font-display mb-3 flex items-center gap-3">
+          <Repeat className="text-[--accent-java]" size={28} />
           Spaced Review
         </h2>
-        <p className="text-lg text-muted-foreground">
-          Combat the forgetting curve. Review this core concept using Active Recall.
+        <p className="text-[--text-secondary] leading-7">
+          Combat the forgetting curve. Review this core concept using Active Recall — the most
+          effective learning technique proven by cognitive science.
         </p>
       </div>
 
