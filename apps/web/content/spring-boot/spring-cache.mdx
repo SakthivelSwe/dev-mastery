@@ -1,0 +1,114 @@
+---
+slug: "spring-cache"
+title: "Spring Cache Abstraction"
+level: 4
+---
+
+## WHY
+If you have a `/api/reports/monthly` endpoint that runs a massive, 5-second SQL aggregation query, it will destroy your database if 1,000 users click the "View Report" button simultaneously.
+Because the monthly report data only changes once a month, recalculating it 1,000 times is a massive waste of CPU.
+You need to **Cache** the result.
+While you could manually write code to connect to Redis, check if a key exists, return it, or query the database and save it to Redis... this pollutes your clean business logic with infrastructure boilerplate.
+**Spring Cache Abstraction** solves this elegantly. By simply adding a single `@Cacheable` annotation to a method, Spring uses Aspect-Oriented Programming (AOP) to magically intercept the method call, check the cache, and instantly return the data without ever executing the actual Java code inside the method!
+
+## THEORY
+### The Abstraction Layer
+The beauty of Spring Cache is that it is an *abstraction*. Your Java code doesn't know if it's caching to a simple `ConcurrentHashMap` in RAM, or a massive distributed **Redis** cluster. 
+You can switch the underlying caching provider in `application.properties` without changing a single line of business logic!
+
+### The Core Annotations
+- **`@EnableCaching`:** Turns on the AOP magic globally.
+- **`@Cacheable`:** Intercepts the method. If data is in cache, return it. If not, run method and save result to cache.
+- **`@CachePut`:** Always runs the method, and forcefully updates the cache with the new result.
+- **`@CacheEvict`:** Deletes data from the cache (e.g., when a user deletes a record in the database).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "cache-aside-pattern" }
+```
+
+## CODE
+
+Let's implement a blazing fast product catalog using Spring Cache.
+
+### 1. Enable Caching
+You must add this to your main Application class (or a Configuration class). If you forget this, the annotations are completely ignored!
+
+```java
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+@EnableCaching // CRITICAL! Turns on the caching interceptors!
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+```
+
+### 2. Using @Cacheable
+Let's add caching to a slow database query in the Service layer.
+
+```java
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ProductService {
+
+    private final ProductRepository repository;
+
+    // "products" is the name of the cache "bucket"
+    // "key" defines how we identify this specific item in the bucket.
+    // If we call getProduct(42), the cache key will be "product_42".
+    @Cacheable(value = "products", key = "#id")
+    public Product getProduct(Long id) {
+        // Simulate a painfully slow 3-second database query!
+        simulateSlowNetworkDelay();
+        
+        System.out.println("Executing physical DB query for Product " + id);
+        return repository.findById(id).orElseThrow();
+    }
+}
+```
+**The Result:** 
+- The first time a user requests Product 42, it takes 3 seconds. The console prints "Executing physical DB query". The data is saved to cache.
+- The next 10,000 times users request Product 42, it takes 1 millisecond. The console prints NOTHING. The method is bypassed entirely!
+
+### 3. Evicting Stale Data
+If an admin updates the price of Product 42, the cache still holds the old price! We must clear it.
+
+```java
+import org.springframework.cache.annotation.CacheEvict;
+
+@Service
+public class ProductService {
+
+    // When this method runs, delete the item "product_42" from the "products" bucket!
+    @CacheEvict(value = "products", key = "#updatedProduct.id")
+    public Product updateProduct(Product updatedProduct) {
+        System.out.println("Updating physical DB for Product " + updatedProduct.getId());
+        return repository.save(updatedProduct);
+    }
+}
+```
+
+## REAL_WORLD
+**Switching to Redis**
+By default, Spring uses a simple `ConcurrentHashMap` in local RAM. This is fine for a single server, but if you have 5 Load-Balanced Spring Boot servers, they will all have different, out-of-sync local caches!
+You must upgrade to a centralized, distributed cache like **Redis**.
+Because Spring Cache is an abstraction, upgrading is shockingly simple:
+1. Add the dependency: `spring-boot-starter-data-redis`
+2. Add the URL to `application.yml`: `spring.redis.host=localhost`
+Spring Boot automatically detects the Redis dependency on the classpath, disables the local RAM cache, auto-configures a `RedisCacheManager`, and magically reroutes all your `@Cacheable` annotations to store data in the Redis server over the network! You don't change a single line of Java code!
+
+## INTERVIEW
+**Q: You have a `MathService` class. Inside it, you have a `@Cacheable` method `calculateComplexMath()`. You also have another method in the exact same class called `processData()`. The `processData()` method internally calls `this.calculateComplexMath()`. When you execute `processData()` 100 times, you notice the cache is completely ignored, and the complex math executes 100 times, causing terrible performance! Why did `@Cacheable` fail to work?**
+A: **The Self-Invocation Problem (Proxy Bypass).**
+Spring Cache (like Spring Transactions) relies heavily on Spring AOP (Aspect-Oriented Programming) Proxies.
+When you inject `MathService` into a Controller, Spring doesn't give the Controller the real `MathService` object. It gives it a dynamically generated "Proxy" wrapper.
+When the Controller calls `proxy.calculateComplexMath()`, the Proxy intercepts the call, checks the cache, and then optionally routes the call to the real object.
+However, when `processData()` calls `this.calculateComplexMath()` from *inside* the same class, it is bypassing the Proxy entirely! It is a raw Java internal method call. Because the Proxy is bypassed, the `@Cacheable` interceptor is never triggered, and the method executes physically every single time!
+*The Fix:* The simplest fix is to extract the `@Cacheable` method into a separate, dedicated Spring Bean (e.g., `MathCalculationService`) and inject it, ensuring every call passes through the Proxy boundary!

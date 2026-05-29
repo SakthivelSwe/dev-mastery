@@ -1,0 +1,170 @@
+---
+slug: "aggregation-pipeline"
+title: "MongoDB Aggregation Pipeline"
+level: 3
+---
+
+## WHY
+The `find()` method is excellent for basic querying, but it cannot do GROUP BY, JOINs, or complex data transformations. What if you need "Total revenue by product category for orders placed this month"?
+
+MongoDB's **Aggregation Pipeline** is the answer. It lets you process documents through a series of "stages", where each stage transforms the data, similar to a Unix pipe (`|`). The output of each stage becomes the input to the next, allowing you to build powerful data transformation and analytical queries.
+
+## THEORY
+### Pipeline Stages
+The most commonly used stages are:
+- `$match` — Filter documents (like SQL `WHERE`)
+- `$group` — Aggregate documents by a field (like SQL `GROUP BY`)
+- `$project` — Reshape documents, include/exclude fields (like SQL `SELECT`)
+- `$sort` — Sort documents (like SQL `ORDER BY`)
+- `$limit` / `$skip` — Pagination
+- `$lookup` — Join documents from another collection (like SQL `JOIN`)
+- `$unwind` — Deconstruct an array field into separate documents
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongodb-aggregation" }
+```
+
+## CODE
+
+### Level 1 — Beginner (match + group)
+```javascript
+// Get total revenue by product category
+db.orders.aggregate([
+    
+    // Stage 1: $match — Filter (like WHERE)
+    // Only process orders from this year
+    { $match: { orderDate: { $gte: new Date("2025-01-01") }, status: "completed" } },
+    
+    // Stage 2: $group — Aggregate (like GROUP BY)
+    {
+        $group: {
+            _id: "$category",              // Group by the 'category' field
+            totalRevenue: { $sum: "$amount" },
+            avgOrderValue: { $avg: "$amount" },
+            orderCount: { $sum: 1 }
+        }
+    },
+    
+    // Stage 3: $sort — Order the results (like ORDER BY)
+    { $sort: { totalRevenue: -1 } },   // Descending by revenue
+    
+    // Stage 4: $limit — Take only top 5
+    { $limit: 5 }
+]);
+```
+
+### Level 2 — Building Blocks ($project — Reshape Documents)
+```javascript
+// $project reshapes each document — like SQL SELECT with computed columns
+db.users.aggregate([
+    {
+        $project: {
+            _id: 0,                      // Exclude _id
+            username: 1,                 // Include username
+            email: 1,
+            
+            // Computed fields!
+            fullName: { $concat: ["$firstName", " ", "$lastName"] },
+            
+            // String operations
+            usernameLower: { $toLower: "$username" },
+            
+            // Date operations
+            yearJoined: { $year: "$createdAt" },
+            
+            // Conditional field
+            membershipType: {
+                $cond: {
+                    if: { $gt: ["$totalSpend", 1000] },
+                    then: "Premium",
+                    else: "Standard"
+                }
+            }
+        }
+    }
+]);
+```
+
+### Level 3 — Intermediate ($lookup — Joining Collections)
+```javascript
+// Join orders with user information (like SQL LEFT JOIN)
+db.orders.aggregate([
+    
+    // Stage 1: Filter recent orders
+    { $match: { orderDate: { $gte: new Date("2025-01-01") } } },
+    
+    // Stage 2: $lookup — Join with the 'users' collection
+    {
+        $lookup: {
+            from: "users",           // The collection to join with
+            localField: "userId",    // Field in orders (the FK)
+            foreignField: "_id",     // Field in users (the PK)
+            as: "userDetails"        // Name of the new array field with joined docs
+        }
+    },
+    
+    // Stage 3: $unwind — Flatten the array (lookup returns an array!)
+    { $unwind: "$userDetails" },
+    
+    // Stage 4: Project only the fields we need
+    {
+        $project: {
+            orderId: "$_id",
+            amount: 1,
+            "userDetails.username": 1,
+            "userDetails.email": 1
+        }
+    }
+]);
+```
+
+### Level 4 — Advanced ($unwind & $facet for analytics)
+```javascript
+// $facet: Run MULTIPLE aggregation pipelines simultaneously on the same data!
+// Perfect for a single API call that returns stats dashboard data.
+db.products.aggregate([
+    { $match: { isActive: true } },
+    
+    {
+        $facet: {
+            // Pipeline 1: Category breakdown
+            byCategory: [
+                { $group: { _id: "$category", count: { $sum: 1 }, avgPrice: { $avg: "$price" } } },
+                { $sort: { count: -1 } }
+            ],
+            
+            // Pipeline 2: Price distribution buckets
+            priceRanges: [
+                {
+                    $bucket: {
+                        groupBy: "$price",
+                        boundaries: [0, 50, 100, 500, 1000, Infinity],
+                        default: "Other",
+                        output: { count: { $sum: 1 } }
+                    }
+                }
+            ],
+            
+            // Pipeline 3: Top 5 most expensive
+            topItems: [
+                { $sort: { price: -1 } },
+                { $limit: 5 },
+                { $project: { name: 1, price: 1 } }
+            ]
+        }
+    }
+]);
+```
+
+## REAL_WORLD
+The MongoDB Aggregation Pipeline is used extensively in real-time analytics and reporting dashboards. Since MongoDB 5.0, you can run aggregations on time-series collections optimized for IoT sensor data, making it competitive with dedicated time-series databases like InfluxDB for moderate scale.
+
+However, for complex analytical workloads on hundreds of millions of records, dedicated data warehouses like **Google BigQuery**, **Amazon Redshift**, or **ClickHouse** will significantly outperform MongoDB's aggregation engine.
+
+## INTERVIEW
+**Q: What is the difference between `$project` and `$addFields`?**
+A: `$project` reshapes the document entirely — you must explicitly include every field you want. `$addFields` only adds or overwrites specific fields, keeping all existing fields intact. Use `$addFields` when you want to compute a new field but keep everything else unchanged. Use `$project` when you want full control over the output shape.
+
+**Q: Can you add an index to improve aggregation performance?**
+A: Yes! The `$match` and `$sort` stages at the **beginning** of the pipeline can leverage indexes. MongoDB's aggregation optimizer tries to "push" `$match` and `$sort` stages as early as possible in the pipeline to use indexes and reduce the number of documents processed in subsequent stages. This is why you should always put `$match` first in your pipeline.

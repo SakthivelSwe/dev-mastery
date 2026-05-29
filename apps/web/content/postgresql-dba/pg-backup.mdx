@@ -1,0 +1,96 @@
+---
+slug: "pg-backup-and-restore"
+title: "PostgreSQL Backup, Restore & PITR"
+level: 3
+---
+
+## WHY
+If your database server physically catches fire, or a disgruntled employee runs `DROP TABLE users;`, your entire company is dead unless you have a robust backup strategy.
+A simple daily backup is not enough. If you take a backup at midnight, and the database crashes at 11:59 PM the next day, you just lost 24 hours of customer transactions. 
+PostgreSQL provides advanced Backup and **Point-in-Time Recovery (PITR)** mechanisms that allow you to restore the database to the *exact second* before the disaster happened, with zero data loss.
+
+## THEORY
+### Logical vs. Physical Backups
+- **Logical Backup (`pg_dump`):** Extracts the data by running standard SQL `SELECT` queries and writing the output to a text file as raw `CREATE TABLE` and `INSERT` statements. It is slow, uses a lot of CPU, but the resulting file is portable across different OS versions and Postgres versions.
+- **Physical Backup (`pg_basebackup`):** A literal, byte-for-byte copy of the raw binary files in the `/var/lib/postgresql/data` directory. It is insanely fast to restore, but it can only be restored to the exact same Postgres version and OS architecture. This is the foundation of High Availability and PITR.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-backup" }
+```
+
+## CODE
+
+### Level 1 — The Simple Logical Backup (`pg_dump`)
+For small databases (under 50GB) or for migrating data to a local developer machine, `pg_dump` is perfect.
+
+```bash
+# Dump the entire 'ecommerce' database into a compressed custom format (-Fc)
+# This format allows for parallel restoration later!
+pg_dump -U postgres -Fc -f /backups/ecommerce_backup.dump ecommerce
+
+# Restore the dump into a brand new database
+pg_restore -U postgres -d ecommerce_new_db -1 /backups/ecommerce_backup.dump
+```
+*(The `-1` flag is critical during restore! It wraps the entire restore process in a single transaction. If the restore fails halfway through, it rolls back everything cleanly instead of leaving you with a corrupted, half-restored database).*
+
+### Level 2 — The Physical Backup (`pg_basebackup`)
+When your database is 500GB, running a logical `SELECT *` dump will take 12 hours and crash the server due to IO load. You must use physical backups.
+
+```bash
+# Take a byte-for-byte copy of the running database directory.
+# -P shows progress, -z compresses it, -D specifies the output directory.
+pg_basebackup -h localhost -U replicator_user -D /backups/base_backup -P -z -X stream
+```
+*Wait, how can you copy binary files while the database is actively running and changing?*
+The `-X stream` flag is the magic. While `pg_basebackup` is copying the massive 500GB files (which takes time), it simultaneously opens a second connection and streams all the WAL (Write-Ahead Log) changes happening *during* the backup. When you restore the backup, Postgres replays those WAL files to ensure the restored directory is perfectly consistent!
+
+### Level 3 — Continuous Archiving (WAL Archiving)
+A physical backup taken at midnight is great, but it doesn't solve the "11:59 PM crash" problem.
+To achieve zero data loss, you must continuously archive your WAL files.
+Every time Postgres fills up a 16MB WAL file with transaction logs, instead of recycling it, you tell Postgres to copy it to a secure external location (like AWS S3).
+
+```ini
+# postgresql.conf
+wal_level = replica
+archive_mode = on
+
+# Every time a 16MB WAL file is filled, run this command!
+# Usually, DBAs use a tool like WAL-G or pgBackRest instead of a raw cp command.
+archive_command = 'cp %p /mnt/network_drive/wal_archive/%f' 
+```
+If the database server explodes at 11:59 PM, you simply download the midnight `pg_basebackup`, and then download all the 16MB WAL files generated throughout the day. When you start the new server, Postgres reads the base backup, and then sequentially replays every single WAL file, perfectly reconstructing the entire day's data!
+
+### Level 4 — Point-in-Time Recovery (PITR)
+*The Scenario:* At exactly 2:15 PM, a junior DBA accidentally ran `DELETE FROM users;` (without a WHERE clause).
+You have a base backup from midnight, and you have continuous WAL archiving running. How do you get the users back without losing the legitimate orders that happened between midnight and 2:14 PM?
+
+**Point-in-Time Recovery (PITR).**
+1. You shut down the database and wipe the corrupted `/var/lib/postgresql/data` directory.
+2. You restore the midnight `pg_basebackup` into that directory.
+3. You create a special `recovery.signal` file in the directory.
+4. You configure the recovery settings in `postgresql.conf`:
+
+```ini
+# Tell Postgres where to find the archived WAL files
+restore_command = 'cp /mnt/network_drive/wal_archive/%f %p'
+
+# THE MAGIC SETTING: Stop replaying WAL exactly 1 second before the disaster!
+recovery_target_time = '2024-10-25 14:14:59 EST'
+```
+5. You start the Postgres service.
+Postgres boots up, sees the `recovery.signal` file, and begins replaying the WAL logs. It replays 1:00 PM... 2:00 PM... 2:14 PM... and at exactly `14:14:59`, it intentionally HALTS the recovery process! The database is now perfectly restored to the exact second before the `DELETE` command was executed.
+
+## REAL_WORLD
+**pgBackRest (The Industry Standard)**
+No professional DBA writes custom `cp` or `rsync` bash scripts for WAL archiving. It is too dangerous. What if the network drive is full? What if the network drops for 5 seconds during the copy?
+The industry standard tool for Postgres backups is **pgBackRest** (or **WAL-G**).
+pgBackRest handles parallel physical backups, incremental physical backups (only backing up the 8KB blocks that changed since yesterday!), checksum verification, and perfectly streaming WAL files directly to AWS S3. It is mandatory software for enterprise Postgres deployments.
+
+## INTERVIEW
+**Q: You took a logical `pg_dump` of a massive 500GB table. You need to restore it to a new server using `pg_restore`. The restore is currently estimating it will take 24 hours. How do you drastically speed up the restore process?**
+A: **Parallelism and Disabling Safety Features.**
+First, you must use the `-j` flag on `pg_restore` (e.g., `-j 8`). This tells Postgres to use 8 parallel CPU cores to insert the data, massively speeding it up (assuming you took the dump using the custom `-Fc` format).
+Second, and most importantly, an enormous amount of time during a restore is spent updating Indexes and checking Foreign Key constraints on every single `INSERT`. 
+To optimize, you tell `pg_restore` to restore ONLY the raw data first (`--data-only`). Once the raw data is quickly inserted, you then restore the indexes and constraints (`--section=post-data`). Postgres is vastly more efficient at building an index from scratch *after* the data is loaded, rather than updating the index incrementally millions of times during the insertions.
+*(Bonus: Temporarily increase `maintenance_work_mem` to 2GB in `postgresql.conf` before the restore so Postgres has enough RAM to build the indexes entirely in memory!)*

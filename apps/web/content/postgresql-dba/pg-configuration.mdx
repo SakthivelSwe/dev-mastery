@@ -1,0 +1,90 @@
+---
+slug: "pg-configuration"
+title: "PostgreSQL Configuration (postgresql.conf)"
+level: 3
+---
+
+## WHY
+When you install PostgreSQL out of the box, it is configured to run on a Raspberry Pi. The default settings assume you have very little RAM and a slow hard drive. If you install Postgres on a massive 64-core AWS server with 256GB of RAM and don't change the configuration, the database will literally ignore 90% of your server's resources and perform terribly.
+
+Tuning the `postgresql.conf` file is the absolute first step any DBA takes when provisioning a new database server.
+
+## THEORY
+### The Big Three
+There are dozens of settings in `postgresql.conf`, but three of them dictate 80% of your database's performance:
+1. **`shared_buffers`**: How much RAM is dedicated to caching database pages.
+2. **`work_mem`**: How much RAM is allowed for sorting and hash tables *per query*.
+3. **`maintenance_work_mem`**: How much RAM is allowed for background maintenance (like Vacuuming and creating Indexes).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "postgres-config" }
+```
+
+## CODE
+
+### Level 1 — Beginner (shared_buffers)
+PostgreSQL relies heavily on the Operating System (Linux) to cache files. Therefore, you do not want to give 100% of your RAM to Postgres, because Linux needs RAM to cache the file system!
+
+**The Golden Rule for `shared_buffers`:** Set it to **25%** of your total system RAM.
+If your server has 64GB of RAM:
+```ini
+# postgresql.conf
+shared_buffers = 16GB
+```
+*Why not 80%?* Because of "Double Caching". If Postgres reads a file from disk, Linux caches it in the OS RAM. If Postgres also caches it in `shared_buffers`, you are storing the exact same data twice in memory, wasting massive amounts of RAM.
+
+### Level 2 — Building Blocks (work_mem)
+When you run a query with `ORDER BY` or `JOIN`, Postgres has to sort data. It does this in memory. If the data exceeds `work_mem`, Postgres gives up and writes temporary files to the physical hard drive, which destroys performance.
+
+**The Golden Rule for `work_mem`:** Start low (e.g., `16MB` to `32MB`).
+Wait, if you have 64GB of RAM, why set this so low?
+Because `work_mem` is **NOT** global. It is applied *per operation*. 
+If 100 users run a complex query simultaneously, and each query does 3 sorts, Postgres will allocate `100 * 3 * 32MB = 9.6GB` of RAM instantly! If you set `work_mem` to `1GB`, a traffic spike will cause the server to run out of RAM and the Linux OOM (Out Of Memory) Killer will instantly terminate your database process.
+
+```ini
+# postgresql.conf
+work_mem = 32MB
+```
+
+### Level 3 — Intermediate (maintenance_work_mem)
+This setting controls the memory available for background tasks like `VACUUM`, `CREATE INDEX`, and `ALTER TABLE`. These tasks are usually run by a single worker process (not hundreds of concurrent users), so you can afford to give it a massive chunk of RAM to speed up index creation.
+
+**The Golden Rule:** Set it to **10%** of total RAM (up to a max of `2GB` or `4GB`).
+```ini
+# postgresql.conf
+maintenance_work_mem = 2GB
+```
+
+### Level 4 — Advanced (WAL Configuration)
+PostgreSQL writes all transactions to the Write-Ahead Log (WAL). If your disk cannot keep up with the WAL, your database stalls.
+
+1. **`wal_buffers`:** The amount of memory used for WAL data that has not yet been written to disk. Set to `16MB` (the maximum).
+2. **`max_wal_size`:** If you do a massive bulk data import, Postgres generates massive amounts of WAL files. If it hits this limit, it forces a panic Checkpoint. Set this higher (e.g., `4GB` or `8GB`) to prevent constant checkpoints during bulk inserts.
+3. **`checkpoint_timeout`:** Default is 5 minutes. Increase it to `15min` to reduce disk I/O, at the cost of slightly longer crash recovery times.
+
+```ini
+# postgresql.conf
+wal_buffers = 16MB
+max_wal_size = 4GB
+checkpoint_timeout = 15min
+```
+
+## REAL_WORLD
+**Reloading Configuration**
+If you change `work_mem` in the configuration file, do you have to restart the database and kick all users offline?
+**No.** Most settings in PostgreSQL can be reloaded live without dropping connections.
+You simply run this SQL command as a superuser:
+```sql
+SELECT pg_reload_conf();
+```
+*Note: A few fundamental settings (like `shared_buffers`) require a full server restart because they allocate block memory at boot time.*
+
+## INTERVIEW
+**Q: A developer runs a massive analytical query overnight that sorts 50 million rows. They complain it is incredibly slow because it keeps writing temp files to disk. You don't want to increase `work_mem` globally and risk crashing the server during the day. What do you do?**
+A: `work_mem` can be set dynamically at the session level! You tell the developer to run a specific command at the start of their script:
+```sql
+SET work_mem = '2GB';
+SELECT ... -- Their massive query
+```
+This allocates 2GB of RAM specifically for *their* database session only, leaving the global `postgresql.conf` setting safely at 32MB for all other users!

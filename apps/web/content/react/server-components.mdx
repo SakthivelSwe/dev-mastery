@@ -1,0 +1,151 @@
+---
+slug: "server-components"
+title: "React Server Components (RSC)"
+level: 5
+---
+
+## WHY
+In the modern era of Single Page Applications (SPAs), the browser does all the heavy lifting. The user downloads a massive 2MB JavaScript bundle containing the entire React application, and their phone's CPU struggles to parse and render it. To fetch data from a database, the browser has to make a slow API call across the internet.
+What if we could run React on the Server, sitting physically next to the Database? 
+**React Server Components (RSC)** is the biggest architectural shift in React's history. It splits the rendering workload: heavy data-fetching components run exclusively on the server, while interactive components (buttons, inputs) run on the client browser.
+
+## THEORY
+### Server Components vs. Client Components
+By default in the RSC paradigm (e.g., Next.js App Router), **every component is a Server Component**.
+1. **Server Components:** Execute exactly once on the Node.js server. They can read directly from the Database (`await db.query()`). Their JavaScript is **NEVER** sent to the browser! The server simply generates the final HTML and streams it to the user.
+2. **Client Components:** Execute in the browser. They use `useState`, `onClick`, and `useEffect`. Their JavaScript is downloaded by the user. You explicitly opt-in to a Client Component by adding the `"use client"` directive at the top of the file.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "react-server-components" }
+```
+
+## CODE
+
+### Level 1 — The Server Component (Direct DB Access!)
+Because this runs on the server, you don't need APIs, you don't need `fetch`, and you don't need `useEffect`. You just write an `async` function and await the database directly!
+
+```jsx
+// /app/users/page.jsx (Server Component)
+// Notice there is NO "use client" here. This is the default!
+
+import { db } from '@/database';
+
+// 1. We can make the component ASYNC!
+export default async function UsersPage() {
+  
+  // 2. We query the database directly inside the component!
+  // This executes on the server, right next to the DB. Zero latency!
+  const users = await db.query('SELECT id, name FROM users');
+
+  // 3. The server generates the HTML and sends it to the browser.
+  // The 'db' package is NEVER sent to the browser bundle!
+  return (
+    <div>
+      <h1>User Directory</h1>
+      <ul>
+        {users.map(user => <li key={user.id}>{user.name}</li>)}
+      </ul>
+    </div>
+  );
+}
+```
+
+### Level 2 — The Client Component (Interactivity)
+What if we want to add an interactive "Like" button to each user? Server Components cannot use `onClick` (because the server has no mouse!). We must create a Client Component.
+
+```jsx
+// /components/LikeButton.jsx
+// 1. We declare this as a Client Component!
+"use client";
+
+import { useState } from 'react';
+
+export function LikeButton() {
+  // We can use State and Effects here because this runs in the browser!
+  const [likes, setLikes] = useState(0);
+
+  return (
+    <button onClick={() => setLikes(l => l + 1)}>
+      ❤️ {likes}
+    </button>
+  );
+}
+```
+
+### Level 3 — Interleaving Server and Client
+You can render Client Components inside Server Components seamlessly!
+
+```jsx
+// /app/users/page.jsx (Server Component)
+import { db } from '@/database';
+import { LikeButton } from '@/components/LikeButton'; // Import the Client Component
+
+export default async function UsersPage() {
+  const users = await db.query('SELECT * FROM users');
+
+  return (
+    <div>
+      {users.map(user => (
+        <div key={user.id}>
+          <span>{user.name}</span>
+          {/* The Server Component renders the Client Component! */}
+          <LikeButton /> 
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+*The Magic:* The browser only downloads the tiny JavaScript for `LikeButton`. The rest of the page is pure HTML. The bundle size shrinks by 90%!
+
+### Level 4 — The Strict Boundary Rule
+Server Components can render Client Components. 
+**But Client Components CANNOT import Server Components!**
+If a Client Component imports a Server Component, the bundler is forced to ship the Server Component's code to the browser (including your secret database passwords!), which crashes the build.
+
+*How do you get around this?* **Composition.** You pass the Server Component as a `children` prop into the Client Component!
+
+```jsx
+// "use client"
+function CollapsibleSidebar({ children }) {
+  const [isOpen, setIsOpen] = useState(true);
+  
+  // The Client component controls the layout and state...
+  return (
+    <div className={isOpen ? "w-64" : "w-0"}>
+      <button onClick={() => setIsOpen(!isOpen)}>Toggle</button>
+      {/* ...but it just renders whatever Server Component was passed in! */}
+      {children}
+    </div>
+  );
+}
+
+// Meanwhile, back in the Server Component file:
+export default async function Layout() {
+  return (
+    <CollapsibleSidebar>
+      {/* 
+        This is perfectly legal! The Server passes the evaluated HTML 
+        of the HeavyServerDashboard as the 'children' prop!
+      */}
+      <HeavyServerDashboard /> 
+    </CollapsibleSidebar>
+  );
+}
+```
+
+## REAL_WORLD
+**RSC vs. SSR (Server-Side Rendering)**
+Are Server Components the same as old-school Next.js Server-Side Rendering (`getServerSideProps`)? 
+No! 
+- **SSR** generates HTML on the server, but it STILL sends 100% of the React component's JavaScript to the browser so it can be "hydrated" (become interactive).
+- **RSC** (React Server Components) NEVER sends its JavaScript to the browser. A heavy markdown parser component that runs as an RSC adds literally 0 kilobytes to the client bundle. 
+RSC and SSR actually work together. Server Components execute first, generate a special JSON stream, pass it to SSR to generate initial HTML, and then the Client Components hydrate in the browser.
+
+## INTERVIEW
+**Q: You have a Server Component that fetches a massive list of User objects from the database and passes it as a prop to a Client Component: `<UserTable data={users} />`. The app compiles, but the page takes 5 seconds to load and the network tab shows a massive payload being transferred. If Server Components don't send JavaScript to the browser, why is the payload so huge?**
+A: **The Serialization Boundary.**
+When a Server Component passes data as a prop to a Client Component, that data crosses the network boundary (from the Server to the Browser). React must serialize that data into JSON, embed it in the HTML payload, and send it over the internet.
+If you query `SELECT * FROM users` (fetching 10,000 rows with 50 columns) and pass that massive array to a Client Component, you are forcing the server to send a 10MB JSON string over the network!
+*The Fix:* Server Components should filter and transform data on the server, passing down *only* the absolute minimum specific data the Client Component needs to render.

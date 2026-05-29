@@ -3,11 +3,25 @@ package com.example.devmastery.content.data.remote
 import retrofit2.http.GET
 import retrofit2.http.Path
 
+data class LessonDto(
+    val id: String,
+    val topicId: String,
+    val sectionType: String,
+    val title: String,
+    val contentMdx: String,
+    val orderIndex: Int
+)
+
 data class TopicDto(
     val id: String,
-    val title: String,
     val slug: String,
-    val markdownContent: String
+    val title: String,
+    val description: String?,
+    val pathSlug: String,
+    val pathTitle: String,
+    val level: Int,
+    val hasVisualizer: Boolean,
+    val lessons: List<LessonDto>
 )
 
 data class TopicRoadmapDto(

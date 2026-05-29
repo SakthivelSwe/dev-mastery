@@ -1,0 +1,150 @@
+---
+slug: "observability"
+title: "Observability (Logs, Metrics, Traces)"
+level: 4
+---
+
+## WHY
+In a Monolith, if an error occurs, you open the server's `application.log` file, scroll to the bottom, and read the StackTrace.
+In a Microservices architecture, a single user request might travel through an API Gateway, an Auth Service, an Order Service, a Kafka Queue, and an Inventory Service before crashing in the Payment Service. Which server's log file do you check? How do you even know the Payment crash is related to that specific user's request?
+
+**Observability** is the architectural property of being able to understand the internal state of a complex system purely by looking at its external outputs. It is built on three pillars: Logs, Metrics, and Distributed Traces. Without Observability, debugging a distributed system is impossible.
+
+## THEORY
+### The Three Pillars
+1. **Logs (Events):** Highly detailed, unstructured text recording exactly what happened at a specific millisecond (e.g., `User 123 failed authentication due to expired JWT`). Great for debugging, but impossible to read at scale.
+2. **Metrics (Numbers):** Aggregated numerical data over time (e.g., `CPU Usage is 85%`, `Checkout Endpoint is taking 500ms`). Cheap to store, great for triggering Alerts and drawing Grafana dashboards.
+3. **Traces (Journeys):** A map of a single request's journey across multiple servers. It visually shows exactly how long the request spent inside every microservice along the path.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "observability" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Structured Logging)
+Never write logs as plain sentences. If you write `console.log("User " + userId + " logged in")`, it is impossible to search or filter millions of logs for a specific user.
+Always use **Structured Logging (JSON)**.
+
+```javascript
+// THE TERRIBLE WAY
+console.log(`Failed to process order ${orderId} for user ${userId}. Reason: Timeout`);
+
+// THE OBSERVABILITY WAY (Structured Logging using Pino/Winston/Log4j)
+logger.error({
+    event: 'ORDER_PROCESSING_FAILED',
+    orderId: 12345,
+    userId: 987,
+    reason: 'TIMEOUT',
+    durationMs: 5002
+}, "Failed to process order");
+
+// Why? Because log aggregators (Elasticsearch / Datadog) can instantly index JSON!
+// You can now run a query: `SELECT * FROM logs WHERE event = 'ORDER_PROCESSING_FAILED' AND durationMs > 5000`
+```
+
+### Level 2 — Building Blocks (Metrics and Prometheus)
+Metrics are counters, gauges, and histograms. They are incredibly cheap to track because they don't store the actual event data, just a number.
+
+```javascript
+const promClient = require('prom-client');
+
+// 1. Create a Counter
+const loginCounter = new promClient.Counter({
+    name: 'user_login_total',
+    help: 'Total number of login attempts',
+    labelNames: ['status'] // Success or Failure
+});
+
+// 2. Create a Histogram (Tracks duration percentiles!)
+const httpRequestDuration = new promClient.Histogram({
+    name: 'http_request_duration_seconds',
+    help: 'Duration of HTTP requests in seconds',
+    labelNames: ['method', 'route'],
+    buckets: [0.1, 0.5, 1, 2, 5] // Track how many requests fall into these buckets
+});
+
+app.post('/login', async (req, res) => {
+    const endTimer = httpRequestDuration.startTimer({ method: 'POST', route: '/login' });
+    
+    try {
+        await authenticate(req.body);
+        loginCounter.inc({ status: 'success' });
+        res.send('Welcome');
+    } catch (err) {
+        loginCounter.inc({ status: 'failure' });
+        res.status(401).send('Denied');
+    } finally {
+        endTimer(); // Automatically records the duration!
+    }
+});
+```
+*(Prometheus periodically scrapes this data, and Grafana uses it to draw live charts!)*
+
+### Level 3 — Intermediate (Distributed Tracing & Correlation IDs)
+How do you track a request across 5 different microservices?
+You generate a **Correlation ID** (or Trace ID) at the very edge of your network (e.g., the API Gateway) and force every single microservice to pass that ID forward in the HTTP Headers.
+
+```javascript
+// Service 1 (API Gateway)
+app.use((req, res, next) => {
+    // 1. Generate a unique ID for this entire journey
+    req.traceId = crypto.randomUUID();
+    
+    // 2. Pass it to the next service in the HTTP Headers!
+    axios.post('http://order-service/create', data, {
+        headers: { 'X-Trace-Id': req.traceId }
+    });
+});
+
+// Service 2 (Order Service)
+app.post('/create', (req, res) => {
+    // 1. Extract the Trace ID from the incoming headers
+    const traceId = req.headers['x-trace-id'];
+    
+    // 2. INCLUDE the Trace ID in every single log you write!
+    logger.info({ traceId, msg: 'Order creation started' });
+    
+    // 3. Pass it to the next service!
+    axios.post('http://inventory-service/reserve', data, {
+        headers: { 'X-Trace-Id': traceId }
+    });
+});
+```
+*(Now, when an error occurs, you copy the Trace ID, paste it into Datadog, and instantly see every single log from every single service that participated in that specific request!)*
+
+### Level 4 — Advanced (OpenTelemetry)
+Writing custom code to manually pass headers and start timers in every microservice is exhausting. 
+**OpenTelemetry (OTel)** is the modern, open-source standard for Observability. It provides SDKs that automatically instrument your code. 
+If you install the OTel SDK in your Node/Java app, it automatically hooks into Express, HTTP, Postgres, and Redis. It silently generates Trace IDs, passes them through headers, records the exact duration of every database query, and ships all of it to an aggregator (like Jaeger or Honeycomb) with almost zero code changes!
+
+```javascript
+// Just requiring the OpenTelemetry SDK at the very top of your app 
+// magically instruments the entire framework!
+require('./opentelemetry-tracing.js'); 
+const express = require('express');
+const app = express();
+
+app.get('/users', async (req, res) => {
+    // OTel automatically wraps this DB call in a "Span", 
+    // records the execution time, and links it to the incoming HTTP request!
+    const users = await db.query('SELECT * FROM users');
+    res.json(users);
+});
+```
+
+## REAL_WORLD
+**Alerting Fatigue**
+Junior teams often set up alerts for everything: `Alert if CPU > 80%`, `Alert if RAM > 90%`. 
+This results in **Alert Fatigue**. Engineers receive 50 emails a day, realize none of them are actual emergencies, and start ignoring the alerting channel. When a real outage happens, nobody notices.
+
+Senior Site Reliability Engineers (SREs) use **SLOs (Service Level Objectives)**. They don't alert on CPU usage (the user doesn't care about your CPU). They alert on **User Symptoms**.
+*Rule:* Only page an engineer at 3:00 AM if a symptom affects the user (e.g., `Alert if HTTP 500 Error Rate > 2% for 5 minutes`, or `Alert if 95th Percentile Checkout Latency > 3 seconds`). If the CPU is at 99%, but the application is still serving requests quickly, let the auto-scaler handle it and let the engineer sleep.
+
+## INTERVIEW
+**Q: We have 50 microservices writing 100GB of JSON logs per day to an Elasticsearch cluster. The Elasticsearch cluster is costing us $5,000/month. How can we reduce this cost without losing visibility?**
+A: **Do not log every single HTTP 200 OK request.**
+In a high-throughput system, logging successful requests is a catastrophic waste of disk space and money. You should rely on **Metrics** (which are incredibly cheap) to track the *volume* of successful requests and the *average latency*. 
+You should only write **Logs** for Warnings, Errors, and critical business events (like `PAYMENT_PROCESSED`). 
+Additionally, you can use **Tail-based Sampling** in your Tracing system: configure the OpenTelemetry Collector to keep 100% of traces that contain an error or take longer than 2 seconds, but randomly throw away 99% of the traces that succeed perfectly.

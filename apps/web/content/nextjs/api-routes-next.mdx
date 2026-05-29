@@ -1,0 +1,224 @@
+---
+slug: "api-routes-next"
+title: "API Routes in Next.js"
+level: 3
+---
+
+## WHY
+Sometimes you need server-side endpoints that aren't tied to page rendering: webhook handlers, third-party API proxies, cron job triggers, or REST endpoints for mobile apps. Next.js API Routes let you define HTTP endpoints alongside your pages — no separate backend server needed.
+The App Router introduces `route.ts` files (replacing the old `pages/api/` directory) that support all HTTP methods with clear, readable handlers.
+
+## THEORY
+### When to Use API Routes vs Server Actions
+- **API Routes:** When you need a proper HTTP endpoint accessible from outside Next.js (mobile apps, webhooks, other services)
+- **Server Actions:** When you're mutating data from a Next.js form or client component (direct server function call, no HTTP overhead)
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-api-routes" }
+```
+
+## CODE
+
+### Basic API Route
+```typescript
+// app/api/users/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+
+// GET /api/users
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const page = parseInt(searchParams.get('page') ?? '1');
+  const limit = parseInt(searchParams.get('limit') ?? '10');
+
+  const users = await db.user.findMany({
+    skip: (page - 1) * limit,
+    take: limit,
+    select: { id: true, name: true, email: true, createdAt: true },
+  });
+  
+  return NextResponse.json({ users, page, limit });
+}
+
+// POST /api/users
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  const { name, email } = body;
+  
+  if (!name || !email) {
+    return NextResponse.json(
+      { error: 'Name and email are required' },
+      { status: 400 }
+    );
+  }
+  
+  const user = await db.user.create({ data: { name, email } });
+  return NextResponse.json(user, { status: 201 });
+}
+```
+
+### Dynamic API Route
+```typescript
+// app/api/users/[id]/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+
+interface RouteContext {
+  params: { id: string };
+}
+
+// GET /api/users/123
+export async function GET(
+  request: NextRequest,
+  { params }: RouteContext
+) {
+  const user = await db.user.findUnique({ where: { id: params.id } });
+  
+  if (!user) {
+    return NextResponse.json({ error: 'User not found' }, { status: 404 });
+  }
+  
+  return NextResponse.json(user);
+}
+
+// PUT /api/users/123
+export async function PUT(request: NextRequest, { params }: RouteContext) {
+  const body = await request.json();
+  const user = await db.user.update({
+    where: { id: params.id },
+    data: body,
+  });
+  return NextResponse.json(user);
+}
+
+// DELETE /api/users/123
+export async function DELETE(
+  request: NextRequest,
+  { params }: RouteContext
+) {
+  await db.user.delete({ where: { id: params.id } });
+  return new NextResponse(null, { status: 204 });
+}
+```
+
+### Webhook Handler
+```typescript
+// app/api/webhooks/stripe/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+export async function POST(request: NextRequest) {
+  const body = await request.text();
+  const signature = request.headers.get('stripe-signature')!;
+  
+  let event: Stripe.Event;
+  
+  try {
+    // Verify webhook signature (IMPORTANT for security!)
+    event = stripe.webhooks.constructEvent(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+  
+  // Handle the event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      await handlePaymentSuccess(event.data.object as Stripe.PaymentIntent);
+      break;
+    case 'customer.subscription.deleted':
+      await handleSubscriptionCanceled(event.data.object as Stripe.Subscription);
+      break;
+  }
+  
+  return NextResponse.json({ received: true });
+}
+```
+
+### Setting CORS Headers
+```typescript
+// app/api/public/route.ts — For external clients
+export async function GET(request: NextRequest) {
+  const response = NextResponse.json({ data: 'Public API response' });
+  
+  response.headers.set('Access-Control-Allow-Origin', '*');
+  response.headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  
+  return response;
+}
+
+// Handle preflight requests
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
+  });
+}
+```
+
+## REAL_WORLD
+**Rate Limiting API Routes**
+```typescript
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(10, '10 s'),  // 10 requests per 10 seconds
+});
+
+export async function POST(request: NextRequest) {
+  const ip = request.ip ?? '127.0.0.1';
+  const { success } = await ratelimit.limit(ip);
+  
+  if (!success) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+  
+  // Process request...
+}
+```
+
+## INTERVIEW
+**Q: Your Next.js app has a `/api/users` endpoint. How do you add authentication to ensure only logged-in users can access it?**
+
+A: Two approaches:
+
+**Option 1: Check session in each route (simple):**
+```typescript
+import { auth } from '@/auth';
+
+export async function GET(request: NextRequest) {
+  const session = await auth();
+  if (!session) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  // Proceed with authorized user...
+}
+```
+
+**Option 2: Middleware (better — protects all API routes at once):**
+```typescript
+// middleware.ts
+import { auth } from '@/auth';
+
+export default auth((req) => {
+  if (!req.auth && req.nextUrl.pathname.startsWith('/api/')) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+});
+
+export const config = {
+  matcher: ['/api/:path*'],
+};
+```
+
+Middleware runs before the route handler — if unauthorized, the request never reaches the route. This is more efficient and centralized than checking in each route handler individually.

@@ -1,0 +1,154 @@
+---
+slug: "event-loop-deep"
+title: "The Event Loop & Concurrency"
+level: 5
+---
+
+## WHY
+JavaScript is strictly **Single-Threaded**. It only has one Call Stack, meaning it can only execute one line of code at a time. If it hits a heavy task (like fetching a 50MB video over the network), execution should theoretically freeze entirely until the video downloads, causing the entire browser tab to lock up.
+
+Yet, JavaScript handles thousands of network requests, animations, and user clicks simultaneously without ever freezing! How is this mathematically possible?
+The answer is the **Event Loop**. The Event Loop is the most famous architectural concept in JavaScript. By offloading heavy tasks to the Browser's background threads, and carefully orchestrating when the results are pushed back onto the main thread, the Event Loop achieves massive asynchronous concurrency using only a single thread.
+
+## THEORY
+### The Components of Concurrency
+To understand the Event Loop, you must understand the 4 moving parts of the architecture:
+1. **The Call Stack (V8)**: The single thread where your JavaScript physically executes.
+2. **Web APIs (The Browser)**: Background C++ threads provided by Chrome (or Node.js). They handle the heavy lifting: HTTP requests, Timers (`setTimeout`), and DOM events.
+3. **The Task Queue (Macrotasks)**: A waiting line for completed Web API tasks (e.g., a timer finished counting, or an API response arrived).
+4. **The Microtask Queue**: A VIP, high-priority waiting line used exclusively for Promises!
+
+### The Event Loop Algorithm
+The Event Loop is simply a continuous `while` loop that asks one question: *"Is the Call Stack empty?"*
+If the Call Stack is empty, it looks at the Microtask Queue. If there are VIP Promises waiting, it pushes them to the Stack one by one until the Microtask Queue is completely empty.
+Only when the Call Stack AND the Microtask Queue are totally empty will the Event Loop look at the Task Queue and pull exactly ONE Macrotask onto the Stack.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "event-loop-queues" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Illusion of Sync)
+```javascript
+console.log("1. Start");
+
+// This tells the Browser's Web API to wait 0 milliseconds.
+// Even though it's 0ms, it is immediately offloaded to the Web API!
+setTimeout(() => {
+  console.log("2. Timer Finished");
+}, 0);
+
+console.log("3. End");
+
+// Output:
+// 1. Start
+// 3. End
+// 2. Timer Finished
+
+// WHY? Because setTimeout is an asynchronous Web API. It gets sent to the Task Queue.
+// The Event Loop will absolutely NEVER pull from the Task Queue until the 
+// synchronous Call Stack is 100% finished executing! 
+```
+
+### Level 2 — Building Blocks (Microtasks vs Macrotasks)
+```javascript
+// This is the most common FAANG JavaScript interview question!
+
+console.log("1. Sync execution");
+
+setTimeout(() => {
+  console.log("2. Macrotask (setTimeout)");
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log("3. Microtask (Promise)");
+});
+
+console.log("4. Sync execution end");
+
+// The Execution Order:
+// 1. Sync execution
+// 4. Sync execution end
+// 3. Microtask (Promise)
+// 2. Macrotask (setTimeout)
+
+// WHY does the Promise beat the setTimeout?
+// Because Promises go to the VIP Microtask Queue! 
+// When the Call Stack empties, the Event Loop checks the Microtask Queue FIRST. 
+// It completely drains the Microtask queue before it ever looks at the Macrotask queue.
+```
+
+### Level 3 — Intermediate (Microtask Starvation)
+```javascript
+// What happens if a Microtask spawns another Microtask?
+
+function recursivePromise() {
+  Promise.resolve().then(() => {
+    console.log("Microtask Executed!");
+    
+    // The Promise recursively pushes ANOTHER Promise onto the Microtask Queue!
+    recursivePromise(); 
+  });
+}
+
+setTimeout(() => {
+  console.log("Will I ever run?");
+}, 0);
+
+recursivePromise();
+
+// DISASTER! 
+// The Event Loop's rule is: "I will not move on to Macrotasks (or UI rendering!) 
+// until the Microtask Queue is 100% empty."
+// Because we are infinitely adding to the Microtask Queue, it never empties.
+// The setTimeout will NEVER run, and the browser UI will permanently freeze!
+// This is called "Microtask Starvation".
+```
+
+### Level 4 — Advanced (requestAnimationFrame)
+```javascript
+// How does the Event Loop interact with the user's screen?
+// The browser attempts to paint the screen 60 times a second (every ~16.6ms).
+// The "Render Pipeline" is a special phase of the Event Loop.
+
+let pos = 0;
+const box = document.getElementById('box');
+
+function animate() {
+  pos += 5;
+  box.style.transform = `translateX(${pos}px)`;
+  
+  // requestAnimationFrame is a highly specialized Web API.
+  // It schedules a callback to run at the EXACT perfect millisecond 
+  // right before the browser calculates the next UI Render!
+  if (pos < 500) {
+    requestAnimationFrame(animate); 
+  }
+}
+
+// Why not use setInterval?
+// If you use setInterval(animate, 16), it blindly pushes Macrotasks onto the queue.
+// If the Call Stack is busy, the setInterval callbacks pile up, and suddenly execute 
+// all at once, causing massive visual stuttering. 
+// requestAnimationFrame guarantees perfect sync with the monitor's refresh rate!
+requestAnimationFrame(animate);
+```
+
+## REAL_WORLD
+In Node.js, the Event Loop is the entire reason the backend architecture exists.
+Traditional backend servers (like Apache/PHP or Spring Boot) are "Thread-per-Request". If 1,000 users connect, the server spins up 1,000 heavy OS threads. If they all query the database and wait 2 seconds for a response, 1,000 threads sit idle, consuming gigabytes of RAM.
+
+Node.js uses exactly 1 thread. When 1,000 users connect and query the database, Node.js instantly offloads all 1,000 DB queries to the background C++ networking APIs. The single thread is instantly freed up! It can accept 10,000 more user connections while the database is working. 
+When the DB finishes a query, it pushes the data to the Task Queue, and the Event Loop pushes it to the stack to send the HTTP response. Because of the Event Loop, Node.js can handle massive amounts of concurrent I/O (Chat Apps, WebSockets) using a fraction of the RAM of traditional servers.
+
+## INTERVIEW
+**Q: Can JavaScript execute multiple lines of code simultaneously?**
+A: No. JavaScript is strictly single-threaded. However, the *Browser* (or Node.js Runtime) is highly multi-threaded! The JS thread simply delegates heavy tasks to the Browser's C++ threads. The actual execution of network requests, timers, and file system reads happens in parallel in the background, entirely outside of V8.
+
+**Q: What is the difference between the Task Queue and the Microtask Queue?**
+A: The Task Queue (Macrotasks) handles generic async callbacks like `setTimeout`, `setInterval`, and DOM events (clicks). The Microtask Queue is an ultra-high-priority queue specifically reserved for `Promises` and `MutationObserver`. The critical architectural difference is that the Event Loop will process exactly ONE Macrotask and then move on, but it will process ALL Microtasks continuously until the queue is completely empty before doing anything else.
+
+**Q: If you have a computationally heavy math equation (e.g., calculating a million primes), will Promises prevent the UI from freezing?**
+A: No! The Event Loop only solves I/O concurrency (waiting for network/timers). If you put heavy math *inside* a Promise `.then()`, that math still executes on the single JS Call Stack! The moment the math hits the stack, the Event Loop is blocked, and the browser UI freezes. To execute heavy synchronous math without freezing the UI, you must spin up a completely separate JS thread using **Web Workers**.

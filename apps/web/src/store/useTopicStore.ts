@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type TabState = 'why' | 'theory' | 'visualizer' | 'code' | 'real-world' | 'interview';
+export type TabState = 'why' | 'theory' | 'visualizer' | 'code' | 'real-world' | 'interview' | 'feynman' | 'build' | 'spaced-review';
 
 interface TopicState {
   activeTab: TabState;
@@ -20,6 +20,9 @@ export const useTopicStore = create<TopicState>((set) => ({
     'code': false,
     'real-world': false,
     'interview': false,
+    'feynman': false,
+    'build': false,
+    'spaced-review': false,
   },
   isAiDrawerOpen: false,
   setActiveTab: (tab) => set({ activeTab: tab }),

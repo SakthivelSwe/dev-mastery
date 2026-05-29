@@ -72,6 +72,9 @@ public class Lesson {
         visual,
         code,
         realworld,
-        interview
+        interview,
+        feynman,
+        build,
+        spacedreview
     }
 }

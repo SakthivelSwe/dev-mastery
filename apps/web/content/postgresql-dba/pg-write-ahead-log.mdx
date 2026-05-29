@@ -1,0 +1,69 @@
+---
+slug: "pg-write-ahead-log"
+title: "The Write-Ahead Log (WAL)"
+level: 3
+---
+
+## WHY
+Imagine you execute an `INSERT` statement into PostgreSQL. The database writes the row to memory, and then suddenly the power goes out and the server crashes before the data is flushed to the physical hard drive. Does the data survive?
+
+The **Write-Ahead Log (WAL)** is the mechanism PostgreSQL uses to guarantee data durability (the 'D' in ACID). It ensures that even if a server explodes mid-transaction, no committed data is ever lost. Understanding the WAL is critical for setting up database backups and high-availability replicas.
+
+## THEORY
+### The Durability Problem
+Writing data directly to the database data files (`.heap` files) on the hard drive is incredibly slow. The disk head has to seek back and forth to find the exact 8KB Page where the data belongs (Random I/O). If Postgres forced a Random I/O write for every single transaction, the database would be unusably slow.
+
+### The WAL Solution
+Instead of writing the data directly to the table files on disk, Postgres writes the changes to memory (the `shared_buffers`). It then immediately appends a tiny record describing the change to the end of a special file called the Write-Ahead Log. 
+
+Appending data to the end of a single file is incredibly fast (Sequential I/O). Once the WAL record is written to disk, Postgres considers the transaction committed and returns "Success" to the user, even though the actual table data is still only in RAM!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "postgres-wal" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Checkpoints)
+So if the actual data is sitting in RAM (memory), and only a log of the changes is on the hard drive, what happens if the server crashes?
+When Postgres reboots, it reads the data files on disk, realizes they are outdated, and immediately reads the WAL file. It "replays" every action in the log (redo), perfectly recreating the data in memory.
+
+But the WAL file can't grow infinitely forever. 
+Periodically, Postgres triggers a **Checkpoint**. A background process takes all the updated data sitting in memory and forcefully flushes it to the actual data files on the hard drive (doing the slow, random I/O in the background). Once the Checkpoint finishes, Postgres deletes the old WAL files because the actual data files are now fully up to date!
+
+### Level 2 — Building Blocks (WAL and Backups)
+How do you back up a 5 Terabyte database? You can't just pause the database for 10 hours while you copy the files.
+
+**Point-in-Time Recovery (PITR)**
+You take a base backup (a snapshot of the data files) on Sunday at 12:00 AM.
+You then configure Postgres to continually copy its WAL files to an Amazon S3 bucket (this is called WAL Archiving).
+
+If someone accidentally drops a production table on Wednesday at 2:15 PM, you can:
+1. Restore the base backup from Sunday.
+2. Feed the archived WAL files into Postgres.
+3. Postgres will replay every single transaction that occurred over the last 3 days, and you can tell it to stop replaying at *exactly* 2:14:59 PM, perfectly restoring the database to the second before the table was dropped!
+
+### Level 3 — Intermediate (WAL and Replication)
+How do you create a Read Replica (a secondary database that stays perfectly in sync with the primary database to handle heavy read traffic)?
+
+**Streaming Replication**
+Instead of the primary database writing the WAL records only to its own hard drive, it streams the WAL records over the network to the secondary database. The secondary database acts in a constant state of "crash recovery", reading the streamed WAL records and replaying them on its own data files, keeping it a near-perfect clone of the primary database.
+
+### Level 4 — Advanced (fsync and Performance)
+When you commit a transaction, Postgres asks the Operating System to write the WAL record to disk. But Operating Systems are tricky—they often cache writes in their own RAM to seem faster. If the power cuts out, the OS cache is lost, and the WAL record is gone.
+
+To prevent this, Postgres executes an `fsync()` command, which forces the physical hard drive to write the data to the metal platters before returning success.
+- `fsync=on`: Data is perfectly safe, but transactions are slightly slower.
+- `fsync=off`: Transactions are blazingly fast, but if the power cuts, your entire database is corrupt and unrecoverable. (Only turn this off for throwaway test databases!)
+
+## REAL_WORLD
+**Synchronous vs Asynchronous Replication**
+By default, Streaming Replication is **Asynchronous**. 
+The Primary database writes the WAL to its local disk and immediately tells the user "Success!" It then streams the WAL to the Replica in the background. If the Primary database explodes instantly after saying "Success", the Replica might not have received the latest data yet (a lag of a few milliseconds). If you promote the Replica to be the new Primary, you will lose a few milliseconds of data.
+
+In banking or financial applications, this is unacceptable. You can configure **Synchronous Replication** (`synchronous_commit = on`). The Primary database will not tell the user "Success" until the Replica confirms it has successfully received and written the WAL record. This guarantees zero data loss, but doubles the latency of every single write query.
+
+## INTERVIEW
+**Q: Can you explain the concept of a "Full Page Write" in the WAL?**
+A: When a Checkpoint occurs, Postgres begins writing the 8KB dirty pages from RAM to disk. If the server crashes exactly in the middle of writing that 8KB page, the page on disk becomes corrupted (a "torn page"). The WAL log cannot fix a torn page because the WAL only contains the delta (the changes), not the base data. To prevent this, the *very first time* a page is modified after a Checkpoint, Postgres writes the *entire 8KB page* into the WAL (a Full Page Write). If a torn page occurs, Postgres can restore the entire 8KB page from the WAL before replaying the rest of the logs.

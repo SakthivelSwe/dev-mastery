@@ -1,0 +1,88 @@
+---
+slug: "sharding-mongodb"
+title: "MongoDB Sharding"
+level: 4
+---
+
+## WHY
+Replica Sets solve the problem of High Availability (if a server crashes, you don't go offline). However, Replica Sets do **not** solve the problem of Horizontal Scaling. If your database grows to 10 Terabytes, every single server in your Replica Set must have a 10 Terabyte hard drive because they all hold a 100% exact copy of the data!
+
+When your data becomes too massive to fit on a single physical machine, or your write traffic becomes too heavy for a single Primary node to handle, you must implement **Sharding**. Sharding is the process of splitting your massive database into smaller chunks and distributing those chunks across many independent servers.
+
+## THEORY
+### The Sharded Cluster Architecture
+A Sharded Cluster consists of three distinct components:
+1. **The Shards:** These are standard Replica Sets. Shard A might hold users A-M. Shard B holds users N-Z.
+2. **The Config Servers:** A separate Replica Set that strictly stores the metadata. It acts as the "Map", knowing exactly which Shard holds which specific data.
+3. **The Query Routers (`mongos`):** The traffic cops. Your Node.js application never connects to the Shards directly. It connects to the `mongos` router. The router looks at the query, checks the Config Server "Map", and routes the query to the correct Shard!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-sharding" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Shard Key)
+How does MongoDB know how to split your data? You must choose a **Shard Key**. 
+A Shard Key is simply a field (or combination of fields) inside your documents.
+
+Imagine you have a `users` collection with 10 million documents. You decide to shard it using the `country` field as your Shard Key.
+- Shard A handles all users where `country = USA` and `country = Canada`.
+- Shard B handles all users where `country = UK` and `country = France`.
+
+When your Node.js app runs `db.users.find({ country: "USA" })`, the `mongos` router instantly forwards the query ONLY to Shard A. Shard B is completely left alone to process other queries! This is called a **Targeted Query**.
+
+### Level 2 — Building Blocks (Scatter-Gather Queries)
+What happens if you run a query that does NOT include the Shard Key?
+```javascript
+// We sharded by 'country', but we query by 'age'!
+db.users.find({ age: 30 });
+```
+Because the router has absolutely no idea which Shards contain 30-year-olds, it is forced to execute a **Scatter-Gather (Broadcast) Query**. It sends the query to EVERY SINGLE SHARD in the entire cluster simultaneously, waits for all of them to respond, merges the results together, and sends them back to the client.
+
+Scatter-Gather queries are incredibly slow and destroy the performance benefits of a sharded cluster. You should always try to include the Shard Key in your most frequent queries!
+
+### Level 3 — Intermediate (Choosing the Perfect Shard Key)
+Choosing a Shard Key is the most critical architectural decision in MongoDB. If you choose poorly, your cluster will perform worse than a single server.
+
+**Bad Idea 1: Ascending IDs (e.g., MongoDB `_id` or a Timestamp)**
+If you use a constantly increasing number, ALL new inserts will be routed to the exact same chunk on the exact same Shard! (This is called a **Hot Shard**). The other Shards will sit completely idle while one Shard burns at 100% CPU.
+
+**Bad Idea 2: Low Cardinality (e.g., `boolean isAdmin`)**
+If you shard by `isAdmin`, there are only 2 possible values (`true` or `false`). You can never scale beyond 2 Shards! Furthermore, 99% of your users are `false`, meaning one Shard holds 99% of your data (a massive imbalance called a **Jumbo Chunk**).
+
+**The Solution: Hashed Shard Keys**
+Instead of sharding by the raw value, you tell MongoDB to mathematically hash the `_id` field.
+```javascript
+// The data is distributed randomly and perfectly evenly across all shards!
+sh.shardCollection("myApp.users", { _id: "hashed" });
+```
+*Pros:* Perfect distribution of Write traffic. No Hot Shards!
+*Cons:* Range queries (`find({ _id: { $gt: 100 } })`) become Scatter-Gather queries, because consecutive IDs are scattered randomly across the cluster.
+
+### Level 4 — Advanced (The Balancer)
+What happens when Shard A starts getting too much data?
+MongoDB runs a background process called the **Balancer**. 
+
+Data on a Shard is grouped into logical blocks called "Chunks" (usually 64MB each).
+If the Balancer notices that Shard A has 500 Chunks, and Shard B only has 100 Chunks, it will automatically wake up and begin physically copying Chunks from Shard A over the network to Shard B, deleting them from Shard A once the migration is complete.
+
+This guarantees that over time, your data remains perfectly distributed across the cluster without any manual intervention!
+
+## REAL_WORLD
+**The Cost of Sharding**
+Many startups hear about "Sharding" and try to implement it on day one to be "web scale." This is a massive mistake.
+A basic production Replica Set requires 3 servers.
+A basic Sharded Cluster requires:
+- 3 Config Servers
+- 2 `mongos` Routers
+- Shard A (3 Servers)
+- Shard B (3 Servers)
+Total = **11 Servers minimum!**
+
+Sharding introduces massive operational complexity and skyrocketing infrastructure costs. You should scale your primary Replica Set vertically (buying a bigger CPU and more RAM) for as long as humanly possible. You only shard when AWS literally doesn't sell a server big enough to hold your data anymore!
+
+## INTERVIEW
+**Q: Can you update a document's Shard Key after it has been inserted?**
+A: Historically, no. Before MongoDB 4.2, the Shard Key was completely immutable. If a user changed their country, you had to delete the entire document and re-insert it! In modern MongoDB (4.2+), you can update the Shard Key. If the update causes the document to belong to a different Shard, MongoDB will automatically execute a distributed transaction behind the scenes to physically move the document from the old Shard to the new Shard.

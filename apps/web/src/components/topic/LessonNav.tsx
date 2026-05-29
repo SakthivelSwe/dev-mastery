@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { useTopicStore, TabState } from '@/store/useTopicStore';
-import { CheckCircle, Circle, Play, BookOpen, Code, Activity, Briefcase, MessageSquare, Lock } from 'lucide-react';
+import { CheckCircle, Circle, Play, BookOpen, Code, Activity, Briefcase, MessageSquare, Lock, Mic, Hammer, Repeat } from 'lucide-react';
 
 const tabs: { id: TabState; label: string; icon: any; est: string }[] = [
   { id: 'why', label: 'Why it matters', icon: Activity, est: '2m' },
@@ -11,14 +11,17 @@ const tabs: { id: TabState; label: string; icon: any; est: string }[] = [
   { id: 'code', label: 'Code Lab', icon: Code, est: '20m' },
   { id: 'real-world', label: 'Real World', icon: Briefcase, est: '5m' },
   { id: 'interview', label: 'Interview Prep', icon: MessageSquare, est: '10m' },
+  { id: 'feynman', label: 'Feynman Check', icon: Mic, est: '5m' },
+  { id: 'build', label: 'Build Challenge', icon: Hammer, est: '30m' },
+  { id: 'spaced-review', label: 'Spaced Review', icon: Repeat, est: '3m' },
 ];
 
 export default function LessonNav() {
   const { activeTab, setActiveTab, completedTabs } = useTopicStore();
 
   return (
-    <div className="w-64 border-r border-border bg-card/50 h-full p-4 flex flex-col gap-2">
-      <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">Learning Layers</h3>
+    <div className="w-64 border-r border-border bg-card/50 h-full p-4 flex flex-col gap-2 overflow-y-auto">
+      <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2 shrink-0">Learning Layers</h3>
       
       {tabs.map((tab) => {
         const isActive = activeTab === tab.id;

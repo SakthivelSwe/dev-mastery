@@ -1,0 +1,408 @@
+---
+title: components-angular
+slug: components-angular
+---
+
+# Architectural Deep Dive: Angular Components
+
+## 1. Architectural Foundations & Core Mechanics
+
+In Angular 17+, components are the fundamental building blocks of the user interface. Under the hood, the Ivy compilation engine transforms a component class decorated with `@Component` into a highly optimized set of instructions. To truly understand Angular components, we must look past the decorator and examine how the compiler transforms our code into the runtime architecture.
+
+### The Ivy Engine: `TView` and `LView`
+
+When Angular compiles a component, it generates two critical internal data structures: the **Logical View (`LView`)** and the **Template View (`TView`)**.
+
+```
++-------------------------------------------------------------+
+|                           TView                             |
+|  (Shared Template Definition - Static Metadata & Blueprints)|
+|  - Directive defs, Binding metadata, Query definitions      |
++-------------------------------------------------------------+
+                               |
+                               | Instantiates
+                               v
++-------------------------------------------------------------+
+|                           LView                             |
+|  (Logical View Instance - Dynamic State & DOM Elements)     |
+|  - [0]: Controller Instance (Component Context)             |
+|  - [1..N]: Native DOM Elements, Directive Instances,        |
+|            Child LViews, Projected Nodes                    |
++-------------------------------------------------------------+
+```
+
+*   **`TView` (Template View)**: This is a static, shared structure created once for each component type. It contains the blueprint of the component's template, including directive definitions, binding metadata, and query definitions. It is read-only at runtime and is shared across all instances of that component.
+*   **`LView` (Logical View)**: This represents a specific instance of a component. It is a flat array containing the actual state of the view: native DOM elements, directive instances, child `LView` references, and binding values. 
+
+The first element (`LView[0]`) points to the component controller instance. Every property binding in your template corresponds to an index in this array. During change detection, Angular compares the current expression value with the value stored at the corresponding index in `LView` to determine if the DOM needs to be updated.
+
+### Component Lifecycle Execution Sequence
+
+The lifecycle of an Angular component is governed by the change detection loop. When an `LView` is processed, Angular executes lifecycle hooks in a strict sequence:
+
+```
+[Component Creation]
+         │
+         ▼
+ 1. Constructor (Dependency Injection resolved)
+         │
+         ▼
+ 2. ngOnChanges() (If inputs exist; parses SimpleChanges)
+         │
+         ▼
+ 3. ngOnInit() (Component state initialized; inputs available)
+         │
+         ▼
+ 4. ngDoCheck() (Custom change detection run)
+         │
+         ├──────────────────────────────┐
+         ▼                              ▼
+ 5. ngAfterContentInit()        6. ngAfterViewInit()
+         │                              │
+         ▼                              ▼
+ 7. ngAfterContentChecked()     8. ngAfterViewChecked()
+         │                              │
+         └──────────────┬───────────────┘
+                        │
+                        ▼
+               [Change Detection Loop]
+                        │ (On Component Destroy)
+                        ▼
+ 9. ngOnDestroy() (Teardown, unsubscribe, clean up)
+```
+
+1.  **`constructor`**: The class is instantiated. Dependencies are resolved via the Injector. Inputs are *not* yet available.
+2.  **`ngOnChanges`**: Triggered whenever data-bound inputs change. It receives a `SimpleChanges` object containing current and previous values.
+3.  **`ngOnInit`**: Executed once after the first `ngOnChanges`. Ideal for initializing component state.
+4.  **`ngDoCheck`**: Executed during every change detection cycle, immediately after `ngOnChanges`. Used for custom change detection algorithms.
+5.  **`ngAfterContentInit`**: Executed after projected content (`<ng-content>`) has been fully initialized into the component's view.
+6.  **`ngAfterContentChecked`**: Executed after every check of projected content.
+7.  **`ngAfterViewInit`**: Executed after the component's own view (and child views) has been fully initialized.
+8.  **`ngAfterViewChecked`**: Executed after every check of the component's view and child views.
+9.  **`ngOnDestroy`**: Executed immediately before the component is destroyed. Critical for preventing memory leaks by unsubscribing from Observables and clearing timers.
+
+---
+
+## 2. Deep-Dive API & Declarative Synthesis
+
+Angular 17+ introduces modern, declarative APIs that replace legacy decorators and configurations.
+
+### Standalone Component Configuration
+
+Standalone components eliminate the need for `NgModule`. They directly manage their template dependencies via the `imports` array:
+
+```typescript
+import { Component, ChangeDetectionStrategy } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { CustomDirective } from './custom.directive';
+
+@Component({
+  selector: 'app-root-container',
+  standalone: true,
+  imports: [CommonModule, CustomDirective],
+  templateUrl: './root-container.component.html',
+  styleUrls: ['./root-container.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush
+})
+export class RootContainerComponent {}
+```
+
+### Modern Input Transformations
+
+Input properties can now be declared with transform functions to parse or sanitize values declaratively:
+
+```typescript
+import { Component, Input, booleanAttribute, numberAttribute } from '@angular/core';
+
+@Component({
+  selector: 'app-data-card',
+  standalone: true,
+  template: `<div>ID: {{ id }} | Active: {{ active }}</div>`
+})
+export class DataCardComponent {
+  // Coerces string 'true' or empty attribute to boolean true
+  @Input({ transform: booleanAttribute }) active: boolean = false;
+
+  // Coerces string to number
+  @Input({ transform: numberAttribute }) id: number = 0;
+}
+```
+
+### Output and Event Emitters
+
+Outputs allow components to communicate events upwards to parent contexts:
+
+```typescript
+import { Component, Output, EventEmitter } from '@angular/core';
+
+@Component({
+  selector: 'app-action-button',
+  standalone: true,
+  template: `<button (click)="emitAction()">Click Me</button>`
+})
+export class ActionButtonComponent {
+  @Output() actionOccurred = new EventEmitter<string>();
+
+  emitAction(): void {
+    this.actionOccurred.emit('Button clicked successfully!');
+  }
+}
+```
+
+---
+
+## 3. Advanced Implementation & Production Patterns
+
+Let's build a highly optimized, type-safe, standalone Component that manages a dynamic grid layout. It uses structural directives, content projection, queries, and `OnPush` change detection.
+
+### `dynamic-grid.component.ts`
+
+```typescript
+import { 
+  Component, 
+  Input, 
+  Output, 
+  EventEmitter, 
+  ContentChildren, 
+  QueryList, 
+  AfterContentInit, 
+  ChangeDetectionStrategy,
+  Directive,
+  TemplateRef
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Directive({
+  selector: '[gridItem]',
+  standalone: true
+})
+export class GridItemDirective {
+  constructor(public templateRef: TemplateRef<any>) {}
+}
+
+export interface GridConfig {
+  columns: number;
+  gapPx: number;
+}
+
+@Component({
+  selector: 'app-dynamic-grid',
+  standalone: true,
+  imports: [CommonModule],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div 
+      class="grid-container" 
+      [style.grid-template-columns]="'repeat(' + config.columns + ', 1fr)'"
+      [style.gap.px]="config.gapPx"
+    >
+      <div 
+        *ngFor="let item of items; let idx = index" 
+        class="grid-item"
+        (click)="handleItemClick(item, idx)"
+      >
+        <!-- Projecting template dynamic content -->
+        <ng-container *ngTemplateOutlet="itemTemplate; context: { $implicit: item, index: idx }"></ng-container>
+      </div>
+    </div>
+  `,
+  styles: [`
+    .grid-container {
+      display: grid;
+      width: 100%;
+    }
+    .grid-item {
+      cursor: pointer;
+      border: 1px solid #ccc;
+      padding: 16px;
+      border-radius: 4px;
+      transition: background-color 0.2s ease;
+    }
+    .grid-item:hover {
+      background-color: #f5f5f5;
+    }
+  `]
+})
+export class DynamicGridComponent<T> implements AfterContentInit {
+  @Input({ required: true }) items: T[] = [];
+  @Input() config: GridConfig = { columns: 3, gapPx: 16 };
+  @Output() itemSelected = new EventEmitter<{ item: T; index: number }>();
+
+  @ContentChildren(GridItemDirective) 
+  queryItems!: QueryList<GridItemDirective>;
+
+  protected itemTemplate!: TemplateRef<any>;
+
+  ngAfterContentInit(): void {
+    const firstItem = this.queryItems.first;
+    if (firstItem) {
+      this.itemTemplate = firstItem.templateRef;
+    } else {
+      throw new Error('DynamicGridComponent requires a projected [gridItem] template directive.');
+    }
+  }
+
+  protected handleItemClick(item: T, index: number): void {
+    this.itemSelected.emit({ item, index });
+  }
+}
+```
+
+---
+
+## 4. Diagnostics, Performance, & Memory Management
+
+### Avoiding Memory Leaks in Component Subscriptions
+
+A major source of memory leaks in Angular is failing to clean up active subscriptions when a component is destroyed. If a subscription is held in a component instance, the Garbage Collector cannot reclaim the component's `LView` and class instance, causing a leak.
+
+#### The `takeUntilDestroyed` Pattern (Angular 16+)
+
+```typescript
+import { Component, OnInit, DestroyRef, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { interval } from 'rxjs';
+
+@Component({
+  selector: 'app-leak-free',
+  standalone: true,
+  template: `<div>Active Component</div>`
+})
+export class LeakFreeComponent implements OnInit {
+  private destroyRef = inject(DestroyRef);
+  private http = inject(HttpClient);
+
+  ngOnInit(): void {
+    interval(1000)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(val => console.log('Interval Tick:', val));
+  }
+}
+```
+
+### Performance Profiling with `ChangeDetectionStrategy.OnPush`
+
+By default, Angular uses the `Default` change detection strategy, which checks the entire component tree from top to bottom on every asynchronous event (click, timer, HTTP response). 
+
+By switching to `OnPush`, you instruct Angular to skip change detection for this component and its children *unless*:
+1.  One of its `@Input` references changes.
+2.  An event originates from the component or its children (e.g., a click event handler).
+3.  An Observable bound in the template via the `async` pipe emits a new value.
+4.  Change detection is explicitly invoked via `ChangeDetectorRef.markForCheck()`.
+
+#### Profiling Change Detection
+
+Using the Angular DevTools chrome extension, you can record change detection cycles. If you notice components re-rendering when their inputs haven't changed, they are likely set to `Default` strategy or are receiving mutated object references instead of immutable updates.
+
+---
+
+## 5. Enterprise Testing & Verification Matrix
+
+Testing components requires isolation and careful mock setups. Below is a comprehensive test suite for `DynamicGridComponent` using modern testing practices.
+
+```typescript
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { Component } from '@angular/core';
+import { By } from '@angular/platform-browser';
+import { DynamicGridComponent, GridItemDirective } from './dynamic-grid.component';
+
+// Create a host component to test content projection and directives
+@Component({
+  standalone: true,
+  imports: [DynamicGridComponent, GridItemDirective],
+  template: `
+    <app-dynamic-grid [items]="testItems" (itemSelected)="onSelect($event)">
+      <ng-template [gridItem] let-item let-idx="index">
+        <span class="test-content">{{ item.name }} - {{ idx }}</span>
+      </ng-template>
+    </app-dynamic-grid>
+  `
+})
+class TestHostComponent {
+  testItems = [{ name: 'Item A' }, { name: 'Item B' }];
+  selectedData: any = null;
+
+  onSelect(event: any): void {
+    this.selectedData = event;
+  }
+}
+
+describe('DynamicGridComponent', () => {
+  let fixture: ComponentFixture<TestHostComponent>;
+  let hostComponent: TestHostComponent;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [TestHostComponent, DynamicGridComponent, GridItemDirective]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(TestHostComponent);
+    hostComponent = fixture.componentInstance;
+    fixture.detectChanges(); // Triggers initial lifecycle hooks
+  });
+
+  it('should project the template correct amount of times', () => {
+    const projectedElements = fixture.debugElement.queryAll(By.css('.test-content'));
+    expect(projectedElements.length).toBe(2);
+    expect(projectedElements[0].nativeElement.textContent).toContain('Item A - 0');
+    expect(projectedElements[1].nativeElement.textContent).toContain('Item B - 1');
+  });
+
+  it('should emit itemSelected event when a grid item is clicked', () => {
+    const gridItems = fixture.debugElement.queryAll(By.css('.grid-item'));
+    gridItems[1].triggerEventHandler('click', null);
+    fixture.detectChanges();
+
+    expect(hostComponent.selectedData).toEqual({
+      item: { name: 'Item B' },
+      index: 1
+    });
+  });
+});
+```
+
+---
+
+## 6. Anti-Patterns, Refactoring, & Decoupling
+
+### Anti-Pattern: Direct DOM Manipulation via `ElementRef.nativeElement`
+
+```typescript
+// BAD: Violates platform abstraction, breaks SSR (Server-Side Rendering)
+constructor(private el: ElementRef) {
+  this.el.nativeElement.style.backgroundColor = 'red';
+}
+```
+
+#### Refactoring Solution: Use `Renderer2` or Declarative Directives
+
+```typescript
+// GOOD: Safe platform abstraction, compatible with SSR and Web Workers
+import { Component, ElementRef, Renderer2, inject, OnInit } from '@angular/core';
+
+@Component({
+  selector: 'app-safe-dom',
+  standalone: true,
+  template: `<div #target>Safe Styled Box</div>`
+})
+export class SafeDomComponent implements OnInit {
+  private el = inject(ElementRef);
+  private renderer = inject(Renderer2);
+
+  ngOnInit(): void {
+    const targetEl = this.el.nativeElement.querySelector('[target]');
+    if (targetEl) {
+      this.renderer.setStyle(targetEl, 'background-color', 'red');
+    }
+  }
+}
+```
+
+### Anti-Pattern: Over-reliance on Parent-Child Coupling
+
+Using `@Parent` or traversing `fixture.debugElement.parent` in tests tightly couples components together, making reuse impossible.
+
+#### Refactoring Solution: Unify communication via Inputs, Outputs, or scoped State Services.
+
+---

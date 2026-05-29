@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from 'react';
-import CodeEditorShell from '@/components/code/CodeEditorShell';
+import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import { Play, X } from 'lucide-react';
 
 interface Problem {
@@ -95,7 +95,7 @@ export default function PatternVisualizer({ pattern }: { pattern: Pattern }) {
                 <p className="text-[#8b949e]">Description for {activeProblem.title} goes here. Read the problem statement carefully and then use the editor on the right to implement your solution.</p>
               </div>
               <div className="w-2/3">
-                <CodeEditorShell initialCode={activeProblem.starterCode || "// Write your solution here\n"} language="java" />
+                <CodeEditorShell initialCode={activeProblem.starterCode || "// Write your solution here\n"} languageString="java" />
               </div>
             </div>
           </div>

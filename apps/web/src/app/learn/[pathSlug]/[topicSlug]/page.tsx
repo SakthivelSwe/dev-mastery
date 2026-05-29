@@ -1,31 +1,67 @@
 import { Metadata } from 'next';
+import { notFound } from 'next/navigation';
 import TopicPage from '@/components/topic/TopicPage';
-import { AiChatContainer } from '@/components/chat/AiChatContainer';
+import { MdxRenderer } from '@/components/topic/MdxRenderer';
+import { fetchTopic, fetchPath } from '@/lib/api';
 
-export async function generateMetadata({ params }: { params: { pathSlug: string, topicSlug: string } }): Promise<Metadata> {
-  const title = params.topicSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+interface PageProps {
+  params: { pathSlug: string; topicSlug: string };
+}
+
+export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
+  const topic = await fetchTopic(params.topicSlug);
+  const title = topic?.title ?? params.topicSlug
+    .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  const pathTitle = topic?.pathTitle ?? params.pathSlug
+    .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
   return {
     title: `${title} | DevMastery`,
-    description: `Master ${title} in the ${params.pathSlug} learning path.`,
+    description: `Master ${title} — part of the ${pathTitle} learning path on DevMastery.`,
+    openGraph: {
+      title: `${title} | DevMastery`,
+      description: `Deep-dive into ${title} with theory, code, visualizers, and AI-assisted Feynman practice.`,
+    },
   };
 }
 
-export default function Page({ params }: { params: { pathSlug: string, topicSlug: string } }) {
-  const title = params.topicSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+export default async function TopicPageRoute({ params }: PageProps) {
+  // Fetch topic data server-side (SSR)
+  const topic = await fetchTopic(params.topicSlug);
+
+  // If topic genuinely doesn't exist in DB, show 404
+  // (comment out for dev if backend is off)
+  // if (!topic) notFound();
+
   return (
-    <div className="flex flex-col h-screen">
-      <header className="h-16 border-b border-border flex items-center px-6 bg-card shrink-0">
-        <h1 className="text-xl font-bold font-syne tracking-tight">
-          Dev<span className="text-primary">Mastery</span>
-        </h1>
-        <div className="ml-8 text-sm font-medium text-muted-foreground bg-muted px-3 py-1 rounded-full">
-          {params.pathSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
+    <div className="flex flex-col h-screen overflow-hidden">
+      {/* App Shell Header */}
+      <header className="h-16 border-b border-[--border-default] flex items-center px-6 bg-[--bg-surface]/80 backdrop-blur-md shrink-0 z-10">
+        <a href="/" className="flex items-center gap-1">
+          <span className="text-xl font-bold font-display tracking-tight text-[--text-primary]">
+            Dev<span className="text-[--accent-ai]">Mastery</span>
+          </span>
+        </a>
+        <div className="ml-6 flex items-center gap-2 text-sm text-[--text-muted]">
+          <span>/</span>
+          <a href="/dashboard" className="hover:text-[--text-primary] transition-colors">Dashboard</a>
+          <span>/</span>
+          <a
+            href={`/learn/${params.pathSlug}/roadmap`}
+            className="hover:text-[--text-primary] transition-colors capitalize"
+          >
+            {params.pathSlug.replace(/-/g, ' ')}
+          </a>
         </div>
       </header>
-      
-      <main className="flex-1 overflow-hidden relative">
-        <TopicPage topicSlug={params.topicSlug} />
-        <AiChatContainer topicSlug={params.topicSlug} topicTitle={title} />
+
+      {/* Topic Page — takes up remaining height */}
+      <main className="flex-1 overflow-hidden">
+        <TopicPage
+          topicSlug={params.topicSlug}
+          topic={topic}
+          MdxRenderer={MdxRenderer}
+        />
       </main>
     </div>
   );

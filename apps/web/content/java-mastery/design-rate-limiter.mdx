@@ -1,0 +1,96 @@
+---
+title: design-rate-limiter
+slug: design-rate-limiter
+---
+
+# Design a Distributed Rate Limiter | Level: 5
+
+## 1. Requirements Gathering
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        REQUIREMENTS GATHERING                          │
+├───────────────────────────────────┬────────────────────────────────────┤
+│ Candidate Clarifying Questions    │ Interviewer Responses & Decoded    │
+│                                   │ Requirements                       │
+├───────────────────────────────────┼────────────────────────────────────┤
+│ Q: Where should the rate limiter  │ A: It must run as an API Gateway   │
+│ run (client, service, or gateway)?│ middleware or standalone sidecar.  │
+├───────────────────────────────────┼────────────────────────────────────┤
+│ Q: What are the limiting criteria │ A: IP address, API key, or User ID.│
+│ (IP, User ID, etc.)?              │ Support multi-tier limits.         │
+├───────────────────────────────────┼────────────────────────────────────┤
+│ Q: What should happen when a limit│ A: Return HTTP 429 (Too Many       │
+│ is exceeded?                      │ Requests) with a Retry-After header│
+├───────────────────────────────────┼────────────────────────────────────┤
+│ Q: Is low latency a priority?     │ A: Yes. The rate limiter must add  │
+│                                   │ $<2\text{ms}$ overhead per request.│
+├───────────────────────────────────┼────────────────────────────────────┤
+│ Q: How should we handle temporary │ A: Prioritize availability over    │
+│ rate-limiting database failures?  │ hard limiting. Fail open if needed.│
+└───────────────────────────────────┴────────────────────────────────────┘
+```
+
+### Functional Requirements
+* **Accurate Rate Limiting**: Limit requests based on configurable keys (e.g., User ID, Client IP, API Token).
+* **Configurable Rules**: Support dynamic rule definitions (e.g., Premium users: 10,000 req/min; Free users: 100 req/min).
+* **Standard HTTP Response**: Return HTTP Status Code `429 Too Many Requests` along with headers:
+  * `X-RateLimit-Limit`: Maximum requests allowed in the window.
+  * `X-RateLimit-Remaining`: Remaining requests allowed in the current window.
+  * `X-RateLimit-Reset`: Unix epoch timestamp indicating when the limit resets.
+
+### Non-Functional Requirements
+* **Ultra-Low Latency Overhead**: The checking mechanism must execute in $<2\text{ms}$ (p99) to avoid degrading API performance.
+* **High Availability & Fault Tolerance**: Must handle millions of concurrent requests. If the rate-limiting cluster goes down, the system should fail open to prevent blocking legitimate traffic.
+* **Distributed Accuracy**: Ensure consistent rate limiting across a highly distributed, multi-region server fleet without suffering from race conditions.
+
+---
+
+## 2. Back-of-the-Envelope Estimation
+
+Let us assume our platform handles a high-scale load of $100,000$ requests per second (RPS).
+
+### Memory Calculation for Rate Limiter State
+We need to estimate the memory footprint of keeping track of rate limits for active users. Let's assume we have $10\text{M}$ daily active users (DAUs), with $1\text{M}$ active within any given minute.
+
+Using a sliding window counter algorithm, we store the following data per user key in Valkey:
+* Key: `rl:user:{user_id}` (e.g., `rl:user:10928374` $\rightarrow 20 \text{ bytes}$)
+* Value: Hash containing current window count and previous window count ($\approx 32 \text{ bytes}$)
+* Overhead per key in Redis/Valkey: $\approx 250 \text{ bytes}$ (metadata, pointers, hash structures)
+* **Total Memory per User**: $\approx 300 \text{ bytes}$
+
+$$\text{Total Memory for 1M Active Users} = 1,000,000 \times 300 \text{ bytes} \approx 300 \text{ MB}$$
+$$\text{Total Memory for 10M DAUs} = 10,000,000 \times 300 \text{ bytes} \approx 3 \text{ GB}$$
+
+*This memory footprint is extremely small and can easily fit into a standard Redis/Valkey cache instance.*
+
+### Network Bandwidth & QPS
+* **Rate Limiter QPS**: $100,000 \text{ req/sec}$
+* **Bandwidth Overhead**: If each rate-limit request to the centralized cache takes $100 \text{ bytes}$ of payload:
+  $$\text{Bandwidth} = 100,000 \times 100 \text{ bytes} \approx 10 \text{ MB/s}$$
+
+---
+
+## 3. High-Level Architecture
+
+We place the rate-limiting layer at the edge of our network, integrated within our API Gateway.
+
+```mermaid
+graph TD
+    Client([Client]) -->|1. Request| Gateway[API Gateway / Envoy]
+    
+    subgraph Rate Limiting Layer
+        Gateway -->|2. Check Limit (gRPC)| RL_Service[Rate Limiting Service]
+        RL_Service -->|3. Read/Write State (Lua)| Cache[(Valkey Cluster)]
+        ConfigStore[(Consul / Config DB)] -->|4. Push Rules| RL_Service
+    end
+
+    Gateway -->|5. Allowed: Route Request| Backend[Backend Microservices]
+    Gateway -.->|6. Throttled: HTTP 429| Client
+```
+
+### Component Descriptions
+1. **API Gateway (Envoy / Kong)**: Intercepts all incoming client requests. It calls the Rate Limiting Service asynchronously or via blocking inline gRPC filters before routing the request to downstream services.
+2. **Rate Limiting Service**: A stateless, high-performance Go or Rust service that implements the rate-limiting algorithms. It fetches rules from the Config Store and manages state in Valkey.
+3. **Valkey Cluster**: A distributed, in-memory cache used to maintain the active request counters and token buckets.
+4. **Consul / Etcd (Config Store

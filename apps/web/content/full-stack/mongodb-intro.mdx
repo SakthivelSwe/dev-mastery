@@ -1,0 +1,231 @@
+---
+title: mongodb-intro
+slug: mongodb-intro
+---
+
+# MongoDB — Document Model vs Relational | Level: 2
+
+### Layer 1: Deep Dive / Architectural Core
+MongoDB’s storage architecture is driven by the **WiredTiger** storage engine, which employs a highly optimized B-Tree structure for indexes and a row-oriented layout for data files. WiredTiger utilizes a multi-version concurrency control (MVCC) engine to manage concurrent operations without locking entire databases or collections.
+
+```
+       +--------------------------------------------------------+
+       |                     WiredTiger Engine                  |
+       |  +--------------------------------------------------+  |
+       |  |                 WiredTiger Cache                 |  |
+       |  |  [ Active B-Tree Pages ]  [ Dirty Pages (MVCC) ] |  |
+       |  +------------------------+-------------------------+  |
+       |                           |                            |
+       |               Checkpoints | (Every 60s or 2GB)         |
+       |                           v                            |
+       |  +------------------------+-------------------------+  |
+       |  |                Disk / Storage Block              |  |
+       |  |  [ Data Files (.wt) ]     [ Journal Files ]      |  |
+       |  +--------------------------------------------------+  |
+       +--------------------------------------------------------+
+```
+
+#### Memory Management & Eviction
+WiredTiger allocates a dedicated cache size (by default, the larger of 50% of (RAM - 1 GB) or 256 MB). It reads data from disk into memory in the form of B-Tree pages. When memory pressure increases, background eviction threads target dirty pages, writing them to disk using a reconciliation process. 
+
+#### The Journal
+To ensure durability (ACID compliance), MongoDB writes operations to an in-memory journal buffer, which is flushed to disk (the Journal) sequentially every 100 milliseconds (or upon a write with `j: true`). In the event of a crash, WiredTiger replays the journal from the last consistent checkpoint (taken automatically every 60 seconds or when 2 GB of data has been written).
+
+#### BSON (Binary JSON) Serialization
+MongoDB does not store JSON directly. It serializes JSON into BSON, a binary format that introduces type-awareness, length prefixes, and byte-alignment for fast parsing. Key BSON-specific types include:
+*   **`ObjectId` (12-byte hex)**: Optimized for distributed unique ID generation without network coordination.
+    *   `4-byte timestamp` (seconds since epoch)
+    *   `5-byte random value` (unique per process/machine)
+    *   `3-byte counter` (starting with a random value)
+*   **`Date`**: 64-bit integer representing milliseconds since the Unix epoch.
+*   **`NumberDecimal` (Decimal128)**: 128-bit IEEE 754 decimal floating-point format. Crucial for financial calculations to prevent binary floating-point rounding errors.
+*   **`Binary`**: Arbitrary binary data (UUIDs, cryptographic keys, compressed payloads).
+
+#### Document Limits & Schema Philosophy
+MongoDB enforces a **16MB limit** per BSON document. This hard limit prevents poor application design (such as unbounded arrays) from causing memory exhaustion during serialization/deserialization. 
+
+*Schemaless does not mean "no schema."* It means **schema-flexibility**. The application code defines the implicit schema. Relying purely on application-level flexibility can lead to data corruption; hence, MongoDB 7.x supports server-side `$jsonSchema` validation to enforce document integrity at the engine level.
+
+---
+
+### Layer 2: Real-World Use Cases & Schema Design
+#### Scenario: E-Commerce Product Catalog with Dynamic Attributes
+Relational databases struggle with highly polymorphic products (e.g., a laptop has RAM/CPU, while shoes have size/color). This typically forces a slow EAV (Entity-Attribute-Value) anti-pattern in SQL. MongoDB natively handles this by storing attributes as subdocuments or key-value arrays.
+
+```json
+{
+  "_id": ObjectId("64b1f8e9c9e8a7b6d5c4b3a2"),
+  "sku": "TECH-LAP-001",
+  "name": "Developer Pro Laptop",
+  "category": "Electronics",
+  "price": NumberDecimal("1499.99"),
+  "attributes": [
+    { "name": "CPU", "value": "Apple M3 Max", "type": "string" },
+    { "name": "RAM", "value": 64, "type": "number", "unit": "GB" }
+  ],
+  "metadata": {
+    "created_at": ISODate("2023-07-15T08:00:00Z"),
+    "version": 1
+  }
+}
+```
+
+---
+
+### Layer 3: Code Examples (`mongosh` vs Spring Data)
+
+#### 1. Server-Side Schema Validation (`mongosh`)
+Create a collection with strict schema validation enforcing type checks, decimal pricing, and mandatory fields.
+
+```javascript
+db.createCollection("products", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["sku", "name", "price", "category"],
+      properties: {
+        sku: {
+          bsonType: "string",
+          pattern: "^[A-Z]{4}-[A-Z0-9]{3}-[0-9]{3}$",
+          description: "Must be a valid SKU format"
+        },
+        name: {
+          bsonType: "string",
+          minLength: 3
+        },
+        price: {
+          bsonType: "decimal",
+          description: "Price must be a Decimal128"
+        },
+        category: {
+          bsonType: "string"
+        },
+        attributes: {
+          bsonType: "array",
+          items: {
+            bsonType: "object",
+            required: ["name", "value"],
+            properties: {
+              name: { bsonType: "string" },
+              value: { bsonType: ["string", "number", "bool"] }
+            }
+          }
+        }
+      }
+    }
+  }
+});
+```
+
+#### 2. Spring Data MongoDB Entity & Repository Configuration
+Below is the equivalent mapping using Spring Data MongoDB, configuring precise BSON mappings (such as `Decimal128` for financial values) and collection-level properties.
+
+```java
+package com.devmastery.mongodb.model;
+
+import org.bson.types.Decimal128;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+import org.springframework.data.mongodb.core.mapping.FieldType;
+
+import java.time.Instant;
+import java.util.List;
+
+@Document(collection = "products")
+public class Product {
+
+    @Id
+    private String id;
+
+    @Indexed(unique = true)
+    @Field(name = "sku")
+    private String sku;
+
+    @Field(name = "name")
+    private String name;
+
+    @Field(name = "price", targetType = FieldType.DECIMAL128)
+    private Decimal128 price;
+
+    @Field(name = "category")
+    private String category;
+
+    @Field(name = "attributes")
+    private List<Attribute> attributes;
+
+    @Field(name = "created_at")
+    private Instant createdAt;
+
+    // Getters, Setters, Constructors
+    
+    public static class Attribute {
+        private String name;
+        private Object value;
+        private String unit;
+
+        // Getters, Setters, Constructors
+    }
+}
+```
+
+---
+
+### Layer 4: Advanced Patterns & Optimization
+#### Schema Evolution and Versioning Pattern
+When your document structure changes over time, instead of running slow database migrations that lock tables (as in SQL), append a `schema_version` field to your documents.
+
+```javascript
+// Document Version 1
+{ "_id": 1, "name": "John Doe", "phone": "123-456-7890", "schema_version": 1 }
+
+// Document Version 2 (Migrated to nested object)
+{ "_id": 2, "name": "Jane Smith", "contact": { "phone": "987-654-3210", "email": "jane@test.com" }, "schema_version": 2 }
+```
+
+Your application layer handles this gracefully:
+```java
+public User readUser(Document doc) {
+    int version = doc.getInteger("schema_version", 1);
+    if (version == 1) {
+        String phone = doc.getString("phone");
+        return new User(doc.getString("name"), new Contact(phone, null));
+    } else {
+        Document contactDoc = (Document) doc.get("contact");
+        return new User(doc.getString("name"), new Contact(contactDoc.getString("phone"), contactDoc.getString("email")));
+    }
+}
+```
+
+---
+
+### Layer 5: PostgreSQL Comparison Matrix
+
+| Architectural Vector | MongoDB (7.x) | PostgreSQL (16+) |
+| :--- | :--- | :--- |
+| **Storage Model** | Document (BSON) stored in WiredTiger B-Trees. | Relational (tuples) in Heap tables with indexes (B-Tree, GIN). |
+| **Write Path** | App -> Journal Memory -> Journal Disk (Sequential) -> Data Files (Checkpoint). | App -> Shared Buffers -> WAL (Write-Ahead Log) -> Heap. |
+| **Dynamic Attributes** | Native. Subdocuments, indexing nested keys directly. | Supported via `JSONB`. GIN indexes required. |
+| **Schema Enforcement** | Flexible. Optional server-side `$jsonSchema` validation. | Strict. DDL migrations required for structural changes. |
+| **Horizontal Scale** | Native sharding (range, hash, zone-based routing). | Manual sharding or extensions (e.g., Citus). |
+| **Memory Footprint** | Higher. BSON metadata stored per document. | Lower. Schema metadata stored once in catalog table. |
+
+#### When MongoDB Wins:
+1.  **Polymorphic Data**: E-commerce, catalogs, content management systems where entities have diverse structures.
+2.  **Horizontal Scalability**: High write-throughput workloads requiring seamless sharding across multiple nodes.
+3.  **Rapid Prototyping**: Fast-changing application models where schema migrations impede deployment cycles.
+
+#### When PostgreSQL Wins:
+1.  **Complex Ad-hoc Reporting**: Deep analytical queries requiring complex multi-table joins.
+2.  **Strict Data Normalization**: Systems requiring declarative referential integrity constraints (FKs) enforced by the engine.
+3.  **Low Storage Overheads**: Massive record sets where repeating schema keys (as in BSON) would dramatically inflate storage costs.
+
+---
+
+### Layer 6: Production Gotchas & Best Practices
+1.  **The 16MB Limit Violation**: Avoid designing schemas where arrays grow indefinitely (e.g., storing all logs or comments inside a single document). *Mitigation*: Reference the child documents or use the Bucket Pattern.
+2.  **WiredTiger Cache Starvation**: By default, containerized deployments (Docker/Kubernetes) may miscalculate host memory, causing WiredTiger to allocate more memory than the container limit, triggering OOM kills. *Mitigation*: Explicitly set `--wiredTigerCacheSizeGB` to match the container's limits.
+3.  **BSON Key Bloat**: BSON stores field names inside every single document. Storing `{"long_descriptive_field_name": "value"}` millions of times wastes storage and memory. *Mitigation*: Use short, concise field names (e.g., `{"desc": "value"}`) or rely on compression (WiredTiger block compression defaults to Snappy; Zlib or Zstd can be configured for higher ratios).
+
+---

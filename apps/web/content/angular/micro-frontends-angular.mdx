@@ -1,0 +1,129 @@
+---
+slug: "micro-frontends-angular"
+title: "Micro-Frontends in Angular"
+level: 5
+---
+
+## WHY
+In a monolithic application, 50 developers might be working on the exact same Angular codebase simultaneously. Every time Team A wants to deploy a tiny bug fix to the "Cart", they have to rebuild and redeploy the entire 50-megabyte application, risking breaking Team B's "Dashboard" code.
+**Micro-Frontends** bring the concept of Backend Microservices to the browser. You physically split your massive Angular app into multiple, completely independent mini-applications. Team A can build, test, and deploy the "Cart App" to production independently, and the "Shell App" will dynamically stitch them together in the user's browser at runtime!
+
+## THEORY
+### Webpack Module Federation
+The technology that makes Micro-Frontends possible is **Module Federation** (introduced in Webpack 5).
+It allows a JavaScript application to dynamically load code from *another* completely separate JavaScript application hosted on a different URL, at runtime.
+- **The Host (Shell):** The main application the user visits (`company.com`). It acts as a container.
+- **The Remote (Micro-Frontend):** An independent application (`cart.company.com`) that exposes specific components or routing modules to be consumed by the Host.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "micro-frontends" }
+```
+
+## CODE
+
+### Level 1 — Setting up Module Federation
+In Angular, setting up Module Federation manually is incredibly complex. Instead, you use the official `@angular-architects/module-federation` package to configure it for you.
+
+```bash
+# 1. Generate the Host App (The Shell)
+ng add @angular-architects/module-federation --project shell --port 4200 --type host
+
+# 2. Generate the Remote App (The Micro-Frontend)
+ng add @angular-architects/module-federation --project mfe1 --port 4201 --type remote
+```
+
+This generates a critical `webpack.config.js` file in both applications!
+
+### Level 2 — Exposing the Remote (The Micro-Frontend)
+In the Remote app (`mfe1`), we configure Webpack to "expose" an Angular Component to the outside world!
+
+```javascript
+// mfe1/webpack.config.js
+const { shareAll, withModuleFederationPlugin } = require('@angular-architects/module-federation/webpack');
+
+module.exports = withModuleFederationPlugin({
+  name: 'mfe1',
+  exposes: {
+    // We expose a single Standalone Component, giving it the public name 'FlightComponent'
+    './FlightComponent': './src/app/flights/flight.component.ts',
+  },
+  
+  // Magic: We share ALL Angular libraries!
+  // If the Host already downloaded @angular/core, the Remote won't download it again!
+  shared: { ...shareAll({ singleton: true, strictVersion: true, requiredVersion: 'auto' }) }
+});
+```
+
+### Level 3 — Consuming the Remote (The Host)
+In the Host app (`shell`), we configure the Angular Router to dynamically load the Remote Component over the network!
+
+```typescript
+// shell/src/app/app.routes.ts
+import { Routes } from '@angular/router';
+import { loadRemoteModule } from '@angular-architects/module-federation';
+
+export const routes: Routes = [
+  {
+    path: '',
+    component: HomeComponent
+  },
+  {
+    path: 'flights',
+    // MAGIC! We use the Router to fetch code from a COMPLETELY DIFFERENT URL!
+    loadComponent: () => 
+      loadRemoteModule({
+        type: 'module',
+        remoteEntry: 'http://localhost:4201/remoteEntry.js', // The URL of the MFE!
+        exposedModule: './FlightComponent' // The name we defined in webpack.config.js!
+      }).then(m => m.FlightComponent)
+  }
+];
+```
+When the user visits `company.com/flights`, the Shell app downloads a tiny JS file from `cart.company.com`, extracts the compiled Angular Component, and renders it seamlessly. The user has no idea they just crossed application boundaries!
+
+### Level 4 — Dynamic Federation (Manifests)
+Hardcoding `http://localhost:4201` into the Shell's router is terrible. What if the URL changes in Production? What if you want to add a brand new Micro-Frontend without redeploying the Shell?
+You use **Dynamic Federation**. The Shell downloads a JSON file at startup containing the URLs of all available MFEs!
+
+```json
+// shell/src/assets/mf.manifest.json
+{
+  "mfe1": "https://mfe1.production.company.com/remoteEntry.js",
+  "mfe2": "https://mfe2.production.company.com/remoteEntry.js"
+}
+```
+
+```typescript
+// main.ts (Shell)
+import { setRemoteDefinitions } from '@angular-architects/module-federation';
+
+// 1. Fetch the JSON file at startup!
+fetch('/assets/mf.manifest.json')
+  .then(res => res.json())
+  .then(definitions => {
+    
+    // 2. Register the dynamic URLs with Webpack!
+    setRemoteDefinitions(definitions);
+    
+    // 3. Boot Angular!
+    bootstrapApplication(AppComponent);
+  });
+```
+
+## REAL_WORLD
+**The Danger of Micro-Frontends**
+Micro-Frontends are the most over-engineered trend in modern web development. Junior architects often implement them because "Netflix does it," without understanding the devastating tradeoffs.
+1. **Performance Destruction:** If Host uses Angular 15, MFE1 uses Angular 16, and MFE2 uses React, the user has to download 3 completely different massive framework bundles to view a single webpage!
+2. **State Chaos:** Sharing state (like the User's JWT Token) between completely isolated Webpack applications requires complex global `window` event listeners or shared RxJS bus libraries.
+3. **Debugging Nightmare:** If a bug occurs, is the error in the Shell routing? The MFE configuration? A version mismatch in shared dependencies?
+
+*Golden Rule:* Never use Micro-Frontends unless your organization is massive (100+ frontend developers) and your primary pain point is *organizational scaling* and deployment bottlenecks, not technical features. For 95% of companies, an **Nx Monorepo** solves all code-sharing problems without the runtime overhead of Webpack Federation!
+
+## INTERVIEW
+**Q: Both the Host app and the Remote app are built with Angular 16. However, when the Host app tries to load the Remote component, the browser console explodes with an error: *"NullInjectorError: No provider for HttpClient!"*. The Host app definitely imported `provideHttpClient()` in its `main.ts`. Why can't the Remote component access the Host's Dependency Injection system?**
+A: **The Singleton Sharing Problem in Module Federation.**
+In an Angular application, Services (like `HttpClient` or your custom `AuthService`) rely on a global Singleton registry in memory. 
+When Webpack loads the Remote app, it loads the Remote's compiled JavaScript. If Module Federation is not configured perfectly, Webpack will instantiate a *second, completely separate instance* of the `@angular/core` framework in memory for the Remote app.
+The Remote app asks its own version of Angular for `HttpClient`, but the Remote's Angular never provided it!
+*The Fix:* You must explicitly configure the `shared` block in the `webpack.config.js` of BOTH apps. You must set `{ singleton: true, strictVersion: true }` for `@angular/core` and `@angular/common`. This forces Webpack to guarantee that only ONE instance of the Angular framework exists in the browser's memory, ensuring that the Host and Remote share the exact same Dependency Injection container!

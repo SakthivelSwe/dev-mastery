@@ -1,0 +1,168 @@
+---
+slug: "persistent-volumes"
+title: "Persistent Volumes in Kubernetes"
+level: 4
+---
+
+## WHY
+Pods are ephemeral — when a Pod dies, all its data disappears. For stateful applications (databases, file storage, message queues) you need persistent storage that survives Pod restarts, rescheduling, and even node failures.
+**Persistent Volumes (PV)** and **Persistent Volume Claims (PVC)** are Kubernetes' abstraction for durable storage, decoupling storage provisioning from application consumption.
+
+## THEORY
+### The PV/PVC Model
+- **PersistentVolume (PV):** A cluster resource representing actual storage (NFS, EBS, GCE Persistent Disk, local disk). Created by admins or dynamically provisioned.
+- **PersistentVolumeClaim (PVC):** A request for storage by a user/application ("I need 10Gi of ReadWriteOnce storage"). K8s binds the PVC to an appropriate PV.
+- **StorageClass:** Defines the type of storage (fast SSD vs slow HDD, replicated vs non-replicated) and enables dynamic provisioning (K8s automatically creates PVs).
+
+### Access Modes
+- **ReadWriteOnce (RWO):** One Node can read and write (typical for databases)
+- **ReadOnlyMany (ROX):** Many Nodes can read (typical for shared config)
+- **ReadWriteMany (RWX):** Many Nodes can read and write (requires NFS or distributed storage)
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "persistent-volumes" }
+```
+
+## CODE
+
+### Persistent Volume Claim (What Developers Write)
+```yaml
+# pvc.yml — Developer requests storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3          # AWS EBS gp3 SSD
+  resources:
+    requests:
+      storage: 20Gi              # Request 20GB of storage
+```
+
+```yaml
+# Using the PVC in a Pod/Deployment
+spec:
+  containers:
+    - name: postgres
+      image: postgres:15-alpine
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data  # Postgres data directory
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-data  # Reference the PVC!
+```
+
+### Dynamic Provisioning via StorageClass
+```bash
+# List available StorageClasses
+kubectl get storageclass
+# NAME            PROVISIONER            RECLAIMPOLICY   VOLUMEBINDINGMODE
+# gp2 (default)   ebs.csi.aws.com        Delete           WaitForFirstConsumer
+# gp3             ebs.csi.aws.com        Delete           WaitForFirstConsumer
+# standard        k8s.io/minikube-hostpath Delete         Immediate
+
+# Create a PVC — Kubernetes auto-provisions an EBS volume!
+kubectl apply -f pvc.yml
+
+# Check binding status
+kubectl get pvc
+# NAME            STATUS   VOLUME           CAPACITY   ACCESS MODES
+# postgres-data   Bound    pvc-abc123...    20Gi       RWO
+# ← Kubernetes created an actual EBS volume in AWS!
+
+# Check PersistentVolume (auto-created)
+kubectl get pv
+# NAME             CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS
+# pvc-abc123...    20Gi       RWO            Delete           Bound
+```
+
+### StatefulSet with Persistent Storage (Best Pattern for Databases)
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  # VolumeClaimTemplate: Each StatefulSet Pod gets its OWN PVC!
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 20Gi
+```
+
+## REAL_WORLD
+**Reclaim Policies: Delete vs Retain**
+This is critical — getting it wrong means losing data!
+
+```bash
+# ReclaimPolicy: Delete (default for cloud storage)
+# When you delete the PVC, the PV and underlying cloud disk are DELETED!
+# Good for: Dev/test environments
+
+# ReclaimPolicy: Retain
+# When you delete the PVC, the PV and data are RETAINED!
+# Requires manual cleanup. 
+# Good for: Production databases — data survives accidental PVC deletion!
+
+# Change reclaim policy on a storage class
+kubectl patch storageclass gp3 \
+  -p '{"reclaimPolicy":"Retain"}'
+```
+
+## INTERVIEW
+**Q: You're running a PostgreSQL StatefulSet with a PVC. You accidentally run `kubectl delete pvc postgres-data`. What happens to your data? How do you prevent this?**
+
+A: If the StorageClass has `reclaimPolicy: Delete` (the default for most cloud providers), the PVC deletion triggers the PV to be deleted, which deletes the underlying EBS volume — and your data is permanently gone.
+
+**Prevention measures:**
+1. **Use `reclaimPolicy: Retain`** for production databases:
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-retain
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+reclaimPolicy: Retain  # Data survives PVC deletion!
+```
+
+2. **Enable PVC Protection:** Kubernetes has a `kubernetes.io/pvc-protection` finalizer that prevents PVC deletion while a Pod is using it. It's enabled by default — if you delete a bound PVC, it stays in "Terminating" state until all Pods using it are deleted.
+
+3. **Use Velero for backups:** Regular database backups using Velero or database-native tools (pg_dump on a cron Job).
+
+4. **RBAC:** Restrict who can delete PVCs in production:
+```yaml
+rules:
+  - resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]  # No 'delete' verb for developers!
+```

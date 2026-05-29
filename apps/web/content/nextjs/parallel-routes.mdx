@@ -1,0 +1,147 @@
+---
+slug: "parallel-routes"
+title: "Parallel Routes and Interception"
+level: 5
+---
+
+## WHY
+Modern dashboards often need to load multiple independent sections simultaneously (e.g., an Analytics chart, a User List, and a Revenue summary) on the same page. If one section is slow to fetch data, it shouldn't block the others.
+Furthermore, modern UIs often use modals (like opening a photo on Instagram or a task on Trello). The modal should appear instantly *without* losing the background context, but if you refresh the page or share the URL, it should load as a standalone page.
+**Parallel Routes** and **Intercepting Routes** in the App Router solve these complex UI patterns elegantly.
+
+## THEORY
+### Parallel Routes (`@folder`)
+Parallel routes allow you to render multiple pages simultaneously within the same layout. 
+They are defined using the `@folder` convention (called "slots"). Slots are passed as props to the shared `layout.tsx`. Each slot operates independently with its own error boundary and loading state.
+
+### Intercepting Routes (`(..)folder`)
+Intercepting routes allow you to "intercept" a navigation to another route and display its content within the current layout (usually as a modal), but retain the ability to load the full route if accessed directly via URL.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "parallel-routes" }
+```
+
+## CODE
+
+### Implementing Parallel Routes
+Suppose we want a dashboard with two independent panels: Analytics and Team.
+
+```text
+app/
+├── dashboard/
+│   ├── layout.tsx
+│   ├── page.tsx
+│   ├── @analytics/
+│   │   ├── page.tsx
+│   │   └── loading.tsx   ← Independent loading state!
+│   └── @team/
+│       ├── page.tsx
+│       └── error.tsx     ← Independent error boundary!
+```
+
+```tsx
+// app/dashboard/layout.tsx
+export default function DashboardLayout({
+  children,   // This is the default page.tsx
+  analytics,  // The @analytics slot
+  team,       // The @team slot
+}: {
+  children: React.ReactNode;
+  analytics: React.ReactNode;
+  team: React.ReactNode;
+}) {
+  return (
+    <div className="layout">
+      <main className="main-content">{children}</main>
+      <aside className="sidebar">
+        {/* These render independently! If analytics is slow, team still loads instantly. */}
+        <section>{analytics}</section>
+        <section>{team}</section>
+      </aside>
+    </div>
+  );
+}
+```
+
+### Implementing Intercepting Routes (The Modal Pattern)
+Suppose you have a photo feed (`/feed`) and individual photo pages (`/photo/123`). When you click a photo in the feed, you want it to open in a modal *over* the feed. If you refresh, you want the full standalone photo page.
+
+```text
+app/
+├── feed/
+│   ├── page.tsx                ← The photo feed
+│   └── @modal/                 ← A parallel route slot for the modal
+│       ├── default.tsx         ← Returns null when no modal is active
+│       └── (..)photo/          ← INTERCEPTS navigation to /photo/[id]
+│           └── [id]/
+│               └── page.tsx    ← The modal UI
+├── photo/
+│   └── [id]/
+│       └── page.tsx            ← The standalone, full-page UI
+```
+
+```tsx
+// app/feed/layout.tsx
+export default function FeedLayout({ children, modal }) {
+  return (
+    <>
+      {children}
+      {modal} {/* Renders the intercepted route as a modal! */}
+    </>
+  );
+}
+
+// app/feed/@modal/default.tsx
+// Required so the modal slot doesn't break when no photo is selected
+export default function Default() {
+  return null; 
+}
+
+// app/feed/@modal/(..)photo/[id]/page.tsx
+import Modal from '@/components/Modal';
+import Photo from '@/components/Photo';
+
+export default function InterceptedPhoto({ params }) {
+  // When a user clicks a link to /photo/123 from inside /feed,
+  // Next.js intercepts it and renders this component instead!
+  return (
+    <Modal>
+      <Photo id={params.id} />
+    </Modal>
+  );
+}
+```
+
+## REAL_WORLD
+**Conditional Routing with Parallel Routes**
+You can use Parallel Routes to implement complex conditional routing, such as an Admin-only dashboard panel, without cluttering a single `page.tsx` with massive `if/else` statements.
+
+```tsx
+// app/dashboard/layout.tsx
+import { checkRole } from '@/lib/auth';
+
+export default async function Layout({ children, adminPanel, userPanel }) {
+  const isAdmin = await checkRole('admin');
+  
+  return (
+    <div>
+      {children}
+      {/* Conditionally render slots based on auth! */}
+      {isAdmin ? adminPanel : userPanel}
+    </div>
+  );
+}
+```
+
+## INTERVIEW
+**Q: You implemented a Parallel Route (`@analytics`) in your dashboard. When a user clicks a link to navigate from `/dashboard` to `/dashboard/settings`, the app crashes with a 404 error, even though `/dashboard/settings/page.tsx` exists. Why?**
+
+A: You are experiencing an **unmatched slot**.
+
+When you navigate to `/dashboard/settings`, Next.js tries to render the `settings` page. However, the `layout.tsx` at the `/dashboard` level is still active, and it expects to receive the `@analytics` slot as a prop. 
+
+Next.js looks for `app/dashboard/@analytics/settings/page.tsx` to figure out what to render in the analytics slot for the settings URL. If it doesn't exist, it throws a 404.
+
+**The Fix:**
+You must provide a `default.tsx` file inside the slot (`app/dashboard/@analytics/default.tsx`). If Next.js cannot find a matching route for a slot during client-side navigation, it will fall back to rendering the `default.tsx` file instead of crashing.

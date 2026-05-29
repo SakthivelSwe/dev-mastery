@@ -1,0 +1,157 @@
+---
+slug: "exception-handling-spring"
+title: "Exception Handling in Spring"
+level: 3
+---
+
+## WHY
+When a user requests `/api/users/99999` and that user doesn't exist, what should your API do? If you let the exception propagate uncaught, Spring will return a raw, ugly 500 Internal Server Error with a Java stack trace in the response body — which is a massive security vulnerability (revealing your package names and internal class structure to hackers) and a terrible developer experience.
+
+Every production Spring Boot API needs a centralized, consistent global error handling strategy. The industry standard is the `@ControllerAdvice` + `@ExceptionHandler` pattern.
+
+## THEORY
+### @ControllerAdvice
+`@ControllerAdvice` is a special Spring component that acts as a "Global Exception Handler" for your entire application. When any Controller method throws an exception, Spring checks if any `@ControllerAdvice` class has a matching `@ExceptionHandler` method for that specific exception type. If it does, Spring routes the exception to that handler instead of crashing.
+
+This keeps your Controller methods clean and free of `try-catch` blocks. All error handling logic lives in one centralized place.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-exception-handling" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Custom Exception + Handler)
+First, define your own custom business exceptions that carry semantic meaning.
+
+```java
+// 1. Define a custom exception!
+// RuntimeException = Unchecked, no need for throws declarations
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String resource, Long id) {
+        super(resource + " not found with id: " + id);
+    }
+}
+```
+
+```java
+// 2. Throw it from your Service layer
+@Service
+public class UserService {
+    public User findById(Long id) {
+        return userRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("User", id));
+    }
+}
+```
+
+### Level 2 — Building Blocks (The @ControllerAdvice Class)
+```java
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+// 3. The Global Error Handler!
+@RestControllerAdvice // = @ControllerAdvice + @ResponseBody
+public class GlobalExceptionHandler {
+
+    // A standard error response body
+    public record ErrorResponse(String message, int status) {}
+
+    // 4. This method fires ONLY when a ResourceNotFoundException is thrown ANYWHERE
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleNotFound(ResourceNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(new ErrorResponse(ex.getMessage(), 404));
+    }
+
+    // 5. Catch-all handler for unexpected crashes
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGenericError(Exception ex) {
+        // NEVER return the raw exception message in production!
+        // It might contain sensitive internal details.
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ErrorResponse("An unexpected error occurred.", 500));
+    }
+}
+```
+
+### Level 3 — Intermediate (Handling Validation Errors)
+When `@Valid` fails on a `@RequestBody`, Spring throws a `MethodArgumentNotValidException`. You should catch this and return a readable list of field-level errors.
+
+```java
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import java.util.stream.Collectors;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidationError(
+            MethodArgumentNotValidException ex) {
+
+        // Extract every field error into a clean Map<fieldName, errorMessage>
+        Map<String, String> errors = ex.getBindingResult()
+                .getFieldErrors()
+                .stream()
+                .collect(Collectors.toMap(
+                        FieldError::getField,
+                        fe -> fe.getDefaultMessage() != null ? fe.getDefaultMessage() : "Invalid"
+                ));
+
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errors);
+    }
+}
+
+/* Response Body:
+{
+  "name": "Name is required",
+  "email": "Must be a valid email"
+}
+*/
+```
+
+### Level 4 — Advanced (Problem Details — RFC 7807)
+Spring Boot 3.x includes built-in support for the **RFC 7807 Problem Details** standard — a formal specification for how HTTP APIs should return machine-readable error objects.
+
+```java
+// application.properties
+// spring.mvc.problemdetails.enabled=true
+
+// With this enabled, Spring's default errors (like 405 Method Not Allowed) 
+// will automatically return a standardized Problem Details JSON body:
+/*
+{
+  "type": "about:blank",
+  "title": "Method Not Allowed",
+  "status": 405,
+  "detail": "Method 'DELETE' is not supported.",
+  "instance": "/api/users"
+}
+*/
+
+// You can also extend ProblemDetail manually:
+@ExceptionHandler(ResourceNotFoundException.class)
+public ProblemDetail handleNotFound(ResourceNotFoundException ex) {
+    ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+    pd.setTitle("Resource Not Found");
+    pd.setProperty("errorCode", "USER_404"); // Custom extension fields!
+    return pd;
+}
+```
+
+## REAL_WORLD
+**Never expose stack traces or raw Java exception messages in production API responses.** This is a OWASP security vulnerability (CWE-209). If an attacker sees `java.sql.SQLSyntaxErrorException`, they know your database is SQL-based. If they see a table name in the error, they can craft a SQL injection attack.
+
+Always define specific custom exceptions for each business scenario, catch them globally, log the full stack trace internally (using SLF4J), and return only a clean, sanitized error message to the client.
+
+## INTERVIEW
+**Q: What is the difference between `@ExceptionHandler` inside a `@Controller` vs inside a `@ControllerAdvice`?**
+A: `@ExceptionHandler` inside a `@Controller` only handles exceptions thrown by methods within that specific Controller class. `@ControllerAdvice` applies globally to all Controllers in the application. You should always prefer `@ControllerAdvice` to avoid duplicating error handling code.
+
+**Q: What happens when two `@ControllerAdvice` classes both have a handler for the same exception type?**
+A: Spring picks the one with the most specific matching exception type. If both are equal, you can use `@Order(1)` (lower number = higher priority) to explicitly control the selection order.

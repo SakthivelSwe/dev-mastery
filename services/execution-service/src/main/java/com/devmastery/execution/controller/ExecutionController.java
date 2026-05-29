@@ -1,22 +1,24 @@
 package com.devmastery.execution.controller;
 
-import com.devmastery.execution.dto.ExecutionRequest;
-import com.devmastery.execution.dto.ExecutionResponse;
+import com.devmastery.execution.dto.CodeExecutionRequest;
 import com.devmastery.execution.service.ExecutionService;
-import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.handler.annotation.DestinationVariable;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.stereotype.Controller;
 
-@RestController
-@RequestMapping("/v1/execution")
+@Slf4j
+@Controller
 @RequiredArgsConstructor
 public class ExecutionController {
 
     private final ExecutionService executionService;
 
-    @PostMapping("/submit")
-    public ResponseEntity<ExecutionResponse> submitCode(@Valid @RequestBody ExecutionRequest request) {
-        return ResponseEntity.ok(executionService.submitCode(request));
+    @MessageMapping("/execute/{sessionId}")
+    public void executeCode(@DestinationVariable String sessionId, @Payload CodeExecutionRequest request) {
+        log.info("Received execution request for session: {}", sessionId);
+        executionService.executeCode(sessionId, request);
     }
 }

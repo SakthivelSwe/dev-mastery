@@ -1,0 +1,82 @@
+---
+slug: "sd-search-engines"
+title: "Search Engines (Elasticsearch & Inverted Index)"
+level: 4
+---
+
+## WHY
+If you build an E-Commerce store using PostgreSQL, your users will search for products. 
+A naive developer writes: `SELECT * FROM products WHERE description LIKE '%wireless headphones%'`.
+This triggers a Full Table Scan (Sequential Scan). The database physically reads every single byte on the hard drive for all 10 million products. The query takes 15 seconds. If 1,000 users search at the same time, the database catches fire and the company dies.
+
+**Search Engines** (like Elasticsearch or Apache Solr) are specialized distributed databases designed explicitly for full-text search. They return results in 50 milliseconds across billions of documents by fundamentally changing how data is indexed.
+
+## THEORY
+### The Inverted Index
+Standard databases use B-Trees (Forward Indexes). A Forward Index answers: *"I have Document 1, what words are inside it?"*
+A Search Engine uses an **Inverted Index** (like the glossary at the back of a textbook). It answers: *"I have the word 'wireless', which documents contain it?"*
+
+To build an Inverted Index, the Search Engine passes every document through an **Analyzer**:
+1. **Tokenization:** Breaks the sentence into words (Tokens). `"The Wireless Headphones!"` -> `["The", "Wireless", "Headphones"]`.
+2. **Lowercasing:** `["the", "wireless", "headphones"]`.
+3. **Stop Words:** Removes useless words (the, a, is). `["wireless", "headphones"]`.
+4. **Stemming:** Reduces words to their root (Running -> Run). `["wireless", "headphon"]`.
+
+The engine then stores a massive HashMap where the Key is the Token, and the Value is an Array of Document IDs!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "elasticsearch" }
+```
+
+## CODE
+
+*(No code is written in a System Design interview, but you must draw the architecture and explain the data flow!)*
+
+### Level 1 — The Search Process
+**The Interview Explanation:**
+"When a user searches for 'Wireless Headphones', the search query is passed through the *exact same Analyzer* used during ingestion."
+1. "The string 'Wireless Headphones' becomes `["wireless", "headphon"]`."
+2. "The engine looks up 'wireless' in the Inverted Index HashMap. It finds Document IDs `[1, 5, 9]`."
+3. "The engine looks up 'headphon' in the Inverted Index. It finds Document IDs `[5, 9, 22]`."
+4. "The engine performs a rapid set intersection (Binary AND). The overlapping documents are `[5, 9]`."
+5. "The engine instantly returns Documents 5 and 9 to the user!"
+
+### Level 2 — Relevance and Scoring (TF-IDF)
+*The Interviewer Trap:* "If both Document 5 and 9 contain the words, which one appears at the top of the search results? How do you rank them?"
+
+**The Solution:**
+"Search Engines use ranking algorithms like **TF-IDF** (Term Frequency - Inverse Document Frequency) or **BM25**."
+- **Term Frequency (TF):** If Document 5 mentions "wireless" 10 times, and Document 9 mentions it 1 time, Document 5 is probably more relevant!
+- **Inverse Document Frequency (IDF):** If the user searches for "The Headphones", the word "The" appears in 10 million documents. The word "Headphones" appears in 500 documents. The IDF mathematically heavily weights the rare word ("Headphones") and almost entirely ignores the common word ("The").
+
+### Level 3 — Distributed Search Architecture
+*The Interviewer Trap:* "Our Wikipedia clone has 500 million documents. A single server's Inverted Index cannot fit into RAM. How do you scale this?"
+
+**The Architecture:**
+1. **Sharding:** "We slice the 500 million documents into 5 Shards (100M each). We place Shard 1 on Server A, Shard 2 on Server B, etc."
+2. **Scatter-Gather Phase:** "When a user searches, the Coordinator Node sends the search query to ALL 5 Shards simultaneously (Scatter). Each shard independently runs the query against its local Inverted Index and returns its local Top 10 results."
+3. **The Merge Phase:** "The Coordinator Node receives the 50 results (Gather), sorts them by their TF-IDF scores globally, and returns the absolute Top 10 results to the user."
+
+### Level 4 — Keeping the Search Engine Updated
+*The Interviewer Trap:* "Elasticsearch is not a primary database. Our source of truth is PostgreSQL. How do you keep Elasticsearch updated when a product's price changes?"
+
+**The Solution:**
+1. **The Anti-Pattern (Dual Writes):** "Do NOT have the Node.js application write to PostgreSQL and then immediately write to Elasticsearch. If the Elasticsearch write fails, the data is permanently out of sync."
+2. **The Correct Pattern (Change Data Capture - CDC):** "We use a CDC tool like **Debezium**. It tails the raw transaction logs (WAL) of the PostgreSQL database. When a row changes in Postgres, Debezium instantly streams an event into a Kafka topic. A background worker consumes the Kafka topic and safely updates Elasticsearch. This guarantees Eventual Consistency and completely decouples the search engine from the critical path of the application."
+
+## REAL_WORLD
+**Fuzzy Searching (Typos)**
+What happens if the user searches for "Wreless" (Typo)? It misses the Inverted Index completely!
+Modern search engines implement **Fuzzy Matching** using the **Levenshtein Distance** (Edit Distance) algorithm. It calculates how many single-character edits (insertions, deletions, substitutions) are required to turn "Wreless" into "Wireless".
+If the Edit Distance is 1, the search engine forgives the typo and finds the correct token in the index.
+*(Warning: Fuzzy searching is incredibly CPU intensive because it cannot do a direct $O(1)$ HashMap lookup. It must traverse complex Trie data structures. You should only enable it for short words or specific fields).*
+
+## INTERVIEW
+**Q: We are building a massive log aggregation system (like Splunk/Datadog). We write 1TB of logs per day into Elasticsearch. After 30 days, the cluster runs out of disk space. How do we manage this without deleting all the data?**
+A: **Index Lifecycle Management (ILM) and Hot/Warm/Cold Tiers.**
+Log data is fundamentally time-series data. You should NOT put all logs into one massive "Logs" index. 
+Instead, you create daily indices (`logs-2023-10-01`).
+1. **Hot Tier:** Today's logs go into the Hot Tier (Servers with NVMe SSDs and massive RAM). These are queried constantly.
+2. **Warm Tier:** After 7 days, nobody searches those logs anymore. ILM automatically moves the index to the Warm Tier (Cheaper HDD servers with less RAM).
+3. **Cold Tier:** After 30 days, the index is automatically frozen and backed up to AWS S3. It is removed from the active cluster, freeing up disk space, but can be "thawed" if an auditor needs to search it!

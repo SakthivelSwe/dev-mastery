@@ -1,0 +1,161 @@
+---
+slug: "configmaps"
+title: "ConfigMaps"
+level: 4
+---
+
+## WHY
+Hardcoding configuration (database URLs, feature flags, external API endpoints) inside your Docker image is a fundamental anti-pattern. It means you need different images for different environments (dev vs staging vs prod).
+The 12-Factor App methodology says: **separate configuration from code**.
+**Kubernetes ConfigMaps** store non-sensitive configuration data as key-value pairs. You inject this configuration into Pods as environment variables or mounted files, allowing the same Docker image to run correctly in every environment.
+
+## THEORY
+### ConfigMap vs Secret
+- **ConfigMap:** Non-sensitive configuration data. Stored in etcd in plain text. OK for DB hostnames, feature flags, API endpoints.
+- **Secret:** Sensitive data (passwords, API keys, TLS certificates). Stored encoded in etcd (Base64 encoding — not encryption!). Requires proper RBAC for security.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "configmap-injection" }
+```
+
+## CODE
+
+### Creating ConfigMaps
+```yaml
+# configmap.yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+data:
+  # Simple key-value pairs
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  API_BASE_URL: "https://api.mycompany.com"
+  MAX_CONNECTIONS: "100"
+  
+  # Multi-line values (entire config files!)
+  application.yml: |
+    server:
+      port: 8080
+    spring:
+      datasource:
+        url: jdbc:postgresql://db-service:5432/myapp
+```
+
+```bash
+# Create from command line
+kubectl create configmap api-config \
+  --from-literal=NODE_ENV=production \
+  --from-literal=LOG_LEVEL=info
+
+# Create from a file
+kubectl create configmap nginx-config --from-file=nginx.conf
+
+# Create from a directory (all files become keys)
+kubectl create configmap app-config --from-file=./config/
+
+# View the configmap
+kubectl describe configmap api-config
+kubectl get configmap api-config -o yaml
+```
+
+### Using ConfigMaps in Pods
+```yaml
+# Method 1: Inject all ConfigMap keys as environment variables
+spec:
+  containers:
+    - name: api
+      image: my-api:1.0.0
+      envFrom:
+        - configMapRef:
+            name: api-config  # All keys become env vars: NODE_ENV, LOG_LEVEL, etc.
+
+# Method 2: Inject specific keys as env vars with custom names
+spec:
+  containers:
+    - name: api
+      env:
+        - name: APP_LOG_LEVEL     # Custom env var name
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: LOG_LEVEL        # Source key from ConfigMap
+
+# Method 3: Mount as files (perfect for config files!)
+spec:
+  containers:
+    - name: api
+      volumeMounts:
+        - name: config-volume
+          mountPath: /app/config    # The file appears here!
+  volumes:
+    - name: config-volume
+      configMap:
+        name: api-config
+        # This mounts 'application.yml' key as /app/config/application.yml file!
+```
+
+### Updating ConfigMaps
+```bash
+# Edit in-place
+kubectl edit configmap api-config
+
+# Apply updated YAML
+kubectl apply -f configmap.yml
+
+# Note: Pods using env vars DON'T automatically get updates!
+# You must restart Pods to pick up new env var values.
+kubectl rollout restart deployment/api-deployment
+
+# Pods using volume mounts DO get updates automatically (within ~1 minute)
+# No restart needed!
+```
+
+## REAL_WORLD
+**Feature Flags via ConfigMap**
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+data:
+  ENABLE_NEW_CHECKOUT: "false"
+  ENABLE_AI_RECOMMENDATIONS: "true"
+  MAINTENANCE_MODE: "false"
+```
+
+In code:
+```javascript
+const enableNewCheckout = process.env.ENABLE_NEW_CHECKOUT === 'true';
+```
+
+To toggle a feature in production: `kubectl edit configmap feature-flags` → change the value → `kubectl rollout restart deployment/api`. Feature toggled in seconds without a code deployment!
+
+## INTERVIEW
+**Q: You store database connection strings in a ConfigMap and inject them as environment variables into your Pods. A developer argues that Secrets should be used instead. Who is right and why?**
+A: The developer is right for **passwords/credentials**, but it depends on what's in the connection string.
+
+**ConfigMap is acceptable for:** Non-sensitive parts of connection config — hostname (`db-service.default.svc.cluster.local`), port (`5432`), database name (`myapp`).
+
+**Secret is required for:** Any sensitive data — database password, TLS certificates, API keys.
+
+The practical pattern:
+```yaml
+env:
+  # Non-sensitive: ConfigMap
+  - name: DB_HOST
+    valueFrom:
+      configMapKeyRef:
+        name: api-config
+        key: DB_HOST
+  # Sensitive: Secret!
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: db-secrets
+        key: password
+```
+
+Why Secrets for passwords specifically? Kubernetes provides additional protections for Secrets that ConfigMaps don't get: Secrets can be restricted via RBAC so only specific ServiceAccounts/Pods can read them, they can be encrypted at rest with KMS (using EncryptionConfiguration), and audit logs can track all reads of Secret objects. ConfigMaps have no such protections.

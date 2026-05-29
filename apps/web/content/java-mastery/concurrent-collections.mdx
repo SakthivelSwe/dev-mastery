@@ -1,0 +1,140 @@
+---
+slug: "concurrent-collections"
+title: "Concurrent Collections"
+level: 4
+---
+
+## WHY
+If you share a standard `HashMap` or `ArrayList` across multiple threads, and one thread modifies the collection while another thread is reading it, the internal pointers become completely corrupted. `HashMap` in particular had a legendary bug before Java 8 where concurrent modifications could cause the internal linked lists to form a circular infinite loop, freezing the server at 100% CPU utilization.
+
+To solve this, developers historically used `Collections.synchronizedMap()`. This wraps the Map in a gigantic `synchronized` lock. But this creates a massive bottleneck: if 1,000 threads want to read a value, only 1 thread can read at a time. The other 999 threads freeze, completely destroying application performance.
+
+Java 5 introduced `java.util.concurrent` collections (`ConcurrentHashMap`, `CopyOnWriteArrayList`). These are architectural masterpieces. They use advanced lock-striping and non-blocking algorithms to guarantee thread safety while allowing massive parallel throughput without freezing the application.
+
+## THEORY
+### Lock Striping (ConcurrentHashMap)
+Instead of locking the entire Map, `ConcurrentHashMap` divides the map into independent segments or "buckets". When Thread A wants to write to Bucket 1, it locks *only* Bucket 1. Thread B can simultaneously write to Bucket 5, because Bucket 5 has its own independent lock! Furthermore, Read operations (`.get()`) are completely lock-free and never block, making `ConcurrentHashMap` exponentially faster than `Hashtable`.
+
+### Copy-On-Write (CopyOnWriteArrayList)
+How do you iterate safely over an array while another thread is adding to it? `CopyOnWriteArrayList` takes a radical approach: every time you call `.add()`, it physically creates a brand new copy of the entire underlying array, adds the element to the new array, and atomically swaps the pointer. This means Readers never lock, they just continue reading the old snapshot of the array safely until the new one is ready!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DataStructureVisualizer", "state": "lock-striping-hashmap" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Problem)
+```java
+import java.util.Map;
+import java.util.HashMap;
+
+public class BrokenMap {
+    public static void main(String[] args) {
+        // Shared across threads. HIGHLY DANGEROUS!
+        Map<String, String> cache = new HashMap<>(); 
+        
+        Runnable task = () -> {
+            for (int i = 0; i < 1000; i++) {
+                cache.put(Thread.currentThread().getName() + i, "Value");
+            }
+        };
+        
+        // Running this concurrently will corrupt the HashMap state
+        // causing lost updates, or worse, infinite loops.
+        new Thread(task).start();
+        new Thread(task).start();
+    }
+}
+```
+
+### Level 2 — Building Blocks (ConcurrentHashMap)
+```java
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class SafeCache {
+    public static void main(String[] args) {
+        // Rock-solid thread-safe cache
+        ConcurrentMap<String, String> cache = new ConcurrentHashMap<>();
+        
+        // 1000 threads can read and write to this Map simultaneously
+        // without corrupting data and without blocking each other on reads!
+        cache.put("user:123", "Alice");
+        
+        System.out.println(cache.get("user:123"));
+    }
+}
+```
+
+### Level 3 — Intermediate (Atomic Operations)
+```java
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class AtomicUpdates {
+    public static void main(String[] args) {
+        ConcurrentMap<String, Integer> pageViews = new ConcurrentHashMap<>();
+        pageViews.put("home", 100);
+        
+        // DANGEROUS: Read, Calculate, Write (Race Condition!)
+        // int views = pageViews.get("home");
+        // pageViews.put("home", views + 1);
+        
+        // SAFE: Atomic update built directly into ConcurrentHashMap!
+        // This guarantees the update is completely thread-safe without locks.
+        pageViews.merge("home", 1, (oldValue, newValue) -> oldValue + 1);
+        
+        System.out.println(pageViews.get("home")); // 101
+    }
+}
+```
+
+### Level 4 — Advanced (CopyOnWriteArrayList)
+```java
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class EventListeners {
+    // Imagine a list of subscribers listening to events.
+    // 99% of operations are Iterations (firing events to subscribers).
+    // 1% of operations are Writes (subscribing / unsubscribing).
+    
+    // CopyOnWriteArrayList is PERFECT for this exact scenario.
+    private static final List<String> listeners = new CopyOnWriteArrayList<>();
+    
+    public static void main(String[] args) {
+        listeners.add("Alice");
+        listeners.add("Bob");
+        
+        // Thread A is iterating over the list...
+        for (String listener : listeners) {
+            System.out.println("Notifying " + listener);
+            
+            // At the EXACT SAME TIME, Thread B adds a new listener.
+            // In a normal ArrayList, this throws ConcurrentModificationException!
+            // Here, it works perfectly. Thread A safely finishes iterating over the old snapshot.
+            listeners.add("Charlie"); 
+        }
+    }
+}
+```
+
+## REAL_WORLD
+When building a distributed rate-limiter in Spring Boot, you often need an extremely fast, thread-safe in-memory cache to track API calls.
+
+If you use `Collections.synchronizedMap()`, every single API request hitting your server must form a single-file line to increment the counter. Your server's throughput will collapse.
+Instead, Spring Boot developers universally use `ConcurrentHashMap`. 
+
+Furthermore, `ConcurrentHashMap` provides `computeIfAbsent()`. This is an architectural lifesaver for the Cache Stampede problem. If an expensive database record expires from the cache, 500 threads might instantly try to query the DB to refill it. By using `cache.computeIfAbsent("key", k -> expensiveDbQuery())`, the `ConcurrentHashMap` guarantees that the DB query lambda is executed exactly **once**, while the other 499 threads safely wait for the result, saving your database from a catastrophic traffic spike.
+
+## INTERVIEW
+**Q: How does `ConcurrentHashMap` achieve high performance compared to `Hashtable`?**
+A: `Hashtable` uses a single global lock on the entire object; any read or write blocks all other threads. `ConcurrentHashMap` uses lock-striping (locking individual buckets/segments) for writes, and relies on `volatile` memory variables for reads. This means read operations (`.get()`) never block, and write operations only block threads trying to write to the exact same bucket.
+
+**Q: When should you use `CopyOnWriteArrayList`?**
+A: It should ONLY be used in scenarios where reads vastly outnumber writes (e.g., lists of Event Listeners). Because every single `.add()` or `.remove()` operation requires duplicating the entire underlying array, write operations are horribly slow and consume massive amounts of memory. If you have frequent writes, you should use `Collections.synchronizedList()` or restructure your architecture.
+
+**Q: Can you put a `null` key or value in a `ConcurrentHashMap`?**
+A: No! Unlike a standard `HashMap` which allows one null key and multiple null values, `ConcurrentHashMap` absolutely forbids `null` keys and `null` values. If you try to insert `null`, it will instantly throw a `NullPointerException`. This is because in a multithreaded environment, if `.get("key")` returns `null`, it is impossible to distinguish between "the key does not exist" and "the key exists but its value is mapped to null."

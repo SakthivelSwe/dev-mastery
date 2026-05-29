@@ -1,0 +1,69 @@
+---
+title: executorservice
+slug: executorservice
+---
+
+# ExecutorService, ThreadPools, and CompletableFuture
+
+Manually managing platform threads is an anti-pattern. Java provides the `ExecutorService` framework to decouple task submission from task execution, and `CompletableFuture` to coordinate asynchronous pipelines.
+
+---
+
+## 1. Deep Internals of ThreadPoolExecutor
+
+The core engine of the Java Executor framework is `ThreadPoolExecutor`. It uses a highly optimized state-tracking variable and a structured task submission pipeline.
+
+### The State Control Variable (`ctl`)
+Inside `ThreadPoolExecutor`, a single `AtomicInteger` called `ctl` packs two pieces of information to minimize synchronization overhead:
+*   **workerCount:** The active number of threads (using the low 29 bits).
+*   **runState:** The lifecycle state of the pool (using the high 3 bits):
+    *   `RUNNING`: Accepts new tasks and processes queued tasks.
+    *   `SHUTDOWN`: Rejects new tasks but processes queued tasks.
+    *   `STOP`: Rejects new tasks, purges queued tasks, and interrupts active tasks.
+    *   `TIDYING`: All tasks terminated, worker count is zero; runs the `terminated()` hook.
+    *   `TERMINATED`: `terminated()` execution completed.
+
+```
+ctl (32-bit AtomicInteger)
++-------------------------+-------------------------------------------------+
+| runState (3 bits)       | workerCount (29 bits)                           |
+| e.g., 111 (RUNNING)     | e.g., 00000000000000000000000001000 (8 threads) |
++-------------------------+-------------------------------------------------+
+```
+
+### Task Submission Lifecycle Flow
+
+When a task is submitted via `execute(Runnable)`, the executor follows a strict hierarchical decision tree:
+
+```
+                  [ Submit Task ]
+                         |
+                         v
+            +-------------------------+
+            |  Current Pool Size <    | --( Yes )--> [ Create Worker Thread ]
+            |      corePoolSize?      |
+            +-------------------------+
+                         | ( No )
+                         v
+            +-------------------------+
+            |   Can task be added     | --( Yes )--> [ Queue Task ]
+            |     to workQueue?       |
+            +-------------------------+
+                         | ( No )
+                         v
+            +-------------------------+
+            |  Current Pool Size <    | --( Yes )--> [ Create Worker Thread ]
+            |    maximumPoolSize?     |
+            +-------------------------+
+                         | ( No )
+                         v
+            [ Trigger RejectedExecutionHandler ]
+```
+
+1.  **Core Pool Check:** If fewer than `corePoolSize` threads are running, a new worker thread is created to run the task immediately, even if other worker threads are idle.
+2.  **Work Queue Enqueue:** If `corePoolSize` is reached, the executor attempts to offer the task to the configured `workQueue`.
+3.  **Maximum Pool Check:** If the `workQueue` is full, the executor attempts to spawn a new worker thread, up to the limit of `maximumPoolSize`.
+4.  **Rejection:** If the pool size is at `maximumPoolSize` and the queue is full, the task is rejected using the configured `RejectedExecutionHandler`.
+
+### Unbounded Queues and OOM Risk
+Using `Executors.newFixedThreadPool

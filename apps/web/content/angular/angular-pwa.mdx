@@ -1,0 +1,148 @@
+---
+slug: "angular-pwa"
+title: "Angular PWA (Progressive Web Apps)"
+level: 4
+---
+
+## WHY
+Native iOS and Android apps have incredible features: they work offline, they can be installed to the home screen, and they send Push Notifications. 
+Websites historically could do none of these things. If the user lost cellular signal on a train, the website crashed and showed the Chrome Dinosaur game.
+**Progressive Web Apps (PWAs)** bridge the gap. By turning your Angular application into a PWA, users can "Install" your website directly to their phone (bypassing the App Store completely), and it will load instantly even in Airplane Mode! 
+
+## THEORY
+### The Service Worker
+The entire magic of a PWA is powered by the **Service Worker**.
+A Service Worker is a specialized JavaScript script that runs in the background of the user's browser, completely separate from the Angular application.
+It acts as a Network Proxy. When your Angular app tries to fetch an image or an API payload, the request goes *through* the Service Worker. If the user is offline, the Service Worker intercepts the request, grabs the image from its local Cache, and returns it to the Angular app. The app literally doesn't know the internet is down!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "pwa-service-worker" }
+```
+
+## CODE
+
+### Level 1 — Adding PWA to Angular
+Writing a Service Worker from scratch is incredibly complex and prone to catastrophic caching bugs (where users are stuck seeing a 3-month-old version of your app forever).
+Angular provides an official package that generates a flawless, battle-tested Service Worker for you!
+
+```bash
+ng add @angular/pwa
+```
+This command does several things:
+1. Adds the `@angular/service-worker` package.
+2. Registers the Service Worker in your `app.config.ts`.
+3. Creates a `manifest.webmanifest` file (which tells the phone what the App Icon and Name should be when installed to the home screen).
+4. Creates the all-important `ngsw-config.json` file.
+
+### Level 2 — Configuring the Cache (`ngsw-config.json`)
+This JSON file tells the Angular compiler exactly *how* to cache your application.
+
+```json
+{
+  "$schema": "../../node_modules/@angular/service-worker/config/schema.json",
+  "index": "/index.html",
+  "assetGroups": [
+    {
+      "name": "app",
+      "installMode": "prefetch",
+      "resources": {
+        "files": [
+          "/favicon.ico",
+          "/index.html",
+          "/manifest.webmanifest",
+          "/*.css",
+          "/*.js"
+        ]
+      }
+    },
+    {
+      "name": "assets",
+      "installMode": "lazy",
+      "updateMode": "prefetch",
+      "resources": {
+        "files": [
+          "/assets/**",
+          "/*.(svg|cur|jpg|jpeg|png|apng|webp|avif|gif|otf|ttf|woff|woff2)"
+        ]
+      }
+    }
+  ]
+}
+```
+- **`installMode: "prefetch"`:** The moment the user visits your site, the Service Worker aggressively downloads all HTML, CSS, and JS in the background. The next time they open the app, it loads from the cache instantly!
+- **`installMode: "lazy"`:** The Service Worker only caches images *after* the user requests them for the first time.
+
+### Level 3 — Data Caching (APIs)
+Caching static HTML/JS is easy. Caching dynamic API data (like a list of Tweets) is harder.
+You can configure the Service Worker to cache specific API routes using `dataGroups`!
+
+```json
+"dataGroups": [
+  {
+    "name": "weather-api",
+    "urls": ["https://api.weather.com/**"],
+    "cacheConfig": {
+      "strategy": "freshness",
+      "maxSize": 100,
+      "maxAge": "1h",
+      "timeout": "3s"
+    }
+  }
+]
+```
+**Strategies:**
+- **`freshness` (Network First):** The Service Worker tries to fetch the newest data from the Internet. If the internet is down (or takes longer than the 3s timeout), it falls back to the Cache! Perfect for highly dynamic data.
+- **`performance` (Cache First):** The Service Worker instantly returns the Cached data. It then silently fetches the newest data in the background and updates the cache for *next* time. Perfect for static data (like a list of Countries).
+
+### Level 4 — Handling Updates
+Because the HTML and JS are served from the Cache, what happens when you deploy a new version of your app to production? The user will still see the old cached version!
+You must use the `SwUpdate` service to notify the user that an update is available!
+
+```typescript
+import { Component, inject, OnInit } from '@angular/core';
+import { SwUpdate } from '@angular/service-worker';
+
+@Component({
+  selector: 'app-update-notifier',
+  template: `
+    @if (updateAvailable) {
+      <div class="toast">
+        A new version is available! 
+        <button (click)="refreshApp()">Update Now</button>
+      </div>
+    }
+  `
+})
+export class UpdateNotifierComponent implements OnInit {
+  private swUpdate = inject(SwUpdate);
+  updateAvailable = false;
+
+  ngOnInit() {
+    // Listen for the Service Worker detecting a new version on the server!
+    this.swUpdate.versionUpdates.subscribe((event) => {
+      if (event.type === 'VERSION_READY') {
+        this.updateAvailable = true; // Show the UI Toast!
+      }
+    });
+  }
+
+  refreshApp() {
+    // Tell the browser to physically reload the page, 
+    // which forces the Service Worker to serve the newly downloaded assets!
+    window.location.reload();
+  }
+}
+```
+
+## REAL_WORLD
+**Push Notifications**
+The most powerful feature of a PWA is Web Push Notifications. Even if the browser is closed and the phone is locked, your server can send a payload to the Apple/Google Push servers. The Push servers wake up the Service Worker in the background, and the Service Worker displays a native system notification on the lock screen!
+To do this in Angular, you inject the `SwPush` service, request permission from the user, and generate a unique `PushSubscription` object. You send this object to your backend database. Your backend (Node/Spring) then uses a library like `web-push` to fire notifications directly to that specific user!
+
+## INTERVIEW
+**Q: You successfully added `@angular/pwa`. You run `ng serve` and open the app in Chrome. However, you go to the Network tab, check "Offline", and reload the page. The app crashes and shows the Chrome Dinosaur. Why isn't the Service Worker caching your app?**
+A: **Service Workers do not run in Development Mode!**
+By design, the Angular CLI completely disables the Service Worker when running `ng serve`. 
+If the Service Worker was active during development, it would aggressively cache your JavaScript. Every time you modified a Component and saved, the browser would ignore the changes and serve the cached version, completely breaking the development experience!
+*The Fix:* To test a PWA locally, you must create a production build (`ng build`), and then use a simple static HTTP server (like `http-server`) to serve the `dist/` folder. Only the production build includes the compiled `ngsw.json` manifest and activates the Service Worker!

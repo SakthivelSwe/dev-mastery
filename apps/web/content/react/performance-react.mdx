@@ -1,0 +1,185 @@
+---
+slug: "performance-react"
+title: "React Performance Optimization"
+level: 5
+---
+
+## WHY
+React is generally fast enough out of the box for most applications. 
+However, due to React's rendering model (where a state change in a parent component forces *every single child component* to re-render by default), complex UIs like Dashboards, Data Grids, and Canvas Editors can experience severe lag. 
+If an entire page re-renders 60 times a second just because a user is dragging a slider, the browser will lock up. Mastering Performance Optimization allows you to build incredibly complex web applications that feel as smooth as native desktop apps.
+
+## THEORY
+### The Render Phase vs. The Commit Phase
+When a state changes, React goes through two phases:
+1. **Render Phase:** React calls your component functions, generates a new Virtual DOM tree, and mathematically compares it (diffs it) against the old Virtual DOM tree. This happens purely in memory.
+2. **Commit Phase:** React takes the differences and actually updates the physical HTML DOM in the browser.
+
+*The physical DOM update is the slowest part.* React already heavily optimizes the Commit phase. Most performance issues in React stem from the Render Phase—your components executing heavy logic or generating massive Virtual DOM trees unnecessarily!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "RenderVisualizer", "state": "react-performance" }
+```
+
+## CODE
+
+### Level 1 — `React.memo` (Bailing out of Renders)
+By default, if a parent component renders, all of its children render, even if the child's `props` didn't change!
+You can wrap a component in `React.memo()`. React will memorize the component. If the parent renders, React will check the child's props. If the props are identical to the last render, React completely skips rendering the child!
+
+```jsx
+import React, { useState, memo } from 'react';
+
+// Wrap the heavy component in memo!
+const HeavyChart = memo(function HeavyChart({ data }) {
+  console.log("HeavyChart rendered!"); // This will only log when 'data' actually changes!
+  return <div>Rendering 10,000 data points...</div>;
+});
+
+export function Dashboard() {
+  const [count, setCount] = useState(0);
+  // This array reference NEVER changes.
+  const chartData = [1, 2, 3]; 
+
+  return (
+    <div>
+      {/* Clicking this button triggers a Dashboard re-render.
+          Because HeavyChart is memoized and its props didn't change, 
+          it completely skips rendering! */}
+      <button onClick={() => setCount(c => c + 1)}>Increment {count}</button>
+      <HeavyChart data={chartData} />
+    </div>
+  );
+}
+```
+
+### Level 2 — The Object Reference Trap (`useMemo` & `useCallback`)
+`React.memo` uses a "shallow equality" check (`===`).
+If you pass an object, array, or function as a prop, they get recreated with a brand new memory reference on *every single render*. `React.memo` will see the new reference, assume the prop changed, and force the re-render anyway!
+You must use `useMemo` (for objects/arrays) and `useCallback` (for functions) to freeze the memory references!
+
+```jsx
+import { useState, useMemo, useCallback } from 'react';
+
+export function Dashboard() {
+  const [count, setCount] = useState(0);
+
+  // BAD: Creates a new array reference in memory every render!
+  // const chartData = [1, 2, 3]; 
+
+  // GOOD: Freezes the array reference in memory!
+  const chartData = useMemo(() => [1, 2, 3], []);
+
+  // BAD: Creates a new function reference in memory every render!
+  // const onChartClick = () => console.log("clicked");
+
+  // GOOD: Freezes the function reference!
+  const onChartClick = useCallback(() => console.log("clicked"), []);
+
+  return (
+    <div>
+      <button onClick={() => setCount(c => c + 1)}>Increment {count}</button>
+      {/* Now HeavyChart will successfully skip rendering! */}
+      <HeavyChart data={chartData} onClick={onChartClick} />
+    </div>
+  );
+}
+```
+
+### Level 3 — Virtualization (Windowing)
+If you need to render a list of 50,000 users, bailing out of renders won't help. Generating 50,000 DOM nodes will instantly crash the browser.
+**Virtualization** is the ultimate performance hack. It only renders the exact 20 rows that are currently visible on the screen. As the user scrolls, it recycles those 20 DOM nodes, swapping the data inside them.
+You never write this from scratch; use a library like `@tanstack/react-virtual` or `react-window`.
+
+```jsx
+// A massive list that scrolls flawlessly at 60FPS!
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { useRef } from 'react';
+
+function MassiveList({ items }) {
+  const parentRef = useRef(null);
+
+  const rowVirtualizer = useVirtualizer({
+    count: items.length, // 50,000
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 35, // Height of each row in pixels
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: '400px', overflow: 'auto' }}>
+      {/* A massive invisible container to force the scrollbar to the correct size */}
+      <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+        
+        {/* Only map over the ~15 rows that are currently visible! */}
+        {rowVirtualizer.getVirtualItems().map((virtualItem) => (
+          <div
+            key={virtualItem.key}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: `${virtualItem.size}px`,
+              // Translate the row down to its exact physical scroll position!
+              transform: `translateY(${virtualItem.start}px)`,
+            }}
+          >
+            User: {items[virtualItem.index].name}
+          </div>
+        ))}
+        
+      </div>
+    </div>
+  );
+}
+```
+
+### Level 4 — State Colocation
+The fastest way to prevent a component from re-rendering is to never give it the state in the first place!
+If `Dashboard` holds the `isModalOpen` state, then opening the modal re-renders the entire Dashboard.
+Move the state down (Colocation) into the exact component that actually needs it.
+
+```jsx
+// BAD: State is too high up!
+function Dashboard() {
+  const [text, setText] = useState("");
+  // Every keystroke re-renders the HeavyChart!
+  return (
+    <div>
+      <input value={text} onChange={e => setText(e.target.value)} />
+      <HeavyChart /> 
+    </div>
+  );
+}
+
+// GOOD: State is colocated!
+function SearchInput() {
+  const [text, setText] = useState("");
+  return <input value={text} onChange={e => setText(e.target.value)} />;
+}
+
+function Dashboard() {
+  // Now Dashboard NEVER re-renders when the user types!
+  return (
+    <div>
+      <SearchInput />
+      <HeavyChart />
+    </div>
+  );
+}
+```
+
+## REAL_WORLD
+**The "Premature Optimization" Trap**
+Junior developers learn about `useMemo` and immediately wrap *every single variable* and component in their entire application with it. 
+This is a massive mistake. `useMemo` and `React.memo` are not free! They require React to allocate memory, cache the value, and execute mathematical comparison checks (`===`) on every single render. 
+If you wrap a simple `<Button>` component in `React.memo`, the cost of running the equality checks is actually *slower* than just letting React re-render the button!
+**The Rule:** Only use `memo` and `useMemo` when rendering the component has proven to be an actual performance bottleneck (verified using the React Profiler in Chrome DevTools), or when you must preserve a memory reference to prevent an infinite `useEffect` loop.
+
+## INTERVIEW
+**Q: You notice a component is re-rendering twice on every single state change, even when `React.memo` is applied correctly. You check your code, and nothing seems to be triggering a double render. What is happening?**
+A: **React StrictMode.**
+In development mode (when running `npm run dev`), if your app is wrapped in `<React.StrictMode>`, React intentionally double-invokes every single render function, state updater, and `useMemo` calculation!
+It does this to brutally expose "Impure" functions. If your component is secretly modifying a global variable during render, rendering it twice will cause the global variable to become corrupted, making the bug obvious to you immediately.
+This double-rendering ONLY happens in development. When you build for production (`npm run build`), StrictMode strips itself out, and components will only render once. You should never try to "fix" the double render in development!

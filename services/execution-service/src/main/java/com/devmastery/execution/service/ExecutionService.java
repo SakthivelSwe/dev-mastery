@@ -1,63 +1,74 @@
 package com.devmastery.execution.service;
 
-import com.devmastery.execution.dto.ExecutionRequest;
-import com.devmastery.execution.dto.ExecutionResponse;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.devmastery.execution.dto.CodeExecutionRequest;
+import com.devmastery.execution.dto.CodeExecutionResponse;
+import com.devmastery.execution.dto.Judge0SubmissionRequest;
+import com.devmastery.execution.dto.Judge0SubmissionResponse;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
+import reactor.core.publisher.Mono;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.time.Duration;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ExecutionService {
 
-    private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper;
+    private final Judge0Client judge0Client;
+    private final SimpMessagingTemplate messagingTemplate;
 
-    @Value("${judge0.url}")
-    private String judge0Url;
+    public void executeCode(String sessionId, CodeExecutionRequest request) {
+        Judge0SubmissionRequest submissionRequest = Judge0SubmissionRequest.builder()
+                .sourceCode(request.sourceCode())
+                .languageId(request.languageId())
+                .stdin(request.stdin())
+                .expectedOutput(request.expectedOutput())
+                .build();
 
-    public ExecutionResponse submitCode(ExecutionRequest request) {
-        String submitUrl = judge0Url + "/submissions?base64_encoded=false&wait=true";
+        judge0Client.submitCode(submissionRequest)
+                .subscribe(
+                        token -> pollForResults(sessionId, token),
+                        error -> sendError(sessionId, "Failed to submit code to Judge0: " + error.getMessage())
+                );
+    }
 
-        Map<String, Object> body = new HashMap<>();
-        body.put("source_code", request.sourceCode());
-        body.put("language_id", request.languageId());
-        if (request.stdin() != null) {
-            body.put("stdin", request.stdin());
-        }
-        if (request.expectedOutput() != null) {
-            body.put("expected_output", request.expectedOutput());
-        }
+    private void pollForResults(String sessionId, String token) {
+        Mono.defer(() -> judge0Client.getSubmission(token))
+                .flatMap(response -> {
+                    // Status 1 = In Queue, 2 = Processing
+                    if (response.getStatus() != null && (response.getStatus().getId() == 1 || response.getStatus().getId() == 2)) {
+                        return Mono.<Judge0SubmissionResponse>empty(); // Trigger repeatWhenEmpty
+                    }
+                    return Mono.just(response);
+                })
+                .repeatWhenEmpty(repeat -> repeat.delayElements(Duration.ofMillis(500)))
+                .subscribe(
+                        response -> sendResult(sessionId, response),
+                        error -> sendError(sessionId, "Failed to get execution results: " + error.getMessage())
+                );
+    }
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+    private void sendResult(String sessionId, Judge0SubmissionResponse response) {
+        CodeExecutionResponse result = new CodeExecutionResponse(
+                response.getStdout(),
+                response.getStderr(),
+                response.getCompileOutput(),
+                response.getMessage(),
+                response.getStatus() != null ? response.getStatus().getId() : null,
+                response.getStatus() != null ? response.getStatus().getDescription() : null,
+                response.getTime(),
+                response.getMemory()
+        );
+        messagingTemplate.convertAndSend("/topic/execution/" + sessionId, result);
+    }
 
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
-
-        try {
-            ResponseEntity<String> response = restTemplate.postForEntity(submitUrl, entity, String.class);
-            JsonNode root = objectMapper.readTree(response.getBody());
-
-            String stdout = root.path("stdout").asText(null);
-            String time = root.path("time").asText(null);
-            String memory = root.path("memory").asText(null);
-            String stderr = root.path("stderr").asText(null);
-            String compileOutput = root.path("compile_output").asText(null);
-            String status = root.path("status").path("description").asText("Unknown Error");
-
-            return new ExecutionResponse(stdout, time, memory, stderr, compileOutput, status);
-        } catch (Exception e) {
-            return new ExecutionResponse(null, null, null, "Internal Error connecting to Execution Engine: " + e.getMessage(), null, "Internal Error");
-        }
+    private void sendError(String sessionId, String message) {
+        CodeExecutionResponse errorResult = new CodeExecutionResponse(
+                null, null, null, message, null, "Error", null, null
+        );
+        messagingTemplate.convertAndSend("/topic/execution/" + sessionId, errorResult);
     }
 }

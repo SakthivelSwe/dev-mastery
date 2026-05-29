@@ -1,0 +1,178 @@
+---
+slug: "nextjs-streaming"
+title: "Streaming in Next.js"
+level: 5
+---
+
+## WHY
+Traditional SSR waits for ALL data to be fetched before sending any HTML to the browser. If one slow database query takes 3 seconds, the user sees a blank page for 3 seconds.
+**Streaming** sends HTML to the browser progressively — fast parts render immediately, slow parts stream in as they complete. Users see meaningful content within milliseconds, even if some data is still loading.
+
+## THEORY
+### How Streaming Works
+HTTP supports chunked transfer encoding — the server can send data in pieces. React 18 + Next.js uses this to stream React component output progressively.
+
+Streaming is implemented via React's `<Suspense>` boundary: wrap slow components in `<Suspense>`, and Next.js streams them when ready while rendering other content immediately.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-streaming" }
+```
+
+## CODE
+
+### Basic Streaming with Suspense
+```tsx
+// app/dashboard/page.tsx
+import { Suspense } from 'react';
+
+// Slow component — fetches from database (3+ seconds)
+async function RecentOrders() {
+  const orders = await db.orders.findMany({
+    take: 10,
+    orderBy: { createdAt: 'desc' }
+  });
+  // Takes 2.5 seconds
+
+  return (
+    <ul>
+      {orders.map(o => <li key={o.id}>{o.product} - ${o.total}</li>)}
+    </ul>
+  );
+}
+
+// Fast component — no data fetching
+function DashboardHeader({ username }: { username: string }) {
+  return <h1>Welcome back, {username}!</h1>;  // Renders instantly!
+}
+
+// The page that orchestrates everything
+export default async function DashboardPage() {
+  const user = await getCurrentUser();  // Fast — from cookie/cache
+
+  return (
+    <div>
+      {/* Renders IMMEDIATELY — no waiting! */}
+      <DashboardHeader username={user.name} />
+      
+      {/* Streams in when ready — shows skeleton while loading */}
+      <Suspense fallback={<OrdersSkeleton />}>
+        <RecentOrders />  {/* Streams in after 2.5 seconds */}
+      </Suspense>
+      
+      {/* Each Suspense boundary streams independently! */}
+      <Suspense fallback={<StatsSkeleton />}>
+        <AnalyticsStats />
+      </Suspense>
+    </div>
+  );
+  // The page feels fast because headers and navigation render in <100ms!
+  // Slow content streams in progressively without blocking the page
+}
+```
+
+### Loading.tsx — Automatic Streaming Boundary
+```tsx
+// app/dashboard/loading.tsx
+// Next.js automatically wraps the entire page in a Suspense boundary
+// This shows while the page's data is loading!
+
+export default function DashboardLoading() {
+  return (
+    <div className="animate-pulse">
+      <div className="h-8 bg-gray-200 rounded w-64 mb-4" />  {/* Header skeleton */}
+      <div className="h-4 bg-gray-200 rounded w-full mb-2" />
+      <div className="h-4 bg-gray-200 rounded w-3/4 mb-2" />
+      <div className="h-4 bg-gray-200 rounded w-5/6" />
+    </div>
+  );
+}
+```
+
+### Streaming with generateMetadata and page data
+```tsx
+// You can stream even page metadata!
+export async function generateMetadata({ params }: { params: { id: string } }) {
+  const product = await getProduct(params.id);  // Fast metadata query
+  return {
+    title: product.name,
+    description: product.description,
+  };
+}
+
+export default async function ProductPage({ params }: { params: { id: string } }) {
+  // Fast: product metadata (used for title, breadcrumb)
+  const product = await getProduct(params.id);
+  
+  return (
+    <div>
+      <h1>{product.name}</h1>  {/* Immediate! */}
+      
+      {/* Slow: recommendations from ML service — doesn't block the page! */}
+      <Suspense fallback={<RecommendationsSkeleton />}>
+        <ProductRecommendations productId={params.id} />
+      </Suspense>
+      
+      {/* Slow: reviews from external service */}
+      <Suspense fallback={<ReviewsSkeleton />}>
+        <ProductReviews productId={params.id} />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+## REAL_WORLD
+**The Impact: Time to First Byte (TTFB) vs Time to Interactive (TTI)**
+
+Without Streaming:
+- Server waits 3 seconds for all data
+- Sends complete HTML
+- TTFB: 3.1s
+- TTI: 3.5s
+- User sees blank page for 3 seconds
+
+With Streaming:
+- Server immediately sends page shell HTML (header, navigation, skeleton)
+- TTFB: 50ms (page shell is tiny and immediate)
+- Progressive content: slow data streams in at 3s
+- User sees meaningful content in < 100ms
+- TTI: 0.4s for shell, 3s for complete content
+
+## INTERVIEW
+**Q: Your dashboard page loads 5 different data sources that each take 1-3 seconds. Without streaming, the page blocks for 3 seconds. How do you use streaming to make the page feel instantaneous?**
+
+A: Wrap each independent data section in its own `<Suspense>` boundary with a skeleton placeholder:
+
+```tsx
+export default async function Dashboard() {
+  // This runs in parallel with all the Suspense boundaries!
+  const user = await getUser();  // Fast — 50ms
+
+  return (
+    <div>
+      <h1>Hello, {user.name}</h1>  {/* Immediate! */}
+      
+      {/* Each of these renders and streams INDEPENDENTLY */}
+      <Suspense fallback={<StatsSkeleton />}>
+        <Stats />          {/* 1 second — streams first */}
+      </Suspense>
+      
+      <Suspense fallback={<OrdersSkeleton />}>
+        <RecentOrders />   {/* 2 seconds */}
+      </Suspense>
+      
+      <Suspense fallback={<ChartSkeleton />}>
+        <RevenueChart />   {/* 3 seconds — streams last */}
+      </Suspense>
+    </div>
+  );
+}
+```
+
+Key points:
+1. The page shell renders in < 100ms — user immediately sees the layout
+2. All 5 data fetches run in PARALLEL (not sequentially!)
+3. Each Suspense boundary resolves independently as its data arrives
+4. At 1 second: Stats appear. At 2 seconds: Orders appear. At 3 seconds: Chart appears
+5. Total perceived wait: ~1 second (when first real data appears) instead of 3 seconds

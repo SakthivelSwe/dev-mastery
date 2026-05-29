@@ -1,0 +1,151 @@
+---
+slug: "data-fetching-next"
+title: "Data Fetching in Next.js"
+level: 3
+---
+
+## WHY
+Data fetching is at the heart of every web application. In traditional React, you'd use `useEffect` + `useState` to fetch data client-side, resulting in waterfall requests, loading spinners, and empty states.
+Next.js provides multiple data fetching strategies — chosen per page based on how often the data changes and whether SEO matters. Picking the right strategy dramatically impacts performance and user experience.
+
+## THEORY
+### The Four Rendering Strategies
+1. **Static Generation (SSG):** HTML generated at BUILD TIME. Fastest possible — served from CDN.
+2. **Incremental Static Regeneration (ISR):** SSG + periodic refresh. Serve cached, rebuild in background.
+3. **Server-Side Rendering (SSR):** HTML generated on every REQUEST. Always fresh data.
+4. **Client-Side Rendering (CSR):** Data fetched in the browser. SEO-unfriendly, shows loading state.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-data-fetching" }
+```
+
+## CODE
+
+### App Router: Server Components Fetch Data Directly
+```tsx
+// app/products/page.tsx — Static by default (SSG)!
+export default async function ProductsPage() {
+  // This fetch is CACHED by Next.js and runs at build time (or first request)
+  const products = await fetch('https://api.example.com/products', {
+    next: { revalidate: 3600 }  // Revalidate once per hour (ISR!)
+  }).then(r => r.json());
+
+  return (
+    <ul>
+      {products.map(p => <li key={p.id}>{p.name}</li>)}
+    </ul>
+  );
+}
+
+// Add this to force SSR (always fresh):
+export const dynamic = 'force-dynamic';
+// Or:
+export const revalidate = 0;
+```
+
+### Database Fetching in Server Components
+```tsx
+// app/dashboard/page.tsx
+import { db } from '@/lib/db';  // Prisma, Drizzle, etc.
+
+export default async function DashboardPage() {
+  // Direct database query — no API layer needed!
+  const [userCount, recentOrders] = await Promise.all([
+    db.user.count(),
+    db.order.findMany({
+      take: 10,
+      orderBy: { createdAt: 'desc' },
+      include: { user: true }
+    })
+  ]);
+
+  return (
+    <div>
+      <p>Total Users: {userCount}</p>
+      <OrderList orders={recentOrders} />
+    </div>
+  );
+}
+```
+
+### Client-Side Fetching with SWR
+```tsx
+// app/components/LivePrices.tsx
+'use client';  // Client component for real-time data!
+import useSWR from 'swr';
+
+const fetcher = (url: string) => fetch(url).then(r => r.json());
+
+export function LivePrices() {
+  const { data, error, isLoading } = useSWR('/api/prices', fetcher, {
+    refreshInterval: 5000  // Refetch every 5 seconds!
+  });
+
+  if (isLoading) return <div>Loading prices...</div>;
+  if (error) return <div>Failed to load prices</div>;
+
+  return (
+    <div>
+      {data.prices.map(p => (
+        <div key={p.symbol}>{p.symbol}: ${p.price}</div>
+      ))}
+    </div>
+  );
+}
+```
+
+### Parallel Data Fetching
+```tsx
+// WRONG: Sequential (slow!)
+const user = await fetchUser(id);              // 200ms
+const posts = await fetchPosts(user.id);       // 300ms
+// Total: 500ms
+
+// CORRECT: Parallel (fast!)
+const [user, posts] = await Promise.all([
+  fetchUser(id),      // 200ms
+  fetchPosts(id)      // 300ms
+]);
+// Total: 300ms (max, not sum!)
+```
+
+## REAL_WORLD
+**Choosing the Right Strategy**
+
+| Page Type | Strategy | Implementation |
+|---|---|---|
+| Blog posts | ISR | `revalidate: 3600` |
+| Product catalog | ISR | `revalidate: 300` |
+| Home/landing page | SSG | Build-time, no revalidate |
+| User dashboard | SSR | `dynamic: 'force-dynamic'` |
+| Live sports scores | CSR | `useSWR` with short interval |
+| Admin panel | SSR + Auth check | Dynamic with session |
+
+## INTERVIEW
+**Q: Your e-commerce product page shows the price fetched at build time. A price changes in the database. How long before the user sees the new price, and how do you fix this?**
+A: With pure SSG (no revalidation), the user might see the old price until the next full deployment — potentially days or weeks.
+
+**Fix with ISR (Incremental Static Regeneration):**
+```tsx
+export const revalidate = 300;  // Revalidate every 5 minutes
+```
+Now: the page is served from cache, but Next.js rebuilds it in the background every 5 minutes. Users see at most 5-minute-old prices.
+
+**Fix with On-Demand Revalidation (best for critical data like prices):**
+When a price changes in the database (via admin or automated update), trigger immediate cache invalidation:
+
+```typescript
+// API endpoint called by your pricing system when prices change
+export async function POST(request: Request) {
+  // Verify it's a trusted internal call (webhook secret)
+  const body = await request.json();
+  
+  revalidatePath(`/products/${body.productId}`);
+  revalidateTag('prices');
+  
+  return Response.json({ revalidated: true });
+}
+```
+
+Now the product page updates within seconds of a price change — not 5 minutes, not days.

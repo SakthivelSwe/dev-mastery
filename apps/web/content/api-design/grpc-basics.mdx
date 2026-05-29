@@ -1,0 +1,166 @@
+---
+slug: "grpc-basics"
+title: "gRPC & Protocol Buffers"
+level: 4
+---
+
+## WHY
+REST over HTTP/1.1 is the backbone of the web, but it is slow and bloated. When Microservice A calls Microservice B via REST, it sends a massive text-based JSON string. The receiver has to parse that string back into an object. Furthermore, there is no strict contract—if Service A changes a field name from `userId` to `user_id`, Service B crashes at runtime.
+
+**gRPC** (gRPC Remote Procedure Calls) was built by Google to solve these exact problems. It replaces JSON with **Protocol Buffers (Protobufs)**, an ultra-fast, strictly typed, binary data format. It replaces HTTP/1.1 with HTTP/2, allowing massive multiplexed streaming. The result is internal microservice communication that is 7x to 10x faster than REST.
+
+## THEORY
+### Protocol Buffers (The Contract)
+Instead of writing API documentation in Swagger/OpenAPI after the fact, gRPC forces you to write the API Contract first using a `.proto` file.
+You define exactly what the request looks like, exactly what the response looks like, and exactly what functions can be called. 
+The magic? The gRPC compiler reads that `.proto` file and automatically generates the client and server code for you in Java, Python, Node, Go, or C++! You just import the generated classes and use them.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "grpc-architecture" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Defining the Protobuf)
+We start by defining the strict contract in a `.proto` file.
+
+```protobuf
+// user.proto
+syntax = "proto3";
+
+package users;
+
+// 1. Define the Request Payload
+message GetUserRequest {
+  // The numbers (1) are NOT values. They are binary field tags!
+  // They tell the compiler exactly where to put this data in the binary stream.
+  string user_id = 1;
+}
+
+// 2. Define the Response Payload
+message GetUserResponse {
+  string name = 1;
+  int32 age = 2;
+  bool is_active = 3;
+}
+
+// 3. Define the Service (The API Endpoints)
+service UserService {
+  // A standard Request/Response endpoint (Unary RPC)
+  rpc GetUser (GetUserRequest) returns (GetUserResponse);
+}
+```
+
+### Level 2 — Building Blocks (Implementing the Server)
+We use the gRPC tools to compile the `.proto` file. Let's assume we compile it for Node.js. 
+We now write the actual business logic to fulfill that contract.
+
+```javascript
+// server.js (Node.js)
+const grpc = require('@grpc/grpc-js');
+const protoLoader = require('@grpc/proto-loader');
+
+// Load the compiled proto definitions
+const packageDefinition = protoLoader.loadSync('user.proto');
+const usersProto = grpc.loadPackageDefinition(packageDefinition).users;
+
+// Implement the actual business logic!
+function getUser(call, callback) {
+  // The request data is strictly typed!
+  const userId = call.request.user_id;
+  
+  // Fetch from DB...
+  const dbUser = { name: "John", age: 30, is_active: true };
+  
+  if (dbUser) {
+    // Return success (null error, then the response object)
+    callback(null, dbUser);
+  } else {
+    // Return a strict gRPC error code (NOT HTTP 404!)
+    callback({
+      code: grpc.status.NOT_FOUND,
+      details: "User not found"
+    });
+  }
+}
+
+// Start the gRPC Server!
+const server = new grpc.Server();
+server.addService(usersProto.UserService.service, { getUser: getUser });
+server.bindAsync('0.0.0.0:50051', grpc.ServerCredentials.createInsecure(), () => {
+  server.start();
+});
+```
+
+### Level 3 — Intermediate (Calling the Server)
+Now, imagine the Client is a Python microservice. The Python developer compiles the *exact same* `.proto` file. They don't have to write HTTP `requests.post()` or parse JSON. They just call the function as if it lived in their own codebase!
+
+```python
+# client.py
+import grpc
+import user_pb2
+import user_pb2_grpc
+
+# Connect to the Node.js server!
+channel = grpc.insecure_channel('localhost:50051')
+stub = user_pb2_grpc.UserServiceStub(channel)
+
+# Create the strictly typed request object
+request = user_pb2.GetUserRequest(user_id="123")
+
+try:
+    # Make the network call! It looks exactly like a local function call.
+    response = stub.GetUser(request)
+    print(f"Name: {response.name}, Age: {response.age}")
+except grpc.RpcError as e:
+    print(f"Failed: {e.details()}")
+```
+
+### Level 4 — Advanced (Streaming)
+Because gRPC runs on HTTP/2, it supports massive, bidirectional, long-lived streams. 
+If a client needs to download 1 million rows from a database, a REST API would crash trying to load 1 million JSON objects into RAM before sending the response. gRPC can stream them one by one!
+
+```protobuf
+// In the .proto file
+service MetricsService {
+  // The 'stream' keyword unlocks magic!
+  // The client opens a persistent connection and the server streams chunks continuously.
+  rpc StreamServerLogs (LogRequest) returns (stream LogResponse);
+}
+```
+
+```javascript
+// Server Implementation
+function streamServerLogs(call) {
+  const serverId = call.request.server_id;
+  
+  // Setup an event listener (e.g., listening to a file or Kafka topic)
+  logEmitter.on('new_log', (log) => {
+    // Stream the data back to the client immediately!
+    // The connection stays open indefinitely!
+    call.write({ message: log.text, timestamp: log.time });
+  });
+
+  // If the client disconnects, clean up!
+  call.on('cancelled', () => {
+    logEmitter.removeAllListeners();
+  });
+}
+```
+
+## REAL_WORLD
+**The Netflix Microservice Migration**
+When Netflix migrated from a Monolith to Microservices, they initially used REST (JSON over HTTP) for internal communication. As the number of services grew to thousands, the overhead of JSON serialization and deserialization became a massive bottleneck, consuming unacceptable amounts of CPU and network bandwidth. 
+They migrated their internal communication layer to gRPC. Because Protobufs are binary, they are mathematically smaller and parse instantly (by essentially casting binary bytes directly into memory structs). This migration drastically reduced their cloud computing costs and significantly lowered inter-service latency. 
+*Rule of thumb:* Use REST/GraphQL for public-facing APIs (where browsers and humans need to read JSON). Use gRPC for internal, backend-to-backend microservice communication where speed and strict contracts are paramount.
+
+## INTERVIEW
+**Q: I have a `.proto` file defining my `User` message. It is currently in production. My new feature requires changing the `age` field from an `int32` to a `string`. Can I just change `int32 age = 2;` to `string age = 2;`?**
+A: **Absolutely NOT. This will corrupt the entire system.** 
+Protobuf binary data does not send the field names (it doesn't send the word "age"). It only sends the Binary Tag (the number `2`). If an older microservice receives the binary stream, it will look at Tag 2, expect a 32-bit integer, but receive a String. It will crash or read garbage memory.
+In gRPC, you can NEVER change the type of an existing field, and you can NEVER reuse a tag number. If you need a new type, you must create a brand new field with a brand new tag:
+```protobuf
+// DEPRECATED: int32 age = 2; (Leave the old tag reserved so no one uses it!)
+string age_string = 3;
+```

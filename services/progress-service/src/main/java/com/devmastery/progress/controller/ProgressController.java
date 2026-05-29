@@ -1,7 +1,11 @@
 package com.devmastery.progress.controller;
 
+import com.devmastery.progress.dto.LayerCompletionRequest;
 import com.devmastery.progress.dto.MarkCompleteRequest;
+import com.devmastery.progress.dto.ReviewRatingRequest;
+import com.devmastery.progress.service.GamificationService;
 import com.devmastery.progress.service.ProgressService;
+import com.devmastery.progress.service.SpacedReviewService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +19,8 @@ import java.util.Map;
 public class ProgressController {
 
     private final ProgressService progressService;
+    private final GamificationService gamificationService;
+    private final SpacedReviewService spacedReviewService;
 
     // Ideally userId comes from the JWT via Spring Security Context.
     // For local testing in Phase 1B, we can accept it as a header or just use a mock if auth isn't fully propagated yet.
@@ -39,6 +45,28 @@ public class ProgressController {
             @RequestHeader("X-User-Id") UUID userId,
             @PathVariable String slug) {
         progressService.completeTopic(userId, slug);
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/layers/complete")
+    public ResponseEntity<Void> completeLayer(
+            @RequestHeader("X-User-Id") UUID userId,
+            @Valid @RequestBody LayerCompletionRequest request) {
+        gamificationService.processLayerCompletion(userId, request.topicId(), request.layerName());
+        return ResponseEntity.ok().build();
+    }
+
+    @GetMapping("/reviews/due")
+    public ResponseEntity<Object> getDueReviews(@RequestHeader("X-User-Id") UUID userId) {
+        return ResponseEntity.ok(spacedReviewService.getDueReviews(userId));
+    }
+
+    @PostMapping("/reviews/{topicId}")
+    public ResponseEntity<Void> submitReview(
+            @RequestHeader("X-User-Id") UUID userId,
+            @PathVariable UUID topicId,
+            @Valid @RequestBody ReviewRatingRequest request) {
+        spacedReviewService.processReview(userId, topicId, request);
         return ResponseEntity.ok().build();
     }
 

@@ -1,0 +1,116 @@
+---
+slug: "nextjs-edge-runtime"
+title: "The Edge Runtime"
+level: 5
+---
+
+## WHY
+Traditional Node.js servers run in a specific data center (e.g., AWS us-east-1 in Virginia). If a user in Tokyo requests a Server-Side Rendered (SSR) page, the request travels across the ocean, the server processes it, and sends the HTML back. This physical distance adds hundreds of milliseconds of latency.
+**The Edge Runtime** solves this by running your server-side code on a CDN (Content Delivery Network). The code is replicated globally to hundreds of edge nodes. When the user in Tokyo makes a request, the SSR runs in a Tokyo data center, responding in milliseconds.
+
+## THEORY
+### Node.js vs Edge Runtime
+- **Node.js Runtime (Default):** Runs on a full V8 engine with access to the entire Node.js API (`fs`, `child_process`, `crypto`). It runs in a single region. Cold starts take ~1 second.
+- **Edge Runtime:** A stripped-down, ultra-fast JavaScript environment based on standard Web APIs (like the browser: `fetch`, `Request`, `Response`). It has **NO access** to native Node.js APIs. Cold starts are nearly instantaneous (under 10ms).
+
+### Where Edge is Used
+In Next.js, the Edge Runtime is the required runtime for **Middleware**. 
+You can also opt-in to the Edge runtime for specific **API Routes** or **Server Components** to make them globally distributed.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "edge-runtime" }
+```
+
+## CODE
+
+### Opting a Route into the Edge
+By default, pages and API routes use the Node.js runtime. You can switch to the Edge with a single configuration line.
+
+```tsx
+// app/api/fast-route/route.ts
+import { NextResponse } from 'next/server';
+
+// Opt into the Edge runtime!
+export const runtime = 'edge';
+
+export async function GET() {
+  // This code runs globally, close to the user
+  return NextResponse.json({ 
+    message: 'Hello from the Edge!',
+    timestamp: Date.now()
+  });
+}
+```
+
+### The Limitations of the Edge
+Because the Edge runtime is not Node.js, you cannot use native Node modules or npm packages that rely on them.
+
+```tsx
+export const runtime = 'edge';
+
+// ❌ THIS WILL CRASH! 'fs' is a Node.js API.
+import fs from 'fs'; 
+
+// ❌ THIS WILL CRASH! Traditional Prisma requires a Rust binary engine.
+import { PrismaClient } from '@prisma/client'; 
+
+// ✅ THIS WORKS! Standard Web APIs are fully supported.
+export async function GET() {
+  const url = new URL('https://example.com');
+  const res = await fetch(url);
+  return new Response('Success');
+}
+```
+
+### Using Databases at the Edge
+To connect to a database from an Edge function, you must use a database client that works over HTTP/WebSockets instead of traditional TCP sockets.
+
+```tsx
+// Using Drizzle ORM with PlanetScale (MySQL over HTTP)
+import { drizzle } from 'drizzle-orm/planetscale-serverless';
+import { connect } from '@planetscale/database';
+
+export const runtime = 'edge';
+
+export async function GET() {
+  // Connect over HTTP (supported at the Edge)
+  const connection = connect({ url: process.env.DATABASE_URL });
+  const db = drizzle(connection);
+  
+  const users = await db.select().from(usersTable);
+  
+  return Response.json(users);
+}
+```
+
+## REAL_WORLD
+**Edge Geo-Location**
+Because Edge functions run on the CDN node closest to the user, the CDN provider injects headers detailing the user's location. This makes Edge computing perfect for personalization.
+
+```tsx
+// middleware.ts (Always runs at the Edge)
+import { NextRequest, NextResponse } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  // Vercel injects the 'x-vercel-ip-country' header at the edge
+  const country = request.headers.get('x-vercel-ip-country') || 'US';
+  
+  if (country === 'GB') {
+    return NextResponse.redirect(new URL('/uk-store', request.url));
+  }
+  
+  return NextResponse.next();
+}
+```
+This redirect happens in ~10ms for a user in London, rather than traveling to a server in the US first.
+
+## INTERVIEW
+**Q: You want to add JSON Web Token (JWT) verification to your Next.js Middleware. You install the popular `jsonwebtoken` npm package, but your app crashes in production with an error about missing crypto modules. Why, and how do you fix it?**
+
+A: The crash occurs because Next.js Middleware **must** run on the Edge Runtime. The popular `jsonwebtoken` library relies on Node.js native `crypto` and `Buffer` APIs, which do not exist in the Edge Runtime.
+
+**The Fix:**
+You must use a JWT library that is designed for the Edge, relying on the standard Web Crypto API rather than Node.js native modules. 
+
+The industry standard solution for this is to switch from `jsonwebtoken` to the `jose` npm package. `jose` is a lightweight library built entirely on Web Standards and works perfectly in Next.js Middleware, Cloudflare Workers, and Deno.

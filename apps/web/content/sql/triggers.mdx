@@ -1,0 +1,165 @@
+---
+slug: "triggers"
+title: "SQL Triggers"
+level: 4
+---
+
+## WHY
+Imagine building an Audit Log system. Every time a user updates their profile, you need to insert a record into the `profile_audit_log` table tracking the old email and the new email. 
+If you implement this in your Node.js/Java application, you must guarantee that *every single API endpoint* that touches the user profile remembers to also insert into the audit log. If a junior developer writes a script that updates the database directly, the audit log is bypassed, destroying your compliance!
+
+**Triggers** are automated tripwires built directly into the database. They listen for specific events (`INSERT`, `UPDATE`, `DELETE`) on a table and instantly execute a function. Because they live at the deepest layer of the database, they are absolutely impossible to bypass, guaranteeing 100% data integrity.
+
+## THEORY
+### Trigger Components
+A Trigger consists of three parts:
+1. **The Event:** What are we listening for? (`INSERT`, `UPDATE`, or `DELETE`).
+2. **The Timing:** Does the tripwire activate *BEFORE* the data is saved, or *AFTER* the data is saved?
+3. **The Action:** What Function should we execute when the tripwire is tripped?
+
+*Crucial Concept:* Triggers have access to special variables called `NEW` (the data trying to be saved) and `OLD` (the data currently in the database before the update).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SQLVisualizer", "state": "sql-triggers" }
+```
+
+## CODE
+
+*(Note: The examples use standard PostgreSQL PL/pgSQL syntax).*
+
+### Level 1 — Beginner (The BEFORE Trigger for Validation)
+Let's prevent an employee's salary from ever being decreased!
+
+```sql
+-- 1. Create the Function that the Trigger will execute
+CREATE OR REPLACE FUNCTION check_salary_decrease()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- 'NEW' holds the incoming data. 'OLD' holds the existing data in the DB.
+    IF NEW.salary < OLD.salary THEN
+        -- If we RAISE EXCEPTION in a BEFORE trigger, it completely aborts the UPDATE!
+        RAISE EXCEPTION 'Salary cannot be decreased! Old: %, New: %', OLD.salary, NEW.salary;
+    END IF;
+    
+    -- In a BEFORE trigger, we MUST return the NEW row so the DB can finish saving it!
+    RETURN NEW;
+END;
+$$;
+
+-- 2. Create the actual Tripwire (Trigger) on the table
+CREATE TRIGGER prevent_salary_decrease
+BEFORE UPDATE ON employees
+FOR EACH ROW
+EXECUTE FUNCTION check_salary_decrease();
+
+-- Usage:
+-- UPDATE employees SET salary = salary + 5000 WHERE id = 1; (Works!)
+-- UPDATE employees SET salary = salary - 1000 WHERE id = 1; (FAILS! Exception thrown by database)
+```
+
+### Level 2 — Building Blocks (The AFTER Trigger for Audit Logs)
+Let's build an ironclad Audit Log that tracks every time a price changes on a product.
+
+```sql
+-- 1. Create the Audit Function
+CREATE OR REPLACE FUNCTION log_price_change()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- We only care if the price ACTUALLY changed!
+    IF OLD.price IS DISTINCT FROM NEW.price THEN
+        -- Automatically insert a row into the audit table!
+        INSERT INTO price_audit_log (product_id, old_price, new_price, changed_at)
+        VALUES (OLD.id, OLD.price, NEW.price, NOW());
+    END IF;
+    
+    -- In an AFTER trigger, the return value is ignored by the DB.
+    RETURN NULL;
+END;
+$$;
+
+-- 2. Create the Tripwire
+CREATE TRIGGER trigger_log_price
+AFTER UPDATE ON products
+FOR EACH ROW
+EXECUTE FUNCTION log_price_change();
+```
+
+### Level 3 — Intermediate (Auto-Updating Timestamps)
+A classic database pattern: Every table has an `updated_at` column. Instead of relying on the backend application to remember to send the current timestamp on every `UPDATE` query, we force the database to do it automatically!
+
+```sql
+-- 1. Create a highly reusable function!
+CREATE OR REPLACE FUNCTION auto_update_timestamp()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Forcibly overwrite the incoming data's 'updated_at' field with the exact server time!
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+-- 2. Attach it to as many tables as you want!
+CREATE TRIGGER set_timestamp_users
+BEFORE UPDATE ON users
+FOR EACH ROW
+EXECUTE FUNCTION auto_update_timestamp();
+
+CREATE TRIGGER set_timestamp_orders
+BEFORE UPDATE ON orders
+FOR EACH ROW
+EXECUTE FUNCTION auto_update_timestamp();
+
+-- Now, your backend just writes: UPDATE users SET name = 'John' WHERE id = 1;
+-- The database magically updates the timestamp for you!
+```
+
+### Level 4 — Advanced (FOR EACH STATEMENT vs FOR EACH ROW)
+Triggers can be extremely dangerous for performance. 
+If you run `UPDATE products SET price = price * 1.1;` on a table with 100,000 rows, a `FOR EACH ROW` trigger will literally execute 100,000 times sequentially.
+
+If you only need to log that a massive batch operation occurred, use a `FOR EACH STATEMENT` trigger! It only fires exactly ONCE per SQL command, regardless of how many rows were affected.
+
+```sql
+CREATE OR REPLACE FUNCTION log_batch_update()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO system_logs (message, log_time)
+    VALUES ('A massive update command was executed on the products table!', NOW());
+    RETURN NULL;
+END;
+$$;
+
+-- The tripwire fires ONCE for the entire command
+CREATE TRIGGER trigger_batch_log
+AFTER UPDATE ON products
+FOR EACH STATEMENT
+EXECUTE FUNCTION log_batch_update();
+```
+
+## REAL_WORLD
+**The "Soft Delete" Pattern**
+Enterprise applications almost never actually `DELETE` data (for compliance reasons). Instead, they "Soft Delete" it by setting an `is_deleted = true` flag. 
+However, ensuring that 50 different developers remember to write `UPDATE table SET is_deleted = true` instead of `DELETE FROM table` is impossible. 
+Senior DBAs often use an `INSTEAD OF` Trigger! An `INSTEAD OF` trigger hijacks the SQL command before it runs, throws the original command away, and executes custom logic instead!
+```sql
+CREATE TRIGGER soft_delete_hijack
+INSTEAD OF DELETE ON users
+FOR EACH ROW
+EXECUTE FUNCTION perform_soft_delete(); 
+-- Inside the function: UPDATE users SET is_deleted = true WHERE id = OLD.id;
+```
+Now, if a junior developer writes `DELETE FROM users WHERE id = 1;`, the database intercepts it, prevents the deletion, and quietly turns it into an `UPDATE` command!
+
+## INTERVIEW
+**Q: I have a complex Trigger that runs `AFTER UPDATE ON orders`. Inside the trigger function, I perform an `INSERT` into the `audit_log` table. If the `INSERT` into the audit log fails (e.g., due to a disk space error), what happens to the original `UPDATE` command? Does the order price still update?**
+A: **No, the original `UPDATE` fails and is rolled back!**
+A Trigger executes within the exact same database Transaction as the command that tripped it. If *anything* inside the trigger fails, the entire transaction is rolled back instantly. This guarantees atomicity—you will never be in a state where the order updated but the audit log failed. They both succeed, or they both fail together!

@@ -1,0 +1,138 @@
+---
+slug: "module-resolution"
+title: "TypeScript Module Resolution"
+level: 4
+---
+
+## WHY
+When you write `import { User } from "./models/user"`, how does the TypeScript compiler actually find that file on your hard drive? Does it look for `user.ts`? `user.js`? `user/index.ts`? What if you write `import React from "react"`? Where does it search?
+
+This process is called **Module Resolution**. Historically, TypeScript and Node.js had vastly different rules for resolving files. As JavaScript evolved to support native ES Modules (`.mjs`), the rules became incredibly complex. If you misconfigure Module Resolution, your code will compile perfectly in TypeScript, but instantly crash when executed in Node.js or the browser.
+
+## THEORY
+### Node vs. NodeNext vs. Bundler
+TypeScript does *not* bundle your code. It simply translates `.ts` into `.js`.
+You must tell TypeScript *who* is going to be running the final JavaScript, so TypeScript can mimic their resolution rules!
+- **`node` (Legacy CommonJS):** Mimics older Node.js `require()` logic. Looks for `.js`, `.json`, and `index.js` files.
+- **`node16 / nodenext` (Modern ESM):** Enforces the strict new ECMAScript Module rules. You *must* include file extensions in your imports!
+- **`bundler` (Vite/Webpack/Next.js):** Mimics modern bundlers. Bundlers are extremely forgiving. They resolve missing extensions, parse `package.json` exports, and handle weird paths automatically.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ConfigVisualizer", "state": "module-resolution" }
+```
+
+## CODE
+
+### Level 1 — The `moduleResolution` Setting
+In your `tsconfig.json`, the `moduleResolution` setting dictates the algorithm TypeScript uses to find files.
+
+```json
+{
+  "compilerOptions": {
+    // You are writing modern React/Vue code that will be processed by Vite/Webpack
+    "moduleResolution": "bundler",
+    "module": "ESNext",
+    
+    // OR: You are writing a backend Node.js API using native ES Modules
+    "moduleResolution": "NodeNext",
+    "module": "NodeNext"
+  }
+}
+```
+
+### Level 2 — The `.js` Extension Trap (NodeNext)
+If you configure TypeScript for modern Node.js (`"moduleResolution": "NodeNext"`), you will encounter the most confusing quirk in TypeScript.
+
+```typescript
+// ERROR in NodeNext mode: Relative import paths need explicit file extensions!
+import { User } from "./models/user"; 
+```
+Okay, so I should add `.ts`, right?
+```typescript
+// ERROR: An import path cannot end with a '.ts' extension.
+import { User } from "./models/user.ts"; 
+```
+Wait, what? I can't use `.ts`, but I must use an extension? What do I do?
+
+**You must use the `.js` extension!**
+```typescript
+// CORRECT!
+import { User } from "./models/user.js"; 
+```
+*Why?* Because TypeScript refuses to rewrite your import paths during compilation. If you write `import "./user.ts"`, the final output will literally say `import "./user.ts"`. Node.js will try to execute the `.ts` file and crash! By writing `.js` in your source code, TypeScript knows to check the local `.ts` file during compilation, but leaves the `.js` path intact so Node.js can find the compiled output at runtime!
+
+### Level 3 — Path Mapping (Aliases)
+In large projects, you often end up with horrific relative imports like:
+`import { Button } from "../../../../components/Button";`
+
+You can configure TypeScript to use **Path Aliases** to create clean, absolute imports!
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "baseUrl": ".", // Defines the root folder for resolution
+    "paths": {
+      // Map the alias "@components/*" to the physical folder "src/components/*"
+      "@components/*": ["src/components/*"],
+      "@utils/*": ["src/utils/*"]
+    }
+  }
+}
+```
+Now, anywhere in your project, regardless of how deep the file is, you can write:
+```typescript
+import { Button } from "@components/Button";
+import { formatDate } from "@utils/date";
+```
+
+### Level 4 — The `package.json` "exports" Field
+Modern npm packages no longer just expose a `main` file. They use the `exports` field in their `package.json` to strictly define exactly which files you are allowed to import, and which files are hidden internal APIs!
+
+```json
+// Inside a third-party library's package.json
+{
+  "name": "my-cool-lib",
+  "exports": {
+    ".": "./dist/index.js",
+    "./utils": "./dist/utils/index.js"
+  }
+}
+```
+If you configure TypeScript with `"moduleResolution": "bundler"` or `"NodeNext"`, it respects these export maps strictly!
+```typescript
+import { mainFeature } from "my-cool-lib";         // Allowed
+import { helper } from "my-cool-lib/utils";        // Allowed
+
+// ERROR: Package subpath './dist/internal' is not defined by "exports"!
+// The library author successfully hid this internal file from you!
+import { secret } from "my-cool-lib/dist/internal.js"; 
+```
+
+## REAL_WORLD
+**Path Aliases Require Bundler Config!**
+The biggest mistake beginners make is adding `"paths": {"@/*": ["src/*"]}` to their `tsconfig.json` and expecting it to magically work in production.
+**TypeScript does NOT rewrite import paths!**
+When TypeScript compiles your code, it leaves `import { User } from "@/models/user"` exactly as it is. When Node.js tries to run the compiled code, it will crash because it has no idea what `@/` means!
+If you use Path Aliases, you MUST also configure your runtime environment to understand them:
+- **Vite:** Add `vite-tsconfig-paths` plugin.
+- **Webpack:** Configure `resolve.alias`.
+- **Node.js:** Use `tsc-alias` (to rewrite them post-build) or register `tsconfig-paths` at runtime.
+
+## INTERVIEW
+**Q: You are building an npm library. You want it to be usable by both older Node.js projects (CommonJS / `require()`) AND modern React projects (ES Modules / `import`). How do you configure module resolution and TypeScript to support both simultaneously?**
+A: **Dual Publishing via package.json `exports`.**
+You must compile your TypeScript twice: once targeting CommonJS (`"module": "CommonJS"`, outputting `.cjs` or `.js` files), and once targeting ES Modules (`"module": "NodeNext"`, outputting `.mjs` or `.js` files).
+Then, you use Conditional Exports in your `package.json` to tell the consumer's module resolver which version to load based on how they imported it!
+```json
+{
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.mjs",   // Used by 'import'
+      "require": "./dist/cjs/index.cjs",  // Used by 'require()'
+      "types": "./dist/types/index.d.ts"  // Points TypeScript to the declarations!
+    }
+  }
+}
+```

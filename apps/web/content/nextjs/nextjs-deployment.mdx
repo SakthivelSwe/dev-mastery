@@ -1,0 +1,186 @@
+---
+slug: "nextjs-deployment"
+title: "Next.js Deployment"
+level: 5
+---
+
+## WHY
+Next.js is flexible about deployment, but the options have real tradeoffs. Running Next.js requires a Node.js server — unlike a plain React CRA/Vite app which is just static files. Understanding your deployment options helps you choose based on cost, performance, and operational complexity.
+
+## THEORY
+### Deployment Options
+1. **Vercel** (the Next.js creators): Zero-config, automatic scaling, best DX. Commercial pricing.
+2. **Self-hosted Node.js** (any VPS/cloud VM): Run `next build && next start`. Full control, requires server management.
+3. **Docker** (containerized): Best for enterprise/Kubernetes environments.
+4. **Static Export** (`next export`): Only for fully static sites (no SSR, no API routes).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-deployment" }
+```
+
+## CODE
+
+### Option 1: Deploy to Vercel (Easiest)
+```bash
+# Install Vercel CLI
+npm install -g vercel
+
+# Deploy from your project root
+vercel
+
+# Production deploy
+vercel --prod
+
+# Connect to GitHub for automatic deployments:
+# Every push to main → production deploy
+# Every PR → preview deploy with unique URL
+```
+
+### Option 2: Self-Hosted with Docker
+```dockerfile
+# Dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Enable Next.js standalone output (smaller Docker image!)
+ENV NEXT_TELEMETRY_DISABLED 1
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+# Copy only what's needed for production (standalone mode!)
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+EXPOSE 3000
+ENV PORT=3000
+
+CMD ["node", "server.js"]
+```
+
+```javascript
+// next.config.js — Enable standalone output
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: 'standalone',  // Creates a self-contained .next/standalone folder!
+};
+
+module.exports = nextConfig;
+```
+
+### CI/CD: GitHub Actions → Docker → Production
+```yaml
+# .github/workflows/deploy.yml
+name: Build and Deploy Next.js
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Server
+        run: |
+          ssh ${{ secrets.PROD_SERVER }} "
+            docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+            docker stop nextjs-app || true
+            docker rm nextjs-app || true
+            docker run -d \
+              --name nextjs-app \
+              --restart=unless-stopped \
+              -p 3000:3000 \
+              -e DATABASE_URL=${{ secrets.DATABASE_URL }} \
+              ghcr.io/${{ github.repository }}:${{ github.sha }}
+          "
+```
+
+### Environment Variables in Production
+```bash
+# .env.local (local development — NEVER commit!)
+DATABASE_URL=postgresql://localhost:5432/mydb
+NEXTAUTH_SECRET=localdevonly123
+STRIPE_SECRET_KEY=sk_test_...
+
+# In production (Vercel/Docker/Server), set via:
+# Vercel: Settings → Environment Variables
+# Docker: -e DATABASE_URL=...
+# Kubernetes: ConfigMap/Secret
+
+# IMPORTANT: Variables starting with NEXT_PUBLIC_ are exposed to the browser!
+NEXT_PUBLIC_API_URL=https://api.myapp.com  # Public — OK
+DATABASE_URL=postgresql://...              # Private — stays on server!
+```
+
+## REAL_WORLD
+**Edge vs Node.js Runtime**
+Next.js lets you choose the runtime per route:
+
+```typescript
+// This route runs at the EDGE (Cloudflare Workers, Vercel Edge)
+// Ultra-fast, geographically distributed, but limited APIs
+export const runtime = 'edge';
+
+// This route runs in standard Node.js (default)
+// Full Node.js APIs, connect to databases, etc.
+export const runtime = 'nodejs';
+```
+
+Edge runtime pages deploy to CDN edge locations globally — requests are served from the data center closest to the user. Ideal for authentication middleware, A/B testing, personalization. Not suitable for heavy database operations.
+
+## INTERVIEW
+**Q: Your Next.js app is deployed on a single VPS server. Traffic is growing and the server is struggling with memory. What architectural changes would you make to scale?**
+
+A: Multiple scaling strategies, in order of implementation complexity:
+
+1. **Vertical Scaling (quick win):** Upgrade the VPS RAM/CPU. Cheap, zero work. Temporary fix.
+
+2. **Static Generation where possible:** Convert dynamic pages to `getStaticProps` + ISR. Pre-rendered HTML served from Nginx cache — zero Next.js processing needed.
+
+3. **Add a CDN for static assets:** Offload images, CSS, JS, and statically generated pages to Cloudflare. Dramatically reduces origin server load.
+
+4. **Move to managed platform:** Migrate to Vercel or AWS Amplify. They auto-scale serverless functions per request — you never manage servers.
+
+5. **Horizontal scaling with load balancer:** Run multiple Next.js Docker containers behind Nginx or AWS ALB. Requires external session storage (Redis) since you can't rely on server memory for sessions.
+
+6. **Separate the API:** Extract API routes that hit the database into a separate microservice. Scale the API independently from the frontend.
+
+The fastest ROI is usually CDN + static generation, which can reduce origin server load by 80-90% for content-heavy sites.

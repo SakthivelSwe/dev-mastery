@@ -1,0 +1,108 @@
+---
+slug: "pg-parallel-query"
+title: "PostgreSQL Parallel Query Execution"
+level: 5
+---
+
+## WHY
+Historically, PostgreSQL was strictly single-threaded per connection. If a data scientist ran a massive analytical query (e.g., `SELECT SUM(sales) FROM orders;`) on a table with 500 million rows, exactly one CPU core would spin at 100% while the other 31 CPU cores on the server sat completely idle. The query might take 10 minutes.
+Modern Postgres supports **Parallel Query Execution**. It can dynamically spawn multiple background worker processes to divide and conquer the table, reducing a 10-minute query down to 30 seconds!
+
+## THEORY
+### The Gather Node
+Parallel execution is coordinated by a special Query Planner node called **Gather**.
+1. The main connection (the "Leader") decides the query is too big for one core.
+2. The Leader requests 4 "Worker" processes from the background worker pool.
+3. The Leader assigns each Worker a different physical chunk of the table file.
+4. The Workers scan their chunks simultaneously, calculating partial sums.
+5. The Leader "Gathers" the partial results from the Workers, adds them together, and returns the final result.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-parallel" }
+```
+
+## CODE
+
+### Level 1 — Enabling Parallelism (`postgresql.conf`)
+Parallel query is enabled by default in modern Postgres, but it is heavily restricted. You must tune it to unleash it.
+
+```ini
+# postgresql.conf
+
+# Maximum number of background workers allowed globally across the ENTIRE server.
+max_worker_processes = 8
+
+# Maximum number of workers dedicated specifically to Parallel Queries.
+max_parallel_workers = 8
+
+# THE MOST IMPORTANT SETTING:
+# The maximum number of workers allowed for a SINGLE query!
+# Default is 2. If you have 32 cores, set this higher (e.g., 4 or 8).
+max_parallel_workers_per_gather = 4
+```
+
+### Level 2 — When Does Postgres Use Parallelism?
+Postgres does not use parallel queries for everything. There is a startup cost (spawning processes takes milliseconds). If a query is already fast (uses an index to fetch 10 rows), parallelism would actually make it slower!
+The Query Planner calculates the cost. If the table is massive, it uses parallelism.
+
+```sql
+-- Run EXPLAIN to see Parallelism in action!
+EXPLAIN SELECT COUNT(*) FROM massive_table;
+
+/* Output:
+Finalize Aggregate  (cost=12345.67)
+  ->  Gather  (cost=12345.67)
+        Workers Planned: 4
+        ->  Partial Aggregate  (cost=12345.67)
+              ->  Parallel Seq Scan on massive_table  (cost=12345.67)
+*/
+```
+
+### Level 3 — Tuning the Cost Thresholds
+Sometimes, Postgres refuses to use Parallel Query even when you know it should. You can force its hand by tweaking the cost thresholds.
+
+```ini
+# postgresql.conf or run SET at the session level!
+
+# The minimum table size (in bytes) required to trigger a parallel scan.
+# Default is 8MB.
+min_parallel_table_scan_size = 8MB
+
+# How much Postgres "charges" to set up the parallelism. 
+# Lower this to make Postgres more eager to use Parallel Queries.
+parallel_setup_cost = 1000
+
+# How much Postgres "charges" to pass data between the worker and leader.
+parallel_tuple_cost = 0.1
+```
+
+### Level 4 — Parallel Limitations (What CAN'T be parallelized?)
+Parallel Query is not magic. It cannot be used if:
+1. **Writing Data:** You cannot use parallelism for `INSERT`, `UPDATE`, or `DELETE`. (Though Postgres 14+ introduced parallel `CREATE TABLE AS` and Postgres 15+ introduced parallel `CREATE INDEX`).
+2. **PL/pgSQL Functions:** If your query calls a custom database function (e.g., `SELECT my_custom_func(id) FROM table`), Postgres assumes the function is dangerous and disables parallelism!
+To fix this, you must explicitly declare your function as **PARALLEL SAFE**.
+
+```sql
+-- Tell the planner this function does not write data or use shared state!
+CREATE OR REPLACE FUNCTION calculate_tax(amount NUMERIC) 
+RETURNS NUMERIC 
+LANGUAGE sql 
+PARALLEL SAFE 
+AS $$
+    SELECT amount * 0.20;
+$$;
+```
+
+## REAL_WORLD
+**OLTP vs. OLAP**
+Should you set `max_parallel_workers_per_gather = 16`?
+- **OLAP (Data Warehouse):** Yes! If you run 5 massive reporting queries an hour, you want them to consume all 16 cores to finish as fast as possible.
+- **OLTP (Web Application):** NO! A web application handles 1,000 small transactions per second. If a single bad query suddenly steals 16 CPU cores, the other 999 queries will instantly freeze waiting for CPU time. The entire application will experience massive latency spikes. In high-traffic OLTP environments, DBAs often explicitly disable parallel query (`max_parallel_workers_per_gather = 0`) to ensure predictable latency and prevent resource starvation.
+
+## INTERVIEW
+**Q: You execute a query that uses a Hash Join between a massive 10GB `users` table and a 1GB `roles` table. The `EXPLAIN` plan shows a `Parallel Hash Join`. How does memory (`work_mem`) behave in this scenario?**
+A: **Memory Allocation Multiplies!**
+In a standard query, if `work_mem = 64MB`, the Hash Join uses 64MB of RAM to build the hash table.
+In a Parallel Hash Join, if `max_parallel_workers_per_gather = 4`, Postgres spawns 4 worker processes. **Every single worker gets its own `work_mem` allocation!**
+This means the single query will instantly consume $4 \times 64MB = 256MB$ of RAM just for that one Hash Join operation. If you do not account for this multiplier when tuning `work_mem` on a highly parallelized server, you will trigger Out-Of-Memory (OOM) crashes during heavy analytical workloads.

@@ -5,7 +5,9 @@ import { useParams } from 'next/navigation';
 import { PathRoadmapResponse } from '@/components/roadmap/RoadmapCanvas';
 import { RoadmapCanvas } from '@/components/roadmap/RoadmapCanvas';
 import { RoadmapListView } from '@/components/roadmap/RoadmapListView';
-import { fetchAuthData } from '@/lib/api';
+import { fetchPath } from '@/lib/api';
+import type { LearningPath } from '@/lib/api';
+
 
 export default function PathRoadmapPage() {
   const params = useParams();
@@ -18,8 +20,8 @@ export default function PathRoadmapPage() {
   useEffect(() => {
     async function loadRoadmap() {
       try {
-        const data = await fetchAuthData(`/paths/${pathSlug}/roadmap`);
-        setRoadmapData(data);
+        const data = await fetchPath(pathSlug);
+        if (data) setRoadmapData(data as any);
       } catch (error) {
         console.error('Failed to load roadmap:', error);
       } finally {

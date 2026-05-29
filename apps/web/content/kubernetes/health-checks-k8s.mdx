@@ -1,0 +1,115 @@
+---
+slug: "health-checks-k8s"
+title: "Health Checks in Kubernetes"
+level: 4
+---
+
+## WHY
+Kubernetes needs to know whether your application is healthy enough to receive traffic. Without health checks, Kubernetes routes requests to containers that are still starting up (connection refused) or have crashed internally but the process is still running (application-level deadlock).
+**Liveness** and **Readiness** probes are Kubernetes's health check mechanisms — the difference between them determines whether a Pod is restarted or just removed from load balancing.
+
+## THEORY
+### Three Types of Probes
+1. **Liveness Probe:** "Is this container alive?" If it fails → Kubernetes RESTARTS the container.
+2. **Readiness Probe:** "Is this container ready for traffic?" If it fails → Kubernetes REMOVES it from Service endpoints (stops sending requests).
+3. **Startup Probe:** "Has this container finished starting?" Disables liveness/readiness checks until startup completes. For slow-starting apps.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-health-checks" }
+```
+
+## CODE
+
+### HTTP Health Check Endpoints
+```java
+// Spring Boot automatically exposes /actuator/health!
+// Add to pom.xml:
+// spring-boot-starter-actuator
+
+// GET /actuator/health → {"status": "UP"}
+// GET /actuator/health/liveness → {"status": "UP"}
+// GET /actuator/health/readiness → {"status": "UP"}
+```
+
+### Configuring Probes in a Deployment
+```yaml
+spec:
+  containers:
+    - name: api
+      image: my-api:1.0.0
+      ports:
+        - containerPort: 8080
+
+      # Startup Probe: runs until it passes (then stops)
+      startupProbe:
+        httpGet:
+          path: /actuator/health
+          port: 8080
+        failureThreshold: 30    # Try 30 times...
+        periodSeconds: 10       # ...every 10 seconds = max 300s startup time
+        # JVM apps can take 60-90 seconds to start! This gives them time.
+
+      # Liveness Probe: continues running after startup (restarts on failure)
+      livenessProbe:
+        httpGet:
+          path: /actuator/health/liveness
+          port: 8080
+        initialDelaySeconds: 0  # Startupprobe handles the delay!
+        periodSeconds: 20       # Check every 20 seconds
+        failureThreshold: 3     # Restart after 3 consecutive failures
+
+      # Readiness Probe: removes from Service if unhealthy
+      readinessProbe:
+        httpGet:
+          path: /actuator/health/readiness
+          port: 8080
+        initialDelaySeconds: 0
+        periodSeconds: 5        # Check every 5 seconds (faster response)
+        failureThreshold: 3     # Remove from endpoints after 3 failures
+```
+
+### Non-HTTP Health Checks
+```yaml
+# TCP Socket probe (for databases, Redis)
+livenessProbe:
+  tcpSocket:
+    port: 5432    # Just check if the port is open
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+# Exec probe (run a command inside the container)
+livenessProbe:
+  exec:
+    command:
+      - pg_isready
+      - -U
+      - postgres
+  initialDelaySeconds: 30
+  periodSeconds: 10
+```
+
+## REAL_WORLD
+**The Difference in Practice**
+Scenario: Your API is running but has a memory deadlock — all goroutines/threads are stuck, but the process is alive.
+
+- **Without probes:** The container appears "Running." Kubernetes keeps sending traffic. Users get timeouts for hours.
+- **With liveness probe:** The health endpoint times out → 3 failures → Kubernetes kills and restarts the container. Back to healthy in 30 seconds.
+
+Scenario: Your API just started but is still warming up the cache (5 second startup).
+
+- **Without readiness probe:** Service routes traffic immediately → `Connection refused` errors for first 5 seconds during each rolling update.
+- **With readiness probe:** The Pod is NOT in the Service endpoints until `/health/readiness` returns 200. Zero errors during rolling updates!
+
+## INTERVIEW
+**Q: Your application passes its liveness probe but fails its readiness probe intermittently. Kubernetes removes the Pod from the Service endpoints. Is the Pod restarted? And what could cause intermittent readiness failures?**
+
+A: **No, the Pod is NOT restarted.** Liveness failure triggers restart. Readiness failure only removes the Pod from the Service's endpoint list (stops sending traffic). The Pod continues running — it just doesn't receive requests until readiness recovers.
+
+**Common causes of intermittent readiness failures:**
+1. **Database connection pool exhausted:** The app is healthy but can't accept more requests because all DB connections are in use. Readiness probe correctly removes it from rotation until connections free up.
+2. **External dependency timeout:** If readiness checks downstream services (DB, Redis, external API) that are temporarily slow, it will intermittently fail.
+3. **GC pause (JVM):** Long garbage collection pauses cause the health endpoint to not respond in time, failing the probe.
+4. **CPU throttling:** Container hitting CPU limit causes slow health check response → timeout → failure.
+
+The correct pattern: Liveness should check ONLY that the application process is alive (no deadlocks). Readiness should check that the application can serve traffic (DB connected, required dependencies up). Don't mix the two.

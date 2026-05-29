@@ -1,0 +1,241 @@
+---
+title: event-loop
+slug: event-loop
+---
+
+# JavaScript Event Loop — Complete Internal Model
+
+The JavaScript runtime environment is designed around a single-threaded execution model. To achieve high-throughput, non-blocking I/O, engines like V8 coordinate with host environments (the browser’s rendering engine or Node.js’s `libuv` platform) via an asynchronous event loop.
+
+---
+
+## 1. The V8 Call Stack
+
+The V8 Call Stack is a Last-In, First-Out (LIFO) data structure that tracks the execution of synchronous code. 
+
+### Stack Frames (Activation Records)
+When a JavaScript function is invoked, V8 allocates a **Stack Frame** (or Activation Record) on the call stack. This frame stores:
+*   **Return Address**: The instruction pointer to resume execution at after the function returns.
+*   **Local Variables and Parameters**: Primitive values and references to heap-allocated objects.
+*   **Execution Context**: A pointer to the current lexical environment and the `this` binding.
+
+```
++------------------------------------------+
+|  Frame 3: baz() [Local vars, Return ADDR] |  <-- Stack Pointer (Top)
++------------------------------------------+
+|  Frame 2: bar() [Local vars, Return ADDR] |
++------------------------------------------+
+|  Frame 1: foo() [Local vars, Return ADDR] |
++------------------------------------------+
+|  Global Execution Context                |  <-- Bottom of Stack
++------------------------------------------+
+```
+
+### Stack Overflow and `StackGuard`
+V8 has a hard limit on the call stack size (typically 10,000 to 50,000 frames depending on the host OS and architecture). This boundary is monitored by V8’s internal `StackGuard` class (`src/execution/stack-guard.h`). 
+
+If a recursive function lacks a base case, it continuously pushes frames:
+
+```javascript
+function recurse() {
+    recurse();
+}
+recurse(); // Uncaught RangeError: Maximum call stack size exceeded
+```
+
+When the stack pointer crosses the memory address limit set by `StackGuard`, V8 halts execution and throws a `RangeError`.
+
+---
+
+## 2. Web APIs and libuv: Out-of-V8 Execution
+
+V8 is purely an execution engine; it does not have built-in timers (`setTimeout`), network capabilities (`fetch`), or DOM awareness. These are **Host-Defined APIs**.
+
+```
++-----------------------------------------------------------------------+
+|                           HOST ENVIRONMENT                            |
+|                                                                       |
+|   +-------------------+                     +---------------------+   |
+|   |     V8 Engine     |                     |      Web APIs       |   |
+|   |                   |   Binding Call      |  - setTimeout       |   |
+|   |  +-------------+  | ------------------> |  - fetch            |   |
+|   |  | Call Stack  |  |                     |  - DOM Events       |   |
+|   |  +-------------+  | <------------------ +---------------------+   |
+|   +-------------------+   Push Callback                |              |
+|             ^                                          |              |
+|             |                                          v              |
+|             |                               +---------------------+   |
+|             +------------------------------ |   Callback Queues   |   |
+|                     Event Loop Tick         +---------------------+   |
++-----------------------------------------------------------------------+
+```
+
+*   **Browsers**: Web APIs are implemented in C++ by the browser engine (e.g., Blink in Chrome). When you call `fetch()`, V8 makes a C++ binding call to Blink. Blink handles the network socket on a background browser thread.
+*   **Node.js**: Asynchronous operations are delegated to **libuv**, a multi-platform C library focusing on asynchronous I/O. libuv manages a system-level thread pool (default size of 4, configurable via `UV_THREADPOOL_SIZE`) and uses OS-specific asynchronous mechanisms like `epoll` (Linux), `kqueue` (macOS), or `IOCP` (Windows).
+
+Once the background operation completes, the host environment (Blink or libuv) wraps the result in a callback and places it into the appropriate queue.
+
+---
+
+## 3. The Queue Architecture
+
+The Event Loop manages two primary categories of queues:
+
+### The Microtask Queue
+This queue handles high-priority tasks that must be executed immediately after the current synchronous execution block finishes, before control yields to rendering or macrotasks.
+*   **Sources**: `Promise.resolve().then()` (specifically V8's internal `PromiseReactionJob`), `queueMicrotask()`, and `MutationObserver` callbacks.
+*   **V8 Implementation**: Managed directly by V8 inside `v8::internal::MicrotaskQueue` (`src/execution/microtask-queue.cc`).
+
+### The Callback Queue (Macrotask Queue)
+This queue handles standard asynchronous operations.
+*   **Sources**: `setTimeout`, `setInterval`, network callbacks (`fetch`/`xhr`), DOM events, `setImmediate` (Node.js only), and I/O.
+*   **Management**: Handled entirely by the host environment (Blink's task scheduler or libuv's event loop).
+
+---
+
+## 4. The Event Loop Algorithm (Precise Spec Model)
+
+The browser event loop operates according to the HTML5 Specification (Section 8.1.4). The exact execution sequence is as follows:
+
+```
+                  +------------------------+
+                  |   Execute Sync Code    |
+                  |   (Drain Call Stack)   |
+                  +------------------------+
+                              |
+                              v
+                +----------------------------+
+                | DRAIN Microtask Queue      | <------+
+                | (Including newly queued)   |        | (Loop until
+                +----------------------------+        |  queue empty)
+                              |                       |
+                              +-----------------------+
+                              |
+                              v
+                  +------------------------+
+                  | Take ONE Macrotask     |
+                  |   and execute it       |
+                  +------------------------+
+                              |
+                              v
+                +----------------------------+
+                | DRAIN Microtask Queue      | <------+
+                | (Including newly queued)   |        | (Loop until
+                +----------------------------+        |  queue empty)
+                              |                       |
+                              +-----------------------+
+                              |
+                              v
+                  +------------------------+
+                  |  Need Render? (vsync)  |
+                  +------------------------+
+                             / \
+                            /   \
+                     Yes   /     \   No
+                          v       v
+         +--------------------------+     +-------------------+
+         | Run requestAnimationFrame|     |  Loop back to     |
+         | Run Style, Layout, Paint |     |  next Macrotask   |
+         +--------------------------+     +-------------------+
+                      |                             ^
+                      v                             |
+                      +-----------------------------+
+```
+
+1.  **Execute Synchronous Code**: The call stack is processed until it is completely empty.
+2.  **Drain Microtask Queue**:
+    *   The engine processes the Microtask Queue until it is completely empty.
+    *   *Critical Detail*: If a microtask queues another microtask, the newly added microtask is executed **during the same tick**. This can lead to infinite microtask loops (starvation of the Macrotask Queue and UI rendering).
+3.  **Process One Macrotask**:
+    *   The event loop pulls exactly **one** task from the Macrotask Queue and pushes it onto the Call Stack.
+    *   The Call Stack executes this task to completion (stack is empty again).
+4.  **Drain Microtask Queue**:
+    *   The Microtask Queue is drained completely again.
+5.  **Render Phase (Browsers only)**:
+    *   The browser determines if a frame update is required (typically every 16.6ms for 60Hz displays).
+    *   If a render is scheduled, it executes `requestAnimationFrame` (rAF) callbacks, followed by recalculating styles, layout, and painting the pixels.
+6.  **Repeat**: Loop back to Step 3.
+
+### Implication: Microtask Precedence
+Because the entire microtask queue is drained before the next macrotask is pulled, a resolved Promise callback will *always* execute before a `setTimeout(fn, 0)` callback, even if the timer was registered first.
+
+```javascript
+setTimeout(() => console.log("Macrotask (setTimeout)"), 0);
+
+Promise.resolve().then(() => {
+    console.log("Microtask 1");
+    Promise.resolve().then(() => console.log("Microtask 2 (nested)"));
+});
+
+console.log("Synchronous");
+
+// Output:
+// 1. Synchronous
+// 2. Microtask 1
+// 3. Microtask 2 (nested)
+// 4. Macrotask (setTimeout)
+```
+
+---
+
+## 5. Node.js Event Loop (libuv)
+
+Node.js uses libuv for its event loop, which differs from the browser specification. The libuv event loop consists of 6 distinct phases executed in a loop:
+
+```
+   ┌───────────────────────────┐
+┌─>│          TIMERS           │ <--- setTimeout(), setInterval()
+│  └─────────────┬─────────────┘
+│                v
+│  ┌───────────────────────────┐
+│  │     PENDING CALLBACKS     │ <--- TCP errors, system-level I/O
+│  └─────────────┬─────────────┘
+│                v
+│  ┌───────────────────────────┐
+│  │       IDLE, PREPARE       │ <--- Internal use only
+│  └─────────────┬─────────────┘
+│                v
+│  ┌───────────────────────────┐
+│  │           POLL            │ <--- Incoming connections, data, I/O
+│  └─────────────┬─────────────┘
+│                v
+│  ┌───────────────────────────┐
+│  │           CHECK           │ <--- setImmediate()
+│  └─────────────┬─────────────┘
+│                v
+│  ┌───────────────────────────┐
+│  │      CLOSE CALLBACKS      │ <--- socket.on('close', ...)
+└─┬└───────────────────────────┘
+  │
+  v
+[process.nextTick() & Microtasks executed between phases]
+```
+
+### The 6 Phases
+1.  **Timers**: Executes callbacks scheduled by `setTimeout()` and `setInterval()`.
+2.  **Pending Callbacks**: Executes I/O callbacks deferred to the next loop iteration (e.g., system errors like `ECONNREFUSED`).
+3.  **Idle, Prepare**: Used internally by libuv for housekeeping.
+4.  **Poll**: Retrieves new I/O events. Node.js blocks here if there are no timers or immediate scripts scheduled.
+5.  **Check**: Executes `setImmediate()` callbacks.
+6.  **Close Callbacks**: Executes close event handlers (e.g., `socket.destroy()`).
+
+### `process.nextTick()` and Microtasks in Node.js
+*   `process.nextTick()` is **not** part of libuv's event loop. It belongs to Node.js's native layer.
+*   The `nextTick` queue is processed immediately after the current operation completes, regardless of the current phase of the event loop.
+*   The `nextTick` queue has strict priority over the Promise microtask queue.
+
+```javascript
+setTimeout(() => console.log("Timeout"), 0);
+setImmediate(() => console.log("Immediate"));
+
+Promise.resolve().then(() => console.log("Promise"));
+process.nextTick(() => console.log("NextTick"));
+
+// Output:
+// 1. NextTick
+// 2. Promise
+// 3. Timeout (depending on entry speed, usually runs before Immediate)
+// 4. Immediate
+```
+
+---

@@ -1,0 +1,128 @@
+---
+slug: "design-whatsapp"
+title: "Design: WhatsApp Messaging"
+level: 5
+---
+
+## WHY
+WhatsApp serves 2 billion users, delivering 100 billion messages per day with end-to-end encryption, reliable delivery, and real-time presence indicators. Designing a real-time messaging system tests deep knowledge of WebSockets, message persistence, delivery guarantees, and distributed notification systems.
+
+The core challenge: Messages must be delivered reliably even when the recipient is offline. When they come back online, they must receive every missed message in perfect chronological order.
+
+## THEORY
+### The Core Technical Challenges
+1. **Real-time delivery:** How do you push messages instantly to a recipient's device without polling?
+2. **Offline delivery:** How do you deliver messages to users who are offline?
+3. **Message ordering:** How do you guarantee messages appear in the correct order?
+4. **Delivery receipts:** How does the sender know if the message was delivered/read?
+5. **End-to-end encryption:** The server should never be able to read message content.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "design-whatsapp" }
+```
+
+## CODE
+
+### Level 1 — Beginner (WebSocket vs HTTP)
+```
+HTTP Request-Response Model:
+Client ──── GET /messages (polls every 5 seconds) ────► Server
+Client ◄─── 200 OK: [] ──────────────────────────────── Server
+(Wasteful: 99% of polls return empty! High latency for real-time feel)
+
+WebSocket:
+Client ──── CONNECT ws://chat.example.com ────────────► Server
+Client ◄──────────────────────────── "Message from Alice!" Server
+(Single persistent connection! Server pushes messages immediately!)
+
+For real-time messaging, WebSockets are MANDATORY.
+Each connected user maintains a persistent WebSocket connection to a Chat Server.
+```
+
+### Level 2 — Building Blocks (Message Delivery Architecture)
+```
+ONLINE USER FLOW:
+Alice sends "Hello Bob" →
+  1. Alice's device → WebSocket → Chat Server A
+  2. Chat Server A → Kafka Topic (for durability & async processing)
+  3. Kafka → Message Service (saves to Cassandra with unique message ID)
+  4. Message Service → User Presence Service: "Is Bob online?"
+  5. Yes: → Bob's WebSocket Connection Server → Bob's device (real-time!)
+  6. Bob's device sends DELIVERED acknowledgment
+  7. Server updates message status to "DELIVERED" (✓✓)
+  
+OFFLINE USER FLOW:
+  5. No: → Push Notification Service (FCM/APNs) → Bob's device lock screen
+  6. When Bob opens the app → new WebSocket connection → fetches missed messages
+```
+
+### Level 3 — Intermediate (Data Model with Cassandra)
+```sql
+-- MESSAGES table (Cassandra for massive write throughput)
+-- Partitioned by conversation_id → all messages in a chat are colocated!
+CREATE TABLE messages (
+    conversation_id  UUID,
+    message_id       TIMEUUID,          -- TimeUUID = globally unique + time-ordered!
+    sender_id        BIGINT,
+    content          BLOB,              -- Encrypted client-side!
+    content_type     VARCHAR,           -- 'text', 'image', 'voice', 'video'
+    status           VARCHAR,           -- 'sent', 'delivered', 'read'
+    created_at       TIMESTAMP,
+    PRIMARY KEY (conversation_id, message_id)  -- Clustered by time!
+) WITH CLUSTERING ORDER BY (message_id DESC);  -- Newest messages first!
+
+-- CONVERSATIONS table
+CREATE TABLE conversations (
+    id           UUID PRIMARY KEY,
+    type         VARCHAR,              -- 'direct', 'group'
+    participants SET<BIGINT>,
+    last_message_at TIMESTAMP
+);
+
+-- USER PRESENCE (Redis for real-time)
+-- SET user_presence:123 "online" EX 30 (expires in 30 seconds)
+-- Client sends heartbeat every 20 seconds to maintain presence
+```
+
+### Level 4 — Advanced (Message Ordering & CRDT for Group Chats)
+```
+PROBLEM: When Alice and Bob send messages simultaneously in a group chat,
+the messages might arrive at different Chat Servers in different orders,
+causing different group members to see different message orderings!
+
+SOLUTION 1: Lamport Timestamps
+Each message gets a logical clock value. The server uses these to establish
+a consistent total order that all clients agree on.
+
+SOLUTION 2: Sequence Numbers per Conversation
+The Message Service assigns a monotonically increasing sequence_number to
+every message in a conversation. Clients display messages ordered by sequence_number.
+
+The "WhatsApp way":
+- Each message gets a unique timestamp-based ID (TIMEUUID in Cassandra).
+- The server resolves ordering conflicts using the server's receipt timestamp.
+- This isn't perfect (clock skew), but for chat, "good enough" ordering is acceptable.
+
+DELIVERY STATUS PROTOCOL:
+Single grey tick   ✓   → Message sent to server (server ACK)
+Double grey ticks  ✓✓  → Message delivered to recipient's device
+Double blue ticks  ✓✓  → Message read by recipient (read receipt)
+```
+
+## REAL_WORLD
+WhatsApp's actual architecture:
+- **Backend:** Erlang (for massive concurrent WebSocket connection management — one Erlang node can handle 2M+ concurrent connections)
+- **Message storage:** Custom distributed store (previously Mnesia, later Riak)
+- **Encryption:** Signal Protocol (E2E encryption — WhatsApp servers literally cannot read messages)
+- **Media:** Messages themselves are tiny (text). Media is uploaded to WhatsApp's CDN directly from the sender's device, generating a URL. Only the URL is sent through the message infrastructure.
+
+## INTERVIEW
+**Q: How would you handle the "Last Seen" and online presence at scale?**
+A: Use a Redis hash to store each user's last active timestamp: `HSET presence 123 "2025-05-28T10:30:00Z"`. Each connected WebSocket sends a heartbeat every 20 seconds; the server updates Redis. If a user's heartbeat timestamp is > 30 seconds ago, they are considered offline. This approach can handle millions of users with Redis Cluster. Never store presence in the primary relational database (too many updates per second).
+
+**Q: How do you design read receipts without a notification storm?**
+A: Batching and debouncing! Instead of sending a server notification for every message read event, the client accumulates read events for 500ms and sends them in a batch. The server receives `{conversation: 123, read_up_to: message_id: 456}` which marks all messages up to that ID as read. This reduces read receipt network traffic by 90%+.
+
+**Q: What is the difference between WebSockets and Server-Sent Events for messaging?**
+A: **WebSockets** provide a full-duplex (bi-directional) persistent connection — both client and server can send messages at any time. **Server-Sent Events (SSE)** are uni-directional (server → client only). For a chat app where the client sends messages, WebSockets are necessary. SSE works for notification-only use cases (news feeds, dashboards) where the client only receives data.

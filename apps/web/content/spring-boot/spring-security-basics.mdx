@@ -1,0 +1,166 @@
+---
+slug: "spring-security-basics"
+title: "Spring Security Basics"
+level: 4
+---
+
+## WHY
+If you deploy a Spring Boot API without any security, any anonymous user on the internet can delete your database, read all user data, and impersonate other users. Every production API needs Authentication (Who are you?) and Authorization (What are you allowed to do?).
+
+Spring Security is the de-facto standard for securing Spring applications. It provides a powerful, pluggable security filter chain that intercepts every HTTP request before it reaches your Controllers, verifying the caller's identity and permissions.
+
+## THEORY
+### The Filter Chain Architecture
+Spring Security works by installing a chain of Servlet Filters in front of your application. Every HTTP request passes through this chain in a specific order. Key filters include:
+- `UsernamePasswordAuthenticationFilter`: Handles login form submissions.
+- `BearerTokenAuthenticationFilter`: Handles JWT tokens in the `Authorization` header.
+- `AuthorizationFilter`: The last filter, which enforces access control rules on matched URLs.
+
+### Authentication vs Authorization
+- **Authentication:** Verifying identity ("I am Alice, with password 'secret123'").
+- **Authorization:** Verifying permissions ("Alice is an ADMIN and can access `/admin/dashboard`").
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-security" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The SecurityFilterChain Bean)
+In Spring Security 6 (Spring Boot 3.x), you configure security by defining a `SecurityFilterChain` bean. The old `WebSecurityConfigurerAdapter` class has been removed.
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // Disable CSRF for stateless REST APIs (we'll use JWT instead)
+            .csrf(csrf -> csrf.disable())
+            
+            // Define Authorization Rules
+            .authorizeHttpRequests(auth -> auth
+                // Public endpoints — no authentication required
+                .requestMatchers("/api/auth/**", "/api/public/**").permitAll()
+                
+                // Only users with ROLE_ADMIN can access /admin/**
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                
+                // All other endpoints require authentication
+                .anyRequest().authenticated()
+            );
+
+        return http.build();
+    }
+}
+```
+
+### Level 2 — Building Blocks (UserDetailsService)
+Spring Security needs to load user details from your database to verify the provided credentials. You implement the `UserDetailsService` interface to provide this.
+
+```java
+import org.springframework.security.core.userdetails.*;
+import org.springframework.stereotype.Service;
+
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        // Find the user in your database
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+
+        // Wrap it in Spring Security's UserDetails format
+        return org.springframework.security.core.userdetails.User.builder()
+                .username(user.getUsername())
+                .password(user.getPasswordHash()) // Must be BCrypt encoded!
+                .roles(user.getRole())            // e.g., "ADMIN", "USER"
+                .build();
+    }
+}
+```
+
+### Level 3 — Intermediate (Password Encoding)
+**NEVER store plain-text passwords in your database.** Always use BCrypt, a one-way adaptive hashing algorithm. Spring Security provides a built-in `BCryptPasswordEncoder`.
+
+```java
+@Configuration
+public class SecurityConfig {
+
+    // Define BCryptPasswordEncoder as a Bean so it can be injected anywhere
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder(12); // Work factor: 12 (higher = slower = safer)
+    }
+}
+
+@Service
+public class AuthService {
+    
+    private final PasswordEncoder passwordEncoder;
+
+    public void registerUser(String rawPassword) {
+        // Hash the password before saving to DB
+        String hash = passwordEncoder.encode(rawPassword); // "$2a$12$abc123..."
+        userRepository.save(new User(hash));
+    }
+
+    public boolean verifyPassword(String rawPassword, String storedHash) {
+        // BCrypt compares the raw password against the stored hash
+        return passwordEncoder.matches(rawPassword, storedHash);
+    }
+}
+```
+
+### Level 4 — Advanced (Method-Level Security with @PreAuthorize)
+Instead of configuring URL patterns in `SecurityFilterChain`, you can secure individual methods using annotations. This is much more granular.
+
+```java
+// Enable this in your Security config class
+@EnableMethodSecurity
+
+// In your Service or Controller:
+@Service
+public class AdminService {
+
+    // Only executes if the logged-in user has the ROLE_ADMIN role
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteAllUsers() {
+        userRepository.deleteAll();
+    }
+
+    // Only executes if the user is accessing their OWN resource
+    // #userId is a reference to the method parameter!
+    @PreAuthorize("hasRole('ADMIN') or #userId == authentication.principal.id")
+    public UserDto getUser(Long userId) {
+        return userRepository.findById(userId).map(UserDto::from).orElseThrow();
+    }
+}
+```
+
+## REAL_WORLD
+In modern REST APIs, the standard authentication mechanism is **JWT (JSON Web Tokens)**, not session-based authentication. With JWTs, the server is completely stateless: it doesn't store any user sessions in memory or in a database. Instead, it issues a signed token to the client after login. On every subsequent request, the client sends the token in the `Authorization: Bearer <token>` header. The server cryptographically verifies the token signature to confirm the user's identity.
+
+Combining Spring Security with a JWT library (like `java-jwt` from Auth0 or `nimbus-jose-jwt`) is the industry standard setup for modern microservice architectures.
+
+## INTERVIEW
+**Q: What is the difference between `permitAll()` and `anonymous()`?**
+A: `permitAll()` allows ALL users — both authenticated and anonymous. `anonymous()` allows ONLY unauthenticated (anonymous) users. So a logged-in user would be denied by `anonymous()`.
+
+**Q: Why is CSRF protection disabled for REST APIs?**
+A: CSRF attacks exploit browser cookies to make unauthorized requests. Since REST APIs use `Authorization: Bearer <JWT>` headers instead of cookies, the browser can never automatically attach the token to malicious cross-site requests. Therefore, CSRF protection is irrelevant for stateless JWT-based APIs.
+
+**Q: What is `@Secured` vs `@PreAuthorize`?**
+A: `@Secured("ROLE_ADMIN")` is the older, simpler annotation. It only supports role checks. `@PreAuthorize("hasRole('ADMIN') or #id == principal.id")` is the modern annotation that supports full SpEL (Spring Expression Language) expressions, enabling much more complex access control rules.

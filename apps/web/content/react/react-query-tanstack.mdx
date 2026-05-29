@@ -1,0 +1,149 @@
+---
+slug: "react-query-tanstack"
+title: "React Query (TanStack Query)"
+level: 4
+---
+
+## WHY
+Historically, developers fetched data in React using `useEffect` and stored the result in `useState`. They also needed a `loading` state, an `error` state, and maybe a Redux store if the data needed to be shared across pages.
+This manual approach is deeply flawed. It doesn't handle caching, it doesn't automatically retry failed requests, it doesn't background-refresh stale data, and it leads to race conditions.
+
+**TanStack Query (React Query)** completely eliminates this nightmare. It treats fetching not as "State Management", but as **"Server State Synchronization"**. It is arguably the most important library in the modern React ecosystem.
+
+## THEORY
+### The Cache is King
+React Query sits between your components and your API.
+When Component A requests data (e.g., `fetchUser(1)`), React Query fetches it, stores it in a massive internal cache, and gives it to Component A.
+If Component B suddenly mounts and requests the exact same data (`fetchUser(1)`), React Query intercepts the request. It instantly gives Component B the cached data (zero loading time!), while silently doing a background re-fetch to ensure the data is still accurate.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "StateVisualizer", "state": "react-query" }
+```
+
+## CODE
+
+### Level 1 — Queries (`useQuery`)
+You wrap your app in a `<QueryClientProvider>`. Then, you use `useQuery` to fetch data.
+A Query needs two things: a unique `queryKey` (how the cache identifies the data), and a `queryFn` (the actual Promise that fetches the data).
+
+```jsx
+import { useQuery } from '@tanstack/react-query';
+import axios from 'axios';
+
+function UserProfile({ userId }) {
+  // The magic hook!
+  const { data, isLoading, isError, error } = useQuery({
+    // The Cache Key! An array. If the userId changes, React Query 
+    // knows it's a completely different cache entry!
+    queryKey: ['user', userId],
+    // The Fetch Function
+    queryFn: () => axios.get(`/api/users/${userId}`).then(res => res.data)
+  });
+
+  if (isLoading) return <div>Loading user skeleton...</div>;
+  if (isError) return <div>Failed to load: {error.message}</div>;
+
+  return <h1>Welcome, {data.name}!</h1>;
+}
+```
+
+### Level 2 — Mutations (`useMutation`)
+While `useQuery` is for reading data (GET), `useMutation` is for creating, updating, or deleting data (POST, PUT, DELETE).
+Mutations don't run automatically on mount; they give you a trigger function (e.g., `mutate()`).
+
+```jsx
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import axios from 'axios';
+
+function AddUserForm() {
+  const queryClient = useQueryClient();
+
+  const { mutate, isPending } = useMutation({
+    // The function that executes the POST request
+    mutationFn: (newUser) => axios.post('/api/users', newUser),
+    
+    // What happens when the POST succeeds?
+    onSuccess: () => {
+      // THE MAGIC: Tell the Cache that the 'users' list is now Stale!
+      // React Query will instantly background-refresh any components 
+      // currently looking at the 'users' list!
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+    }
+  });
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    mutate({ name: "Alice", role: "Admin" });
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <button disabled={isPending}>
+        {isPending ? 'Saving...' : 'Create User'}
+      </button>
+    </form>
+  );
+}
+```
+
+### Level 3 — StaleTime vs CacheTime
+React Query is aggressive by default. The default `staleTime` is **0 milliseconds**.
+This means the instant a query finishes, it is considered "stale". If the user switches tabs and comes back, React Query will instantly trigger a background re-fetch.
+
+```jsx
+const { data } = useQuery({
+  queryKey: ['settings'],
+  queryFn: fetchSettings,
+  // Tell React Query: "This data is fresh for 5 minutes. 
+  // Do NOT re-fetch it in the background until 5 minutes pass!"
+  staleTime: 1000 * 60 * 5, 
+});
+```
+*Note:* `gcTime` (formerly `cacheTime`) is different. It determines how long the data stays in memory *after the component unmounts* before being garbage collected.
+
+### Level 4 — Optimistic Updates
+When a user clicks a "Like" button, they expect the heart icon to turn red instantly. They don't want to wait 500ms for the API to respond.
+**Optimistic Updates** manually update the cache *before* the API responds. If the API fails, it rolls the cache back to the original state.
+
+```jsx
+const { mutate } = useMutation({
+  mutationFn: likePost,
+  // Run this IMMEDIATELY when mutate() is called!
+  onMutate: async (postId) => {
+    // 1. Cancel any outgoing refetches so they don't overwrite our optimistic update
+    await queryClient.cancelQueries({ queryKey: ['posts'] });
+
+    // 2. Snapshot the previous value (in case we need to roll back)
+    const previousPosts = queryClient.getQueryData(['posts']);
+
+    // 3. Optimistically update the cache! The UI updates instantly!
+    queryClient.setQueryData(['posts'], (old) => {
+      return old.map(p => p.id === postId ? { ...p, likes: p.likes + 1 } : p);
+    });
+
+    // 4. Return a context object with the snapshotted value
+    return { previousPosts };
+  },
+  // If the mutation fails, use the context returned from onMutate to roll back
+  onError: (err, newTodo, context) => {
+    queryClient.setQueryData(['posts'], context.previousPosts);
+  },
+  // Always refetch after error or success to ensure we are perfectly synced
+  onSettled: () => {
+    queryClient.invalidateQueries({ queryKey: ['posts'] });
+  },
+});
+```
+
+## REAL_WORLD
+**The "State Management" Illusion**
+Before React Query, developers dumped all their API data into Redux.
+Once you adopt React Query, you realize that 90% of your Redux store was just cached API responses. 
+When you move API fetching to React Query, your Redux store suddenly becomes almost empty. You only need global state for true "Client State" (like `isSidebarOpen` or `theme: dark`). Because Client State is so small, you can usually drop Redux entirely and just use Zustand or Context for the remaining 10%!
+
+## INTERVIEW
+**Q: You use `useQuery` to fetch a list of Users. In a different component on the same page, you need to display just the *count* of those users. If you call `useQuery({ queryKey: ['users'] })` again in the second component, does it trigger two network requests?**
+A: **No.**
+This is the core power of React Query's deduplication. If multiple components call `useQuery` with the exact same `queryKey` at the exact same time, React Query merges them into a single network request. When the API responds, it hands the data to both components simultaneously. 
+You never need to fetch data in a parent and pass it down via props again. Any component that needs the data simply calls `useQuery` with the correct key, and the cache handles the rest!

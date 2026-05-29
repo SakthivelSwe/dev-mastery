@@ -1,0 +1,103 @@
+---
+slug: "indexes"
+title: "Database Indexes"
+level: 3
+---
+
+## WHY
+Imagine you have a physical phonebook with 10 million names, but they are arranged completely randomly (not alphabetically). If someone asks you to find "John Smith", you have to start at page 1 and read every single name until you find him. This is an $O(N)$ full table scan, and it is the #1 cause of slow databases.
+
+An **Index** is like the alphabetical sorting of that phonebook (or the index at the back of a textbook). It is a separate data structure that stores a copy of a specific column, sorted in a way that allows the database engine to find the data in $O(\log N)$ time without scanning the entire table.
+
+## THEORY
+### B-Trees (The Default Index)
+When you create a standard index in a relational database, it builds a **B-Tree** (Balanced Tree) data structure. 
+A B-Tree allows the database to perform a binary search. Instead of checking 10 million rows, the database traverses the tree, halving the search space at each step, finding the exact row in just ~24 operations.
+
+### The Cost of Indexing
+Indexes are not free! 
+1. **Storage:** An index is a literal copy of the column data. Adding 5 indexes to a table will massively increase your disk space usage.
+2. **Write Performance:** Every time you `INSERT`, `UPDATE`, or `DELETE` a row, the database must also update the B-Tree for every index attached to that table. Too many indexes will make your database writes extremely slow.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "db-indexes" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating a Basic Index)
+Let's assume we have a `users` table with 5 million rows, and clients frequently log in using their email.
+
+```sql
+-- Without an index, this query scans 5 million rows!
+SELECT * FROM users WHERE email = 'john@example.com';
+
+-- Creating a B-Tree index on the email column
+CREATE INDEX idx_users_email ON users (email);
+
+-- Now, the EXACT SAME query will find the user in milliseconds.
+-- You don't change your SELECT query; the database engine uses the index automatically.
+```
+
+### Level 2 — Building Blocks (Primary Keys and Unique Indexes)
+When you define a Primary Key or a Unique constraint, the database automatically creates a unique index behind the scenes.
+
+```sql
+CREATE TABLE products (
+    -- Automatically creates a Unique B-Tree Index!
+    id SERIAL PRIMARY KEY, 
+    
+    -- We can enforce uniqueness manually by creating a UNIQUE index
+    sku VARCHAR(50) NOT NULL
+);
+
+CREATE UNIQUE INDEX idx_products_sku ON products (sku);
+```
+A Unique Index guarantees that no two rows can have the same value in that column, and it provides the exact same read-performance benefits as a standard index.
+
+### Level 3 — Intermediate (Composite Indexes)
+What if you frequently query based on TWO columns together? 
+
+```sql
+-- Finding users in New York named John
+SELECT * FROM users WHERE city = 'New York' AND first_name = 'John';
+```
+If you only have an index on `city`, the DB uses the index to find all 500,000 users in New York, then manually scans those 500,000 to find "John". 
+
+You need a **Composite Index** (Multi-column index):
+```sql
+CREATE INDEX idx_users_city_name ON users (city, first_name);
+```
+
+**CRITICAL RULE: The Left-to-Right Rule**
+A composite index on `(A, B)` can be used to search for `A`, or for `A AND B`. It CANNOT be used to search for `B` alone! 
+If you query `WHERE first_name = 'John'`, the `idx_users_city_name` index is completely useless! Always put the most frequently queried column first.
+
+### Level 4 — Advanced (EXPLAIN ANALYZE)
+How do you know if the database is actually using your index? You ask it to explain its Query Plan.
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'john@example.com';
+```
+
+**Reading the Output:**
+- `Seq Scan on users (cost=... rows=5000000)`: **DANGER!** Sequential Scan means Full Table Scan. The index is NOT being used (or doesn't exist).
+- `Index Scan using idx_users_email`: Excellent! The DB traversed the B-Tree and fetched the row.
+- `Index Only Scan`: The Holy Grail. The query asked for data that exists *entirely* inside the index itself (e.g., `SELECT email FROM users`). The database didn't even have to look at the main table!
+
+## REAL_WORLD
+**Why isn't my Index being used?**
+Sometimes you create an index, but `EXPLAIN ANALYZE` shows a `Seq Scan`. Why? 
+The Query Planner is smart. If it estimates that your query will return 80% of the table (e.g., `WHERE status = 'ACTIVE'` and almost everyone is active), it will ignore the index! Reading from an index requires jumping back and forth on the hard drive (random I/O) to fetch the full row. If it has to read 80% of the table anyway, a Sequential Scan (reading the disk straight through) is actually faster!
+
+**Functions destroy Indexes:**
+```sql
+-- This WILL NOT use the index on email!
+SELECT * FROM users WHERE LOWER(email) = 'john@example.com';
+```
+Applying a function (`LOWER()`) to an indexed column completely invalidates the B-Tree. You must create a specific "Function-Based Index": `CREATE INDEX idx_lower_email ON users (LOWER(email));`.
+
+## INTERVIEW
+**Q: Should you put an index on a boolean column like `is_admin`?**
+A: Usually, no. This is called a "Low Cardinality" column (it only has two possible values: true or false). If 99% of your users are `is_admin = false`, an index won't help the database find them faster than a full scan. However, if you frequently query for the 1% who *are* admins, you can create a **Partial Index** (`CREATE INDEX idx_admins ON users (id) WHERE is_admin = true;`). This creates a tiny, lightning-fast index that only contains the admins!

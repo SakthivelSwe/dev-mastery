@@ -1,0 +1,132 @@
+---
+slug: "testcontainers-spring"
+title: "Testcontainers in Spring Boot"
+level: 5
+---
+
+## WHY
+Writing tests is non-negotiable. But testing a database is notoriously difficult.
+Historically, developers used an In-Memory Database (like H2) for integration tests. But H2 is not PostgreSQL. It speaks a slightly different dialect of SQL. If you write a complex query using Postgres-specific features (like JSONB or specialized indexes), your H2 test will crash, even though the code works perfectly in production!
+You need your tests to run against a real, physical PostgreSQL database. But requiring every developer on your team (and the CI/CD server) to manually install and configure Postgres on their laptop is a nightmare.
+**Testcontainers** is the ultimate solution. It is a Java library that integrates with Docker. When you run your JUnit tests, Testcontainers automatically spins up a real, physical PostgreSQL Docker container, runs your Spring Boot tests against it, and then instantly deletes the container when the tests finish!
+
+## THEORY
+### The Death of H2
+In-memory databases were necessary 10 years ago because spinning up a real database took minutes. With Docker, spinning up a real Postgres database takes 2 seconds.
+Testcontainers guarantees **Environment Parity**: Your tests execute against the exact same database engine, exact same version, and exact same configuration that runs in production.
+
+### How it integrates with Spring Boot
+Testcontainers intercepts the Spring Boot startup process. Before Spring connects to the database, Testcontainers boots the Docker container, finds out what random dynamic port Docker assigned to Postgres, and dynamically overrides the `spring.datasource.url` property in Spring Boot to point to the newly created container!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "testcontainers-flow" }
+```
+
+## CODE
+
+Setting up Testcontainers in Spring Boot 3 is incredibly elegant.
+
+### 1. The Dependencies
+Add the Testcontainers Postgres module to your `pom.xml`. (Make sure your computer actually has Docker Desktop installed and running!)
+
+```xml
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+### 2. The Integration Test
+We write a standard `@SpringBootTest`. We use the `@Testcontainers` and `@Container` annotations to manage the Docker lifecycle.
+
+```java
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@SpringBootTest
+@Testcontainers // 1. Tells JUnit 5 to enable Testcontainers support!
+public class UserRepositoryIntegrationTest {
+
+    // 2. Defines the exact Docker Image we want to run!
+    // JUnit will start this container before any tests run, and destroy it after!
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15-alpine");
+
+    @Autowired
+    private UserRepository userRepository;
+
+    // 3. MAGIC! Before Spring boots, we extract the dynamic connection details 
+    // from the Docker container and inject them into Spring's environment!
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        // Force Hibernate to create the schema in the empty test DB!
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "create-drop"); 
+    }
+
+    @Test
+    void testSaveAndFindUser() {
+        // This test is executing against a REAL PostgreSQL database running in Docker!
+        User user = new User("alice", "alice@example.com");
+        userRepository.save(user);
+
+        User foundUser = userRepository.findByEmail("alice@example.com");
+        assertEquals("alice", foundUser.getName());
+    }
+}
+```
+
+### 3. Spring Boot 3.1+ (The New Way)
+If you are using Spring Boot 3.1 or newer, the `@DynamicPropertySource` boilerplate is entirely gone! You just use `@ServiceConnection`.
+
+```java
+@SpringBootTest
+@Testcontainers
+public class UserRepositoryIntegrationTest {
+
+    @Container
+    // @ServiceConnection magically discovers it's a Postgres container, 
+    // automatically extracts the URL/Username/Password, and auto-configures the DataSource!
+    @ServiceConnection 
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15-alpine");
+
+    @Test
+    void testLogic() { ... }
+}
+```
+
+## REAL_WORLD
+**Testing Beyond Databases (Kafka & Redis)**
+Testcontainers isn't just for SQL databases. It supports almost every infrastructure tool in existence.
+If your microservice uses Apache Kafka, testing it is a nightmare. Do you mock the Kafka broker? No!
+You declare a `@Container static KafkaContainer kafka = new KafkaContainer(...)`.
+Testcontainers will spin up a real Kafka broker, ZooKeeper, and network them together. You can write an integration test that actually produces a real message, sends it through the real Dockerized Kafka broker, and asserts that your `@KafkaListener` consumed it successfully!
+This completely eliminates the phrase: *"It worked on my machine, I don't know why it failed in production."*
+
+## INTERVIEW
+**Q: You have 50 different Integration Test classes in your Spring Boot application. Each class has a `@Container static PostgreSQLContainer<?> postgres...` definition. When you run `mvn test`, the test suite takes 45 minutes to execute. You look at the Docker logs and realize Testcontainers is destroying the Postgres container and spinning up a brand new one 50 separate times! How do you optimize this so the 50 classes share a single Postgres container?**
+A: **The Singleton Container Pattern.**
+If you put `@Container` and `@Testcontainers` inside every test class, JUnit assumes you want strict isolation and will spin up a fresh database for every class. This adds massive overhead (2-3 seconds of boot time per class).
+To solve this, you use the Singleton Container Pattern.
+1. You remove `@Testcontainers` and `@Container` from all 50 test classes.
+2. You create an `abstract class AbstractIntegrationTest`.
+3. Inside this abstract class, you instantiate the `PostgreSQLContainer` manually (without annotations) and explicitly call `postgres.start()` inside a `static { }` initialization block.
+4. You make all 50 test classes `extend AbstractIntegrationTest`.
+When the very first test class executes, the JVM loads the Abstract class, triggers the static block, and boots Postgres exactly once. For the remaining 49 test classes, the JVM ignores the static block. The single Postgres container stays alive for the entire 45-minute test suite, bringing execution time down drastically! (Note: You must carefully manage data cleanup between tests using `@Transactional` or manual deletion to avoid tests interfering with each other!).

@@ -1,0 +1,105 @@
+---
+slug: "authorization-api"
+title: "API Authorization (RBAC & ABAC)"
+level: 3
+---
+
+## WHY
+Once your API knows *who* a user is (Authentication), it must determine *what* they are allowed to do. If Alice logs into your HR system, she shouldn't be able to view Bob's salary just because she is authenticated. A failure in Authorization (AuthZ) leads to IDOR (Insecure Direct Object Reference) vulnerabilities, which are consistently ranked as the #1 most critical API security flaw by OWASP.
+
+## THEORY
+### Role-Based Access Control (RBAC)
+The most common authorization pattern. Users are assigned predefined **Roles** (e.g., `Admin`, `Editor`, `Viewer`). The API checks the user's role before allowing them to execute an endpoint.
+
+### Attribute-Based Access Control (ABAC)
+RBAC is often too rigid. What if an `Editor` is only allowed to edit an article *if they are the original author*? The API must evaluate the specific **Attributes** of the resource (the article's `authorId`) against the attributes of the user (the user's `id`).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-authorization" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Simple RBAC)
+In many frameworks (like Spring Boot or NestJS), RBAC is enforced using simple decorators or annotations directly on the controller methods.
+
+```java
+@RestController
+@RequestMapping("/api/reports")
+public class ReportController {
+
+    // Any authenticated user can read the reports
+    @GetMapping
+    @PreAuthorize("hasRole('USER')")
+    public List<Report> getAllReports() { ... }
+
+    // ONLY Admins can delete reports!
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteReport(@PathVariable String id) { ... }
+}
+```
+
+### Level 2 — Building Blocks (The IDOR Vulnerability)
+Imagine a simple banking API where a user fetches their account details.
+
+```javascript
+// ❌ BAD: A classic IDOR Vulnerability
+app.get('/api/accounts/:accountId', (req, res) => {
+    // 1. We extract the account ID from the URL (/api/accounts/999)
+    const targetAccountId = req.params.accountId;
+    
+    // 2. We fetch the account from the DB
+    const account = db.accounts.findById(targetAccountId);
+    
+    // 3. We return it!
+    res.json(account);
+});
+```
+**Why is this a critical vulnerability?**
+Alice logs in. Her account ID is `123`. The frontend fetches `/api/accounts/123`. 
+Alice opens Postman, changes the URL to `/api/accounts/999`, and sends the request. Because the API never checked if Alice actually *owns* account `999`, it returns Bob's banking details to Alice!
+
+### Level 3 — Intermediate (Fixing IDOR with ABAC)
+To fix IDOR, the API must perform Attribute-Based Authorization. It must compare the currently authenticated user's ID against the owner of the resource.
+
+```javascript
+// ✅ GOOD: Enforcing Ownership (ABAC)
+app.get('/api/accounts/:accountId', (req, res) => {
+    const targetAccountId = req.params.accountId;
+    
+    // 1. Who is making this request? (Extracted securely from their JWT)
+    const currentUserId = req.user.id;
+    
+    // 2. Fetch the requested account
+    const account = db.accounts.findById(targetAccountId);
+    
+    // 3. AUTHORIZATION CHECK!
+    // Does the current user own this account? Are they a super admin?
+    if (account.ownerId !== currentUserId && req.user.role !== 'ADMIN') {
+        // Return 403 Forbidden!
+        return res.status(403).json({ error: "Access Denied." });
+    }
+    
+    res.json(account);
+});
+```
+
+### Level 4 — Advanced (Externalized Authorization - OPA)
+If you have 50 different microservices, writing `if (user.id == resource.ownerId)` inside every single service leads to massive duplication. If the business changes the rules (e.g., "Admins can no longer view private accounts on weekends"), you have to update and deploy 50 microservices.
+
+Modern enterprise architecture uses **Externalized Authorization**. 
+Tools like **OPA (Open Policy Agent)** run as a standalone sidecar next to your microservices. You write your authorization rules in a special policy language (Rego) and load them into OPA.
+
+When a request hits your microservice, the microservice pauses and asks OPA: "User 123 wants to read Article 99. Allowed?" OPA evaluates the global policies and returns a simple `True` or `False`. Your microservices no longer contain *any* authorization logic!
+
+## REAL_WORLD
+**401 Unauthorized vs 403 Forbidden**
+Many junior developers mix up these HTTP status codes.
+- **401 Unauthorized:** Actually means *Unauthenticated*. It means "I don't know who you are. Please log in." (The client forgot to send a JWT, or it expired).
+- **403 Forbidden:** Actually means *Unauthorized*. It means "I know exactly who you are, Alice, but you do not have permission to delete this file." (The client sent a valid JWT, but failed the RBAC/ABAC check).
+
+## INTERVIEW
+**Q: How do you handle authorization when a user requests a list of 10,000 items, but they are only allowed to see 50 of them? You can't fetch 10,000 items into memory and run an `if` check on every single one.**
+A: This is a classic problem known as **Data Filtering Authorization**. You must push the authorization logic down into the database query itself. Instead of fetching all items and filtering in memory, the Business Layer injects the user's ID directly into the SQL `WHERE` clause (e.g., `SELECT * FROM articles WHERE is_published = true OR author_id = ?`). The database does the heavy lifting, ensuring the user only ever receives the exact records they are authorized to see.

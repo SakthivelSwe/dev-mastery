@@ -1,0 +1,148 @@
+---
+slug: "daemonsets"
+title: "DaemonSets"
+level: 4
+---
+
+## WHY
+Some infrastructure concerns need to run on EVERY node in your cluster — log collectors, monitoring agents, security scanners, and network plugins. If you use a Deployment, you have no guarantee that every node runs the workload.
+**DaemonSets** ensure exactly ONE Pod runs on every Node in the cluster. When a new Node is added, DaemonSet automatically deploys a Pod to it. When a Node is removed, the Pod is garbage collected.
+
+## THEORY
+### DaemonSet vs Deployment
+- **Deployment:** Run N replicas, distributed as scheduler decides. Best for stateless apps.
+- **DaemonSet:** Run one Pod on EVERY node. Best for node-level agents.
+
+### Common DaemonSet Use Cases
+- **Log collection:** Fluentd, Filebeat (tails logs from each node's filesystem)
+- **Monitoring agents:** Prometheus Node Exporter, Datadog Agent
+- **Network plugins:** CNI plugins (Calico, Flannel run as DaemonSets)
+- **Security:** Falco (runtime security), Sysdig
+- **Storage:** GlusterFS or Ceph storage nodes
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "daemonset" }
+```
+
+## CODE
+
+### DaemonSet YAML
+```yaml
+# Log collection DaemonSet using Fluentd
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      name: fluentd
+  template:
+    metadata:
+      labels:
+        name: fluentd
+    spec:
+      # Allow scheduling on control-plane nodes too (optional)
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.16
+          env:
+            - name: FLUENT_ELASTICSEARCH_HOST
+              value: elasticsearch.logging.svc.cluster.local
+          resources:
+            limits:
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          volumeMounts:
+            # Mount the node's log directory to collect all container logs!
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      
+      volumes:
+        - name: varlog
+          hostPath:          # Access the actual Node's filesystem!
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+```
+
+### DaemonSet Commands
+```bash
+# Apply DaemonSet
+kubectl apply -f fluentd-daemonset.yml
+
+# View DaemonSet status
+kubectl get daemonsets -n logging
+# NAME      DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR
+# fluentd   3         3         3       3            3           <none>
+# DESIRED = number of nodes!
+
+# View Pods (one per node!)
+kubectl get pods -n logging -o wide
+# NAME            READY   STATUS    NODE
+# fluentd-abc123  1/1     Running   worker-01
+# fluentd-def456  1/1     Running   worker-02
+# fluentd-ghi789  1/1     Running   master-01
+
+# Add a new node → DaemonSet automatically adds a Pod!
+```
+
+### Targeting Specific Nodes with Node Selectors
+```yaml
+# Only run on nodes labeled 'role=worker' (not control-plane)
+spec:
+  template:
+    spec:
+      nodeSelector:
+        role: worker
+```
+
+## REAL_WORLD
+**Prometheus Node Exporter as a DaemonSet**
+Node Exporter exposes hardware and OS-level metrics from every node (CPU, memory, disk, network) for Prometheus to scrape.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+spec:
+  template:
+    spec:
+      hostNetwork: true    # Use node's network namespace (not Pod's)
+      hostPID: true        # Access host's process list for metrics
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.7.0
+          ports:
+            - containerPort: 9100
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+```
+
+## INTERVIEW
+**Q: You add a new node to your Kubernetes cluster. Which workloads automatically get scheduled on the new node, and which don't?**
+
+A: 
+**Automatically scheduled on new node:**
+- **DaemonSet Pods:** The DaemonSet controller immediately schedules a Pod on every new node. Zero action required.
+
+**NOT automatically moved:**
+- **Deployment/ReplicaSet Pods:** Existing running Pods do NOT automatically migrate to new nodes. The scheduler only places NEW Pods (from scale-out, rolling updates, or Pod restarts) on the new node. Existing Pods stay where they are unless killed and rescheduled.
+
+**To rebalance:** You can use the **Descheduler** (a separate Kubernetes tool) to automatically evict and reschedule Pods to achieve better distribution across nodes. Or manually cordon old nodes (`kubectl cordon node-name`) and drain them (`kubectl drain node-name`) to force rescheduling.
+
+This is by design — unnecessarily moving running Pods would cause brief downtime and is disruptive. DaemonSets need immediate presence on every node, so they're the exception.

@@ -1,0 +1,77 @@
+---
+slug: "design-google-drive"
+title: "Design Google Drive / Dropbox"
+level: 5
+---
+
+## WHY
+"Design Google Drive" (or Dropbox) is a classic System Design interview question that focuses on **Block Storage**, **Data Synchronization**, and **Network Bandwidth Optimization**.
+If a user edits a single line of text in a 500MB Word document, and your system forces them to re-upload the entire 500MB file to the cloud, your network bills will be astronomical and the user experience will be terrible. You must design a system that intelligently syncs only the changes.
+
+## THEORY
+### Block Storage vs. Object Storage
+- **Object Storage (AWS S3):** Stores files as massive, immutable objects. You cannot edit line 5 of a 10GB file in S3; you must overwrite the entire 10GB file.
+- **Block Storage (AWS EBS):** Slices a file into tiny, fixed-size blocks (e.g., 4MB). You can edit a single block without touching the rest of the file. 
+
+Google Drive uses a combination of both. It conceptually acts like Block Storage (chunking files) but physically stores the chunks in Object Storage (S3) for cheap, infinite scaling.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "google-drive" }
+```
+
+## CODE
+
+*(In a System Design interview, you don't write code, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — The Block Servers (Chunking)
+**The Explanation:**
+1. "When a user uploads a 100MB file, the Desktop Client does NOT send a 100MB HTTP request."
+2. "The Desktop Client acts as a **Block Server**. It slices the file into 4MB chunks (25 chunks total)."
+3. "The Client runs a cryptographic hash function (SHA-256) on each chunk to generate a unique `Chunk_Hash`."
+4. "The Client sends these 25 chunks to the Cloud Storage servers (AWS S3) in parallel, maximizing network throughput."
+
+### Level 2 — The Metadata Database
+We need a standard SQL database to keep track of the folders, filenames, and which chunks belong to which file.
+
+**The Explanation:**
+1. "The **Metadata DB** (PostgreSQL) has a `Files` table: `{ file_id: 1, name: "report.pdf", version: 1 }`."
+2. "It has a `Blocks` table mapping the file to its chunks: `{ file_id: 1, chunk_order: 1, chunk_hash: "abc12..." }`."
+3. "When the 25 chunks finish uploading to S3, the Cloud Storage API tells the Metadata API to update the database."
+
+### Level 3 — Delta Sync (The Magic of Dropbox)
+*The Interviewer Trap:* "The user opens the 100MB `report.pdf`, adds a single comma to the first page, and hits Save. Walk me through the upload process."
+
+**The Solution: Delta Sync.**
+1. "Because the Desktop Client sliced the file into 4MB chunks, it only recalculates the SHA-256 hashes for the chunks that changed."
+2. "It realizes that Chunk 1 has a new hash (`xyz987`), but Chunks 2-25 have the exact same hash as before."
+3. "The Client only uploads the NEW 4MB chunk (Chunk 1) to S3."
+4. "It tells the Metadata DB: *Create Version 2 of `report.pdf`. It is identical to Version 1, except `chunk_order: 1` is now pointing to `xyz987`!*"
+5. "We just saved 96MB of network bandwidth and instantly implemented Version History (Time Travel) by simply creating a new database row pointing to the old chunks!"
+
+### Level 4 — Real-Time Synchronization (WebSockets)
+*The Interviewer:* "User A is editing the file on their Laptop. User B has the exact same shared folder open on their iPad. How does the iPad know the file changed?"
+
+**The Solution:**
+1. "The iPad maintains a persistent **WebSocket** connection to our **Notification Service**."
+2. "When User A's laptop uploads the new 4MB chunk and updates the Metadata DB, the Metadata Service publishes an event to Kafka: `File 1 Updated`."
+3. "The Notification Service consumes the Kafka event, looks up who is currently online and sharing that file, and pushes a WebSocket message to the iPad: *File 1 has a new Version!*"
+4. "The iPad receives the WebSocket ping. It calls the Metadata API to find out what chunks changed, and then downloads ONLY the new 4MB chunk from S3."
+
+## REAL_WORLD
+**Deduplication (Save Billions in Storage)**
+What happens when 5 million different users all upload the exact same 1GB MP4 of a viral meme? Does Google Drive store 5 Petabytes of identical data?
+No. Because of the Chunking and Hashing architecture, they achieve massive **Deduplication**.
+
+When User B tries to upload the viral meme, their Desktop Client calculates the SHA-256 hash of the chunks. 
+Before uploading the 1GB of data, the Client sends the list of Hashes to the Metadata API. 
+The Metadata API checks the database and says: *"Wait, we already have these exact chunks stored in S3 from when User A uploaded them yesterday! Do not upload the data!"*
+The Client instantly stops uploading. The Metadata DB simply creates a new `File` row for User B, but points it to the exact same physical chunks in S3 that User A uploaded. User B's upload finishes in 0.1 seconds, and Google saves 1GB of server storage.
+
+## INTERVIEW
+**Q: A user deletes a file from their Google Drive. Do we instantly delete the chunks from AWS S3?**
+A: **No. Never delete raw data synchronously.**
+First, the user might want to restore it from the "Trash Bin" within 30 days.
+Second, because of Deduplication, another user might be secretly sharing those exact same chunks! If you delete them from S3, the other user's file is instantly corrupted.
+**The Solution:** You only "Soft Delete" the file in the Metadata DB (`is_deleted = true`). 
+A background **Garbage Collection** worker runs every night. It scans the Metadata DB. If a chunk has zero active files pointing to it, AND it has been marked deleted for over 30 days, only then does the Garbage Collector explicitly send the DELETE command to AWS S3.

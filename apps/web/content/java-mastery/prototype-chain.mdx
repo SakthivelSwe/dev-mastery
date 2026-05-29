@@ -1,0 +1,140 @@
+---
+title: prototype-chain
+slug: prototype-chain
+---
+
+# The Prototype Chain: Inheritance and V8 Hidden Classes
+
+JavaScript uses prototype-based inheritance. Every object in JavaScript has an internal link to another object called its prototype.
+
+---
+
+## 1. The `[[Prototype]]` Internal Slot and Accessors
+
+Every JavaScript object contains an internal slot called `[[Prototype]]` (specified in ECMAScript). This slot is a direct pointer to another object or `null`.
+
+```
+[myObject] 
+   |
+   +-- [[Prototype]] ----> [prototypeObject]
+                              |
+                              +-- [[Prototype]] ----> [Object.prototype]
+                                                         |
+                                                         +-- [[Prototype]] ----> null
+```
+
+* **`__proto__`**: A legacy getter/setter exposed on `Object.prototype` that acts as an accessor for the internal `[[Prototype]]` slot. It is standardized but deprecated.
+* **Modern Standard APIs**:
+  * To get an object's prototype: `Object.getPrototypeOf(obj)`
+  * To set an object's prototype: `Object.setPrototypeOf(obj, newProto)` (Warning: altering prototypes of existing objects is highly discouraged as it invalidates V8 JIT compiler optimizations).
+
+---
+
+## 2. Object Creation Mechanics
+
+### `Object.create(proto)`
+Creates a new object and sets its internal `[[Prototype]]` slot directly to the provided object `proto`.
+
+```javascript
+const proto = { greet() { return "Hello"; } };
+const obj = Object.create(proto);
+
+console.log(Object.getPrototypeOf(obj) === proto); // true
+```
+
+---
+
+### Constructor Functions and `new`
+When you invoke a constructor function with the `new` operator, the engine performs the following operations:
+
+```javascript
+function Foo(name) {
+  this.name = name;
+}
+const instance = new Foo("Alice");
+```
+
+#### Under the Hood:
+1. Creates a brand new, empty, plain JavaScript object: `{}`.
+2. Sets this new object's internal `[[Prototype]]` slot to point to the constructor function's `prototype` property: `Object.getPrototypeOf(instance) === Foo.prototype`.
+3. Binds the new object as the `this` context for the constructor function execution.
+4. Executes the constructor function.
+5. If the constructor function does not explicitly return a non-primitive object, the newly created object is returned.
+
+---
+
+## 3. The Property Lookup Algorithm
+
+When you attempt to read a property from an object (e.g., `obj.prop`), the execution engine executes the following lookup process:
+
+```javascript
+function getProperty(obj, key) {
+  // 1. Check if the property exists as an "own" property
+  if (Object.prototype.hasOwnProperty.call(obj, key)) {
+    return obj[key];
+  }
+  
+  // 2. Move up the chain
+  const proto = Object.getPrototypeOf(obj);
+  
+  // 3. If prototype is null, we reached the end of the chain
+  if (proto === null) {
+    return undefined;
+  }
+  
+  // 4. Recursively search the prototype
+  return getProperty(proto, key);
+}
+```
+
+### `hasOwnProperty()` vs. `in` Operator
+* **`in` Operator**: Returns `true` if the property is found on the object or *anywhere* along its prototype chain.
+  ```javascript
+  "toString" in {}; // true (inherited from Object.prototype)
+  ```
+* **`hasOwnProperty()` / `Object.hasOwn()`**: Returns `true` *only* if the property is defined directly on the target object itself (an "own" property).
+  ```javascript
+  ({}).hasOwnProperty("toString"); // false
+  ```
+
+---
+
+## 4. V8 Hidden Classes (Shapes/Maps) and Optimization
+
+At the C++ level, JavaScript objects do not have fixed structures. To optimize property access times, V8 avoids slow dictionary lookups by generating **Hidden Classes** (internally called **Maps** in V8 source code, defined in `src/objects/map.h`).
+
+### Property Offsets and Transitions
+An object's Hidden Class defines the layout of the object in memory. It maps property keys to specific memory offsets within the object's backing storage array.
+
+```
+Object A (empty) ---> Map 0 (no properties)
+  |
+  +-- Add property 'x' ---> Map 1 (Property 'x' at offset 0)
+  |
+  +-- Add property 'y' ---> Map 2 (Property 'x' at offset 0, 'y' at offset 1)
+```
+
+If you create two objects and add properties to them in the **exact same order**, they will share the same Hidden Class:
+
+```javascript
+const obj1 = {};
+obj1.x = 10;
+obj1.y = 20; // Map 2
+
+const obj2 = {};
+obj2.x = 30;
+obj2.y = 40; // Map 2 (Shared!)
+```
+
+However, if you add properties in a **different order**, V8 creates distinct transition paths and different Hidden Classes:
+
+```javascript
+const obj3 = {};
+obj3.y = 40; // Map 3 (Property 'y' at offset 0)
+obj3.x = 30; // Map 4 (Property 'y' at offset 0, 'x' at offset 1)
+```
+
+### Why Order Matters (Inline Caches and Deoptimization)
+When V8 compiles a function that accesses a property (e.g., `function getX(o) { return o.x; }`), it uses an **Inline Cache (IC)**. 
+* The IC remembers the Hidden Class of the objects passed to the function.
+* If

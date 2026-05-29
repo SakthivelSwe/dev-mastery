@@ -1,0 +1,139 @@
+---
+slug: "design-youtube"
+title: "Design: YouTube / Netflix"
+level: 5
+---
+
+## WHY
+Video streaming is one of the most technically demanding system design challenges. Netflix alone serves 200 million subscribers, delivering 1 Petabyte of video per day. The challenge spans distributed storage, video transcoding pipelines, adaptive bitrate streaming, CDN architecture, and recommendation systems.
+
+YouTube and Netflix share similar core challenges, making this a dual-purpose design problem.
+
+## THEORY
+### The Two Major Systems
+1. **Video Ingestion Pipeline:** When a creator uploads a video, it goes through a complex backend pipeline before going live.
+2. **Video Delivery System:** How the video is served to millions of concurrent viewers globally with minimal buffering.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "design-youtube" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Scale Estimates)
+```
+USERS: 2 billion active users per month. 500 hours of video uploaded per minute.
+
+UPLOAD SCALE:
+- 500 hours/minute = 30,000 hours/hour of video uploaded
+- A 1-hour video at 1080p ≈ 2 GB raw
+- Raw storage needed: 30,000 * 2 GB = 60 TB per hour of new content!
+- After transcoding (multiple resolutions + compression): still ~10-15 TB/hour
+
+VIEWING SCALE:
+- ~1 billion videos viewed per day
+- Peak concurrent viewers: ~30-50 million
+- Average video chunk size: 10 seconds * 5 Mbps (1080p) = 6.25 MB per chunk
+- Peak bandwidth: 50M viewers * 5 Mbps = 250 Tbps of egress! (MASSIVE CDN required)
+```
+
+### Level 2 — Building Blocks (The Video Upload Pipeline)
+```
+RAW VIDEO UPLOAD:
+Creator → Upload Service → Raw Video Storage (S3/Blob)
+                         → Video Processing Queue (Kafka)
+                         → Publish "video-uploaded" event
+
+VIDEO PROCESSING PIPELINE (The heavy lifting):
+Kafka Event → Video Transcoding Workers:
+  1. Extract metadata (duration, resolution, codec)
+  2. Generate thumbnail frames
+  3. Transcode to multiple resolutions:
+     - 4K UHD (3840×2160) @ 20 Mbps
+     - 1080p FHD (1920×1080) @ 8 Mbps
+     - 720p HD (1280×720) @ 5 Mbps
+     - 480p SD (854×480) @ 2.5 Mbps
+     - 360p Low (640×360) @ 1 Mbps
+     (This allows Adaptive Bitrate Streaming!)
+  4. Split each resolution into 10-second chunks (HLS segments)
+  5. Upload all chunks to CDN Origin Storage (S3)
+  6. Update video metadata in database (status: "ready")
+```
+
+### Level 3 — Intermediate (Adaptive Bitrate Streaming — HLS)
+```
+ADAPTIVE BITRATE STREAMING (HLS - HTTP Live Streaming):
+
+Instead of one video file, the server serves a "manifest" file (.m3u8):
+
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080
+https://cdn.youtube.com/videos/abc123/1080p/chunk000.ts
+https://cdn.youtube.com/videos/abc123/1080p/chunk001.ts
+...
+
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1280x720
+https://cdn.youtube.com/videos/abc123/720p/chunk000.ts
+
+The PLAYER (browser/app) monitors the user's download speed:
+- If downloading chunks faster than playing: switch UP to higher quality
+- If buffering: switch DOWN to lower quality
+
+This is why YouTube smoothly switches from 1080p to 480p when your WiFi gets weak!
+All without any server-side session state — pure client-side adaptation!
+
+HLS CHUNKS stored in S3:
+  /videos/abc123/
+    manifest.m3u8          ← The index file
+    1080p/
+      chunk_000.ts         ← 10-second video segment
+      chunk_001.ts
+    720p/
+      chunk_000.ts
+    480p/
+      chunk_000.ts
+```
+
+### Level 4 — Advanced (The CDN Strategy for Video)
+```
+CHALLENGE: 50 million concurrent viewers. Server bandwidth is finite!
+
+SOLUTION: Push-Based CDN (vs Pull-Based for normal content)
+
+Popular Videos (viral or new releases):
+  YouTube proactively PUSHES the video chunks to hundreds of CDN edge nodes
+  BEFORE anyone requests them, based on trending predictions.
+  Result: The video is already at the CDN edge closest to each user.
+  No origin server is ever hit.
+
+Long-tail Videos (older, less popular):
+  Pull-through CDN: The first viewer in a region triggers the CDN to fetch
+  from origin S3 and cache it locally for subsequent viewers.
+
+LIVE STREAMING (additional complexity):
+  - No chunks can be pre-generated!
+  - Broadcaster sends video stream to ingest servers
+  - Chunks are created in near real-time (2-second segments)
+  - Published to CDN edge nodes within ~10 seconds of capture
+  - Viewers experience ~10-30 second delay vs live (the "live latency")
+```
+
+## REAL_WORLD
+Netflix's CDN — called **Open Connect** — is the world's largest content delivery network:
+- Netflix owns 17,000+ custom CDN servers embedded INSIDE ISPs (Comcast, AT&T, etc.).
+- During the day, Netflix analyzes what content users are likely to watch tonight.
+- It pre-loads the predicted popular content to the embedded servers overnight.
+- By 8pm when people start watching, 95%+ of Netflix traffic is served from inside the ISP, never touching the public internet!
+- This is why Netflix can serve 200 million subscribers without owning a traditional cloud CDN.
+
+## INTERVIEW
+**Q: How does YouTube handle video search indexing?**
+A: Full-text search across billions of videos requires a massive Elasticsearch cluster. Video titles, descriptions, transcripts (auto-generated captions), and tags are indexed. YouTube also uses ML to understand video content — analyzing audio for spoken keywords, visual frames for object recognition (identifying product brands, faces, etc.), to improve search relevance beyond just text matching.
+
+**Q: What is DASH vs HLS for adaptive streaming?**
+A: Both are adaptive bitrate streaming protocols. **HLS (HTTP Live Streaming)** was developed by Apple and uses `.ts` segments. Best support on Apple devices. **DASH (Dynamic Adaptive Streaming over HTTP)** is the open standard, using `.mp4` segments. YouTube uses DASH. Both achieve the same goal. Modern players typically support both.
+
+**Q: How would you design the "Recommended Videos" system?**
+A: This is a two-stage recommendation pipeline: (1) **Candidate Generation** (fast, broad): For each user, fetch hundreds of candidate videos based on watch history, collaborative filtering (users similar to you watched these), and trending videos. (2) **Ranking** (slow, precise): Run a Deep Neural Network ranking model on the candidates, using 100+ user signals (watch time, click probability, freshness) to rank the best 10-20 recommendations. This is how Netflix and YouTube work — two separate ML models.

@@ -1,0 +1,153 @@
+---
+slug: "services-k8s"
+title: "Kubernetes Services"
+level: 3
+---
+
+## WHY
+Pods are ephemeral. When a Pod crashes and is recreated, it gets a new IP address. If your frontend sends requests directly to a Pod's IP, it will break every time that Pod is restarted.
+**Kubernetes Services** provide a stable network endpoint (IP address + DNS name) that automatically routes traffic to healthy Pods behind the scenes. Even as Pods are created, destroyed, and rescheduled, the Service IP never changes.
+
+## THEORY
+### How Services Work
+A Service uses a **selector** (label matching) to identify which Pods to send traffic to. Kubernetes' kube-proxy component maintains routing rules on every Node to forward Service traffic to the correct Pod IPs.
+
+### Service Types
+1. **ClusterIP** (default): Accessible only WITHIN the cluster. Perfect for internal communication between microservices.
+2. **NodePort**: Exposes the service on a port on every Node's IP. Accessible from outside the cluster via `NodeIP:NodePort`. Mainly for development.
+3. **LoadBalancer**: Creates a cloud load balancer (AWS ELB, GCP LB) with a public IP. The standard way to expose services to the internet in cloud environments.
+4. **ExternalName**: Maps to an external DNS name (e.g., RDS database endpoint).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-service" }
+```
+
+## CODE
+
+### ClusterIP Service (Internal)
+```yaml
+# service.yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  type: ClusterIP  # Default — only accessible within the cluster
+  selector:
+    app: api       # Routes traffic to all Pods with label app=api
+  ports:
+    - protocol: TCP
+      port: 80          # The Service listens on port 80
+      targetPort: 3000  # Forwards to container port 3000
+```
+
+```bash
+# Inside the cluster, other Pods reach this service via DNS:
+# http://api-service:80   ← by service name
+# http://api-service.default.svc.cluster.local:80  ← fully qualified DNS name
+```
+
+### LoadBalancer Service (Public)
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-loadbalancer
+spec:
+  type: LoadBalancer     # Provisions a cloud LB with a public IP!
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000
+```
+
+```bash
+kubectl apply -f service.yml
+kubectl get service api-loadbalancer
+# NAME               TYPE           CLUSTER-IP    EXTERNAL-IP     PORT(S)
+# api-loadbalancer   LoadBalancer   10.96.0.100   52.14.83.21     80:30080/TCP
+#                                                 ↑ Public IP!
+```
+
+### NodePort Service (Development)
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000
+      nodePort: 30080    # Exposed on all Nodes at port 30080 (range: 30000-32767)
+```
+
+### Service Commands
+```bash
+# List services
+kubectl get services
+kubectl get svc  # Short form
+
+# Describe service (see endpoints)
+kubectl describe service api-service
+# Shows which Pod IPs are in the routing pool!
+
+# Get endpoints (Pod IPs the service routes to)
+kubectl get endpoints api-service
+
+# Port-forward for local access (development!)
+kubectl port-forward service/api-service 8080:80
+# Now localhost:8080 routes to the service!
+```
+
+## REAL_WORLD
+**Headless Services (StatefulSets)**
+For StatefulSets (databases), you sometimes need to reach individual Pods directly (e.g., reading from a specific replica). A **headless service** (`clusterIP: None`) doesn't do load balancing — it returns the IP addresses of all matching Pods via DNS.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None  # Headless!
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+```
+
+DNS then returns A records for each Pod:
+- `postgres-0.postgres.default.svc.cluster.local` → Pod 0's IP
+- `postgres-1.postgres.default.svc.cluster.local` → Pod 1's IP
+
+Applications can then connect to a specific replica (e.g., the primary database, not a read replica).
+
+## INTERVIEW
+**Q: You have a Deployment with 3 Pods. You create a LoadBalancer Service. A user reports that their session data (stored in memory) is lost randomly. What is the cause and how do you fix it?**
+A: The cause is **stateless load balancing**. The Service distributes requests across all 3 Pods using round-robin. If the user's first request goes to Pod A and sets session data in memory, their second request might go to Pod B or Pod C, which have no knowledge of that session. Session data is lost.
+
+**Fix:**
+1. **Session affinity (Sticky Sessions):** Configure the Service with `sessionAffinity: ClientIP`. This ensures requests from the same client IP always route to the same Pod. But this breaks load balancing and Pod restarts still lose sessions.
+
+2. **(Better) External session storage:** Move session data out of Pod memory into Redis or a database. All Pods read/write sessions from the same Redis instance. Any Pod can serve any request. This is the correct stateless architecture for Kubernetes.
+
+```yaml
+spec:
+  sessionAffinity: ClientIP  # Quick fix
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+```
+
+```javascript
+// Better fix: Store sessions in Redis
+const session = require('express-session');
+const RedisStore = require('connect-redis')(session);
+app.use(session({ store: new RedisStore({ client: redisClient }) }));
+```

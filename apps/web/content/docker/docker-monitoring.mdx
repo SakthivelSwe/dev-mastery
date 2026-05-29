@@ -1,0 +1,143 @@
+---
+slug: "docker-monitoring"
+title: "Docker Monitoring"
+level: 4
+---
+
+## WHY
+Running containers in production without monitoring is flying blind. You need to know: Is my container consuming too much CPU? Is it about to run out of memory? Is it handling requests or is it unhealthy? Are my containers even running?
+**Docker Monitoring** provides real-time visibility into your containers' resource usage and health, enabling proactive issue resolution before users are impacted.
+
+## THEORY
+### What to Monitor
+- **CPU Usage:** Abnormal spikes indicate load issues or runaway processes
+- **Memory Usage:** Containers approaching their limit will be OOM-killed
+- **Network I/O:** Unusual traffic patterns indicate issues
+- **Disk I/O:** High disk writes can indicate logging issues or database problems
+- **Container Status:** Is it running? Healthy? Restarting?
+- **Process Count:** Process leaks inside containers
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-monitoring" }
+```
+
+## CODE
+
+### Built-in Docker Stats
+```bash
+# Real-time resource usage for all containers
+docker stats
+
+# Output:
+# CONTAINER   CPU%  MEM USAGE/LIMIT    MEM%   NET I/O     BLOCK I/O
+# api         25%   256MiB / 512MiB    50%    1.2GB/800MB 120MB/5MB
+# db          5%    512MiB / 2GiB      25%    200MB/500MB 20GB/8GB
+
+# Single container, one snapshot
+docker stats --no-stream api
+
+# Format output
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+```
+
+### Prometheus + cAdvisor (Standard Production Stack)
+```yaml
+# docker-compose.monitoring.yml
+services:
+  # cAdvisor: Exposes Docker container metrics for Prometheus
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8080:8080"
+
+  # Prometheus: Scrapes and stores metrics
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  # Grafana: Beautiful dashboards
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+```
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+```
+
+### Health Check Monitoring Script
+```bash
+#!/bin/bash
+# Simple health monitoring script
+
+CONTAINERS="api db redis"
+ALERT_EMAIL="ops@mycompany.com"
+
+for container in $CONTAINERS; do
+  STATUS=$(docker inspect --format='{{.State.Health.Status}}' $container 2>/dev/null)
+
+  if [ "$STATUS" == "unhealthy" ] || [ "$STATUS" == "" ]; then
+    echo "ALERT: Container '$container' is $STATUS!"
+    # Send alert (email, Slack, PagerDuty, etc.)
+    curl -X POST https://hooks.slack.com/services/... \
+      -d "{\"text\": \"🚨 Container '$container' is $STATUS!\"}"
+  fi
+done
+```
+
+## REAL_WORLD
+**Grafana Dashboard for Docker**
+In production, import the pre-built "Docker and system monitoring" dashboard (ID: 893) into Grafana. It automatically shows:
+- CPU % per container over time
+- Memory usage with limit overlay
+- Network I/O per container
+- Container restart count (crucial — frequent restarts = crashing app!)
+
+Set up Grafana alerts:
+- Alert when any container restarts more than 3 times in 5 minutes → PagerDuty
+- Alert when memory > 90% of limit → Slack #ops channel
+- Alert when container is unhealthy for more than 2 minutes → PagerDuty
+
+## INTERVIEW
+**Q: You receive an alert that one of your API containers is consuming 95% of its memory limit and will soon be OOM-killed. What's your immediate response and long-term fix?**
+
+**Immediate response:**
+```bash
+# 1. Get current state
+docker stats api --no-stream
+docker exec api ps aux | sort -k 4 -r | head -10  # Top memory consumers
+
+# 2. Check recent logs for memory-related errors
+docker logs --since=30m api | grep -i "memory\|heap\|oom"
+
+# 3. Quick mitigation: Restart the container (temporary!)
+docker restart api
+# OR if you can scale: add another instance temporarily
+docker run -d --name api-2 -p 8081:8080 my-api:current
+```
+
+**Long-term fix:**
+1. **Profile the application** for memory leaks (heap dumps, APM tools)
+2. **Increase the memory limit** if the app's requirements legitimately grew
+3. **Fix the memory leak** in the application code (most common root cause)
+4. **Implement circuit breakers** to prevent memory-intensive operations from running during high load
+5. **Set up Prometheus alerts** earlier (e.g., alert at 80% to give time to investigate before OOM kill)

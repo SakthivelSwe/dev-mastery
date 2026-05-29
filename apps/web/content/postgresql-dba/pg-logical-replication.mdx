@@ -1,0 +1,91 @@
+---
+slug: "pg-logical-replication"
+title: "PostgreSQL Logical Replication"
+level: 4
+---
+
+## WHY
+Standard Streaming Replication (Physical Replication) creates an exact byte-for-byte clone of your entire database server. You cannot replicate just one database, or just one table. You cannot replicate from Postgres 14 to Postgres 15. The replica is strictly read-only.
+What if you have a massive `orders` table in your main database, and you want to replicate *only* that table to a completely separate Data Warehouse database that allows analysts to write their own custom tables next to it? 
+You need **Logical Replication**.
+
+## THEORY
+### The Publisher and Subscriber Model
+Logical Replication uses a Publish/Subscribe model.
+Instead of copying binary files, the Primary server (Publisher) reads the Write-Ahead Log (WAL), mathematically decodes the binary data back into logical SQL commands (`INSERT`, `UPDATE`, `DELETE`), and sends those commands over the network.
+The Standby server (Subscriber) receives the SQL commands and simply executes them locally!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-logical-replication" }
+```
+
+## CODE
+
+### Level 1 — Creating the Publisher
+First, you must ensure the Primary server is configured to generate the extra WAL data required for logical decoding.
+```ini
+# postgresql.conf on the Publisher
+wal_level = logical
+```
+
+Then, you create a Publication. You can publish all tables, or specific tables.
+```sql
+-- Create a publication that only publishes the 'users' and 'orders' tables
+CREATE PUBLICATION analytics_pub FOR TABLE users, orders;
+```
+
+### Level 2 — Creating the Subscriber
+On the destination server (which can be a totally different Postgres version or OS), you must first manually create the tables. **Logical Replication does NOT copy the schema (CREATE TABLE)!**
+
+```sql
+-- On the Subscriber Database (must match the Publisher's schema exactly)
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT);
+
+-- Subscribe to the Publisher!
+-- As soon as this runs, Postgres will automatically connect, download a snapshot 
+-- of the current data, and then begin streaming real-time updates!
+CREATE SUBSCRIPTION analytics_sub
+CONNECTION 'host=10.0.0.1 dbname=main_db user=repl_user password=secret'
+PUBLICATION analytics_pub;
+```
+
+### Level 3 — Replica Identity (The Update Problem)
+When the Publisher executes an `UPDATE users SET name = 'Bob' WHERE id = 5`, how does the Subscriber know *which* row to update?
+It relies on the **Replica Identity**, which defaults to the `PRIMARY KEY`.
+If your table does NOT have a Primary Key (or a Unique Index), Logical Replication will crash the moment an `UPDATE` or `DELETE` occurs!
+
+```sql
+-- If a table has no Primary Key, you must change the Replica Identity to FULL.
+-- This forces Postgres to log the ENTIRE row state in the WAL on every update,
+-- which consumes massive amounts of disk space. Always use Primary Keys!
+ALTER TABLE log_events REPLICA IDENTITY FULL;
+```
+
+### Level 4 — Row Filters and Column Lists (Postgres 15+)
+Modern Postgres allows incredibly granular replication. What if you only want to replicate `orders` that are greater than $100? Or what if you want to replicate the `users` table, but hide the `password_hash` column from the Data Warehouse?
+
+```sql
+-- Column Filtering: Only replicate ID and Name
+-- Row Filtering: Only replicate rows where tenant_id is 5
+CREATE PUBLICATION safe_tenant_pub FOR TABLE users (id, name) WHERE (tenant_id = 5);
+```
+This is a game-changer for building Multi-Tenant SaaS architectures or complying with GDPR, as the sensitive data never even leaves the Primary database server!
+
+## REAL_WORLD
+**Zero-Downtime Upgrades**
+The killer feature of Logical Replication is major version upgrades.
+You have a 5TB Postgres 12 database. You want to upgrade to Postgres 16.
+1. Spin up a Postgres 16 server.
+2. Setup Logical Replication from v12 to v16.
+3. Wait for v16 to catch up.
+4. Point your web application to the new v16 server.
+5. Turn off the v12 server.
+You just executed a major version database upgrade with literally zero seconds of downtime!
+
+## INTERVIEW
+**Q: You set up Logical Replication. A developer accidentally runs a massive `DELETE FROM users` on the Subscriber database. What happens to the replication process?**
+A: **Replication breaks (Conflict).**
+Unlike Physical Replication (where the standby is strictly read-only), a Logical Replica is fully writeable. If a developer deletes a user (e.g., `id = 10`) on the Subscriber, and then later the Publisher updates that same user, the replication process will throw an error: `tuple not found for update`. The background replication worker will crash and continuously retry, causing replication lag to spike infinitely.
+To fix this, you must either manually re-insert the missing row on the Subscriber, or temporarily tell the Subscription to skip the conflicting transaction using `ALTER SUBSCRIPTION ... SKIP`. To prevent this entirely, you should revoke write permissions for human users on the replicated tables in the Subscriber database!

@@ -1,0 +1,140 @@
+---
+slug: "weakref-and-finalizationregistry"
+title: "WeakRef and FinalizationRegistry"
+level: 4
+---
+
+## WHY
+In JavaScript, memory management is handled automatically by the Garbage Collector (GC). If an object is no longer accessible (no variables point to it), the GC sweeps it out of memory to prevent the browser from crashing.
+Normally, if you hold a reference to a massive 50MB Image object in a caching Map or an array, the Garbage Collector is completely forbidden from deleting it, even if the image is no longer on the screen! This is the #1 cause of Memory Leaks in Single Page Applications.
+ES2021 introduced **WeakRef** and **FinalizationRegistry** to allow developers to reference massive objects *without* preventing the Garbage Collector from destroying them!
+
+## THEORY
+### Strong vs. Weak References
+- **Strong Reference:** The default in JavaScript. `const x = { data: "huge" }`. The GC sees that `x` is holding the object, so it will *never* delete it.
+- **Weak Reference:** A special reference that does not count towards the GC. You tell the engine: *"I want to keep track of this object if it's still around, but if the system is running out of memory, feel free to delete it. I won't stop you."*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "MemoryVisualizer", "state": "weak-references" }
+```
+
+## CODE
+
+### Level 1 — The Problem (Strong Reference Memory Leak)
+Imagine we load massive 4K images into a cache so we don't have to re-download them.
+
+```javascript
+// A global cache holding Strong References
+const imageCache = new Map();
+
+function loadImage(imageName) {
+  // Create a massive 50MB object
+  const imageData = new Uint8Array(50_000_000); 
+  
+  // Save it in the cache
+  imageCache.set(imageName, imageData); 
+  return imageData;
+}
+
+loadImage('mountain.jpg');
+loadImage('ocean.jpg');
+// Even if the user navigates to a new page and the images leave the DOM,
+// the 'imageCache' Map is still holding Strong References!
+// The 100MB of RAM will NEVER be freed. The browser eventually crashes!
+```
+
+### Level 2 — `WeakRef` (The Solution)
+We wrap the massive object in a `WeakRef`. Now, the cache is not forcing the object to stay alive!
+
+```javascript
+const imageCache = new Map();
+
+function getCachedImage(imageName) {
+  // 1. Check if we have a WeakRef for this image
+  const weakRef = imageCache.get(imageName);
+
+  if (weakRef) {
+    // 2. We MUST call .deref() to check if the object still exists!
+    // If the Garbage Collector ran, .deref() returns 'undefined'!
+    const image = weakRef.deref();
+    
+    if (image) {
+      console.log("Cache Hit! Image is still in memory.");
+      return image;
+    } else {
+      console.log("Cache Miss! The GC deleted the image. We must download it again.");
+      // Clean up the dead WeakRef from the map
+      imageCache.delete(imageName); 
+    }
+  }
+
+  // 3. Image wasn't in cache (or was deleted). Create it!
+  const newImage = new Uint8Array(50_000_000);
+  
+  // 4. Wrap it in a WeakRef before saving it!
+  imageCache.set(imageName, new WeakRef(newImage));
+  
+  return newImage;
+}
+```
+*How it works:* If the user is actively using the `newImage` variable on the screen, a Strong Reference exists elsewhere, so the GC leaves it alone. The moment the user stops looking at the image and the Strong References disappear, the GC sweeps the image out of RAM. The `WeakRef` inside our cache silently becomes empty!
+
+### Level 3 — `FinalizationRegistry` (The Cleanup Crew)
+In the previous example, if the GC deletes the image, our `imageCache` Map still holds the empty `WeakRef` object itself. Over time, the Map will fill up with thousands of useless, empty WeakRefs.
+We need a way to be notified the exact moment the GC destroys our object so we can clean up our Map!
+Enter the **FinalizationRegistry**. It allows you to register a callback that fires *after* the Garbage Collector destroys an object!
+
+```javascript
+const imageCache = new Map();
+
+// 1. Create the Cleanup Crew! 
+// The callback receives a custom 'key' we define.
+const cleanupCrew = new FinalizationRegistry((imageNameKey) => {
+  console.log(`GC just destroyed ${imageNameKey}! Removing empty WeakRef from Map.`);
+  imageCache.delete(imageNameKey); // Delete the empty wrapper!
+});
+
+function cacheImage(imageName, imageData) {
+  imageCache.set(imageName, new WeakRef(imageData));
+
+  // 2. Tell the Cleanup Crew to watch this massive object!
+  // If 'imageData' gets garbage collected, fire the callback and pass 'imageName' to it!
+  cleanupCrew.register(imageData, imageName);
+}
+```
+
+### Level 4 — WeakMap and WeakSet
+Before ES2021 introduced `WeakRef`, JavaScript developers relied on `WeakMap` and `WeakSet`. 
+A `WeakMap` is a specialized dictionary where the **Keys MUST be Objects** (not strings). If the object used as the key is garbage collected, the entire Key-Value pair is automatically instantly deleted from the WeakMap!
+
+```javascript
+// A Map where keys are weakly held
+const userActiveSessions = new WeakMap();
+
+function createSession(userObject) {
+  // We use the entire Object as the key!
+  userActiveSessions.set(userObject, { lastLogin: Date.now(), token: "xyz" });
+}
+
+let user = { id: 1, name: "Alice" };
+createSession(user);
+
+// Later in the app, Alice logs out and we delete her object:
+user = null;
+
+// MAGIC: Because 'user' was garbage collected, 'userActiveSessions' instantly 
+// and automatically deletes the { lastLogin, token } data to free memory!
+```
+
+## REAL_WORLD
+**When NOT to use WeakRef**
+The official MDN documentation for `WeakRef` begins with a massive warning: *"Avoid where possible"*.
+Garbage Collection in JavaScript is entirely non-deterministic. You have absolutely zero control over when the GC runs. It might run instantly, it might run in 5 minutes, or it might never run at all if the browser has plenty of RAM.
+If your application logic *depends* on `WeakRef.deref()` returning undefined or `FinalizationRegistry` callbacks firing to execute core business logic, your app will fail randomly. These tools should ONLY be used for invisible performance optimizations (like caches), where the app works perfectly fine regardless of whether the cache is full or empty.
+
+## INTERVIEW
+**Q: You use a `WeakRef` to hold a massive array. You wrap your entire codebase in a loop, continuously calling `const arr = weakRef.deref()`, waiting to see when the Garbage Collector deletes it so you can measure how fast the GC is. However, `deref()` NEVER returns `undefined`. The object is never collected. Why?**
+A: **The Current Event Loop Execution constraints.**
+JavaScript engine specifications guarantee that a `WeakRef` will *never* be cleared while the current synchronous execution context (the current task on the Event Loop) is still running. 
+Because you are calling `deref()` inside an infinite synchronous `while` loop (or constantly within the exact same Call Stack execution), you are preventing the Event Loop from finishing. The Garbage Collector is generally prevented from sweeping objects from under your feet while a single synchronous script is actively executing, to prevent race conditions. The GC will only sweep the object during idle time *between* tasks on the Event Loop!

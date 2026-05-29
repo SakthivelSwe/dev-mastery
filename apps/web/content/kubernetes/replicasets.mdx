@@ -1,0 +1,107 @@
+---
+slug: "replicasets"
+title: "ReplicaSets"
+level: 3
+---
+
+## WHY
+You almost never work with ReplicaSets directly — Deployments manage them for you. But understanding what ReplicaSets are and how they work explains WHY Kubernetes self-healing and rolling updates work the way they do.
+
+## THEORY
+### The ReplicaSet Contract
+A ReplicaSet's sole responsibility is one guarantee: **"At any given moment, exactly N copies of this Pod must be running."**
+
+If a Pod crashes → ReplicaSet creates a new one. If you manually delete a Pod → ReplicaSet creates a replacement. If a Node dies → ReplicaSet reschedules the Pods on other Nodes.
+
+### How Deployments Use ReplicaSets
+- **Deployment v1 creates ReplicaSet A** (manages Pods running v1.0 image, replicas=3)
+- **When you update the Deployment image**, Kubernetes creates **ReplicaSet B** (manages Pods running v2.0 image)
+- During rolling update: RS-A scales down (3→2→1→0), RS-B scales up (0→1→2→3)
+- **Old RS-A is kept** (at 0 replicas) for rollback! That's why `kubectl rollout undo` is instant.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "replicaset" }
+```
+
+## CODE
+
+### ReplicaSet YAML (Rarely Used Directly)
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api-replicaset
+spec:
+  replicas: 3             # Always maintain exactly 3 Pods!
+  selector:
+    matchLabels:
+      app: api
+      version: "1.0"      # Label selector — ReplicaSet manages Pods with this label
+  template:
+    metadata:
+      labels:
+        app: api
+        version: "1.0"    # Pods must have labels matching the selector!
+    spec:
+      containers:
+        - name: api
+          image: my-api:1.0.0
+```
+
+### Viewing ReplicaSets
+```bash
+# List all ReplicaSets
+kubectl get replicasets
+kubectl get rs   # Short form
+
+# After a Deployment rolling update, you'll see TWO ReplicaSets:
+kubectl get rs
+# NAME                         DESIRED   CURRENT   READY
+# api-deployment-abc123         3         3         3    ← Current (v2.0)
+# api-deployment-def456         0         0         0    ← Old (v1.0) kept for rollback!
+
+# Describe to see which Pods a ReplicaSet manages
+kubectl describe rs api-deployment-abc123
+
+# Check owner reference (which Deployment owns this RS)
+kubectl get rs api-deployment-abc123 -o yaml | grep -A5 ownerReferences
+```
+
+### The Label Selector Danger
+```bash
+# ReplicaSets use label selectors to identify "their" Pods.
+# If you manually create a Pod with matching labels,
+# the ReplicaSet will count it as one of its managed Pods!
+
+# Example: ReplicaSet wants 3 replicas, currently has 3.
+# You manually create a Pod with label app=api:
+kubectl run extra-pod --image=nginx --labels=app=api
+
+# Now the RS sees 4 Pods matching its selector.
+# To maintain 3, it DELETES one of them!
+```
+
+## REAL_WORLD
+**Why Old ReplicaSets Are Kept**
+Kubernetes keeps a history of old ReplicaSets (controlled by `revisionHistoryLimit`, default=10) to enable instant rollbacks.
+
+`kubectl rollout undo deployment/api` doesn't rebuild the old image — it simply scales up the old ReplicaSet (already configured, just at 0 replicas) and scales down the new one. The rollback happens in seconds.
+
+To save etcd space, reduce the history:
+```yaml
+spec:
+  revisionHistoryLimit: 3  # Only keep last 3 RS versions (can only rollback 3 times)
+```
+
+## INTERVIEW
+**Q: A Deployment has 3 Pods running. You manually delete one of the Pods using `kubectl delete pod`. What happens next? And why?**
+A: Kubernetes **immediately creates a new replacement Pod**. This happens within seconds.
+
+The mechanism: The ReplicaSet controller is continuously watching (via the Kubernetes API server watch mechanism) for Pods that match its selector. When you delete the Pod, the API server notifies the ReplicaSet controller. The controller compares:
+- Desired state: 3 Pods
+- Actual state: 2 Pods
+
+The reconciliation loop detects the discrepancy and creates a Pod specification. The scheduler assigns it to a Node, the kubelet on that Node pulls the image and starts the container. The process takes seconds.
+
+This is the fundamental self-healing property of Kubernetes: the desired state always wins. No matter what causes the actual state to diverge (Pod crash, manual deletion, Node failure), Kubernetes continuously reconciles.

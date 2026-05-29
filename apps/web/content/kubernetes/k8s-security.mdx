@@ -1,0 +1,127 @@
+---
+slug: "k8s-security"
+title: "Kubernetes Security"
+level: 5
+---
+
+## WHY
+A compromised Kubernetes cluster is catastrophic. A single vulnerable container that escapes to the host can give attackers access to all your data, all your services, and the ability to pivot to other cloud resources. Kubernetes security is layered defense — securing the control plane, API access, Pods, images, and network.
+
+## THEORY
+### Security Layers
+1. **Cluster access:** Who can call the API server? (RBAC, authentication)
+2. **Pod security:** What can containers do on the host? (SecurityContext, Pod Security Standards)
+3. **Image security:** Are container images trusted and vulnerability-free?
+4. **Network security:** Which Pods can talk to which? (NetworkPolicy)
+5. **Secrets management:** How are sensitive values stored? (Secrets + external stores)
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SecurityVisualizer", "state": "k8s-security" }
+```
+
+## CODE
+
+### Pod Security Context
+```yaml
+spec:
+  containers:
+    - name: api
+      image: my-api:1.0.0
+      securityContext:
+        runAsNonRoot: true           # Never run as root (UID 0)!
+        runAsUser: 1000              # Specific non-root user
+        runAsGroup: 1000
+        readOnlyRootFilesystem: true # Container FS is read-only!
+        allowPrivilegeEscalation: false  # Can't gain more privileges
+        capabilities:
+          drop: ["ALL"]              # Drop ALL Linux capabilities
+          add: ["NET_BIND_SERVICE"]  # Only add what's needed
+      
+      # If using read-only FS, mount writable volume for tmp/logs
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  
+  volumes:
+    - name: tmp
+      emptyDir: {}
+
+  securityContext:
+    # Pod-level: applies to all containers
+    fsGroup: 1000  # Shared group for volume ownership
+    seccompProfile:
+      type: RuntimeDefault  # Use container runtime's default seccomp
+```
+
+### Pod Security Standards (Namespace Level)
+```yaml
+# Apply security policies to an entire namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    # Enforce: reject Pods that violate the policy
+    pod-security.kubernetes.io/enforce: restricted  
+    # Warn: allow but warn on violations
+    pod-security.kubernetes.io/warn: restricted
+    # Audit: log violations
+    pod-security.kubernetes.io/audit: restricted
+# 'restricted' policy: the strictest setting. Requires runAsNonRoot,
+# drops all capabilities, disallows privileged containers, etc.
+```
+
+### Image Security Scanning
+```bash
+# Scan images for vulnerabilities before deploying
+# Using Trivy (free, open source)
+docker pull aquasec/trivy
+
+# Scan an image
+trivy image my-api:1.0.0
+# Output:
+# my-api:1.0.0 (debian 11.7)
+# Total: 4 (HIGH: 2, CRITICAL: 2)
+# ┌────────────┬───────────┬──────────┬──────────────┐
+# │ Library    │ Vuln ID   │ Severity │ Fixed Version│
+# ├────────────┼───────────┼──────────┼──────────────┤
+# │ openssl    │ CVE-2023-X│ CRITICAL │ 1.1.1t       │
+
+# Integrate into CI pipeline:
+# GitHub Actions step:
+# - uses: aquasecurity/trivy-action@master
+#   with:
+#     image-ref: my-api:${{ github.sha }}
+#     exit-code: '1'                     # Fail CI on CRITICAL vulnerabilities!
+#     severity: 'CRITICAL,HIGH'
+```
+
+## REAL_WORLD
+**Security Hardening Checklist**
+```
+□ RBAC: Principle of least privilege for all ServiceAccounts
+□ Pod Security Standards: 'restricted' for production namespaces
+□ NetworkPolicy: Default-deny all, whitelist specific paths
+□ Secrets: External secrets manager (Vault/AWS Secrets Manager)
+□ Image scanning: Trivy/Snyk in CI pipeline, reject CRITICAL vulns
+□ Image signing: Cosign (SLSA supply chain security)
+□ Non-root: All containers run as non-root user
+□ Read-only FS: All containers use readOnlyRootFilesystem: true
+□ Audit logging: API server audit logs enabled
+□ Node hardening: CIS Kubernetes Benchmark applied to nodes
+□ Control plane access: API server not publicly accessible (private endpoint)
+```
+
+## INTERVIEW
+**Q: A container in your production cluster has a critical vulnerability in a library (CVE). The vulnerability allows remote code execution. What is your incident response?**
+
+A: 
+1. **Isolate immediately:** NetworkPolicy to block external traffic to the vulnerable Pod(s)
+2. **Determine exposure:** Has the vulnerability been exploited? Check logs for exploitation patterns
+3. **Patch the image:** Update the library, rebuild the image, scan again with Trivy
+4. **Deploy the patched image:** Rolling update to replace vulnerable Pods
+5. **Verify:** Confirm old Pods are gone, new ones are running patched image
+6. **Post-mortem:** Why wasn't this caught by image scanning in CI? Improve pipeline to block on CRITICAL CVEs
+
+Prevention: Automate vulnerability scanning in CI and block deployment if CRITICAL/HIGH CVEs are found. Use automated image rebuild tools (Renovate, Dependabot) to keep base images updated.

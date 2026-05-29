@@ -1,0 +1,134 @@
+---
+slug: "change-streams"
+title: "MongoDB Change Streams"
+level: 4
+---
+
+## WHY
+In modern applications, users expect real-time reactivity. If an Uber driver accepts your ride, your app shouldn't force you to press a "Refresh" button to see the update. The data should instantly push to your screen.
+
+Historically, to achieve this, backend developers had to write complex polling loops (querying the database every 5 seconds to ask, "Did anything change?"). This destroyed database performance. 
+**Change Streams** allow your Node.js application to subscribe to a MongoDB collection and receive instant, real-time push notifications the exact millisecond a document is inserted, updated, or deleted!
+
+## THEORY
+### The Oplog (Operations Log)
+Change Streams are built directly on top of the MongoDB **Oplog**. 
+As we learned in the Replication module, the Oplog is the internal ledger that Primary nodes use to synchronize with Secondary nodes. When a document is updated, the Primary writes the change to the Oplog.
+
+Change Streams simply open a persistent connection (a cursor) to this Oplog. Instead of syncing another database server, the Oplog events are streamed directly over the network to your Node.js application layer!
+
+*Note: Because Change Streams rely on the Oplog, they **only work** if your MongoDB cluster is configured as a Replica Set or a Sharded Cluster. They do not work on standalone instances!*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-change-streams" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Listening to a Collection)
+Listening to a collection in Node.js is incredibly simple. It uses the standard JavaScript EventEmitter pattern.
+
+```javascript
+// 1. Target the collection you want to monitor
+const collection = db.collection('orders');
+
+// 2. Open the Change Stream
+const changeStream = collection.watch();
+
+// 3. Listen for the 'change' event!
+changeStream.on('change', (next) => {
+    console.log("A change occurred in the database!");
+    console.log("Operation Type:", next.operationType); // 'insert', 'update', 'delete', etc.
+    
+    if (next.operationType === 'insert') {
+        console.log("New document inserted:", next.fullDocument);
+    }
+});
+```
+If another developer opens a MongoDB Shell and runs `db.orders.insertOne(...)`, your Node.js console will instantly log the new document!
+
+### Level 2 — Building Blocks (Filtering the Stream)
+If your `users` collection receives 1,000 updates a second, opening a raw Change Stream will flood your Node.js server with useless events, crashing its memory. 
+
+You should always filter the Change Stream so MongoDB only sends the events you actually care about. You do this by passing a standard **Aggregation Pipeline** into the `watch()` method!
+
+```javascript
+// We only want to be notified when a HIGH VALUE order is INSERTED.
+const pipeline = [
+    { 
+        $match: { 
+            'operationType': 'insert',
+            'fullDocument.totalPrice': { $gt: 500 }
+        } 
+    }
+];
+
+const changeStream = db.collection('orders').watch(pipeline);
+
+changeStream.on('change', (next) => {
+    // Send an email to the VIP Sales Team!
+    emailService.sendVipAlert(next.fullDocument);
+});
+```
+
+### Level 3 — Intermediate (Update Document Lookups)
+When a document is *inserted*, the Change Stream event contains a `fullDocument` object representing the new data.
+
+However, when a document is *updated* (`db.users.updateOne`), MongoDB strives for maximum efficiency. The Oplog only records the *delta* (the exact fields that changed). By default, the Change Stream event will **not** contain the full document, it will only contain an `updateDescription` object showing which fields were modified.
+
+If your application needs to see the entire document after the update, you must configure `fullDocument: 'updateLookup'`.
+
+```javascript
+const changeStream = db.collection('users').watch([], {
+    // Tells MongoDB to instantly execute an extra query to fetch 
+    // the most current version of the document and attach it to the event!
+    fullDocument: 'updateLookup' 
+});
+
+changeStream.on('change', (next) => {
+    if (next.operationType === 'update') {
+        // Now you have access to the entire document, not just the delta!
+        console.log("The fully updated document is:", next.fullDocument);
+    }
+});
+```
+
+### Level 4 — Advanced (Resume Tokens)
+Networks are unstable. What happens if your Node.js server loses connection to MongoDB for 5 seconds? Does it miss the events that happened during those 5 seconds?
+
+Yes, unless you use **Resume Tokens**.
+Every single event emitted by a Change Stream contains a unique `_id` field called the Resume Token. This token acts as a bookmark in the Oplog.
+
+```javascript
+changeStream.on('change', (next) => {
+    // 1. Save this token to a persistent storage (like Redis or a file)
+    const resumeToken = next._id;
+    redis.set('lastMongoEventToken', JSON.stringify(resumeToken));
+});
+```
+If your Node.js server crashes and reboots, it can pull the last token from Redis and tell MongoDB to rewind history and replay all the events it missed while it was offline!
+
+```javascript
+const lastToken = JSON.parse(await redis.get('lastMongoEventToken'));
+
+// 2. Resume exactly where we left off!
+const changeStream = db.collection('users').watch([], {
+    resumeAfter: lastToken
+});
+```
+
+## REAL_WORLD
+**WebSockets and Reactivity**
+Change Streams are the backend mechanism for generating real-time events. To push these events all the way to the user's browser, you pair Change Streams with **WebSockets** (using a library like `Socket.io`).
+
+1. The React Frontend connects to Node.js via WebSocket.
+2. The Node.js server opens a Change Stream to MongoDB.
+3. When MongoDB fires a change event, Node.js catches it, transforms it into a WebSocket payload, and emits it to the React frontend.
+4. React updates the UI state, and the user sees the screen change instantly!
+
+## INTERVIEW
+**Q: I have 5 identical Node.js servers running behind a load balancer. I put a Change Stream in my code to send a welcome email when a user registers. But now, when a user registers, they receive 5 identical welcome emails! Why?**
+A: Because Change Streams are stateful network connections, not distributed queues! Every single Node.js server opened its own independent connection to the MongoDB Oplog. When a user is inserted, MongoDB happily streams that event to ALL 5 servers simultaneously. Each server executes the email logic. 
+
+To fix this, you should never trigger side effects (like sending emails) directly from a Change Stream in a multi-server architecture. Instead, you should use the Change Stream on a single, dedicated worker service, OR have the Change Stream push the event into a message queue (like RabbitMQ/Kafka), which then distributes a single task to the worker pool.

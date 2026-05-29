@@ -1,0 +1,86 @@
+---
+slug: "design-uber"
+title: "Design Uber / Lyft"
+level: 5
+---
+
+## WHY
+"Design Uber" is one of the most famous System Design interview questions in the world. It tests a specific, incredibly difficult architectural problem: **Real-Time Geospatial Indexing**. 
+Millions of drivers are constantly moving. A rider requests a car, and you must instantly calculate the distance between the rider and 500,000 drivers to find the closest 5. If you try to do this in a standard SQL database, the math alone will melt your servers.
+
+## THEORY
+### The Core Problem: The Geospatial Query
+If Driver A is at `[Lat: 37.77, Long: -122.41]`, and Rider B requests a ride at `[Lat: 37.78, Long: -122.40]`. 
+To find the closest drivers in a naive SQL database, you would have to calculate the Haversine formula (spherical distance) between Rider B and *every single driver in the database*.
+`SELECT * FROM drivers ORDER BY haversine_distance(rider_lat, rider_long, driver_lat, driver_long) LIMIT 5;`
+This requires a full table scan and massive CPU math for every single ride request. It is impossible to scale.
+
+### The Solution: Geohashing (or S2/H3 Geometry)
+To make geospatial searching $O(1)$, we must turn 2D coordinates into a 1D string.
+**Geohashing** divides the entire world into a grid.
+1. The world is a box. Cut it in half. Left is `0`, Right is `1`.
+2. Cut the box again horizontally. Top is `0`, Bottom is `1`.
+3. Keep dividing the boxes infinitely. A specific 10x10 meter square in San Francisco gets a unique string ID: `9q8yyk`.
+*The Magic:* If two Geohashes share a long prefix (e.g., `9q8yyk` and `9q8yyj`), they are physically close to each other on Earth!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "uber-architecture" }
+```
+
+## CODE
+
+*(In a System Design interview, you don't write code, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — Tracking Driver Locations (The Write Path)
+Drivers send their GPS coordinates to the server every 5 seconds.
+**The Explanation:**
+1. "Driver apps maintain a constant WebSockets connection to the **Location Gateway**."
+2. "Every 5 seconds, the driver pushes their Lat/Long over the WebSocket."
+3. "The Location Gateway pushes these massive streams of data into **Kafka**."
+4. "We absolutely do NOT write this stream directly into a persistent database like PostgreSQL. The write load (millions per second) would destroy it."
+5. "Instead, a cluster of worker nodes reads from Kafka and updates an In-Memory Database like **Redis**."
+`Redis.set("driver_123", {lat: 37.77, long: -122.41, geohash: "9q8yyk"})`
+
+### Level 2 — The Quadtree / Geospatial Index
+How do we actually find the closest drivers? We use a specialized in-memory data structure called a **Quadtree** (or we use Redis Geospatial capabilities built on Geohashes).
+
+**The Explanation:**
+1. "We maintain an in-memory Quadtree (or Geohash mapping). The key is the Geohash (the 10x10 meter grid). The value is a Set of Driver IDs currently inside that grid."
+`Grid "9q8yyk" -> [Driver 123, Driver 456]`
+2. "When Driver 123 moves across the street, their Geohash changes. The worker node removes them from `9q8yyk` and adds them to `9q8yyl`."
+
+### Level 3 — Matching the Rider (The Read Path)
+A rider opens the app and requests a car.
+**The Explanation:**
+1. "The Rider's app sends their Lat/Long to the **Matching Service**."
+2. "The Matching Service converts the Rider's Lat/Long into a Geohash (e.g., `9q8yyk`)."
+3. "It asks Redis/Quadtree: *Give me all drivers in grid `9q8yyk`*."
+4. "If it doesn't find enough drivers, it simply expands the search ring! It looks at the neighboring Geohashes (which is mathematically trivial because of the string prefixes)."
+5. "It instantly finds 10 nearby drivers. It then sends these 10 drivers to the **Routing Service**."
+6. "The Routing Service (using maps data) calculates the *actual* driving time (accounting for traffic, one-way streets, bridges) and selects the absolute fastest driver."
+
+### Level 4 — The Dispatch Flow (WebSockets & Sagas)
+How do we notify the driver?
+**The Explanation:**
+1. "The Matching Service selects Driver 123."
+2. "It sends a message down the WebSocket connection to Driver 123's phone: *Do you accept this ride?*"
+3. "We give the driver 10 seconds to accept. During this time, we put a temporary 'Lock' on that driver in Redis so they aren't assigned to another rider simultaneously."
+4. "If they decline (or timeout), we immediately query the Quadtree for the next closest driver and repeat the process."
+
+## REAL_WORLD
+**Uber's H3 Hexagonal Grid**
+While standard Geohashes are square grids, Uber actually invented and open-sourced their own geospatial indexing system called **H3**.
+H3 divides the world into Hexagons instead of Squares.
+Why? Because squares have a massive mathematical flaw: the distance from the center of a square to its corner is significantly longer than the distance from the center to its edge. This makes calculating exact neighbor distances wildly inaccurate. 
+A hexagon is essentially a circle. The distance from the center of a hexagon to *any* of its neighboring hexagons is mathematically identical! This makes Uber's geospatial clustering and machine learning algorithms (like surge pricing calculations) infinitely more accurate.
+
+## INTERVIEW
+**Q: During New Year's Eve, millions of people request rides simultaneously. Our Redis clusters managing the Quadtrees run out of memory and CPU, crashing the system. How do you scale the Geospatial Index?**
+A: **Geospatial Sharding.**
+You cannot store the entire planet's driver locations on a single Redis server. You must shard the cache geographically.
+You use a **City-Based Sharding** strategy. 
+1. Redis Server 1 handles ONLY the Geohashes inside San Francisco.
+2. Redis Server 2 handles ONLY New York City. 
+Because a driver in San Francisco will never be matched with a rider in New York, the data sets are perfectly isolated and independent! 
+*(Follow up trap: What if a driver drives from SF to LA?) -> You write logic in the Location Gateway that detects the massive Geohash change, and seamlessly migrates their session from the SF Redis shard to the LA Redis shard!*

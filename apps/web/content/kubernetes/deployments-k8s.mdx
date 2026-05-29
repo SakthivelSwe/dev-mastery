@@ -1,0 +1,155 @@
+---
+slug: "deployments-k8s"
+title: "Kubernetes Deployments"
+level: 3
+---
+
+## WHY
+You almost never create raw Pods directly. If you do and a Pod crashes, Kubernetes doesn't recreate it — it's just gone.
+**Deployments** are the standard way to run applications in Kubernetes. A Deployment tells Kubernetes: "I want 3 replicas of this Pod to always be running. If one crashes, create a new one. When I update the image, do a rolling update with zero downtime."
+Deployments are the core of Kubernetes self-healing and rolling update capabilities.
+
+## THEORY
+### How Deployments Work
+A Deployment manages a **ReplicaSet**, which in turn manages the actual Pods.
+- **Deployment:** Defines the desired state (which image, how many replicas, update strategy)
+- **ReplicaSet:** Ensures the exact number of Pod replicas are running at all times
+- **Pods:** The actual running containers
+
+### Rolling Update Strategy
+By default, when you update a Deployment's image, Kubernetes:
+1. Creates 1 new Pod with the new image
+2. Waits for it to become Ready
+3. Terminates 1 old Pod
+4. Repeats until all Pods are updated
+5. Zero downtime throughout the entire process!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-deployment" }
+```
+
+## CODE
+
+### Deployment YAML
+```yaml
+# deployment.yml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-deployment
+  labels:
+    app: api
+spec:
+  replicas: 3                 # Always keep 3 Pods running!
+  selector:
+    matchLabels:
+      app: api                # This Deployment manages Pods with label app=api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1             # Create at most 1 extra Pod during update
+      maxUnavailable: 0       # Never take down a Pod until a new one is ready (zero downtime!)
+  template:
+    metadata:
+      labels:
+        app: api              # Pods get this label (must match selector above)
+    spec:
+      containers:
+        - name: api
+          image: my-api:1.0.0
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+```
+
+### Deployment Commands
+```bash
+# Create/update the deployment
+kubectl apply -f deployment.yml
+
+# Check deployment status
+kubectl get deployments
+# NAME             READY   UP-TO-DATE   AVAILABLE
+# api-deployment   3/3     3            3
+
+# Watch rolling update progress
+kubectl rollout status deployment/api-deployment
+
+# Update the image (triggers rolling update!)
+kubectl set image deployment/api-deployment api=my-api:2.0.0
+
+# Watch the rollout (very satisfying!)
+kubectl rollout status deployment/api-deployment
+# Waiting for deployment "api-deployment" rollout to finish: 1 out of 3 new replicas have been updated...
+# Waiting for deployment "api-deployment" rollout to finish: 2 out of 3 new replicas have been updated...
+# deployment "api-deployment" successfully rolled out
+
+# ROLLBACK to previous version instantly!
+kubectl rollout undo deployment/api-deployment
+
+# Rollback to specific revision
+kubectl rollout history deployment/api-deployment  # Show revision history
+kubectl rollout undo deployment/api-deployment --to-revision=2
+
+# Scale replicas
+kubectl scale deployment/api-deployment --replicas=10
+
+# Pause/resume rolling update
+kubectl rollout pause deployment/api-deployment
+kubectl rollout resume deployment/api-deployment
+```
+
+### Checking Pods from a Deployment
+```bash
+# Get pods owned by this deployment
+kubectl get pods -l app=api
+# NAME                              READY   STATUS    RESTARTS
+# api-deployment-abc123-xyz789      1/1     Running   0
+# api-deployment-abc123-uvw456      1/1     Running   0
+# api-deployment-abc123-rst123      1/1     Running   0
+
+# See the replicasets (intermediate layer)
+kubectl get replicasets
+```
+
+## REAL_WORLD
+**Deployment vs StatefulSet**
+Deployments are for **stateless** applications (APIs, web servers) where any Pod can serve any request.
+
+For **stateful** applications (databases, Kafka, ZooKeeper) that need:
+- Stable, predictable Pod names (pod-0, pod-1, pod-2 not random UUIDs)
+- Stable network identities that persist across restarts
+- Ordered deployment and scaling
+
+You use a **StatefulSet** instead of a Deployment.
+
+## INTERVIEW
+**Q: During a rolling update, 2 out of 3 Pods are updated to v2.0 but the third Pod's readiness probe keeps failing. The deployment appears stuck. What happened, and how do you recover?**
+A: Kubernetes paused the rolling update because the new Pod is not passing its readiness probe. This is the system working as designed — it detected that v2.0 is unhealthy and stopped the rollout to prevent a complete outage.
+
+**Diagnosis:**
+```bash
+kubectl rollout status deployment/api  # Shows 'paused'
+kubectl describe pod <new-pod-name>    # Shows readiness probe failures
+kubectl logs <new-pod-name>            # Find the actual error (e.g., DB connection failed)
+```
+
+**Recovery options:**
+1. **Fix the code and push a new image:** `kubectl set image deployment/api api=my-api:2.0.1`
+2. **Immediate rollback:** `kubectl rollout undo deployment/api`
+   - This rolls back to v1.0.0 instantly
+
+The key advantage: because `maxUnavailable: 0` was set, the 1 old Pod (v1.0.0) was never terminated. At all times during this incident, 2/3 of Pods were serving traffic normally. Only when the new Pod becomes healthy does the old one get removed.

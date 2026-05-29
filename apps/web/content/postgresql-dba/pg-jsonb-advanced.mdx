@@ -1,0 +1,109 @@
+---
+slug: "pg-jsonb-advanced"
+title: "PostgreSQL JSONB Advanced"
+level: 5
+---
+
+## WHY
+For years, the battle was SQL vs. NoSQL (MongoDB). Developers loved NoSQL because you didn't have to define a rigid schema; you could just dump JSON objects into the database.
+PostgreSQL destroyed this debate by introducing the **JSONB** data type. It gives you the perfect hybrid: strict relational integrity where you need it (Users, Payments), and complete NoSQL flexibility where you don't (Dynamic Settings, Sensor Payloads, Third-Party API Responses).
+Understanding JSONB means you never need a separate NoSQL database again.
+
+## THEORY
+### JSON vs. JSONB
+Postgres has two types: `json` and `jsonb`.
+- **`json`**: Stores the exact text string you give it (including whitespace and duplicate keys). Every time you query it, Postgres must parse the text string. It is slow.
+- **`jsonb` (Binary JSON)**: When you insert data, Postgres parses it immediately, strips whitespace, sorts keys, and converts it into a custom binary format. It is slightly slower to insert, but exponentially faster to query and supports advanced GIN Indexing. **Always use JSONB.**
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-jsonb" }
+```
+
+## CODE
+
+### Level 1 — Querying JSONB (The Operators)
+The most common mistake is treating JSONB like text. You must use the specialized JSONB operators.
+
+```sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    settings JSONB
+);
+
+INSERT INTO users (name, settings) VALUES 
+('Alice', '{"theme": "dark", "notifications": {"email": true, "sms": false}}');
+
+-- The '->' operator returns a JSONB object.
+-- The '->>' operator returns pure TEXT (essential for string comparisons!).
+SELECT name, settings->>'theme' AS theme FROM users;
+
+-- Extracting nested data (Chain the operators!)
+SELECT name FROM users WHERE settings->'notifications'->>'email' = 'true';
+```
+
+### Level 2 — The Containment Operator (`@>`)
+The most powerful operator in JSONB is the Containment operator (`@>`). It asks: *"Does the JSONB document on the left contain the JSONB structure on the right?"*
+
+```sql
+-- Find all users who have the dark theme enabled.
+-- This is vastly superior to the '->>' operator because it can be indexed!
+SELECT name FROM users 
+WHERE settings @> '{"theme": "dark"}';
+
+-- Find users with email notifications enabled
+SELECT name FROM users 
+WHERE settings @> '{"notifications": {"email": true}}';
+```
+
+### Level 3 — GIN Indexing (The Magic)
+If you have 10 million rows, running `WHERE settings @> '{"theme": "dark"}'` will do a Full Table Scan and take 5 seconds.
+You can index the *entire* JSONB document using a **GIN (Generalized Inverted Index)**.
+
+```sql
+-- Create a GIN index on the entire JSONB column!
+CREATE INDEX idx_user_settings ON users USING GIN (settings);
+```
+With this single index, the query `WHERE settings @> '{"theme": "dark"}'` will now execute in **1 millisecond**. The GIN index literally indexes every single key-value pair inside the JSON document automatically!
+
+### Level 4 — Modifying JSONB
+Updating a massive JSON document used to require downloading it to the application, modifying it in Node.js, and saving it back. Modern Postgres provides functions to mutate JSONB directly in the database.
+
+```sql
+-- Use jsonb_set to update a specific nested value without touching the rest of the document!
+-- Signature: jsonb_set(target, path_array, new_value)
+UPDATE users 
+SET settings = jsonb_set(
+    settings, 
+    '{notifications, sms}', 
+    'true'::jsonb
+)
+WHERE id = 1;
+
+-- To easily append or merge two JSON documents, use the '||' operator!
+UPDATE users 
+SET settings = settings || '{"beta_tester": true}'::jsonb
+WHERE id = 1;
+```
+
+## REAL_WORLD
+**The JSONB Anti-Pattern**
+Because JSONB is so easy, junior developers often put *everything* in a JSONB column. 
+```sql
+-- BAD ARCHITECTURE
+CREATE TABLE ecommerce (
+    id SERIAL,
+    data JSONB -- Contains user info, order total, shipping address, products array...
+);
+```
+This is an anti-pattern. While Postgres can query JSONB fast, it cannot enforce constraints on it. You cannot enforce Foreign Keys on a JSONB field. You cannot enforce `NOT NULL`. You cannot enforce data types (someone might insert `"price": "10"` as a string).
+**The Rule:** Use standard relational columns for anything you query frequently, join against, or aggregate (SUM, AVG). Use JSONB strictly for dynamic, unstructured data (like a "custom properties" dictionary or caching a raw third-party API response).
+
+## INTERVIEW
+**Q: You created a GIN index on the `settings` JSONB column. A developer writes the query `SELECT * FROM users WHERE settings->>'theme' = 'dark';`. They complain the query is still doing a Full Table Scan. Why did Postgres ignore the GIN index?**
+A: **Operator incompatibility.**
+A default GIN index on a JSONB column ONLY supports the containment operator (`@>`), the existence operator (`?`), and a few others. 
+It does NOT support the text extraction operator (`->>`). Because the developer used `->>`, Postgres could not use the index and was forced to scan the table.
+The fix is either to train the developer to use containment: `WHERE settings @> '{"theme": "dark"}'`, OR to create a specialized B-Tree expression index specifically for that one key:
+`CREATE INDEX idx_theme ON users ((settings->>'theme'));`

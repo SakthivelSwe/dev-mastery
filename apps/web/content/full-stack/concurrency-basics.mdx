@@ -1,0 +1,184 @@
+---
+title: concurrency-basics
+slug: concurrency-basics
+---
+
+# Concurrency Basics — Threads, Shared State, Race Conditions
+
+Understanding concurrent execution in Java requires looking past the language abstractions and examining how the Java Virtual Machine (JVM) interacts with the underlying Operating System (OS) and hardware architecture.
+
+---
+
+## 1. Thread Mapping: 1:1 Kernel Thread Mapping on HotSpot
+
+In modern HotSpot JVM implementations, a Java thread (`java.lang.Thread`) has a **1:1 mapping** to an operating system kernel thread (e.g., `pthread` on Linux, `Win32` thread on Windows). 
+
+```
++---------------------------+
+|  java.lang.Thread (Java)  |
++---------------------------+
+              | (1:1 Mapping)
+v
++---------------------------+
+|    OS Kernel Thread       |
++---------------------------+
+              | (Scheduled by OS)
+v
++---------------------------+
+|      Physical CPU Core    |
++---------------------------+
+```
+
+This architectural choice has deep performance implications:
+* **Kernel Thread Creation Cost:** Spawning a thread requires transitioning from user space to kernel space via a system call. The OS must allocate kernel-level data structures, assign scheduling priorities, and allocate a dedicated execution stack.
+* **Context Switching Overhead:** When the OS scheduler preempts a thread to run another, it performs a context switch. This involves:
+  1. Saving CPU registers, the program counter, and stack pointers of the current thread.
+  2. Loading the saved register state of the target thread.
+  3. Flushing or invalidating CPU caches (L1, L2) and the Translation Lookaside Buffer (TLB) due to memory space transitions.
+* **JVM Stack Allocation:** Each thread is allocated its own private JVM stack (default size is typically **512KB to 1MB**, controlled via `-Xss`). This stack holds frame information, local variables, and partial results. While the stack is private, the **heap is shared** among all threads, serving as the primary medium for inter-thread communication and concurrent state hazards.
+
+---
+
+## 2. Race Conditions and Bytecode Interleaving
+
+A **race condition** occurs when multiple threads perform non-atomic, interleaved operations on shared mutable state, and the final outcome depends on the exact order of execution.
+
+Consider the classic non-atomic increment operation:
+
+```java
+public class UnsafeCounter {
+    private int count = 0;
+
+    public void increment() {
+        count++;
+    }
+}
+```
+
+At the Java source level, `count++` looks like a single operation. However, compilation to bytecode reveals that it is compiled into three distinct operations:
+
+```bytecode
+0: aload_0             // Load 'this' reference onto the operand stack
+1: dup                 // Duplicate the 'this' reference
+2: getfield      #2    // Fetch the field 'count' from 'this' and push onto stack
+5: iconst_1            // Push integer constant 1 onto the stack
+6: iadd                // Pop top two values, add them, push result
+7: putfield      #2    // Pop result and write back to field 'count' of 'this'
+```
+
+If Thread A and Thread B attempt to execute `increment()` concurrently, their bytecode instructions can interleave arbitrarily:
+
+| Step | Thread A | Thread B | Stack A | Stack B | Heap Value (`count`) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | `getfield` (reads 0) | | `[0]` | `[]` | `0` |
+| 2 | | `getfield` (reads 0) | `[0]` | `[0]` | `0` |
+| 3 | `iadd` & `putfield` (writes 1) | | `[]` | `[0]` | `1` |
+| 4 | | `iadd` & `putfield` (writes 1) | `[]` | `[]` | **1 (Lost Update!)** |
+
+Even though two increments occurred, the final value of `count` is `1` instead of `2`.
+
+---
+
+## 3. The Java Memory Model (JMM) & Hardware Realities
+
+The JMM is an abstraction over physical hardware architectures. In modern multi-core computers, processors do not write directly to main memory (RAM) because it is too slow. Instead, they use hierarchical caches (L1, L2, L3) and store buffers.
+
+```
++------------------+         +------------------+
+|   CPU Core 1     |         |   CPU Core 2     |
+|  +------------+  |         |  +------------+  |
+|  | Registers  |  |         |  | Registers  |  |
+|  +------------+  |         |  +------------+  |
+|  | L1/L2 Cache|  |         |  | L1/L2 Cache|  |
+|  +------------+  |         |  +------------+  |
++------------------+         +------------------+
+         |                            |
+         +-------------+--------------+
+                       v
+              +------------------+
+              | L3 Cache (Shared)|
+              +------------------+
+                       |
+                       v
+              +------------------+
+              |   Main Memory    |
+              +------------------+
+```
+
+* **Working Memory vs. Main Memory:** The JMM defines that each thread has a logical *working memory* (representing CPU registers, write buffers, and caches) and shares access to *main memory* (RAM).
+* **The Visibility Problem:** When Thread A writes a value, it may reside in Core 1's store buffer or L1 cache without being flushed to the shared L3 cache or main memory. If Thread B reads the same variable from Core 2, it may read a stale value from its own local cache.
+
+---
+
+## 4. Synchronization Mechanics: `synchronized` and `volatile`
+
+To solve visibility and ordering issues, Java provides explicit synchronization mechanisms.
+
+### Intrinsic Locks (Monitors) and the Object Header
+
+Every Java object has an intrinsic lock (monitor) associated with it. The state of this lock is stored in the **Mark Word** of the object's header. On a 64-bit JVM, the Mark Word structure changes dynamically depending on the lock state:
+
+| Lock State | Biased (Deprecated) | Lock Bits (Last 2/3 Bits) | Description |
+| :--- | :--- | :--- | :--- |
+| **Unlocked** | `0` | `01` | Object is not locked. |
+| **Biased** | `1` | `01` | Locked by a specific thread ID without OS-level locks. |
+| **Lightweight** | `0` / `1` | `00` | Locked via CAS (Compare-And-Swap) on a stack location. |
+| **Heavyweight** | `0` / `1` | `10` | Inflated lock pointing to an OS native `ObjectMonitor` structure. |
+| **Marked for GC**| - | `11` | Used during garbage collection marking phases. |
+
+#### Lock Inflation Flow:
+1. **Biased Locking / Unlocked:** The JVM attempts to write the thread ID directly into the Mark Word. (Note: Biased locking is disabled by default or deprecated in modern JVMs due to its complexity and low performance payoff on highly concurrent modern hardware).
+2. **Lightweight Locking:** If another thread attempts to acquire the lock, the lock inflates to *lightweight*. The acquiring thread uses atomic CAS operations to write a pointer to its own stack frame (a lock record) into the Mark Word.
+3. **Heavyweight Locking:** If the CAS fails due to contention, the lock inflates to *heavyweight*. The JVM allocates a native `ObjectMonitor` structure. The Mark Word now points to this native monitor. Threads that fail to acquire the monitor are parked at the OS level (using mutexes like `pthread_mutex` on Linux), yielding their remaining CPU timeslices.
+
+#### Memory Flushing:
+When a thread enters a `synchronized` block and acquires a monitor:
+* It **invalidates** its local working memory cache, forcing all subsequent reads to fetch directly from main memory.
+* When the thread exits the `synchronized` block and releases the monitor, it triggers a **flush** of all modified variables from its working memory to main memory.
+
+---
+
+### Volatile Fields: Visibility and Reordering
+
+The `volatile` keyword guarantees **visibility** and **prevents instruction reordering**, but it does **not** guarantee atomicity for compound operations (like `i++`).
+
+* **Memory Barriers (Fences):** The compiler and processor insert memory barriers around `volatile` accesses:
+  * A **volatile write** is preceded by a `StoreStore` barrier (ensuring all previous writes are flushed before this one) and followed by a `StoreLoad` barrier (preventing subsequent reads/writes from being reordered before this write).
+  * A **volatile read** is followed by `LoadLoad` and `LoadStore` barriers, preventing subsequent memory accesses from being reordered before the read.
+* **No Atomicity:** A `volatile int` still compiles to three bytecode steps for `i++`. If two threads execute `i++` on a volatile variable, they will still suffer from race conditions because the write step relies on a stale read step.
+
+---
+
+## 5. Happens-Before Relationships
+
+The JMM defines execution semantics using the **Happens-Before (HB)** guarantee. If action $A$ happens-before action $B$, then the memory effects of $A$ are guaranteed to be visible to the thread performing $B$, and the execution order is preserved.
+
+Key Happens-Before Rules:
+1. **Program Order Rule:** Each action in a single thread happens-before any action in that thread that comes later in the program order.
+2. **Monitor Lock Rule:** An unlock on a monitor lock happens-before every subsequent lock on that same monitor lock.
+3. **Volatile Variable Rule:** A write to a volatile field happens-before every subsequent read of that same volatile field.
+4. **Thread Start Rule:** A call to `Thread.start()` on a thread happens-before any action in the started thread.
+5. **Thread Termination Rule:** Any action in a thread happens-before any other thread detects that thread has terminated (via `Thread.join()` or `Thread.isAlive()`).
+6. **Transitivity:** If $A \text{ HB } B$ and $B \text{ HB } C$, then $A \text{ HB } C$.
+
+---
+
+## 6. Thread-Safe Implementation
+
+Below is a production-grade, thread-safe metrics accumulator. It avoids race conditions, guarantees visibility, and demonstrates how to safely update shared state.
+
+```java
+package com.devmastery.concurrency;
+
+import java.util.Objects;
+import java.util.concurrent.locks.StampedLock;
+
+/**
+ * A highly optimized, thread-safe metrics accumulator.
+ * Uses a StampedLock to provide optimistic read capabilities, 
+ * minimizing lock contention for read-heavy operations while 
+ * maintaining absolute safety for writes.
+ */
+public final class MetricsAccumulator {
+
+    // Shared mutable state protected by

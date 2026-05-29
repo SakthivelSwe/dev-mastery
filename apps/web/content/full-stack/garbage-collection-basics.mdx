@@ -1,0 +1,184 @@
+---
+title: garbage-collection-basics
+slug: garbage-collection-basics
+---
+
+## WHY
+Garbage Collection (GC) in Java is a double-edged sword: it automates memory reclamation, freeing developers from manual memory management (deallocations, dangling pointers), but introduces non-deterministic execution pauses. In enterprise systems processing millions of concurrent requests, a single Stop-The-World (STW) pause lasting several seconds can degrade throughput, break TCP connection timeouts, cause microservices to fail health checks, and lead to cascading failures across distributed systems.
+
+To design high-performance applications, developers must move beyond the naive assumption that "memory is cleaned up automatically." You must understand how collectors manage memory under the hood. Different applications require different GC characteristics:
+*   A financial trading system requires **ultra-low latency** (sub-millisecond pauses) and is willing to trade CPU overhead for it.
+*   A batch data processing pipeline (e.g., Spark, Hadoop) requires **maximum throughput** and can tolerate longer, planned pauses if it means processing more records per second.
+*   An IoT gateway or microservice running in a resource-constrained container requires **low memory footprints**.
+
+Choosing the wrong collector or misconfiguring memory boundaries can lead to catastrophic application degradation, where the JVM spends more time garbage collecting than executing application code (GC thrashing).
+
+---
+
+## THEORY
+
+### 1. The Weak Generational Hypothesis
+The design of all modern JVM garbage collectors is predicated on the **Weak Generational Hypothesis**:
+1.  Most objects die young (they are allocated for temporary computations, method executions, or JSON parsing, and become unreachable shortly after).
+2.  Objects that survive a threshold of collection cycles tend to live for a long time (application context, caches, connection pools).
+
+```
++-----------------------------------------------------------------------------------+
+|                                     JVM HEAP                                      |
+|                                                                                   |
+|  +--------------------------------------------+  +-----------------------------+  |
+|  |               YOUNG GENERATION             |  |       OLD GENERATION        |  |
+|  |                                            |  |                             |  |
+|  |  +---------------+  +------+  +------+     |  |  +-----------------------+  |  |
+|  |  |     Eden      |  |  S0  |  |  S1  |     |  |  |                       |  |  |
+|  |  |               |  |      |  |      |     |  |  |                       |  |  |
+|  |  +---------------+  +------+  +------+     |  |  +-----------------------+  |  |
+|  |   [Allocation]      [Survivor Spaces]      |  |   [Promoted Objects]        |  |
+|  +--------------------------------------------+  +-----------------------------+  |
+|   <------------- Minor GC Cycles ------------>    <------- Major GC Cycles ---->  |
++-----------------------------------------------------------------------------------+
+```
+
+To exploit this, the JVM splits the heap into:
+*   **Young Generation**: Consists of **Eden** and two **Survivor** spaces (**S0** and **S1**). New objects are allocated in Eden. During a Minor GC, live objects are copied to the active Survivor space. Objects bounce between S0 and S1, incrementing their age.
+*   **Old Generation (Tenured)**: Contains long-lived objects. Objects are promoted here once their age exceeds `-XX:MaxTenuringThreshold`.
+
+### 2. GC Root Tracing and Reachability Analysis
+The JVM determines if an object is "alive" by executing a reachability analysis starting from **GC Roots**. An object is alive if there is a chain of references from any GC Root to that object.
+GC Roots include:
+1.  **Local variables** and input parameters in active thread stack frames.
+2.  **Active JNI (Java Native Interface)** global and local references.
+3.  **Static fields** of loaded classes.
+4.  **System Class Loaders** and classes held by them.
+5.  **Thread objects** themselves.
+
+### 3. Core GC Algorithms
+*   **Mark-Copy (Used in Young Gen)**:
+    1.  Trace GC roots and mark live objects.
+    2.  Copy all live objects to an empty Survivor space (compacting them sequentially).
+    3.  Instantly reclaim the entire Eden and the previous Survivor space.
+    *   *Complexity*: $O(\text{Live Objects})$. Extremely fast when most objects are dead.
+*   **Mark-Sweep-Compact (Used in Old Gen)**:
+    1.  **Mark**: Trace and mark all live objects.
+    2.  **Sweep**: Identify dead objects and reclaim their memory. This leaves memory fragmented.
+    3.  **Compact**: Shift all live objects to the beginning of the memory space to create a large contiguous block of free memory.
+    *   *Complexity*: $O(\text{Heap Size})$. Expensive and requires long STW pauses.
+
+### 4. Comparison of Modern Collectors
+*   **Serial GC (`-XX:+UseSerialGC`)**: Single-threaded collector. Freezes all application threads during collection. Best for small single-core containerized environments.
+*   **Parallel GC (`-XX:+UseParallelGC`)**: Multi-threaded throughput collector. Minimizes total GC overhead by utilizing multiple threads during STW pauses.
+*   **G1 GC (`-XX:+UseG1GC`)**: Region-based collector. Divides the heap into equal-sized regions. It targets user-defined pause times (`-XX:MaxGCPauseMillis`) by reclaiming regions with the most garbage first ("Garbage First").
+*   **ZGC (`-XX:+UseZGC`)**: Ultra-low latency concurrent collector. Performs almost all GC phases (marking, relocation, compaction) concurrently with application threads using **load barriers** and **colored pointers**. Pauses are sub-millisecond, independent of heap size.
+
+---
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "title": "Generational Object Promotion Flow",
+  "type": "flowchart",
+  "nodes": [
+    {"id": "alloc", "label": "New Object Allocation", "details": "Placed in Eden Space"},
+    {"id": "minor_gc", "label": "Minor GC Cycle", "details": "Mark-Copy phase triggered"},
+    {"id": "survivor", "label": "Survivor Spaces (S0/S1)", "details": "Objects age here (Age incremented)"},
+    {"id": "old_gen", "label": "Old Generation", "details": "Promoted when Age > MaxTenuringThreshold"}
+  ],
+  "links": [
+    {"source": "alloc", "target": "minor_gc", "label": "Eden fills up"},
+    {"source": "minor_gc", "target": "survivor", "label": "Live objects copied"},
+    {"source": "survivor", "target": "minor_gc", "label": "Next GC cycle"},
+    {"source": "survivor", "target": "old_gen", "label": "Promoted"}
+  ]
+}
+```
+
+---
+
+## CODE_IMPLEMENTATION
+The following code demonstrates how to monitor GC events programmatically using the JVM's built-in MXBeans. It triggers GC cycles and tracks collection times, memory reclamation, and GC pauses.
+
+```java
+package com.devmastery.gc;
+
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+
+public final class GCMonitoringDemo {
+
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("=== Programmatic GC Monitor ===");
+        printGCStats();
+
+        // Simulate allocation churn to trigger Minor GCs
+        System.out.println("Starting heavy object allocation churn...");
+        List<byte[]> memoryChurn = new ArrayList<>();
+        
+        for (int i = 0; i < 50; i++) {
+            // Allocate 10MB of short-lived objects
+            for (int j = 0; j < 10; j++) {
+                byte[] temp = new byte[1024 * 1024]; // 1MB
+            }
+            
+            // Allocate a long-lived object to promote to Old Gen
+            memoryChurn.add(new byte[2 * 1024 * 1024]); // 2MB
+            
+            Thread.sleep(50);
+        }
+
+        System.out.println("Churn complete. Triggering explicit System.gc()...");
+        System.gc(); // Suggests JVM to run a full GC
+
+        Thread.sleep(1000); // Wait for GC threads to complete
+        printGCStats();
+    }
+
+    private static void printGCStats() {
+        List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        System.out.println("\n--- Current GC Metrics ---");
+        for (GarbageCollectorMXBean gcBean : gcBeans) {
+            System.out.printf("Collector: %-15s | Collections: %4d | Total Time: %4d ms%n",
+                    gcBean.getName(),
+                    gcBean.getCollectionCount(),
+                    gcBean.getCollectionTime());
+        }
+        System.out.println("--------------------------\n");
+    }
+}
+```
+
+---
+
+## ARCHITECTURAL_PATTERNS
+
+### 1. Object Pooling (Latency-Sensitive Systems)
+*   **Context**: High-frequency trading or network sockets where thousands of transient objects are created per second.
+*   **Pattern**: Pre-allocate an array of reusable objects. Instead of instantiating new objects, retrieve an idle object from the pool, populate its fields, process it, clear its state, and return it to the pool.
+*   **Result**: Eliminates allocation churn in Eden, preventing Minor GCs entirely in critical execution paths.
+
+### 2. Large Page Allocation (System-Level Tuning)
+*   **Context**: Massive heaps (e.g., 32GB+ databases or search engines).
+*   **Pattern**: Configure the OS kernel to use Huge/Large Pages (e.g., 2MB or 1GB pages instead of the default 4KB). Enable `-XX:+UseLargePages` in the JVM.
+*   **Result**: Reduces Translation Lookaside Buffer (TLB) cache misses in the CPU, accelerating address translation during GC marking and compaction phases.
+
+---
+
+## ANTI_PATTERNS_AND_DEBUGGING
+
+### 1. The "System.gc() Antipattern"
+*   **Anti-pattern**: Manually calling `System.gc()` in application code, believing it optimizes memory.
+*   **Consequence**: `System.gc()` triggers a **Full GC**, forcing a stop-the-world pause across the entire heap (Young and Old generations), completely disrupting application performance and latency SLAs.
+*   **Resolution**:
+    *   Disable explicit GC calls by adding the JVM argument: `-XX:+DisableExplicitGC`.
+    *   Rely on the JVM's adaptive sizing and generational heuristics to trigger collections.
+
+### 2. Memory Leaks via Static Collections
+*   **Anti-pattern**: Appending objects to a `static List` or `static Map` without an eviction policy.
+*   **Consequence**: Since static fields are GC Roots, all objects appended to the collection remain reachable and can never be garbage collected. This leads to progressive Old Generation bloat and eventual `java.lang.OutOfMemoryError: Java heap space`.
+*   **Resolution & Debugging**:
+    *   Use profiling tools (e.g., Eclipse Memory Analyzer - MAT, JProfiler) to perform heap dumps (`jmap -dump:live,format=b,file=heap.hprof <pid>`).
+    *   Analyze the "Path to GC Roots" to identify which static reference is holding onto the leaked objects.
+    *   Replace static collections with caches that support soft references (`SoftReference`), weak references (`WeakReference`), or automatic eviction policies (e.g., Caffeine cache).
+
+---

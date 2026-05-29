@@ -1,0 +1,157 @@
+---
+slug: "proxy-and-reflect"
+title: "Proxy and Reflect"
+level: 4
+---
+
+## WHY
+In standard JavaScript, interacting with an object is a direct transaction. If you type `user.age = 500`, the object instantly updates. There is no built-in way to intercept that action and say, *"Wait, age cannot be over 150! Block this!"*
+ES6 introduced the **Proxy API**. It is one of the most powerful and "magical" features in JavaScript. A Proxy allows you to wrap an object and invisibly intercept every single operation performed on it (reading properties, writing properties, or even calling functions). This is the secret technology powering modern reactivity in frameworks like Vue 3 and MobX!
+
+## THEORY
+### The Target and the Handler
+To create a Proxy, you need two things:
+1. **The Target:** The original, raw object you want to protect or monitor.
+2. **The Handler (Traps):** An object containing specific methods (like `get` or `set`) that dictate what happens when someone tries to interact with the Target. These methods are called "Traps" because they trap the operation before it hits the Target.
+
+### The Reflect API
+The **Reflect API** is the mirror twin of the Proxy API. Inside a Proxy trap, once you've done your custom logic (like logging or validation), you usually want to perform the original action anyway. The `Reflect` object contains the exact same methods as the Proxy traps, allowing you to easily forward the operation to the original Target without writing hacky code.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "proxies" }
+```
+
+## CODE
+
+### Level 1 — The Interceptor (`get` Trap)
+Let's create an object that yells at you if you try to read a property that doesn't exist, instead of silently returning `undefined`!
+
+```javascript
+const targetUser = { name: "Alice", id: 1 };
+
+const handler = {
+  // The 'get' trap fires EVERY time someone tries to read a property!
+  get(target, propertyName, receiver) {
+    if (propertyName in target) {
+      // If the property exists, return it!
+      return target[propertyName]; 
+    } else {
+      // If it doesn't exist, throw a massive error!
+      throw new ReferenceError(`Property "${propertyName}" does not exist!`);
+    }
+  }
+};
+
+// Wrap the target with the Proxy!
+const proxyUser = new Proxy(targetUser, handler);
+
+console.log(proxyUser.name); // "Alice"
+
+// In normal JS, this returns undefined. 
+// With our Proxy, it crashes the app instantly!
+console.log(proxyUser.password); // ReferenceError: Property "password" does not exist!
+```
+
+### Level 2 — Validation (`set` Trap)
+You can intercept assignments (`=`) to enforce strict data validation on your objects!
+
+```javascript
+const rawData = { age: 25 };
+
+const validatorHandler = {
+  // The 'set' trap intercepts assignments
+  set(target, propertyName, newValue, receiver) {
+    if (propertyName === 'age') {
+      if (typeof newValue !== 'number') {
+        throw new TypeError("Age must be a number!");
+      }
+      if (newValue < 0 || newValue > 150) {
+        throw new RangeError("Invalid age range!");
+      }
+    }
+
+    // Validation passed! 
+    // We use Reflect.set() to actually apply the change to the original target!
+    return Reflect.set(target, propertyName, newValue, receiver);
+  }
+};
+
+const safeUser = new Proxy(rawData, validatorHandler);
+
+safeUser.age = 30; // Works perfectly! Reflect.set applies it.
+// safeUser.age = "Thirty"; // Throws TypeError!
+// safeUser.age = 500; // Throws RangeError!
+```
+
+### Level 3 — Creating Magic (Array Negative Indices)
+In Python, if you do `arr[-1]`, it returns the last item in the array. In JavaScript, `arr[-1]` returns `undefined`.
+We can use a Proxy to magically add Python-style negative indices to JavaScript arrays!
+
+```javascript
+function createNegativeArray(arr) {
+  return new Proxy(arr, {
+    get(target, propertyName, receiver) {
+      // Array indices are passed as Strings! Parse it to an integer.
+      const index = Number(propertyName);
+      
+      if (index < 0) {
+        // MAGIC: Calculate the reverse index!
+        const reverseIndex = target.length + index; 
+        // Use Reflect to grab the actual item from the end of the array!
+        return Reflect.get(target, reverseIndex, receiver);
+      }
+      
+      // For positive indices or array methods (like .length or .push), pass through normally!
+      return Reflect.get(target, propertyName, receiver);
+    }
+  });
+}
+
+const myArr = createNegativeArray(['A', 'B', 'C', 'D']);
+
+console.log(myArr[0]);  // 'A' (Normal)
+console.log(myArr[-1]); // 'D' (Magical Python syntax!)
+console.log(myArr[-2]); // 'C'
+```
+
+### Level 4 — Building Reactivity
+How does Vue 3 know exactly when to re-render the screen? It wraps your data in a Proxy. When you change the data, the `set` trap intercepts it, updates the target, and then yells at the DOM to re-render!
+
+```javascript
+function createReactiveObject(target, onUpdate) {
+  return new Proxy(target, {
+    set(obj, prop, value) {
+      // 1. Perform the actual update
+      const success = Reflect.set(obj, prop, value);
+      
+      // 2. Trigger the callback to re-render the UI!
+      if (success) {
+        onUpdate(prop, value);
+      }
+      return success;
+    }
+  });
+}
+
+const state = createReactiveObject({ count: 0 }, (prop, val) => {
+  console.log(`[DOM UPDATE]: Property '${prop}' changed to ${val}. Re-rendering screen!`);
+});
+
+state.count = 1; // Console: [DOM UPDATE]: Property 'count' changed to 1.
+state.count = 2; // Console: [DOM UPDATE]: Property 'count' changed to 2.
+```
+
+## REAL_WORLD
+**Monkey-Patching vs. Proxies**
+Before Proxies existed, if you wanted to intercept object properties, you had to use `Object.defineProperty()` and write complex getters and setters for *every single specific property* on the object.
+If the developer later added a brand new property (`user.email = "test@test.com"`), `Object.defineProperty` wouldn't catch it, because the property didn't exist when the getters were defined! (This was the famous limitation of Vue 2).
+Proxies intercept operations on the **entire object itself**, not specific properties. Whether the property exists today, or is added dynamically tomorrow, the Proxy will trap it. This is why Vue 3 was completely rewritten to use Proxies!
+
+## INTERVIEW
+**Q: You use `Reflect.set(target, prop, value)` inside a Proxy trap instead of simply writing `target[prop] = value`. Why? Is there actually any difference between them?**
+A: **The `receiver` Context (The `this` keyword issue).**
+In simple objects, `target[prop] = value` works perfectly.
+However, imagine the target object uses standard ES6 getters and setters (e.g., `get fullName() { return this.firstName + this.lastName; }`).
+If you intercept a property and simply do `return target[prop]`, the `this` keyword inside the target's getter will point to the raw target object, bypassing the Proxy completely! If `firstName` is accessed internally by the getter, the Proxy won't trap the access to `firstName`!
+By using `Reflect.get(target, prop, receiver)`, the `receiver` argument (which is the Proxy object itself) forces the internal `this` context to point *back* to the Proxy! This guarantees that any subsequent internal property accesses are routed back through the Proxy traps, ensuring 100% flawless interception.

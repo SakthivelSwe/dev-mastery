@@ -1,0 +1,101 @@
+---
+slug: "replication-mongodb"
+title: "MongoDB Replication (Replica Sets)"
+level: 4
+---
+
+## WHY
+If your entire startup is running on a single database server, you are one hardware failure away from bankruptcy. If the hard drive fails, your data is gone. If the server loses power, your application goes offline.
+
+**Replication** solves the problem of High Availability. By copying your data across multiple physical servers, you ensure that if one server explodes, the others instantly take over with zero downtime and zero data loss.
+
+## THEORY
+### The Replica Set Architecture
+A **Replica Set** in MongoDB is a group of `mongod` instances (servers) that maintain the exact same data set.
+A standard production replica set consists of **3 nodes**:
+- **1 Primary Node:** The only node that can accept `INSERT`, `UPDATE`, and `DELETE` commands.
+- **2 Secondary Nodes:** They constantly copy data from the Primary. By default, they do not accept read or write queries.
+
+### The Oplog (Operations Log)
+How do the Secondaries stay perfectly in sync? 
+When you update a document on the Primary, it writes a record of that operation to a special collection called the **Oplog**. The Secondary nodes constantly poll the Primary's Oplog, pull the new records, and execute them on their own datasets asynchronously.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-replication" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Automatic Failover)
+What happens when the Primary node loses power?
+The two Secondary nodes immediately realize the Primary is dead because they stop receiving heartbeats. They hold an **Election**. 
+
+Because there are two nodes left, they have a quorum (a strict majority of the original 3). They vote, elect one of themselves to be the brand new Primary, and your application is back online in a few seconds!
+
+*Why do you need exactly 3 nodes?* 
+If you only had 2 nodes, and the Primary died, the single remaining Secondary only has 1 vote. 1 vote out of an original 2 is NOT a strict majority (it's exactly 50%). It cannot elect itself Primary! It remains a read-only Secondary, and your application cannot accept writes. You must always have an odd number of nodes to break ties.
+
+### Level 2 — Building Blocks (Read Preferences)
+By default, your Node.js application only talks to the Primary node for everything (Reads and Writes). But if you have two massive Secondary servers sitting there doing nothing, can't you use them to scale your read traffic?
+
+Yes, by changing the **Read Preference**!
+
+```javascript
+// 1. primary (Default)
+// Every read goes to the primary. Always perfectly up-to-date data.
+db.collection('users').find({}).readPref('primary');
+
+// 2. secondaryPreferred
+// Reads go to the Secondary nodes to offload traffic. 
+// ONLY goes to the primary if both secondaries are dead.
+db.collection('users').find({}).readPref('secondaryPreferred');
+
+// 3. nearest
+// Reads go to whichever node has the lowest network latency, 
+// regardless of whether it is a Primary or Secondary!
+db.collection('users').find({}).readPref('nearest');
+```
+
+**The Catch:** Because replication is asynchronous, reading from a Secondary introduces **Eventual Consistency**. If you update a user's name on the Primary, and immediately read it from the Secondary 2 milliseconds later, the Secondary might still return the old name! Only use `secondaryPreferred` for data where slight delays are acceptable (like fetching a list of global products).
+
+### Level 3 — Intermediate (Write Concerns)
+When you run an `INSERT` command, the Primary node writes the data to its own hard drive and immediately tells your Node.js server "Success!". 
+
+But what if the Primary crashes 1 millisecond later, before the Secondaries have time to copy the Oplog? The Secondaries will hold an election, a new Primary is chosen, and your newly inserted data is completely lost (rolled back), even though your Node.js server thought it succeeded!
+
+You solve this with **Write Concerns**.
+
+```javascript
+// Acknowledged by the Primary ONLY (Fastest, but unsafe)
+db.users.insertOne({ name: "Alice" }, { writeConcern: { w: 1 } });
+
+// Acknowledged by the majority of the cluster (Primary + at least 1 Secondary)
+// The Primary will literally pause and wait for the Secondary to confirm the write!
+// (Slower, but guarantees the data survives a failover)
+db.users.insertOne({ name: "Bob" }, { writeConcern: { w: "majority" } });
+```
+
+### Level 4 — Advanced (Arbiter Nodes)
+Production servers are expensive. Paying for 3 massive 64GB RAM servers just to achieve high availability is costly, especially when the 3rd server is just sitting there to provide a tie-breaking vote in an election.
+
+You can use an **Arbiter Node**.
+An Arbiter is a special MongoDB instance that participates in elections (it has 1 vote), but it **does not store any data**. Because it holds no data, it requires almost zero RAM and CPU. You can run an Arbiter on a $5/month micro-VM!
+
+**Architecture:** 
+1 Primary (Massive Server), 1 Secondary (Massive Server), 1 Arbiter (Tiny Server).
+If the Primary dies, the Secondary and the Arbiter form a quorum (2 out of 3 votes). The Arbiter votes for the Secondary, promoting it to Primary, saving you thousands of dollars in hosting fees!
+
+## REAL_WORLD
+**Cross-Region Replication**
+If your startup is hosted entirely in AWS US-East, and a hurricane takes out the entire data center, a standard Replica Set won't save you because all 3 nodes will die simultaneously.
+Enterprise applications deploy Replica Sets across global regions:
+- Primary in US-East
+- Secondary 1 in US-East
+- Secondary 2 in Europe (London)
+
+If US-East goes offline, the London node takes over. However, because London is 3,000 miles away, network latency is high. You should **never** use Write Concern `w: "majority"` in this setup for normal queries, because the Primary in the US would have to wait 100 milliseconds for London to acknowledge every single database write, destroying your application's speed!
+
+## INTERVIEW
+**Q: What is an Oplog size limit, and what happens if it's too small?**
+A: The Oplog is a capped collection (a circular buffer of fixed size). If you set the Oplog size to 5GB, it might hold roughly 24 hours of transaction history. If a Secondary node crashes and stays offline for 48 hours, when it reboots, it will check the Primary's Oplog to catch up. However, the operations it needs are gone! The Primary has overwritten the old logs because the 5GB buffer is full. The Secondary is now in a "Stale" state and must execute a massive "Initial Sync" (downloading the entire multi-terabyte database from scratch), severely degrading the performance of the Primary node during the sync.

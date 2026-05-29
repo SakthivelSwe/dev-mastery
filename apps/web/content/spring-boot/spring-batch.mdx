@@ -1,0 +1,154 @@
+---
+slug: "spring-batch"
+title: "Spring Batch"
+level: 5
+---
+
+## WHY
+REST APIs are designed to process a single request instantly (e.g., fetching one user profile in 50 milliseconds).
+But what if your bank needs to process 10 million credit card transactions, calculate interest, generate PDF statements, and email them to customers every night at 2:00 AM?
+If you try to process 10 million records in a standard Spring `@RestController` using a `for` loop, the server will immediately run out of RAM and crash with an `OutOfMemoryError`.
+**Spring Batch** is a specialized framework explicitly designed for processing massive, high-volume, offline data operations. It provides robust architecture for reading gigabytes of data in chunks, processing it, writing it, handling failures gracefully, and picking up exactly where it left off if a server reboots mid-job.
+
+## THEORY
+### The Chunk-Oriented Processing Model
+Spring Batch does not load 10 million records into RAM at once. It processes them in "Chunks".
+1. **ItemReader:** Reads data 1 row at a time from a source (e.g., CSV file, Database).
+2. **ItemProcessor:** Applies business logic to transform the data 1 row at a time.
+3. **ItemWriter:** Once a specific "Chunk Size" is reached (e.g., 1,000 rows), the Writer saves all 1,000 rows to the destination (e.g., Database) in a single massive, highly-optimized bulk transaction!
+Then, it clears the RAM and reads the next 1,000 rows!
+
+### Jobs and Steps
+- **Job:** The overall automated process (e.g., "Monthly Billing Job").
+- **Step:** A specific phase of the Job (e.g., Step 1: Read CSV and insert to DB. Step 2: Generate PDFs).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-batch-flow" }
+```
+
+## CODE
+
+Let's build a Job that reads users from a CSV file, capitalizes their names, and saves them to a database.
+
+### 1. The Dependency
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-batch</artifactId>
+</dependency>
+```
+
+### 2. Defining the Reader, Processor, and Writer
+We define the three core components as Spring Beans.
+
+```java
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.database.BeanPropertyItemSqlParameterSourceProvider;
+import org.springframework.batch.item.database.JdbcBatchItemWriter;
+import org.springframework.batch.item.database.builder.JdbcBatchItemWriterBuilder;
+import org.springframework.batch.item.file.FlatFileItemReader;
+import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ClassPathResource;
+import javax.sql.DataSource;
+
+@Configuration
+public class BatchConfig {
+
+    // 1. READER: Reads the CSV file line by line
+    @Bean
+    public FlatFileItemReader<UserDto> reader() {
+        return new FlatFileItemReaderBuilder<UserDto>()
+            .name("userItemReader")
+            .resource(new ClassPathResource("users.csv"))
+            .delimited()
+            .names("firstName", "lastName", "email") // Map CSV columns to Object fields
+            .targetType(UserDto.class)
+            .build();
+    }
+
+    // 2. PROCESSOR: Transforms the data
+    @Bean
+    public ItemProcessor<UserDto, User> processor() {
+        return dto -> {
+            // Business Logic: Capitalize the name
+            String fullName = (dto.getFirstName() + " " + dto.getLastName()).toUpperCase();
+            return new User(fullName, dto.getEmail());
+        };
+    }
+
+    // 3. WRITER: Executes bulk SQL inserts
+    @Bean
+    public JdbcBatchItemWriter<User> writer(DataSource dataSource) {
+        return new JdbcBatchItemWriterBuilder<User>()
+            .itemSqlParameterSourceProvider(new BeanPropertyItemSqlParameterSourceProvider<>())
+            .sql("INSERT INTO users (name, email) VALUES (:name, :email)")
+            .dataSource(dataSource)
+            .build();
+    }
+}
+```
+
+### 3. Assembling the Step and the Job
+Now we wire the three components together into a Step, and put the Step in a Job.
+
+```java
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.transaction.PlatformTransactionManager;
+
+@Configuration
+public class JobConfig {
+
+    @Bean
+    public Step importUserStep(JobRepository jobRepository, PlatformTransactionManager transactionManager,
+                               FlatFileItemReader<UserDto> reader, ItemProcessor<UserDto, User> processor,
+                               JdbcBatchItemWriter<User> writer) {
+        return new StepBuilder("importUserStep", jobRepository)
+            // PROCESS IN CHUNKS OF 100!
+            .<UserDto, User>chunk(100, transactionManager) 
+            .reader(reader)
+            .processor(processor)
+            .writer(writer)
+            .build();
+    }
+
+    @Bean
+    public Job importUserJob(JobRepository jobRepository, Step importUserStep) {
+        return new JobBuilder("importUserJob", jobRepository)
+            .start(importUserStep)
+            .build();
+    }
+}
+```
+When this Job runs, it will safely process a 10-Gigabyte CSV file without ever consuming more than a few Megabytes of RAM, because it only ever holds 100 records in memory at a time!
+
+## REAL_WORLD
+**Restartability and State Management**
+What makes Spring Batch enterprise-grade is its Metadata Schema. 
+When you include Spring Batch in your project, it creates several tables in your database automatically (e.g., `BATCH_JOB_EXECUTION`, `BATCH_STEP_EXECUTION`).
+If a batch job is processing 10 million rows, and the server loses power exactly at row 5,432,100, you have a massive problem. You cannot restart the job from row 1, or you will double-charge 5 million customers!
+Spring Batch saves its exact position (the chunk number and row count) into these metadata tables after every successful chunk!
+When the server reboots, you restart the job. Spring Batch checks the database, sees the job failed at row 5,432,100, instantly skips the first 5 million rows in the CSV, and resumes processing flawlessly at row 5,432,101!
+
+## INTERVIEW
+**Q: You build a Spring Batch Job that reads 1 million users from the database, calculates their tax bracket, and writes the updated status back to the database. You use a chunk size of 100. During the Processor phase, if a user's address is invalid, the code throws an `InvalidAddressException`. Currently, if *one* user out of the 1 million has a bad address, the entire Job instantly crashes and stops. How do you configure the Job to ignore bad data, skip that specific user, log the error, and continue processing the remaining 999,999 users?**
+A: **You configure Fault Tolerance and Skip Logic on the Step.**
+By default, any Exception thrown during a Chunk will cause the entire Step to fail and the transaction to roll back.
+To handle dirty data, you must configure the StepBuilder to be `faultTolerant()`.
+You explicitly tell Spring Batch: *"If an InvalidAddressException occurs, skip it!"*
+```java
+new StepBuilder("taxStep", jobRepository)
+    .<User, User>chunk(100, transactionManager)
+    .reader(reader).processor(processor).writer(writer)
+    .faultTolerant() // Enable advanced error handling!
+    .skip(InvalidAddressException.class) // Define which exceptions are safe to ignore!
+    .skipLimit(500) // If there are more than 500 bad addresses, the file is probably corrupted; fail the job!
+    .build();
+```
+With this configuration, if row 42 throws the exception, Spring Batch will discard row 42, successfully commit the other 99 rows in the chunk, log the skipped item (using a `SkipListener`), and seamlessly continue to the next chunk!

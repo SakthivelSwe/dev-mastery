@@ -1,0 +1,256 @@
+=== TOPIC: java-memory-model ===
+
+## WHY
+
+In modern symmetric multiprocessing (SMP) architectures, CPU cores do not execute instructions directly on main memory. To bridge the massive latency gap between CPU registers and DRAM, modern hardware employs complex, multi-tiered cache hierarchies (L1, L2, L3). Each core has its own local, non-coherent L1 and L2 caches, along with store buffers and invalidation queues designed to optimize execution speed.
+
+Without a strict specification, these hardware optimizations introduce severe hazards:
+1. **Instruction Reordering:** Compilers, JVM Just-In-Time (JIT) compilers, and CPU out-of-order execution engines reorder instructions to maximize pipeline utilization, provided the single-threaded execution semantics (as-if-serial) remain unchanged.
+2. **Memory Visibility:** Writes performed by Core A may sit in its local store buffer or L1 cache indefinitely, remaining completely invisible to Core B.
+3. **Cache Coherency Lag:** Hardware protocols like MESI (Modified, Exclusive, Shared, Invalid) manage cache-line synchronization, but the presence of store buffers and invalidation queues means updates are not instantly propagated.
+
+In a multithreaded environment, these optimizations lead to race conditions, partial object publication, and infinite loops where a thread fails to see a state change. The Java Memory Model (JMM) was specified under JSR-133 to solve this exact problem. It defines a formal, hardware-independent abstraction layer that guarantees predictable memory visibility and execution ordering across all compliant JVM implementations and CPU architectures. It acts as a contract between the Java developer, the compiler, and the execution hardware, specifying exactly when writes by one thread become visible to reads by another.
+
+---
+
+## THEORY
+
+The JMM defines concurrent memory behavior using the formal concept of **Happens-Before** relationships. If action $A$ happens-before action $B$, the JMM guarantees that the memory writes performed by $A$ are visible to $B$, and that $A$ is ordered before $B$.
+
+### Key Happens-Before Rules
+1. **Program Order Rule:** Each action in a single thread happens-before every action in that thread that comes later in the program order.
+2. **Monitor Lock Rule:** An unlock on a monitor lock happens-before every subsequent lock on that same monitor lock.
+3. **Volatile Variable Rule:** A write to a volatile field happens-before every subsequent read of that same volatile field.
+4. **Thread Start Rule:** A call to `Thread.start()` on a thread happens-before any action in the started thread.
+5. **Thread Termination Rule:** Any action in a thread happens-before any other thread detects that thread has terminated (via `Thread.join()` or `Thread.isAlive()`).
+6. **Transitivity:** If $A$ happens-before $B$, and $B$ happens-before $C$, then $A$ happens-before $C$.
+
+### Memory Barriers (Fences)
+To enforce these relationships, the JVM inserts hardware-specific memory barrier instructions during JIT compilation:
+* **LoadLoad:** Guarantees all preceding reads are completed before any subsequent reads are executed.
+* **StoreStore:** Guarantees all preceding writes are flushed to cache/memory before any subsequent writes are executed.
+* **LoadStore:** Guarantees all preceding reads are completed before any subsequent writes are executed.
+* **StoreLoad:** The strongest barrier. Guarantees all preceding writes are flushed before any subsequent reads are executed. This prevents reordering of writes followed by reads and is typically mapped to expensive instructions like `MFENCE` or `LOCK` prefixes on x86.
+
+### Volatile Field Mechanics
+When a field is declared `volatile`:
+* **Writes:** The compiler inserts a `StoreStore` barrier before the write, and a `StoreLoad` barrier after the write. This flushes the store buffer of the current core and forces immediate propagation to the cache hierarchy.
+* **Reads:** The compiler inserts a `LoadLoad` and a `LoadStore` barrier after the read. This invalidates the core's local cache, forcing it to reload the variable directly from shared L3 cache or DRAM.
+
+### False Sharing and `@Contended`
+Modern CPUs read and write memory in chunks called **Cache Lines** (typically 64 bytes). If two unrelated variables used by different threads reside on the same cache line, updating one variable invalidates the entire cache line for the other core. This is called **False Sharing**. Java 8 introduced `@Contended` to insert padding around fields, forcing them onto separate cache lines to prevent this performance degradation.
+
+---
+
+## VISUALIZATION_CONFIG
+
+```mermaid
+graph TD
+    subgraph CPU Core 0
+        Reg0[Registers] --> SB0[Store Buffer]
+        SB0 --> L1_0[L1 Cache]
+        L1_0 --> L2_0[L2 Cache]
+    end
+    subgraph CPU Core 1
+        Reg1[Registers] --> SB1[Store Buffer]
+        SB1 --> L1_1[L1 Cache]
+        L1_1 --> L2_1[L2 Cache]
+    end
+    L2_0 --> L3[Shared L3 Cache]
+    L2_1 --> L3
+    L3 --> DRAM[Main Memory]
+
+    style SB0 fill:#f9f,stroke:#333,stroke-width:2px
+    style SB1 fill:#f9f,stroke:#333,stroke-width:2px
+    style L3 fill:#bbf,stroke:#333,stroke-width:2px
+```
+
+---
+
+## IMPLEMENTATION
+
+```java
+package com.devmastery.jmm;
+
+import java.lang.invoke.VarHandle;
+import java.lang.invoke.MethodHandles;
+
+/**
+ * Demonstrates a thread-safe, low-overhead, lock-free State Publisher
+ * utilizing volatile mechanics, explicit memory barriers, and safe publication.
+ */
+public class SafeStatePublisher {
+
+    // Volatile guarantees visibility and prevents instruction reordering across this boundary
+    private volatile boolean initialized = false;
+    private StateData state;
+
+    // Use VarHandle for fine-grained memory fence control
+    private static final VarHandle STATE_HANDLE;
+    static {
+        try {
+            STATE_HANDLE = MethodHandles.lookup()
+                .findVarHandle(SafeStatePublisher.class, "initialized", boolean.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    public static class StateData {
+        private final int id;
+        private final String payload;
+
+        public StateData(int id, String payload) {
+            this.id = id;
+            this.payload = payload;
+        }
+
+        public int getId() { return id; }
+        public String getPayload() { return payload; }
+    }
+
+    /**
+     * Publishes state securely. The writes to StateData are guaranteed to happen-before
+     * the volatile write to 'initialized'.
+     */
+    public void publish(int id, String payload) {
+        // Step 1: Allocate and construct object (writes happen in local memory/cache)
+        StateData tempState = new StateData(id, payload);
+        this.state = tempState;
+
+        // Step 2: Write to volatile variable.
+        // Under the hood, this triggers a StoreStore barrier before, and a StoreLoad barrier after.
+        // This ensures the construction of StateData is fully visible before any thread reads 'initialized' as true.
+        this.initialized = true;
+    }
+
+    /**
+     * Consumes state safely without locking.
+     */
+    public StateData consume() {
+        // Step 1: Read volatile variable.
+        // Under the hood, this triggers a LoadLoad and LoadStore barrier.
+        // This invalidates local caches, forcing a fresh read of 'initialized' and subsequently 'state'.
+        if (initialized) {
+            return this.state;
+        }
+        return null;
+    }
+
+    /**
+     * Alternative highly-optimized publication using explicit VarHandle memory fences.
+     * This avoids the cost of full volatile writes when not strictly necessary.
+     */
+    public void publishWithReleaseFence(StateData data) {
+        this.state = data;
+        // Release fence guarantees that all previous writes are visible before this point
+        VarHandle.releaseFence();
+        this.initialized = true;
+    }
+}
+```
+
+---
+
+## EXECUTION_FLOW
+
+```
+[Thread 1: Publisher]                           [Thread 2: Consumer]
+       |                                                 |
+1. Instantiates StateData(42, "OK")                      |
+2. Writes fields (id=42, payload="OK")                   |
+3. Hits StoreStore Barrier                               |
+4. Writes initialized = true                             |
+5. Hits StoreLoad Barrier (flushes cache)                |
+       |                                                 |
+       +------------------- (Registers over Bus) --------+
+                                                         |
+                                                6. Reads initialized
+                                                7. Hits LoadLoad Barrier (invalidates local cache)
+                                                8. Reads initialized as true
+                                                9. Reads state field
+                                                10. Safely accesses id=42 and payload="OK"
+```
+
+---
+
+## VERIFICATION
+
+```java
+package com.devmastery.jmm;
+
+import org.junit.jupiter.api.Test;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+public class SafeStatePublisherTest {
+
+    @Test
+    public void testSafePublication() throws InterruptedException {
+        final SafeStatePublisher publisher = new SafeStatePublisher();
+        final ExecutorService executor = Executors.newFixedThreadPool(2);
+        final CountDownLatch startLatch = new CountDownLatch(1);
+        final CountDownLatch endLatch = new CountDownLatch(2);
+        final AtomicReference<SafeStatePublisher.StateData> consumedData = new AtomicReference<>();
+
+        // Consumer Thread
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                while (true) {
+                    SafeStatePublisher.StateData data = publisher.consume();
+                    if (data != null) {
+                        consumedData.set(data);
+                        break;
+                    }
+                    Thread.onSpinWait(); // Efficient CPU spinning
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                endLatch.countDown();
+            }
+        });
+
+        // Publisher Thread
+        executor.submit(() -> {
+            try {
+                startLatch.await();
+                publisher.publish(99, "SecurePayload");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                endLatch.countDown();
+            }
+        });
+
+        // Trigger execution
+        startLatch.countDown();
+        boolean finished = endLatch.await(2, TimeUnit.SECONDS);
+
+        assertTrue(finished, "Execution timed out due to visibility issues or deadlock");
+        assertNotNull(consumedData.get(), "StateData must not be null");
+        assertEquals(99, consumedData.get().getId());
+        assertEquals("SecurePayload", consumedData.get().getPayload());
+
+        executor.shutdown();
+    }
+}
+```
+
+---
+
+=== TOPIC: garbage-collection-mechanics ===
+
+## WHY
+
+Automatic memory management is one of Java's core value propositions, freeing developers from manual deallocation bugs like dangling pointers, double-frees, and memory leaks. However, this convenience introduces runtime complexity. If garbage collection (GC) mechanics are not deeply understood, applications suffer from high latency, unpredictable Stop-The-World (STW) pauses, and catastrophic OutOfMemoryErrors (OOME).
+
+To design high-throughput, low-latency systems, developers must understand the fundamental trade-offs of the JVM's memory architecture. In high-frequency trading or real-time streaming APIs, a single GC pause lasting more than a few milliseconds can violate SLAs. Conversely, in batch processing jobs, throughput is paramount, and short, frequent pauses are acceptable if the overall execution time is minimized.
+
+The core challenge GC algorithms solve is identifying dead objects (unreachable from GC Roots) and compacting live memory blocks to prevent fragmentation without halting execution threads indefinitely. As heaps scale from megabytes to terabytes, simple mark-and-sweep approaches fail. Modern collectors (G1, ZGC) must divide memory dynamically, use concurrent marking barriers, and employ sophisticated heuristics to balance CPU overhead against latency goals

@@ -1,0 +1,114 @@
+---
+slug: "api-security-advanced"
+title: "Advanced API Security (OAuth & CORS)"
+level: 5
+---
+
+## WHY
+If an API is on the internet, it is being attacked. Automated bots scan millions of IPs daily looking for unauthenticated endpoints, exposed `.env` files, and endpoints vulnerable to SQL Injection.
+Basic security (like requiring a password) is no longer enough. If your API is public, you must understand Cross-Origin Resource Sharing (CORS) to prevent malicious websites from hijacking user sessions. If you are building an enterprise application, you must master OAuth 2.0 and OIDC to safely delegate permissions across complex microservice architectures.
+
+## THEORY
+### CORS (Cross-Origin Resource Sharing)
+By default, web browsers enforce the **Same-Origin Policy**. If a user is on `https://mywebsite.com`, the browser strictly blocks their JavaScript from making an API call to `https://evil-hacker.com`. 
+
+But what if you *want* your React frontend (`https://app.mycompany.com`) to make an API call to your backend (`https://api.mycompany.com`)? Because the subdomains are different, the browser blocks it! 
+**CORS** is a mechanism where the Server explicitly tells the Browser: *"It's okay, I recognize this frontend domain. You can let the request through."*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "oauth-flow" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Configuring CORS)
+If you see the dreaded error in your Chrome console: *`Access to fetch at 'api.com' from origin 'app.com' has been blocked by CORS policy`*, the fix must be implemented on the **BACKEND SERVER**. The frontend cannot bypass it.
+
+```javascript
+// Express.js Backend Example
+const express = require('express');
+const cors = require('cors');
+const app = express();
+
+// THE INSECURE WAY (Wildcard)
+// NEVER do this in production! It tells the browser that ANY website on the internet 
+// is allowed to send JavaScript requests to your API!
+// app.use(cors({ origin: '*' }));
+
+// THE SECURE WAY (Whitelist)
+// The server explicitly tells the browser exactly which origins are allowed.
+const corsOptions = {
+    origin: ['https://app.mycompany.com', 'https://staging.mycompany.com'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'], // Only allow these verbs
+    allowedHeaders: ['Content-Type', 'Authorization'], // Only allow these headers
+    credentials: true // Crucial! Allows the browser to send secure Cookies!
+};
+
+app.use(cors(corsOptions));
+```
+
+### Level 2 — Building Blocks (The Preflight OPTIONS Request)
+When you send a complex request (like a POST with JSON data or an Authorization header), the browser doesn't just send the POST right away. 
+It silently fires a completely invisible **OPTIONS** request first! This is the "Preflight" check.
+
+The browser asks the server: *"Hey, I am about to send a POST request with a JWT. Are you cool with that?"*
+If the server's CORS configuration allows it, the server replies `200 OK`. Then (and only then) does the browser send the actual POST request!
+
+*Performance Tip:* Preflight requests literally double the network latency of your API! You should cache the preflight response so the browser doesn't ask twice.
+```javascript
+// Cache the CORS Preflight response in the browser for 24 hours!
+const corsOptions = {
+    origin: 'https://app.mycompany.com',
+    maxAge: 86400 
+};
+```
+
+### Level 3 — Intermediate (Rate Limiting)
+If a malicious user writes a `while(true)` loop to hit your `/login` endpoint, they can brute-force passwords or completely crash your server via a DDoS attack. 
+You MUST protect every public endpoint with a Rate Limiter (often backed by Redis).
+
+```javascript
+const rateLimit = require('express-rate-limit');
+
+// 1. General API limit
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again after 15 minutes'
+});
+app.use('/api/', globalLimiter);
+
+// 2. Aggressive limit for sensitive endpoints!
+const loginLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5, // Limit each IP to 5 failed login attempts per hour!
+    message: 'Too many login attempts. Account locked for 1 hour.'
+});
+app.use('/api/auth/login', loginLimiter);
+```
+
+### Level 4 — Advanced (OAuth 2.0 & OIDC)
+OAuth 2.0 is the industry standard for Authorization. When an app asks you to "Login with Google", it is using OAuth.
+
+**The Authorization Code Flow (The most secure flow for web apps):**
+1. The User clicks "Login". Your app redirects their browser to Google's Auth Server.
+2. The User logs into Google and clicks "Allow".
+3. Google redirects the User back to your backend API, providing a temporary, one-time-use string called an **Authorization Code** in the URL.
+4. Your backend API secretly calls Google (Server-to-Server) and trades that temporary Code plus your secret API Key in exchange for the actual **Access Token (JWT)**.
+5. Your backend uses the Access Token to fetch the user's email, creates a local session, and logs them in!
+
+*Why all these extra steps?* Because the highly sensitive Access Token (the keys to the kingdom) is passed strictly Server-to-Server! It never touches the browser URL bar or frontend JavaScript, rendering it immune to XSS attacks or malicious browser extensions!
+
+## REAL_WORLD
+**API Keys vs. Bearer Tokens (JWT)**
+When should you use an API Key vs a JWT?
+- **API Keys (`x-api-key: 123`):** Use these for Server-to-Server communication or Developer tools (like Stripe or Twilio). They do not expire, they are long random strings stored in a database, and they identify a *Project* or a *System*. They should NEVER be embedded in a mobile app or frontend React code.
+- **Bearer Tokens / JWT (`Authorization: Bearer ey...`):** Use these for identifying a human *User*. They are cryptographically signed, contain user claims (like user_id or roles), and have a strict, short expiration time (e.g., 15 minutes). If a JWT is stolen, the hacker only has access for a few minutes. 
+
+## INTERVIEW
+**Q: I have a React app. I read that storing JWTs in `localStorage` is vulnerable to XSS attacks (Cross-Site Scripting). The article recommended storing the JWT in an `HttpOnly` Cookie instead. But if I use Cookies, I read I am now vulnerable to CSRF attacks (Cross-Site Request Forgery)! Which one should I choose?**
+A: **Use an `HttpOnly` Cookie and implement Anti-CSRF protections.**
+If a hacker executes malicious JavaScript on your site (XSS), they can run `localStorage.getItem('token')` and instantly steal the JWT forever. An `HttpOnly` Cookie cannot be read by JavaScript, rendering it mathematically immune to XSS theft.
+However, because browsers automatically attach Cookies to every request to that domain, a hacker could trick a user into clicking a link on `evil.com` that sends a hidden POST request to your bank API. Since the browser attaches the Cookie, the API assumes it's authorized (CSRF)!
+To prevent this while keeping the secure Cookie, you must implement the **SameSite Cookie Attribute** (`SameSite=Strict`), which prevents the browser from attaching the cookie if the request originated from a different domain.

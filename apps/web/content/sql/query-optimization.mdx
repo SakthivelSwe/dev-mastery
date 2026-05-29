@@ -1,0 +1,126 @@
+---
+slug: "query-optimization"
+title: "Query Optimization & EXPLAIN"
+level: 5
+---
+
+## WHY
+In the early days of a startup, writing `SELECT * FROM users JOIN orders` is fast because you only have 100 rows of data. Two years later, that exact same query takes 45 seconds to run, locking up the database and causing the entire application to timeout and crash.
+
+**Query Optimization** is the process of examining exactly how the database engine executes your SQL and rewriting the queries (or adding Indexes) to mathematically reduce the workload. If you understand how the database reads data, you can turn a 45-second query into a 45-millisecond query.
+
+## THEORY
+### The Query Planner (The Brain)
+When you send a SQL string to the database, it doesn't just blindly execute it. It hands it to the **Query Planner**. The Planner analyzes your SQL, looks at statistics about your tables (how many rows exist, the distribution of data), and generates multiple different "Execution Plans". It then chooses the plan with the lowest estimated "Cost" (CPU and disk I/O effort).
+
+The absolute most important command in all of SQL is `EXPLAIN`. Prefixing any query with `EXPLAIN` asks the database: *"Don't run this query. Just show me the Execution Plan you WOULD use, so I can see why it's slow!"*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SQLVisualizer", "state": "query-explain" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Using EXPLAIN)
+Let's see how the database reads a table.
+
+```sql
+-- Prefix the query with EXPLAIN (or EXPLAIN ANALYZE to actually run it and see true timings)
+EXPLAIN ANALYZE 
+SELECT * FROM employees WHERE department = 'Sales';
+```
+
+**The Output (Simplified):**
+```text
+Seq Scan on employees  (cost=0.00..15.50 rows=12 width=40) (actual time=0.015..0.045 rows=15 loops=1)
+  Filter: (department = 'Sales'::text)
+  Rows Removed by Filter: 85
+Execution Time: 0.081 ms
+```
+*What this means:* The database performed a **Seq Scan (Sequential Scan)**. It literally started at Row 1, read every single row on the hard drive, and checked if `department == 'Sales'`. For 100 rows, this is fast. For 10 million rows, a Sequential Scan is a death sentence for performance.
+
+### Level 2 — Building Blocks (Index Scans)
+To fix a Sequential Scan, we add an Index (a B-Tree data structure) on the column we are searching.
+
+```sql
+CREATE INDEX idx_department ON employees(department);
+
+-- Now, run EXPLAIN ANALYZE again!
+EXPLAIN ANALYZE 
+SELECT * FROM employees WHERE department = 'Sales';
+```
+
+**The New Output:**
+```text
+Bitmap Heap Scan on employees  (cost=4.20..12.30 rows=15)
+  Recheck Cond: (department = 'Sales'::text)
+  ->  Bitmap Index Scan on idx_department  (cost=0.00..4.19 rows=15)
+        Index Cond: (department = 'Sales'::text)
+Execution Time: 0.021 ms
+```
+*What this means:* The planner completely changed its strategy! It used an **Index Scan**. It instantly found the exact disk locations in the B-Tree, jumping straight to the correct data without reading the rest of the table.
+
+### Level 3 — Intermediate (Sargable Queries)
+Just because you have an Index doesn't mean the database can use it. A query is **SARGable** (Search ARGument ABLE) if the database engine can utilize an index to execute it.
+
+```sql
+-- NON-SARGABLE (Terrible Performance!)
+-- The database CANNOT use an index on 'created_at' here! 
+-- Why? Because you wrapped the column in a function (EXTRACT). 
+-- The DB is forced to run the function on EVERY SINGLE ROW (Seq Scan) before it can check the year!
+SELECT * FROM orders WHERE EXTRACT(YEAR FROM created_at) = 2023;
+
+-- SARGABLE (Lightning Fast!)
+-- By keeping the column 'naked' on the left side of the operator, 
+-- the DB can instantly traverse the B-Tree index using the range operators!
+SELECT * FROM orders WHERE created_at >= '2023-01-01' AND created_at < '2024-01-01';
+
+
+-- NON-SARGABLE (Wildcard at the start!)
+-- An index is like a phone book. If you ask for names starting with "Sm", it's fast. 
+-- If you ask for names containing "ith" anywhere, the DB must scan the whole book!
+SELECT * FROM users WHERE last_name LIKE '%ith'; 
+
+-- SARGABLE (Wildcard at the end!)
+SELECT * FROM users WHERE last_name LIKE 'Smit%'; 
+```
+
+### Level 4 — Advanced (N+1 Queries and JOIN Types)
+When joining massive tables, the Query Planner has three main strategies:
+1. **Nested Loop Join:** For every row in Table A, loop through Table B. (Slowest, massive $O(N \times M)$ time complexity unless an index is used).
+2. **Hash Join:** Hashes Table A into memory, then scans Table B against the hash map. (Very fast, but requires massive RAM).
+3. **Merge Join:** Sorts both tables first, then zips them together like a zipper. (Extremely fast if the tables are already indexed/sorted).
+
+You can heavily influence which Join the database uses by ensuring Foreign Keys are indexed!
+
+```sql
+-- DANGER: The N+1 Problem (Usually caused by ORMs like Hibernate/Prisma)
+-- Query 1: Get all active users (Returns 1000 users)
+SELECT id, name FROM users WHERE is_active = true;
+-- Query 2 -> 1001: The ORM then loops through the users in Javascript and runs a separate query for each one!
+SELECT * FROM orders WHERE user_id = 1;
+SELECT * FROM orders WHERE user_id = 2;
+-- This causes 1,001 separate network requests to the DB, destroying performance!
+
+-- THE OPTIMIZED WAY: A single JOIN query. Let the DB do the math!
+SELECT u.id, u.name, o.total
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE u.is_active = true;
+-- (Ensure 'user_id' in the orders table has an Index, otherwise this JOIN will trigger a massive Sequential Scan!)
+```
+
+## REAL_WORLD
+**Pagination (OFFSET vs. Keyset)**
+Imagine a Reddit-style feed with 5 million posts. You want to view Page 1,000.
+The standard SQL approach is `SELECT * FROM posts ORDER BY created_at DESC LIMIT 50 OFFSET 50000;`. 
+*This is a massive performance trap.* To execute an `OFFSET` of 50,000, the database literally fetches the first 50,000 rows, throws them in the garbage, and gives you the next 50. As users click deeper into pages, the query gets slower and slower.
+Modern hyper-scale applications use **Keyset Pagination** (or Cursor Pagination). Instead of `OFFSET`, you pass the ID of the last item you saw:
+`SELECT * FROM posts WHERE id < 948293 ORDER BY id DESC LIMIT 50;`
+Because `id` is an Indexed Primary Key, the database instantly jumps to that exact spot in the B-Tree and grabs the next 50 rows in 1 millisecond.
+
+## INTERVIEW
+**Q: I have a massive query that is running slowly. I ran `EXPLAIN ANALYZE` and noticed a node that says `Sort (cost=1000.00)`. Why is sorting so expensive, and how can I fix it?**
+A: Sorting data (`ORDER BY`) is incredibly CPU and RAM intensive. If the dataset is larger than the database's `work_mem` allocation, the database is forced to spill the sort operation onto the physical Hard Drive (a "Disk Sort"), which is catastrophically slow.
+To fix it, you should create a **B-Tree Index** on the column you are sorting by. Because a B-Tree inherently stores data in a pre-sorted order, the database completely skips the `Sort` step in the Execution Plan and just reads the Index sequentially, making the query instant.

@@ -1,0 +1,130 @@
+---
+slug: "jpql-and-criteria"
+title: "JPQL and Criteria API"
+level: 4
+---
+
+## WHY
+Spring Data JPA is magical. You can declare a method interface like `findByNameAndAgeGreaterThan(String name, int age);`, and Spring automatically writes the SQL query for you!
+But what happens when you need to run a complex analytics query? *"Find all users who joined last month, grouped by city, where the total purchases exceed $500, sorted by their last login date."*
+Trying to name a method `findByJoinedDateBetweenAndCityGroupedAndPurchasesGreaterThanOrderByLastLoginDesc()` is utterly ridiculous and impossible for Spring to parse.
+When method names fail, you must write custom queries. You have three choices in Spring: **Native SQL** (Raw SQL strings), **JPQL** (Object-Oriented SQL strings), and the **Criteria API** (Type-Safe programmatic queries).
+
+## THEORY
+### JPQL (Java Persistence Query Language)
+JPQL looks almost identical to SQL, but with one massive difference: **You query Java Classes, not Database Tables!**
+Instead of `SELECT * FROM users_table`, you write `SELECT u FROM User u`. 
+JPQL is database-agnostic. Hibernate reads your JPQL string and dynamically translates it into the correct dialect of SQL (Postgres, MySQL, Oracle) at runtime!
+
+### The Criteria API
+Writing complex JPQL strings means you are still writing raw text inside Java strings (`"SELECT u FROM User u WHERE..."`). If you misspell a variable name inside the string, the compiler won't catch it; it will crash at runtime.
+The **Criteria API** allows you to build SQL queries completely using pure, type-safe Java code (Object chaining). If you misspell a variable, your IDE underlines it in red and refuses to compile!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "jpql-queries" }
+```
+
+## CODE
+
+Let's explore how to write custom queries inside a standard Spring `JpaRepository`.
+
+### 1. The Magic (Derived Query Methods)
+For simple queries, just let Spring write the SQL for you based on the method name!
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+    
+    // Spring automatically generates: SELECT * FROM users WHERE email = ? AND age > ?
+    List<User> findByEmailAndAgeGreaterThan(String email, int age);
+}
+```
+
+### 2. JPQL (`@Query` Annotation)
+When the query gets complex, use the `@Query` annotation to write JPQL. Remember, query the Class variables, not the SQL table columns!
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    // JPQL: Notice we select the Object alias 'u', not '*'
+    // Notice we use the Java property 'u.isActive', not the SQL column 'is_active'
+    @Query("SELECT u FROM User u WHERE u.isActive = true AND u.department.name = :deptName")
+    List<User> findActiveUsersInDepartment(@Param("deptName") String deptName);
+    
+    
+    // What if we want to UPDATE data in bulk?
+    @Modifying // Required when modifying data!
+    @Query("UPDATE User u SET u.status = 'INACTIVE' WHERE u.lastLogin < :cutoffDate")
+    int deactivateOldUsers(@Param("cutoffDate") LocalDateTime cutoffDate);
+}
+```
+
+### 3. Native SQL (The Escape Hatch)
+Sometimes you need to use a super advanced, Postgres-specific database feature (like JSONB querying) that JPQL doesn't understand. You can force Spring to pass raw SQL directly to the database!
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    // nativeQuery = true tells Hibernate: "Don't try to translate this! Just pass it straight to Postgres!"
+    @Query(value = "SELECT * FROM users WHERE metadata->>'tier' = 'premium'", nativeQuery = true)
+    List<User> findPremiumUsersRaw();
+}
+```
+
+### 4. The Criteria API (Dynamic Queries)
+What if you have a search page with 10 optional filters (Name, Min Age, Max Age, City, Role)? You cannot write 100 different `@Query` combinations! You must build the query dynamically using the Criteria API (via Spring's `Specification`).
+
+```java
+import org.springframework.data.jpa.domain.Specification;
+
+public class UserSpecifications {
+
+    // Build a dynamic WHERE clause piece using pure Java!
+    public static Specification<User> hasAgeGreaterThan(Integer age) {
+        return (root, query, criteriaBuilder) -> {
+            if (age == null) return null; // If filter is empty, ignore it!
+            
+            // Evaluates to: WHERE u.age > ?
+            return criteriaBuilder.greaterThan(root.get("age"), age);
+        };
+    }
+}
+
+// In your Service Layer, you can dynamically chain them together!
+// Specification<User> filters = Specification.where(hasAgeGreaterThan(18)).and(hasName("Alice"));
+// userRepository.findAll(filters);
+```
+
+## REAL_WORLD
+**The Danger of N+1 with DTO Projections**
+When you write `SELECT u FROM User u`, Hibernate pulls massive entities into RAM.
+What if you only need the user's name and email for a dashboard? Pulling 10,000 massive `User` objects into RAM just to read 2 strings will crash your server!
+You should use **JPQL Constructor Expressions** (or Spring Data Projections).
+You create a lightweight, flat Java class (a DTO) that is *not* an Entity.
+
+```java
+// A simple DTO (Not an Entity!)
+public class UserSummaryDto {
+    private String name;
+    private String email;
+    public UserSummaryDto(String name, String email) { ... }
+}
+
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    // AMAZING PERFORMANCE: Hibernate generates a highly optimized SQL query:
+    // SELECT name, email FROM users; 
+    // It instantly injects the raw strings into the DTO constructor, bypassing massive Object overhead!
+    @Query("SELECT new com.example.dto.UserSummaryDto(u.name, u.email) FROM User u")
+    List<UserSummaryDto> findAllSummaries();
+}
+```
+
+## INTERVIEW
+**Q: You write a JPQL query that updates 10,000 records: `@Query("UPDATE User u SET u.status = 'VIP' WHERE u.score > 100")`. You call this method. On the very next line of code, you fetch User 42 (who has a score of 500) using `userRepository.findById(42)`. You check User 42's status, and to your shock, it is NOT 'VIP'! Why did the database update fail?**
+A: **It didn't fail. The Cache lied to you.**
+This is a critical concept regarding JPA's **First-Level Cache (Persistence Context)**.
+When you execute a bulk `@Modifying` JPQL UPDATE query, Hibernate fires the raw SQL directly at the database. The database updates the 10,000 rows perfectly!
+*However*, Hibernate does NOT automatically update the `User` objects currently sitting in Java RAM! 
+When you call `findById(42)` on the very next line, Hibernate checks its First-Level RAM Cache, finds the stale, old User 42 object, and instantly returns it to you without ever asking the database for the newly updated row!
+*The Fix:* You must explicitly tell Spring to forcefully clear the RAM cache after the bulk update finishes. You do this by adding `@Modifying(clearAutomatically = true)`! This forces Hibernate to drop the stale cache and fetch the fresh, updated 'VIP' status directly from the database on the next read!

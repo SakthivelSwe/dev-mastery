@@ -1,0 +1,119 @@
+---
+slug: "pg-architecture"
+title: "PostgreSQL Architecture"
+level: 3
+---
+
+## WHY
+PostgreSQL is the world's most advanced open-source relational database. Understanding its internal architecture is crucial for tuning performance, configuring high availability, and writing queries that don't accidentally bring down production. It is not just a black box that executes SQL — it is a complex operating system for data.
+
+## THEORY
+### Process Architecture
+Unlike some databases that use a single multi-threaded process (like MySQL), PostgreSQL uses a **multi-process architecture**. When the PostgreSQL server starts, it spawns a Master Process (the "Postmaster"). Whenever a client connects, the Postmaster forks a dedicated, isolated Backend Process specifically for that client.
+
+### Memory Architecture
+Memory is divided into two distinct areas:
+1. **Local Memory:** Private memory for each Backend Process (used for sorting, hashing, and query execution).
+2. **Shared Memory:** A massive global memory pool shared across all processes (used for caching disk blocks and managing transaction logs).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "pg-architecture" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Connection Lifecycle)
+```text
+1. Client sends connection request to Port 5432.
+2. The Postmaster process receives the request.
+3. Postmaster authenticates the client (checking pg_hba.conf).
+4. Postmaster FORKS a new "Backend Process" (postgres process).
+5. The Backend Process executes SQL queries for the client.
+6. When the client disconnects, the Backend Process terminates.
+
+PRO-TIP: Forking a process in Linux is relatively expensive! 
+If 1,000 clients connect and disconnect rapidly, the server spends all its CPU 
+just starting and stopping processes. 
+This is why you MUST use a Connection Pooler (like PgBouncer) in production!
+```
+
+### Level 2 — Building Blocks (Shared Memory)
+The most critical part of Postgres performance tuning is configuring Shared Memory.
+
+```text
+SHARED BUFFERS (shared_buffers in postgresql.conf)
+- This is PostgreSQL's primary RAM cache.
+- Instead of reading from the slow Hard Drive, Postgres reads/writes to Shared Buffers.
+- Rule of thumb: Set to 25% of the server's total RAM.
+- Why only 25%? Because Linux ALSO caches file reads in the OS Page Cache! 
+  Postgres relies heavily on the OS cache.
+
+WAL BUFFERS (wal_buffers)
+- WAL = Write-Ahead Log.
+- Before changes are written to the actual data files, they are quickly written 
+  to the WAL (sequential write, very fast) to ensure durability (ACID).
+- The WAL Buffers hold this data in RAM briefly before syncing to disk.
+
+SHARED MEMORY SIZES:
+Total Server RAM: 32 GB
+recommended shared_buffers = 8 GB
+```
+
+### Level 3 — Intermediate (Local Memory - work_mem)
+Every time a client executes a query that requires sorting (`ORDER BY`) or joining (`HASH JOIN`), Postgres uses the Backend Process's local memory.
+
+```sql
+-- work_mem dictates how much memory ONE operation can use before spilling to disk.
+-- If work_mem is 4MB, and you sort 10MB of data, Postgres creates temporary 
+-- files on the hard drive to finish the sort. This is SLOW!
+
+-- Check your current setting:
+SHOW work_mem; 
+
+-- You can (and should) increase this for complex analytical queries dynamically!
+SET work_mem = '256MB';
+SELECT * FROM massive_table ORDER BY date_created;
+RESET work_mem;
+
+-- DANGER: 
+-- If work_mem = 64MB, and a query has 4 sorts, that query uses 256MB.
+-- If 100 concurrent clients run that query, Postgres allocates 25 GB of RAM!
+-- The Linux OOM (Out Of Memory) Killer will brutally terminate your database!
+-- Keep the global work_mem conservative, and increase it per-session for big queries.
+```
+
+### Level 4 — Advanced (Background Worker Processes)
+While Backend Processes handle client queries, the Postmaster also starts Several Background Worker Processes to maintain the database:
+
+```text
+1. BACKGROUND WRITER (bgwriter)
+   Periodically flushes "dirty" (modified) pages from Shared Buffers to the actual 
+   data files on disk. It trickles data to disk so the system doesn't freeze during a huge checkpoint.
+
+2. CHECKPOINTER
+   Executes Checkpoints: forces ALL dirty buffers to disk. Once completed, the Write-Ahead 
+   Log (WAL) can be safely truncated because the data is permanently on disk.
+
+3. AUTOVACUUM LAUNCHER
+   Postgres uses MVCC (Multi-Version Concurrency Control). When you UPDATE a row, 
+   Postgres doesn't overwrite it; it creates a NEW row and marks the old one as "dead".
+   The Autovacuum worker periodically scans tables and deletes these dead rows to 
+   free up disk space (preventing "table bloat").
+
+4. WAL WRITER
+   Constantly flushes the WAL buffers from RAM to the WAL files on disk to guarantee durability.
+```
+
+## REAL_WORLD
+**The Connection Scaling Problem**
+Because each connection is a full OS process, Postgres consumes roughly 5MB-10MB of RAM just for the process overhead per connection.
+If you configure `max_connections = 5000` to handle a traffic spike, you will instantly consume 25GB-50GB of RAM just on idle processes!
+**The Industry Solution:** Leave `max_connections` at 100-200. Place **PgBouncer** (a lightweight connection pooler) in front of Postgres. PgBouncer accepts 5,000 connections from your application, but multiplexes them down to just 100 real Postgres connections.
+
+## INTERVIEW
+**Q: Why does Postgres rely on the OS Page Cache instead of just maximizing `shared_buffers` like other databases?**
+A: Postgres was designed to integrate deeply with UNIX systems. The OS Kernel is extremely efficient at managing file caching. Keeping `shared_buffers` at 25% leaves 75% of RAM for the OS Page Cache, `work_mem` allocations, and connection overhead. This "Double Buffering" (data exists in OS cache and Postgres cache) is a known design choice that simplifies the database engine and provides excellent performance.
+
+**Q: What happens if the server crashes before dirty buffers are written to the data files?**
+A: No data is lost! This is the magic of the **Write-Ahead Log (WAL)**. When a transaction COMMITs, it is synchronously written to the WAL on disk. After a crash, Postgres starts up, reads the WAL, and "replays" every transaction that was in the WAL but hadn't yet been flushed from Shared Buffers to the data files. This guarantees ACID durability.

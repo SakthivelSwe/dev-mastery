@@ -1,0 +1,169 @@
+---
+slug: "bean-scope"
+title: "Bean Scopes (Singleton vs Prototype)"
+level: 2
+---
+
+## WHY
+When Spring registers a Bean in the ApplicationContext, it needs to know how long that object should live, and whether it should share that exact same object with everyone who asks for it, or build a brand new one every time. This lifecycle and sharing policy is called the **Bean Scope**.
+
+If you do not fundamentally understand Bean Scopes, you will write a `@Service` that works perfectly in development, but the moment you deploy to production and two users click a button at the exact same time, their data will cross-contaminate and corrupt the database.
+
+## THEORY
+### The Default: Singleton Scope
+By default, **EVERY** Bean in Spring is a Singleton.
+This means Spring creates the object exactly **once** at application startup. It locks that one single instance in memory. Whenever any part of your application asks for that Bean, Spring hands out the exact same memory reference. 
+
+If 10,000 users hit your server at the same time, 10,000 threads will all execute code inside the exact same `UserService` object simultaneously. Because of this, **Singletons must be completely stateless**. They cannot have mutable instance variables.
+
+### The Alternative: Prototype Scope
+If you change a Bean's scope to Prototype, Spring completely changes its behavior. Instead of holding one instance in memory, Spring treats the Bean definition as a blueprint. Every single time a class asks for the Bean, Spring runs `new Object()`, builds a brand new instance, and hands it over. Spring does not store or track prototypes after it gives them away.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "spring-bean-scopes" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Default Singleton Danger)
+```java
+import org.springframework.stereotype.Service;
+
+// THIS IS A DISASTER WAITING TO HAPPEN.
+// By default, this is a Singleton! Only ONE ShoppingCart exists for the entire server!
+
+@Service
+public class ShoppingCart {
+    
+    // Mutable state inside a Singleton!
+    private int totalItems = 0; 
+
+    public void addItem() {
+        totalItems++; // Thread race conditions will destroy this variable!
+    }
+
+    public int getTotal() {
+        return totalItems;
+    }
+}
+
+// User A clicks "Add Item". totalItems = 1.
+// User B clicks "Add Item". totalItems = 2.
+// User A goes to checkout and is billed for 2 items! Data is corrupted!
+```
+
+### Level 2 — Building Blocks (Declaring Scopes)
+```java
+import org.springframework.context.annotation.Scope;
+import org.springframework.stereotype.Component;
+
+// We use the @Scope annotation to change the lifecycle!
+// "prototype" means: Give me a brand new memory instance every time I ask!
+
+@Component
+@Scope("prototype")
+public class SafeShoppingCart {
+    
+    private int totalItems = 0;
+
+    public void addItem() {
+        totalItems++;
+    }
+}
+```
+
+### Level 3 — Intermediate (Web-Aware Scopes)
+If you are running a Spring Boot Web Server, Spring unlocks three additional, highly specialized web scopes:
+
+```java
+import org.springframework.stereotype.Component;
+import org.springframework.web.context.annotation.RequestScope;
+import org.springframework.web.context.annotation.SessionScope;
+
+// 1. Request Scope
+// Spring creates a brand new instance at the start of an HTTP Request.
+// When the server finishes the HTTP Response, the object is immediately destroyed.
+@Component
+@RequestScope
+public class RequestLogger {
+    private String traceId; // Safe! Only exists for one HTTP request.
+}
+
+// 2. Session Scope
+// Spring creates one instance per User Session (tied to a JSESSIONID cookie).
+// It lives for 30 minutes (usually), holding data across multiple requests for ONE user.
+@Component
+@SessionScope
+public class UserPreferences {
+    private String themeColor; // Safe! Isolated to this specific user's session.
+}
+```
+
+### Level 4 — Advanced (The Singleton-Prototype Problem)
+What happens if you inject a `Prototype` Bean into a `Singleton` Bean?
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+@Service // Singleton (Default)
+public class CheckoutService {
+
+    // ShoppingCart is a Prototype! We expect a new one every time!
+    @Autowired
+    private SafeShoppingCart cart;
+
+    public void checkout() {
+        cart.addItem();
+    }
+}
+
+// THE FATAL FLAW:
+// CheckoutService is a Singleton. It is created exactly ONCE at startup.
+// During startup, it asks for a ShoppingCart. Spring builds ONE prototype, injects it, 
+// and then the Singleton locks its state forever.
+// EVERY TIME checkout() is called, it reuses the exact same injected Prototype!
+// The Prototype has essentially been forced into becoming a Singleton!
+```
+
+To fix this, you must use a **Method Injection** or a **Provider**:
+```java
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.stereotype.Service;
+
+@Service
+public class CheckoutService {
+
+    // ObjectProvider doesn't inject the Bean. It injects a FACTORY that can BUILD the bean!
+    private final ObjectProvider<SafeShoppingCart> cartProvider;
+
+    public CheckoutService(ObjectProvider<SafeShoppingCart> cartProvider) {
+        this.cartProvider = cartProvider;
+    }
+
+    public void checkout() {
+        // Now, every single time this method runs, we forcefully pull a 
+        // BRAND NEW prototype from the container!
+        SafeShoppingCart cart = cartProvider.getObject();
+        cart.addItem();
+    }
+}
+```
+
+## REAL_WORLD
+In real-world enterprise Spring Boot applications, developers almost exclusively use **Singleton** scope. 
+
+Why? Because instantiating millions of objects per second (Prototype/Request scopes) places massive pressure on the Java Garbage Collector, crushing server performance. 
+
+Instead of storing user data (like a Shopping Cart) as a stateful Bean inside the server's RAM, modern stateless architectures store the shopping cart in an external database (like Redis) and use purely stateless Singleton Services to retrieve and modify that data on the fly. You will rarely see `@Scope("prototype")` in modern microservices.
+
+## INTERVIEW
+**Q: Can a Singleton Bean hold state?**
+A: Yes, but ONLY if the state is purely read-only and immutable. For example, a `private final String apiUrl;` injected from an `application.properties` file is perfectly safe because it never changes. However, holding mutable user data (like `private User currentUser;`) is catastrophic and will lead to race conditions.
+
+**Q: What is the Application Scope?**
+A: `ApplicationScope` is a web-aware scope. It is functionally identical to a Singleton, but with one tiny technical difference: A Singleton is scoped to exactly one `ApplicationContext`. If you run a bizarre deployment where multiple `ApplicationContexts` run in the same web server, they will each have their own Singleton. An `ApplicationScope` Bean is stored in the `ServletContext`, meaning it is shared across *all* Spring Contexts running in that Tomcat instance.
+
+**Q: If you destroy the ApplicationContext, what happens to the Beans?**
+A: Spring will gracefully execute any `@PreDestroy` methods on all Singleton Beans and then wipe them from memory. However, Spring completely ignores Prototype Beans. Because Spring does not track prototypes after giving them to you, it is your responsibility (and the Garbage Collector's) to destroy them.
