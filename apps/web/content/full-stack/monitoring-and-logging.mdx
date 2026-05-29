@@ -1,0 +1,105 @@
+---
+slug: "monitoring-and-logging"
+title: "Monitoring and Logging"
+level: 5
+---
+
+## WHY
+You successfully deployed a complex architecture to AWS: 10 Microservices, running in 50 Kubernetes Pods, backed by PostgreSQL and Redis.
+On a Tuesday afternoon, users complain on Twitter that the "Checkout" button is spinning infinitely.
+Where is the bug? Is the Frontend broken? Did the Payment Microservice crash? Is the Database locking up? Did a third-party API go offline?
+In a monolithic system running on a single laptop, you can just read the terminal output. In a distributed cloud system with thousands of moving parts, finding a bug is like finding a needle in a haystack spread across 50 different servers.
+**Monitoring (Metrics) and Logging (Traces)** provide complete "Observability". They aggregate every single error, CPU spike, and database delay into a centralized dashboard, allowing engineers to pinpoint the exact line of code that failed across the entire global network in seconds.
+
+## THEORY
+### The Three Pillars of Observability
+1. **Logs (Events):** Immutable text records of specific events. (e.g., `ERROR: 2023-10-24 15:00:00 - Failed to connect to database`). Logs tell you *what* happened and *why*.
+2. **Metrics (Numbers):** Aggregated numerical measurements over time. (e.g., `CPU Usage: 95%`, `HTTP 500 Errors: 40 per minute`). Metrics tell you *when* things go wrong and trigger automated PagerDuty alarms!
+3. **Traces (Journeys):** A map of a single user's request as it travels through multiple microservices. It shows exactly how many milliseconds the request spent inside the Gateway, the Order Service, and the Database. Traces pinpoint the exact bottleneck!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "observability-stack" }
+```
+
+## CODE
+
+### 1. Structured Logging (The Foundation)
+Amateur developers use `console.log("User logged in")`. 
+This is useless in a distributed system because you cannot easily search or filter millions of plain-text lines. 
+Professional systems use **Structured Logging**. They output logs as strict JSON objects!
+
+```javascript
+// npm install winston (A professional Node.js logging library)
+const winston = require('winston');
+
+const logger = winston.createLogger({
+    level: 'info',
+    // Output everything as beautifully formatted JSON!
+    format: winston.format.json(), 
+    transports: [
+        // Print to the console (Docker will capture this!)
+        new winston.transports.Console() 
+    ]
+});
+
+// A standard HTTP Route
+app.post('/api/checkout', (req, res) => {
+    try {
+        processPayment(req.body);
+        
+        // A STRUCTURED LOG!
+        logger.info('Checkout Successful', { 
+            userId: req.body.userId, 
+            amount: req.body.amount,
+            service: 'payment-microservice' 
+        });
+        
+        res.status(200).send();
+    } catch (err) {
+        // Log the exact stack trace for debugging!
+        logger.error('Checkout Failed', { error: err.message, stack: err.stack });
+        res.status(500).send();
+    }
+});
+```
+*Why JSON?* Because centralized log aggregators (like DataDog or ELK) can instantly ingest JSON and create searchable databases. You can instantly run a query: *"Show me all ERROR logs where the service is 'payment' and the amount is > $500"*.
+
+### 2. Distributed Tracing (Correlation IDs)
+If a user request hits the Gateway (Log A), goes to the Order Service (Log B), and then hits the Payment Service (Log C), how do you prove those three isolated logs across three different servers belong to the exact same user click?
+You use a **Correlation ID**.
+
+```javascript
+// 1. The API Gateway generates a unique ID the moment the request enters the system!
+const { v4: uuidv4 } = require('uuid');
+
+app.use((req, res, next) => {
+    // Generate a UUID (e.g., "a1b2c3d4...")
+    req.correlationId = req.headers['x-correlation-id'] || uuidv4();
+    next();
+});
+
+// 2. The Gateway includes the Correlation ID in its own logs!
+logger.info("Request entered Gateway", { correlationId: req.correlationId });
+
+// 3. CRITICAL: When the Gateway makes an HTTP request to the internal Order Service,
+// it MUST pass the Correlation ID in the headers!
+axios.post('http://order-service/create', data, {
+    headers: { 'X-Correlation-ID': req.correlationId }
+});
+```
+Every downstream microservice reads that header and attaches it to their own JSON logs. Now, an engineer can search the global logging dashboard for `"correlationId": "a1b2c3d4..."` and instantly see the perfect chronological timeline of that specific request across the entire system!
+
+## REAL_WORLD
+**The ELK Stack & DataDog**
+You have 50 Kubernetes pods outputting JSON logs to their own local hard drives. If a pod dies, the logs are destroyed forever.
+You must use a Log Aggregator.
+- **The ELK Stack (Open Source):** Elasticsearch, Logstash, and Kibana. A background agent (Logstash/Fluentd) sits on every Kubernetes node, secretly reads the JSON logs generated by your Node.js apps in real-time, and ships them over the network to a massive central Elasticsearch database. You then open the Kibana web dashboard to visualize and search the logs.
+- **DataDog / New Relic (SaaS):** The enterprise standard. You pay them massive amounts of money, and you install their magic agent into your cluster. They automatically capture all Logs, trace all HTTP requests across your microservices, track CPU metrics, and build stunning graphical dashboards without you writing any custom code!
+
+## INTERVIEW
+**Q: An interviewer looks at your Express.js API. You have properly implemented structured JSON logging using Winston. They ask: "If your application throws an unhandled exception (e.g., attempting to read `.length` on `undefined`), the Node.js process will crash. Will Winston successfully log the fatal error to the external monitoring system before the process dies?"**
+A: **No, not by default. The logs will likely be lost!**
+When a Node.js process encounters an `uncaughtException` or `unhandledRejection`, the V8 engine immediately begins tearing down the process. 
+Logging over a network (or even to a file stream) is an asynchronous I/O operation. The Node.js process will brutally terminate *before* the asynchronous network request to DataDog or Elasticsearch can finish sending the JSON payload, leaving you completely blind as to why the server crashed in production!
+*The Fix:* You must explicitly register listeners for `process.on('uncaughtException')`. Inside that listener, you synchronously log the fatal error, forcefully flush the Winston logger buffers, and ONLY THEN gracefully execute `process.exit(1)` to kill the server!

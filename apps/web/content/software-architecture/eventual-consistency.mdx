@@ -1,0 +1,111 @@
+---
+slug: "eventual-consistency"
+title: "Eventual Consistency & CAP Theorem"
+level: 5
+---
+
+## WHY
+In a traditional SQL database, if you update a user's name and immediately run a SELECT query, you will always get the new name. This is called **Strong Consistency**. 
+But to build global applications (like Facebook or Amazon), you cannot rely on a single database server in Virginia. You need database replicas in London, Tokyo, and Sydney. 
+
+If a user updates their name in Virginia, it takes time for the speed of light to carry that data across trans-Atlantic fiber optic cables to the replica in London. If a user in London queries the database during those 200 milliseconds, they will see the *old* name. 
+This is **Eventual Consistency**: The guarantee that if no new updates are made, eventually all nodes in the system will converge and hold the same data. Understanding this tradeoff is the foundation of Distributed Systems engineering.
+
+## THEORY
+### The CAP Theorem
+Formulated by Eric Brewer, the CAP theorem states that a distributed data store can only guarantee **TWO** of the following three properties simultaneously:
+1. **Consistency (C):** Every read receives the most recent write or an error. (Everyone sees the exact same data instantly).
+2. **Availability (A):** Every request receives a non-error response, without guaranteeing it contains the most recent write.
+3. **Partition Tolerance (P):** The system continues to operate despite an arbitrary number of network failures (a "Partition") between nodes.
+
+*The Reality:* In distributed systems, network failures (Partitions) are a physical certainty. Therefore, you do not get to choose between C, A, and P. You **must** choose P. Your only real choice is between **CP** (Consistency) and **AP** (Availability).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "cap-theorem" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Understanding AP vs. CP)
+Imagine an ATM network. A hurricane destroys the fiber line connecting the ATM in Miami to the central database in New York (A Network Partition). A user tries to withdraw $100.
+
+**Scenario A: The CP System (Consistency + Partition Tolerance)**
+The ATM refuses to dispense the money. It says "Network Error." 
+*Why?* Because it cannot contact New York to verify the balance. It chooses Consistency (preventing overdrafts) at the expense of Availability (the ATM is effectively broken for the user).
+
+**Scenario B: The AP System (Availability + Partition Tolerance)**
+The ATM dispenses the $100 and logs the transaction locally. 
+*Why?* It prioritizes Availability (giving the user their money). However, it sacrifices Consistency. The user might have only had $50 in their account! The system accepts this risk and will *eventually* reconcile the negative balance when the network is restored (Eventual Consistency).
+
+### Level 2 — Building Blocks (Read Replicas and Replication Lag)
+The most common source of Eventual Consistency is standard SQL Read Replicas.
+
+```javascript
+// You have 1 Primary DB (accepts Writes)
+// You have 3 Replica DBs (accepts Reads)
+
+async function updateProfile(userId, newName) {
+    // 1. Write to the Primary Database
+    await dbPrimary.query('UPDATE users SET name = ? WHERE id = ?', [newName, userId]);
+    
+    // The Primary DB now starts syncing this change to the 3 replicas in the background.
+    // This takes ~50 milliseconds (Replication Lag).
+}
+
+async function getProfile(userId) {
+    // 2. Read from a random Replica to distribute load
+    // DANGER: If this is called 10ms after the update, the replica hasn't received the sync yet!
+    // The user will see their OLD name!
+    const result = await dbReplica.query('SELECT name FROM users WHERE id = ?', [userId]);
+    return result[0];
+}
+```
+
+### Level 3 — Intermediate (Read-Your-Own-Writes Consistency)
+How do we solve the UX nightmare of a user updating their profile, refreshing the page, and seeing their old data due to Replication Lag?
+We implement a specific consistency model: **Read-Your-Own-Writes**.
+
+```javascript
+async function updateProfile(userId, newName) {
+    await dbPrimary.query('UPDATE users SET name = ? WHERE id = ?', [newName, userId]);
+    
+    // We set a flag in Redis or a signed cookie indicating EXACTLY when this user last wrote data!
+    await redis.set(`last_write:${userId}`, Date.now(), 'EX', 10); // Expires in 10 seconds
+}
+
+async function getProfile(userId) {
+    // Check if the user wrote data recently (e.g., within the last 10 seconds)
+    const lastWrite = await redis.get(`last_write:${userId}`);
+    
+    if (lastWrite) {
+        // Force the read to hit the Primary DB! 
+        // We bypass the replicas to guarantee we see the most recent data.
+        return await dbPrimary.query('SELECT * FROM users WHERE id = ?', [userId]);
+    } else {
+        // Safe to read from the Replicas!
+        return await dbReplica.query('SELECT * FROM users WHERE id = ?', [userId]);
+    }
+}
+```
+
+### Level 4 — Advanced (Conflict Resolution - CRDTs)
+If you have an AP system (like an offline-first mobile app, or a globally distributed NoSQL database like Cassandra), two users might update the exact same record on opposite sides of the world at the exact same millisecond. 
+When the databases eventually sync, you have a **Conflict**. How does the database know which write wins?
+
+1. **LWW (Last Write Wins):** The database looks at the timestamp of the two writes and throws away the older one. Simple, but inherently causes data loss.
+2. **Vector Clocks:** The database tracks the causal history of updates and asks the application layer to manually merge them.
+3. **CRDTs (Conflict-Free Replicated Data Types):** Advanced mathematical data structures designed specifically so that operations can be applied in *any order*, across *any network*, and mathematically guarantee that all nodes will eventually arrive at the exact same final state. (This is how Figma and Google Docs allow simultaneous real-time editing without a central locking server!).
+
+## REAL_WORLD
+**Amazon's Shopping Cart**
+In the early days of Amazon, their shopping cart used a strict SQL database (CP). During Black Friday, the massive load caused the databases to lock up, meaning the system could not guarantee Consistency. Because it was a CP system, it failed over, returning errors to users when they clicked "Add to Cart." Amazon lost millions of dollars.
+Amazon realized that *Availability is infinitely more important than Consistency for a shopping cart*. They invented **DynamoDB** (an AP system). 
+If a network partition occurs today, DynamoDB will absolutely accept your "Add to Cart" click. If there is a conflict between data centers, the system is designed to mathematically merge the carts later. It is far better to accidentally have an item appear in your cart twice (which you can delete) than to block you from adding it at all.
+
+## INTERVIEW
+**Q: We are building a crypto exchange. We need to process trades globally. Should we use an Eventual Consistency (AP) architecture to ensure maximum uptime and availability during traffic spikes?**
+A: **Absolutely NOT. Financial systems must be CP (Consistent).**
+Eventual consistency is perfect for Twitter likes, Reddit comments, and shopping carts. It is catastrophic for financial ledgers. 
+If a user has 1 Bitcoin, and they submit two withdrawal requests simultaneously to two different servers on opposite sides of the world, an AP system might process both (sacrificing consistency for availability) resulting in the "Double Spend Problem." 
+A crypto exchange must enforce Strict Consistency (e.g., using a single master database, or a strongly consistent distributed SQL database like CockroachDB). If the network is partitioned, the system *must* reject the transaction to protect the ledger.

@@ -1,0 +1,114 @@
+---
+slug: "domain-driven-design"
+title: "Domain-Driven Design (DDD)"
+level: 4
+---
+
+## WHY
+As a software project grows from a 3-month startup MVP into a massive 10-year enterprise platform, the technical complexity usually isn't what kills the project. The project fails because the developers and the business experts stop understanding each other. 
+
+The business asks for a "Cancellation Policy update," but the developers translate that into "Updating the `status_flag` on the `trx_orders` table." This translation gap causes bugs. **Domain-Driven Design (DDD)**, introduced by Eric Evans, is a philosophy that forces the code structure and terminology to perfectly mirror the real-world business domain.
+
+## THEORY
+### Ubiquitous Language
+The most important concept in DDD is the **Ubiquitous Language**. 
+Developers, Product Managers, and Domain Experts must agree on a single, shared vocabulary. This vocabulary must be used identically in conversations, in Jira tickets, and *in the actual source code*.
+
+If the business experts call a customer a "Guest," you are not allowed to name your database table `Users`. You must name it `Guests`. If the business says "A guest checks out of a room," you do not write a method called `updateRoomStatus()`. You write a method called `checkOut()`. The code must read like the business rules.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "domain-driven-design" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Entities vs Value Objects)
+In DDD, the objects you model fall into two primary categories:
+
+**1. Entities:** Objects that have a distinct identity that persists over time, even if their properties change. 
+*Example:* A `User`. If a user changes their name or email, they are still the exact same User (identified by their `userId`).
+
+**2. Value Objects:** Objects that have NO identity. Two Value Objects are considered perfectly equal if their properties are identical. They are completely immutable.
+*Example:* An `Address`. If two users live at "123 Main St", the addresses are identical. If a user moves, you don't "update" the address object; you throw it away and create a brand new Address object.
+
+```java
+// ❌ BAD: Primitive Obsession
+class Employee {
+    String id;
+    String street;
+    String city;
+    String zipCode;
+}
+
+// ✅ GOOD: Using Value Objects
+class Employee {
+    String id; // Entity ID
+    Address homeAddress; // Value Object
+}
+
+// Value Objects are immutable. You cannot do address.setCity("New York")
+record Address(String street, String city, String zipCode) {}
+```
+
+### Level 2 — Building Blocks (Aggregates and Aggregate Roots)
+If you have an `Order` entity, and it contains multiple `OrderItem` entities, you have a problem. Can a developer load an `OrderItem` directly from the database and modify its price without telling the `Order`? If they do, the `Order.totalPrice` becomes invalid!
+
+DDD solves this using **Aggregates**. An Aggregate is a cluster of associated objects that are treated as a single unit for data changes. 
+Every Aggregate has one **Aggregate Root** (in this case, the `Order`).
+
+**The Rule:** Outside objects are ONLY allowed to hold references to the Aggregate Root. You cannot modify an `OrderItem` directly. You must ask the `Order` to do it.
+
+```java
+// The Aggregate Root
+public class Order {
+    private String id;
+    private List<OrderItem> items;
+    private double totalAmount;
+
+    // The ONLY way to add an item. 
+    // The Order strictly protects its own internal invariants!
+    public void addItem(Product product, int quantity) {
+        OrderItem item = new OrderItem(product, quantity);
+        this.items.add(item);
+        this.totalAmount += item.getPrice(); // Recalculate total safely!
+    }
+}
+```
+
+### Level 3 — Intermediate (Bounded Contexts)
+In a massive e-commerce company, what is a `Product`?
+- To the **Inventory Team**, a Product is a physical box. It has `weight`, `dimensions`, and `warehouseLocation`.
+- To the **Sales Team**, a Product is something you buy. It has `price`, `discountPercentage`, and `marketingDescription`.
+
+If you try to create a single `Product` class that satisfies both teams (a God Object), it will have 500 fields and be impossible to maintain.
+
+DDD solves this with **Bounded Contexts**. The company is split into distinct boundaries (Inventory Context vs Sales Context). Inside the Inventory Context, there is a `Product` class containing only weight and dimensions. Inside the Sales Context, there is a completely separate `Product` class containing only price. They might share the same ID, but they are entirely different codebases!
+
+### Level 4 — Advanced (Domain Events)
+When something important happens inside one Bounded Context, how does it tell the rest of the company without becoming tightly coupled to them?
+
+Through **Domain Events**. A Domain Event is a historical record of something that happened in the past (named in the past tense).
+
+```java
+// Inside the Order Aggregate
+public void completeCheckout() {
+    this.status = "PAID";
+    
+    // Publish a Domain Event
+    DomainEventPublisher.publish(
+        new OrderPaidEvent(this.id, this.totalAmount)
+    );
+}
+```
+The **Shipping Context** listens for `OrderPaidEvent` messages on a message broker (like Kafka) and automatically starts preparing the shipment, completely decoupled from the Sales system!
+
+## REAL_WORLD
+**The Anti-Corruption Layer (ACL)**
+If your beautiful DDD microservice needs to talk to a legacy, 20-year-old mainframe system that uses terrible, cryptic variable names (like `CUST_FLG_X`), you must protect your Ubiquitous Language.
+
+You build an **Anti-Corruption Layer**—a translation service at the edge of your microservice. When your code wants to check a user's status, it talks to the ACL using clean domain language (`acl.isCustomerActive(user)`). The ACL translates this into the cryptic mainframe language, makes the ugly HTTP request, translates the ugly response back into clean Domain Objects, and returns them to your system. The corruption is quarantined at the boundary.
+
+## INTERVIEW
+**Q: Why shouldn't you use Domain Entities as Data Transfer Objects (DTOs) for your REST API?**
+A: A Domain Entity contains complex business rules, rich behavior, and often references to other entities (like a `User` holding a list of `Orders`). A DTO is a dumb, flat data structure designed solely to transport data over a network. If you return an Entity directly from an API, you might accidentally serialize and expose secure internal state (like a password hash), or cause an infinite JSON recursion loop (User points to Order, Order points to User). Entities belong in the Domain Layer; DTOs belong in the Presentation Layer.

@@ -1,0 +1,112 @@
+---
+slug: "sd-distributed-id"
+title: "Distributed ID Generators"
+level: 5
+---
+
+## WHY
+In a monolithic database, generating a unique ID for a new user is trivial: you use the SQL `AUTO_INCREMENT` (MySQL) or `SERIAL` (PostgreSQL) data type. The database just adds +1.
+In a massive distributed system (like Twitter or Instagram) with 50 different database shards scattered across the globe, you cannot use `AUTO_INCREMENT`. If Shard A generates `ID 5`, and Shard B generates `ID 5`, you have a massive collision.
+
+**Distributed ID Generators** are algorithms and architectural patterns designed to generate billions of mathematically unique, non-colliding IDs across thousands of independent servers, without relying on a single central bottleneck.
+
+## THEORY
+### Requirements for a good Distributed ID
+If the interviewer asks you to design a Distributed ID Generator, you must establish the requirements first:
+1. **Uniqueness:** The ID must be mathematically guaranteed to be unique.
+2. **Sortable by Time:** The ID should roughly reflect the time it was created (e.g., ID A created today should be smaller than ID B created tomorrow). This is critical for database B-Tree index performance and pagination!
+3. **High Availability & Low Latency:** We cannot make a slow network call every time we need an ID.
+4. **Length:** It should fit in a 64-bit integer for maximum performance.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "snowflake-id" }
+```
+
+## CODE
+
+*(In a System Design interview, you explain the approaches, starting from the worst and ending at the best).*
+
+### Level 1 — The UUID (Universally Unique Identifier)
+**The Explanation:**
+"A UUID is a 128-bit random string (e.g., `094b8e...`). The application server can generate it completely locally without talking to the database. Because it is 128-bits of pure randomness, the chance of a collision is mathematically zero."
+
+*The Interviewer Trap:* "So why don't we just use UUIDs everywhere?"
+*Your Answer:* "UUIDs fail the 'Sortable by Time' requirement. Because they are completely random, every INSERT into a database forces the B-Tree index to violently re-balance. Furthermore, a 128-bit string is massive. It bloats the database size and destroys cache efficiency. (UUIDv7 solves the sortability, but is still massive)."
+
+### Level 2 — The Central Ticket Server (Flickr Pattern)
+**The Explanation:**
+"Flickr solved this by creating a dedicated, centralized 'Ticket Server'. It is literally just a single MySQL server with a table called `Tickets`. Its only job in life is to accept `REPLACE INTO` commands, increment a counter, and return the `LAST_INSERT_ID()`."
+
+*The Interviewer Trap:* "What is the problem with this?"
+*Your Answer:* "It is a Single Point of Failure (SPOF). If the Ticket Server dies, the entire company cannot generate IDs. If you add a backup Ticket Server to solve the SPOF, you now have a network sync latency issue, defeating the purpose of low-latency generation."
+
+### Level 3 — The Twitter Snowflake (The Industry Standard)
+**The Explanation:**
+"The industry standard for generating distributed IDs is the **Twitter Snowflake** algorithm. Instead of relying on a central database, every single application server generates its own IDs completely in memory using a 64-bit integer, constructed from three parts:"
+
+**The 64-Bit Structure:**
+1. **1 bit:** The Sign Bit (Always 0 to keep the number positive).
+2. **41 bits:** The **Timestamp** (Milliseconds since a custom epoch). This guarantees the IDs are Sortable by Time! 41 bits gives us 69 years before we run out of numbers.
+3. **10 bits:** The **Machine ID** (or Datacenter ID + Worker ID). This allows us to have 1,024 independent servers generating IDs simultaneously without ever colliding!
+4. **12 bits:** The **Sequence Number**. A local counter that increments every time the server generates an ID in the exact same millisecond. It resets to 0 when the millisecond ticks over. 12 bits allows a single server to generate 4,096 IDs *per millisecond*.
+
+### Level 4 — Implementing Snowflake (Conceptually)
+How does it guarantee uniqueness without a network call?
+Because the `Machine ID` is hardcoded into the server's environment variables when it boots up. 
+If Server A has `Machine ID 1` and Server B has `Machine ID 2`, they can physically never generate the same number, even if they generate it at the exact same millisecond!
+
+```javascript
+// A conceptual implementation of Snowflake (Bitwise Operations)
+class SnowflakeGenerator {
+    constructor(machineId) {
+        this.machineId = BigInt(machineId); // 10 bits max (0-1023)
+        this.sequence = 0n;                 // 12 bits max (0-4095)
+        this.lastTimestamp = -1n;
+        
+        // Custom Epoch (e.g., Jan 1, 2020)
+        this.epoch = 1577836800000n; 
+    }
+
+    generate() {
+        let currentTimestamp = BigInt(Date.now());
+
+        if (currentTimestamp === this.lastTimestamp) {
+            // We are in the exact same millisecond! Increment the sequence!
+            this.sequence = (this.sequence + 1n) & 4095n; // Bitwise mask to 12 bits
+            
+            if (this.sequence === 0n) {
+                // We generated 4096 IDs in 1 millisecond and ran out of sequence space!
+                // We MUST wait for the next millisecond to tick over.
+                currentTimestamp = this.waitNextMillis(this.lastTimestamp);
+            }
+        } else {
+            // New millisecond, reset the sequence!
+            this.sequence = 0n;
+        }
+
+        this.lastTimestamp = currentTimestamp;
+
+        // BITWISE SHIFT MAGIC!
+        // 1. Shift the Timestamp left by 22 bits (10 for machine, 12 for sequence)
+        // 2. Shift the MachineID left by 12 bits
+        // 3. Add the Sequence at the end using Bitwise OR (|)
+        const timestampDelta = currentTimestamp - this.epoch;
+        const id = (timestampDelta << 22n) | (this.machineId << 12n) | this.sequence;
+
+        return id.toString(); // Output: A massive 64-bit integer!
+    }
+}
+```
+
+## REAL_WORLD
+**The NTP Clock Sync Disaster**
+The Snowflake algorithm relies entirely on the server's physical clock (Timestamp). What happens if the server's clock accidentally jumps *backwards* by 2 seconds due to a bad NTP (Network Time Protocol) sync?
+If the clock goes backward, the server will generate a Timestamp that it has already used in the past! Because the Sequence resets, it will mathematically generate an exact duplicate ID, causing a massive database collision.
+*The Solution:* Every production-grade Snowflake implementation MUST include Clock Drift Protection. If `currentTimestamp < lastTimestamp`, the server must instantly throw a catastrophic exception, halt ID generation, and refuse to work until the clock catches up to reality!
+
+## INTERVIEW
+**Q: We are building Instagram. Users upload photos. Does the Photo ID need to be a Snowflake ID, or can we just use an `AUTO_INCREMENT` integer on the primary database shard?**
+A: **You must use a Snowflake ID.**
+Instagram generates thousands of photos a second. A single primary database shard cannot handle all the INSERTs, so you must distribute the `photos` table across multiple shards (e.g., Shard 1, Shard 2, Shard 3). 
+If you use `AUTO_INCREMENT`, Shard 1 will generate Photo ID `5` and Shard 2 will also generate Photo ID `5`. When the frontend asks the CDN for Photo 5, the system doesn't know which shard it belongs to. By using a Snowflake generator, the application servers generate a globally unique ID *before* inserting it into the database, allowing the database router to safely hash the ID and send it to the correct shard without collisions.

@@ -1,0 +1,384 @@
+---
+title: spring-beans
+slug: spring-beans
+---
+
+# Spring Beans — @Component, @Service, @Repository, @Controller
+
+## 1. Deep-Dive Architectural Overview
+
+The Spring Framework's IoC (Inversion of Control) container is powered by a meta-programming model that abstracts object creation, configuration, and lifecycle management. At the heart of this abstraction lies the `BeanDefinition`. When you annotate a class with `@Component` or its specialized stereotypes (`@Service`, `@Repository`, `@Controller`), you are not directly creating a bean; instead, you are providing metadata that Spring's scanning infrastructure processes to construct these `BeanDefinition` objects.
+
+```
++---------------------------------------------------------------------------------+
+|                         Classpath Scanning Phase                                |
+|                                                                                 |
+|  [ Classpath (.class files) ]                                                   |
+|                |                                                                |
+|                v                                                                |
+|  [ ClassPathScanningCandidateComponentProvider ]                                |
+|                |  (Uses ASM MetadataReaderFactory - no classloading)            |
+|                v                                                                |
+|  [ Scanned GenericBeanDefinition ]                                              |
++---------------------------------------------------------------------------------+
+                                 |
+                                 v
++---------------------------------------------------------------------------------+
+|                         Registration Phase                                      |
+|                                                                                 |
+|  [ BeanDefinitionRegistry ] (e.g., DefaultListableBeanFactory)                  |
+|                |                                                                |
+|                v                                                                |
+|  [ BeanDefinitionMap (ConcurrentHashMap) ]                                      |
++---------------------------------------------------------------------------------+
+                                 |
+                                 v
++---------------------------------------------------------------------------------+
+|                         Instantiation & Post-Processing Phase                   |
+|                                                                                 |
+|  [ BeanPostProcessor / BeanFactoryPostProcessor Execution ]                     |
+|                |                                                                |
+|                v                                                                |
+|  [ Instantiated Bean Instance (Singleton / Prototype) ]                        |
++---------------------------------------------------------------------------------+
+```
+
+### Classpath Scanning and ASM Bytecode Parsing
+The classpath scanning process is initiated by `ConfigurationClassPostProcessor` via `ClassPathScanningCandidateComponentProvider`. Rather than loading every `.class` file into the JVM's Metaspace (which would cause massive memory overhead and slow startup times), Spring uses the ASM bytecode manipulation framework. 
+
+A `MetadataReaderFactory` (typically `CachingMetadataReaderFactory`) reads the raw class bytes, producing an `AnnotationMetadata` representation. This allows Spring to evaluate annotations like `@Component` and its stereotypes without actually loading the target class into the JVM's class loader.
+
+### BeanDefinition Registration
+Once a candidate class is identified, it is converted into a `ScannedGenericBeanDefinition`. This object holds metadata about:
+*   The bean's class type.
+*   Scope (e.g., singleton, prototype).
+*   Lazy initialization configuration.
+*   Autowire candidate status.
+*   Constructor arguments and property values.
+
+These definitions are registered within the `BeanDefinitionRegistry` (most commonly implemented by `DefaultListableBeanFactory`) using a unique bean name as the key in a `ConcurrentHashMap`.
+
+### Stereotype Semantics and AOP Hooks
+While all four annotations are meta-annotated with `@Component` and behave identically regarding bean registration, their distinct semantics are critical for Spring's AOP (Aspect-Oriented Programming) and infrastructure layers:
+
+1.  **`@Component`**: The generic archetype for any Spring-managed component. Use this when your bean does not fit a specific architectural layer.
+2.  **`@Service`**: Denotes a business logic facade. While it currently carries no additional behavior out of the box, it is often targeted by custom pointcuts for transaction boundaries and security aspects.
+3.  **`@Repository`**: Denotes a data access object (DAO). This annotation registers a `PersistenceExceptionTranslationPostProcessor` in the container. This post-processor automatically decorates the bean with an AOP advice that intercepts platform-specific exceptions (such as `SQLException`, Hibernate's `SessionException`, or JPA's `PersistenceException`) and translates them into Spring's unified, unchecked `DataAccessException` hierarchy.
+4.  **`@Controller` / `@RestController`**: Denotes a web-layer handler. The `RequestMappingHandlerMapping` scans only beans annotated with `@Controller` (or `@RestController`) to build its routing tables. If you use a generic `@Component` for a web controller, the mapping infrastructure will completely ignore its `@RequestMapping` annotations.
+
+---
+
+## 2. Lifecycle & Internal Mechanics
+
+The lifecycle of a Spring bean is a highly orchestrated process managed by the `AbstractApplicationContext`. Below is the exact step-by-step sequence of execution for a singleton bean during application context initialization:
+
+```
++---------------------------------------------------------------------------------+
+|                               Bean Lifecycle                                    |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  1. Instantiation (Constructor / Factory Method)                                |
+|        |                                                                        |
+|        v                                                                        |
+|  2. Populate Properties (Dependency Injection / Field / Setter)                |
+|        |                                                                        |
+|        v                                                                        |
+|  3. Aware Interfaces Execution (BeanNameAware, BeanFactoryAware, etc.)          |
+|        |                                                                        |
+|        v                                                                        |
+|  4. BeanPostProcessor - Before Initialization                                   |
+|        |                                                                        |
+|        v                                                                        |
+|  5. Initialization (@PostConstruct -> InitializingBean::afterPropertiesSet)     |
+|        |                                                                        |
+|        v                                                                        |
+|  6. BeanPostProcessor - After Initialization (AOP Proxy Creation)              |
+|        |                                                                        |
+|        v                                                                        |
+|  7. Ready for Use (Bean is active in the Application Context)                   |
+|        |                                                                        |
+|        v                                                                        |
+|  8. Destruction (@PreDestroy -> DisposableBean::destroy)                        |
+|                                                                                 |
++---------------------------------------------------------------------------------+
+```
+
+### 1. Instantiation
+The container instantiates the bean using the appropriate constructor (or factory method). Spring resolves the constructor to use via `ConstructorResolver`, performing constructor dependency injection if necessary.
+
+### 2. Populate Properties
+Dependencies are injected into the bean. This is handled by `AutowiredAnnotationBeanPostProcessor` (for `@Autowired` fields, constructors, and setters) and `CommonAnnotationBeanPostProcessor` (for `@Resource` annotations).
+
+### 3. Aware Interfaces Execution
+If the bean implements any of the `Aware` interfaces, Spring injects the corresponding infrastructure dependency:
+*   `BeanNameAware` -> `setBeanName()`
+*   `BeanClassLoaderAware` -> `setBeanClassLoader()`
+*   `BeanFactoryAware` -> `setBeanFactory()`
+*   `EnvironmentAware` -> `setEnvironment()` (processed via `ApplicationContextAwareProcessor`)
+*   `ApplicationContextAware` -> `setApplicationContext()` (processed via `ApplicationContextAwareProcessor`)
+
+### 4. BeanPostProcessor: Before Initialization
+The `postProcessBeforeInitialization()` method of all registered `BeanPostProcessor`s is executed. This is where annotations like `@PostConstruct` are processed (specifically by `CommonAnnotationBeanPostProcessor`).
+
+### 5. Initialization Phase
+The container triggers the initialization callbacks in this strict order:
+1.  Any method annotated with `@PostConstruct` (invoked during the previous step).
+2.  `InitializingBean::afterPropertiesSet()` is called.
+3.  Any custom `initMethod` specified in the bean definition (e.g., `@Bean(initMethod = "init")`).
+
+### 6. BeanPostProcessor: After Initialization
+The `postProcessAfterInitialization()` method of all `BeanPostProcessor`s is executed. This is a critical hook: **AOP auto-proxy creators** (such as `AnnotationAwareAspectJAutoProxyCreator`) intercept the bean here. If the bean is targeted by an aspect (e.g., `@Transactional`, `@Async`, or custom advice), the original bean instance is wrapped in a dynamic proxy (JDK Dynamic Proxy or CGLIB) and the proxy is returned instead of the raw instance.
+
+### 7. Destruction Phase
+When the `ApplicationContext` is closed, the singleton beans are destroyed in the following order:
+1.  Methods annotated with `@PreDestroy`.
+2.  `DisposableBean::destroy()` is called.
+3.  Any custom `destroyMethod` specified in the bean definition (e.g., `@Bean(destroyMethod = "cleanup")`).
+
+---
+
+## 3. Production-Grade Configuration
+
+Below is a production-ready `application.yml` showing advanced configurations for classpath scanning, bean overriding, lazy initialization, and resource handling.
+
+```yaml
+spring:
+  main:
+    # Prevent bean definition overriding to avoid silent bugs when developers register duplicate bean names
+    allow-bean-definition-overriding: false
+    # Keep false in production to fail-fast on configuration/dependency issues during startup
+    lazy-initialization: false
+    # Define custom banner mode
+    banner-mode: "console"
+  context:
+    # Configure Spring's internal indexer to speed up startup on large codebases
+    # Requires 'spring-context-indexer' dependency in pom.xml/build.gradle
+    indexer:
+      enabled: true
+
+# Custom logging to trace bean lifecycle events when debugging container issues
+logging:
+  level:
+    org.springframework.beans.factory: INFO
+    org.springframework.context.annotation: INFO
+```
+
+---
+
+## 4. Complete, Robust Implementation
+
+Here is a complete, runnable Spring Boot 3.2 application using Java 21 features. It demonstrates the differences between `@Component`, `@Service`, `@Repository`, and `@Controller`, including proper exception translation using `@Repository`.
+
+```java
+package com.devmastery.beans;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.annotation.PersistenceExceptionTranslationPostProcessor;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Repository;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.io.Serializable;
+import java.sql.SQLException;
+import java.util.UUID;
+
+// --- DOMAIN MODEL ---
+public record User(UUID id, String username, String email) implements Serializable {}
+
+// --- REPOSITORY LAYER ---
+@Repository
+public class UserRepository {
+    private static final Logger log = LoggerFactory.getLogger(UserRepository.class);
+
+    @PostConstruct
+    public void init() {
+        log.info("[LIFECYCLE] UserRepository initialized via @PostConstruct.");
+    }
+
+    public User findById(UUID id) {
+        if (id == null) {
+            // Simulated raw database exception. Because this class is annotated with @Repository,
+            // and we have registered PersistenceExceptionTranslationPostProcessor,
+            // Spring's AOP proxies will intercept this and translate it if it matches persistence errors.
+            throw new RuntimeException(new SQLException("Database connection failure on query", "08001"));
+        }
+        return new User(id, "dev_mastery", "admin@devmastery.com");
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        log.info("[LIFECYCLE] UserRepository is shutting down via @PreDestroy.");
+    }
+}
+
+// --- SERVICE LAYER ---
+@Service
+public class UserService {
+    private static final Logger log = LoggerFactory.getLogger(UserService.class);
+    private final UserRepository userRepository;
+
+    // Constructor Injection (Best Practice)
+    public UserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    public User getUserDetails(UUID id) {
+        log.info("Processing user details for ID: {}", id);
+        try {
+            return userRepository.findById(id);
+        } catch (DataAccessException ex) {
+            log.error("Spring translated persistence exception caught in Service Layer: {}", ex.getMessage(), ex);
+            throw ex;
+        }
+    }
+}
+
+// --- CONTROLLER LAYER ---
+@RestController
+public class UserController {
+    private final UserService userService;
+
+    public UserController(UserService userService) {
+        this.userService = userService;
+    }
+
+    @GetMapping("/api/v1/user")
+    public User getUser() {
+        return userService.getUserDetails(UUID.randomUUID());
+    }
+
+    @GetMapping("/api/v1/user/error")
+    public User getErrorUser() {
+        // This will trigger the SQLException inside the repository, demonstrating translation
+        return userService.getUserDetails(null);
+    }
+}
+
+// --- CONFIGURATION & RUNNER ---
+@Configuration
+@EnableAspectJAutoProxy
+class AppConfig {
+    
+    // Required to enable automatic translation of JPA/Hibernate/JDBC exceptions 
+    // for classes annotated with @Repository
+    @Bean
+    public static PersistenceExceptionTranslationPostProcessor persistenceExceptionTranslationPostProcessor() {
+        return new PersistenceExceptionTranslationPostProcessor();
+    }
+}
+
+@SpringBootApplication
+public class BeansApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(BeansApplication.class, args);
+    }
+}
+```
+
+---
+
+## 5. Advanced Patterns & Anti-Patterns
+
+### Anti-Pattern: Using Generic `@Component` for Everything
+*   **The Trap**: Registering all classes as `@Component` without using specific stereotypes (`@Service`, `@Repository`, `@Controller`).
+*   **The Consequence**: 
+    *   No automatic persistence exception translation (missing `@Repository` post-processing).
+    *   Loss of semantic clarity for code analysis tools, AOP pointcut definitions, and architectural validation tools (like ArchUnit).
+    *   Web routing will fail to register endpoints if the controller is annotated with `@Component` instead of `@Controller` or `@RestController`.
+*   **The Solution**: Enforce architectural boundaries. Use `@Repository` for DAOs, `@Service` for business facades, `@RestController` for API layer, and `@Component` solely for utility or infrastructure beans.
+
+### Anti-Pattern: Mutating Singleton Bean State (Thread Safety Violations)
+*   **The Trap**: Storing request-specific data inside fields of a singleton bean.
+*   **The Consequence**: Race conditions, data leaks between users, and unpredictable behavior when concurrent requests access the singleton instance.
+*   **The Solution**: Ensure singleton beans are completely stateless. If state must be maintained, use request-scoped or session-scoped beans, or pass state explicitly via method arguments.
+
+```java
+// BAD: State stored in singleton bean
+@Service
+public class BadUserService {
+    private User currentUser; // Thread-safety nightmare!
+
+    public void process(User user) {
+        this.currentUser = user; 
+        doSomething();
+    }
+}
+
+// GOOD: Stateless execution, state passed via thread stack
+@Service
+public class GoodUserService {
+    public void process(User user) {
+        doSomething(user); // Safe: local variables reside on the thread stack
+    }
+}
+```
+
+---
+
+## 6. Verification & Testing
+
+To verify the bean lifecycle, dependency injection, and automatic exception translation, we write an integration test using `MockMvc` and `SpringBootTest`.
+
+```java
+package com.devmastery.beans;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@SpringBootTest
+@AutoConfigureMockMvc
+class BeansApplicationTests {
+
+    @Autowired
+    private ApplicationContext context;
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    void verifyStereotypeBeansAreRegistered() {
+        assertThat(context.containsBean("userController")).isTrue();
+        assertThat(context.containsBean("userService")).isTrue();
+        assertThat(context.containsBean("userRepository")).isTrue();
+    }
+
+    @Test
+    void testUserControllerEndpointSuccess() throws Exception {
+        mockMvc.perform(get("/api/v1/user"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.username").value("dev_mastery"))
+                .andExpect(jsonPath("$.email").value("admin@devmastery.com"));
+    }
+
+    @Test
+    void testRepositoryExceptionTranslation() throws Exception {
+        // Assert that the request fails, but the exception pipeline is triggered.
+        // The nested exception gets translated, which we verify by checking the log output or response.
+        mockMvc.perform(get("/api/v1/user/error"))
+                .andExpect(status().isInternalServerError());
+    }
+}
+```
+
+---
+---

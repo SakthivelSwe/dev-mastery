@@ -1,0 +1,161 @@
+---
+slug: "api-testing"
+title: "API Testing (Postman & Contract Testing)"
+level: 4
+---
+
+## WHY
+Testing an API through the frontend UI is notoriously slow, flaky, and incomplete. If a user cannot checkout, is the React button broken, or did the backend API return a 500 error?
+**API Testing** allows developers to bypass the UI entirely and test the exact JSON payloads flying across the network. By automating API tests, you ensure that backend changes never break the strict contracts that the frontend and third-party consumers rely on.
+
+## THEORY
+### Types of API Tests
+1. **Manual Testing:** Using tools like Postman or Insomnia to manually construct HTTP requests, add Auth tokens, and click "Send" to visually inspect the JSON response during development.
+2. **Automated Integration Testing:** Writing code (using Supertest in Node, or RestAssured in Java) to programmatically send HTTP requests and assert that the response matches expected data, running automatically in CI/CD.
+3. **Contract Testing:** Ensuring the exact shape and types of the JSON payload match the documentation (e.g., ensuring `user_id` is an Integer, not a String).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-testing" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Manual Testing with Postman)
+Postman is the industry standard GUI for testing APIs. 
+Instead of writing complex `curl` commands in the terminal, you get a beautiful interface to manage URLs, Headers, and JSON bodies.
+
+*Postman Superpower: Environments!*
+Instead of hardcoding `http://localhost:3000/users` in your requests, you use variables: `{{base_url}}/users`. 
+You can instantly switch from your "Local" environment to your "Production" environment without changing the URL string.
+
+You can even write JavaScript inside Postman to automate authentication workflows!
+
+```javascript
+// Postman "Tests" Tab (Executes AFTER the response is received)
+
+// 1. Assert the API returned 200 OK!
+pm.test("Status code is 200", function () {
+    pm.response.to.have.status(200);
+});
+
+// 2. Automatically grab the JWT from the Login response...
+var jsonData = pm.response.json();
+var token = jsonData.access_token;
+
+// 3. ...and save it to a Global Variable so all other requests can use it instantly!
+pm.environment.set("jwt_token", token);
+```
+
+### Level 2 — Building Blocks (Automated Tests with Supertest)
+Manual testing is great for development, but terrible for preventing regressions. You must write automated integration tests that boot up the actual HTTP server in memory and test the routes!
+
+```javascript
+// Node.js + Express + Supertest + Jest Example
+const request = require('supertest');
+const app = require('../app'); // Import the Express application
+
+describe('POST /users', () => {
+  it('should create a new user and return 201 Created', async () => {
+    
+    const payload = { name: "Jane", email: "jane@test.com" };
+    
+    // Simulate an HTTP POST request entirely in memory!
+    const response = await request(app)
+      .post('/users')
+      .set('Authorization', 'Bearer fake-token')
+      .send(payload)
+      .expect('Content-Type', /json/)
+      .expect(201); // Assert the status code!
+      
+    // Assert the exact JSON structure of the response!
+    expect(response.body).toHaveProperty('id');
+    expect(response.body.name).toBe("Jane");
+  });
+  
+  it('should return 400 Bad Request if email is missing', async () => {
+    await request(app)
+      .post('/users')
+      .send({ name: "Jane" })
+      .expect(400);
+  });
+});
+```
+
+### Level 3 — Intermediate (Load Testing with K6)
+Your API works perfectly when you test it locally. But what happens when 5,000 users try to hit the checkout endpoint at the exact same second during a Black Friday sale? Will the database lock up? Will the Node.js event loop block?
+
+You must run Load Tests (or Stress Tests) using modern tools like **k6** (written in Go, scriptable in JavaScript).
+
+```javascript
+// load-test.js (k6 script)
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+// Define the massive load!
+export let options = {
+    // Ramp up to 1000 concurrent users over 30 seconds
+    stages: [
+        { duration: '30s', target: 1000 },
+        { duration: '1m', target: 1000 }, // Hold the load for 1 minute
+        { duration: '30s', target: 0 },   // Ramp down
+    ],
+};
+
+// This function simulates what EVERY single virtual user does repeatedly!
+export default function () {
+    // Make the HTTP request
+    let res = http.get('https://api.mycompany.com/products');
+    
+    // Check that the server isn't crashing (returning 500s)
+    check(res, {
+        'status is 200': (r) => r.status === 200,
+        'transaction time < 500ms': (r) => r.timings.duration < 500,
+    });
+    
+    // Wait 1 second before doing it again (simulating human think time)
+    sleep(1);
+}
+```
+*Run it:* `k6 run load-test.js`
+
+### Level 4 — Advanced (Consumer-Driven Contract Testing)
+In a microservices world, Team A (Frontend) relies on Team B (Backend). 
+Team B changes a variable from `firstName` to `first_name` and pushes to production. All of Team B's internal unit tests pass. However, Team A's application instantly crashes in production.
+
+**Contract Testing (using Pact)** prevents this.
+Instead of Team B telling the Frontend what the API looks like, the Frontend writes a strict JSON "Contract" specifying exactly what it *expects*.
+
+```javascript
+// The Frontend defines the Pact (The Contract)
+const { Pact } = require('@pact-foundation/pact');
+
+// "I expect that when I request /user/1, I get exactly this JSON structure!"
+provider.addInteraction({
+  state: 'user 1 exists',
+  uponReceiving: 'a request for user 1',
+  withRequest: { method: 'GET', path: '/user/1' },
+  willRespondWith: {
+    status: 200,
+    body: {
+      id: 1,
+      firstName: Pact.Matchers.string('John') // It MUST be called 'firstName'!
+    }
+  }
+});
+```
+The Magic: This contract is uploaded to a central Pact Broker. When the Backend team runs their CI/CD pipeline, the Pact Broker automatically pulls down this contract, fires a fake request at the backend, and asserts the response. If the Backend team renames the field to `first_name`, the **Backend CI/CD pipeline fails**, preventing them from deploying the breaking change!
+
+## REAL_WORLD
+**API Mocking & Prism**
+In an Agile team, Frontend and Backend developers work in parallel in 2-week sprints. The Frontend team cannot wait 2 weeks for the Backend team to finish building the API before they start writing React code!
+Modern teams use the **API Design-First** approach. The architect writes the `openapi.yaml` (Swagger) file on Day 1.
+The frontend team runs a tool like **Prism** (Stoplight). Prism reads the YAML file and instantly boots up a fake, local web server. When the frontend sends `GET /users`, Prism looks at the YAML schema and instantly generates and returns fake JSON data (using faker.js) that perfectly matches the contract! The frontend team builds the entire UI against this fake server, while the backend team builds the real API in parallel.
+
+## INTERVIEW
+**Q: I am writing a Postman test for an endpoint that creates a User and returns a random Database ID (e.g., `{"id": 9482}`). Because the ID is random every time, I cannot write an assertion like `pm.expect(response.id).to.eql(9482)`. How do I test unpredictable data?**
+A: **You must test the Schema (Types) instead of the absolute values.**
+For unpredictable fields (like IDs, UUIDs, or Timestamps), you cannot assert the exact value. Instead, you write tests asserting the *presence* and the *type* of the data. 
+In Postman, you would use TinyValidator (tv4) or Chai assertions to check the type: 
+`pm.expect(response.id).to.be.a('number');`
+Alternatively, you can write an exact JSON Schema definition and validate the entire response against it to ensure the unpredictable fields adhere to the correct data types.

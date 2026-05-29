@@ -1,0 +1,109 @@
+---
+slug: "resilience4j-spring"
+title: "Resilience4j (Circuit Breakers)"
+level: 5
+---
+
+## WHY
+In a monolithic application, if a Java function calls another Java function, it works 100% of the time.
+In a microservices architecture, the `OrderService` must make an HTTP network call to the `PaymentService`. Networks fail. The Payment Service might be overloaded and taking 15 seconds to respond. 
+If 1,000 users try to place an order, the `OrderService` will spawn 1,000 threads, each waiting 15 seconds for the dead Payment Service. The `OrderService` will exhaust its thread pool, run out of memory, and crash!
+This is a **Cascading Failure**. One dead microservice takes down the entire system.
+**Resilience4j** is a fault-tolerance library that prevents this. By implementing a **Circuit Breaker Pattern**, your application will instantly detect that the Payment Service is failing, "trip the circuit," and immediately return fallback responses to the users, allowing the Order Service to survive and the Payment Service time to recover!
+
+## THEORY
+### The Circuit Breaker State Machine
+A Circuit Breaker sits between your Service and the remote API, monitoring every call. It has three states:
+1. **CLOSED (Normal):** Everything is fine. Requests flow through normally.
+2. **OPEN (Tripped):** If the failure rate exceeds a threshold (e.g., 50% of requests fail or timeout), the circuit "opens". It physically blocks all requests, instantly throwing an error or executing a fallback method *without* ever attempting the network call!
+3. **HALF-OPEN (Testing):** After a cooldown period (e.g., 30 seconds), it allows a limited number of test requests through. If they succeed, it closes the circuit (Recovery!). If they fail, it opens it again.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "circuit-breaker" }
+```
+
+## CODE
+
+Resilience4j integrates beautifully with Spring Boot via annotations (AOP).
+
+### 1. The Dependency
+Add the Spring Boot starter for Resilience4j.
+
+```xml
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot3</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-aop</artifactId> <!-- Required for annotations! -->
+</dependency>
+```
+
+### 2. Configuration (application.yml)
+We define the exact mathematical rules for when the circuit should trip.
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService: # The specific name of this circuit breaker
+        slidingWindowSize: 10 # Monitor the last 10 requests
+        failureRateThreshold: 50 # If 50% of them fail (5 requests), trip the circuit!
+        waitDurationInOpenState: 10s # Wait 10 seconds before entering HALF-OPEN state
+        permittedNumberOfCallsInHalfOpenState: 3 # Allow 3 test requests
+```
+
+### 3. Using the @CircuitBreaker Annotation
+We wrap the dangerous network call in our Service layer with the annotation, and provide a **Fallback Method**.
+
+```java
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+
+@Service
+public class OrderService {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    // 1. name = "paymentService" links it to the YAML config!
+    // 2. fallbackMethod defines what to execute if the remote server fails, 
+    //    OR if the circuit is currently OPEN!
+    @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+    public String processPayment(String orderId) {
+        
+        System.out.println("Attempting physical network call to Payment API...");
+        
+        // This is a dangerous network call. It might timeout or return 500!
+        return restTemplate.getForObject("http://payment-service/api/charge", String.class);
+    }
+
+    // The Fallback Method! 
+    // It MUST have the exact same return type and parameters, plus the Exception.
+    public String paymentFallback(String orderId, Exception e) {
+        System.out.println("Payment API failed or Circuit is OPEN! Executing Fallback!");
+        
+        // Return a safe, graceful degradation response instead of crashing!
+        return "Payment service is currently degraded. Your order " + orderId + " has been saved to a queue and will be processed later.";
+    }
+}
+```
+
+## REAL_WORLD
+**Beyond Circuit Breakers (Retries and Bulkheads)**
+Resilience4j provides several other critical fault-tolerance mechanisms that you can stack together!
+- **`@Retry`:** If a network call fails, don't give up immediately! Maybe it was a minor blip. `@Retry(name = "myService")` tells Spring to automatically try the exact same HTTP call 3 times before finally throwing an exception or opening the Circuit Breaker.
+- **`@RateLimiter`:** Protects *your* server by rejecting requests if too many users hit a specific method per second.
+- **`@Bulkhead`:** Limits the maximum number of concurrent threads executing a specific method. If you have a thread pool of 100, and a heavy report generation method takes all 100 threads, the rest of your app dies. A Bulkhead restricts that specific method to a maximum of 20 threads, guaranteeing the other 80 threads are always available for standard user requests!
+
+## INTERVIEW
+**Q: You implement a Circuit Breaker on a method that calls a highly unreliable 3rd-party API. The API is so terrible that it takes exactly 25 seconds to respond, but it *does* eventually respond with a 200 OK. After monitoring your system, you notice your Circuit Breaker NEVER trips into the OPEN state, but your Spring Boot application still completely crashes due to thread pool exhaustion. Why didn't the Circuit Breaker protect you?**
+A: **Circuit Breakers only trip on Exceptions, not Timeouts! You must configure a `TimeLimiter`.**
+By default, the `RestTemplate` (and standard Java HTTP clients) have infinite (or incredibly long) timeouts. 
+If the 3rd-party API takes 25 seconds to respond with a 200 OK, there is no Java Exception thrown! Because there is no Exception, the Resilience4j Circuit Breaker views the request as a 100% successful operation, so the Failure Rate remains at 0%.
+Meanwhile, 1,000 user threads pile up, waiting 25 seconds each, and the application crashes.
+*The Fix:* You must always pair a Circuit Breaker with strict Timeouts!
+You can configure the timeout directly on the `RestTemplate` factory, or you can stack Resilience4j's `@TimeLimiter` annotation on top of the `@CircuitBreaker`. 
+A TimeLimiter mathematically enforces that if the method takes longer than 2 seconds, it forcefully interrupts the thread and throws a `TimeoutException`. *That* exception will then be caught by the Circuit Breaker, registering as a failure, tripping the circuit, and instantly saving the entire application!

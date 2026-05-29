@@ -1,0 +1,126 @@
+---
+slug: "json-in-sql"
+title: "JSON in SQL Databases"
+level: 4
+---
+
+## WHY
+In the early 2010s, NoSQL databases like MongoDB exploded in popularity because developers loved the flexibility of inserting unstructured JSON data. If a user had "custom settings," developers no longer had to run a massive `ALTER TABLE` to add 50 new columns.
+
+To fight back, modern SQL databases (PostgreSQL, MySQL, SQL Server) integrated native JSON support. Today, you get the absolute best of both worlds: strict, ACID-compliant relational schemas for your core data, and flexible, schema-less JSON columns for dynamic data—all queried using standard SQL!
+
+## THEORY
+### JSON vs JSONB (PostgreSQL)
+While MySQL has a single `JSON` data type, Postgres famously has two:
+1. **`JSON`:** Stores the exact string text you provide, including whitespace and duplicate keys. Every time you query it, Postgres has to re-parse the string. (Slow).
+2. **`JSONB` (JSON Binary):** Postgres parses the JSON upon insertion, removes whitespace, and stores it in a custom binary format. It supports advanced GIN indexing. **You should use JSONB 99.9% of the time.**
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "sql-json" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating and Inserting)
+You define the column just like an `INT` or `VARCHAR`.
+
+```sql
+-- PostgreSQL Syntax
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    -- Store unstructured, dynamic preferences!
+    preferences JSONB DEFAULT '{}'
+);
+
+INSERT INTO users (username, preferences) 
+VALUES (
+    'alice123', 
+    '{"theme": "dark", "notifications": {"email": true, "sms": false}}'
+);
+```
+
+### Level 2 — Building Blocks (Extracting JSON Data)
+To query the JSON, SQL dialects provide specialized operators. 
+
+**PostgreSQL Operators:**
+- `->` returns the value as a JSON object (useful for chaining).
+- `->>` returns the value as raw Text.
+
+```sql
+-- Fetch the 'theme' preference as text
+SELECT username, preferences->>'theme' AS ui_theme
+FROM users;
+
+-- Chain operators to traverse nested objects!
+-- (Get preferences -> notifications -> email)
+SELECT username 
+FROM users 
+WHERE preferences->'notifications'->>'email' = 'true';
+```
+
+**MySQL Syntax:**
+```sql
+SELECT username, JSON_EXTRACT(preferences, '$.theme') AS ui_theme FROM users;
+-- Or the shorthand operator:
+SELECT username, preferences->>'$.theme' FROM users;
+```
+
+### Level 3 — Intermediate (JSON Generation)
+You don't just have to *store* JSON; you can ask the database to *generate* JSON from standard relational tables before it even hits your Node.js backend! This saves your backend from looping through massive datasets to build JSON arrays.
+
+```sql
+-- Convert an entire row into a single JSON object
+SELECT row_to_json(users) FROM users;
+
+-- Aggregate multiple rows into a massive JSON Array!
+SELECT json_agg(
+    json_build_object(
+        'id', id, 
+        'user_name', username
+    )
+) AS all_users_json
+FROM users;
+```
+
+### Level 4 — Advanced (Indexing JSON)
+If you run `WHERE preferences->>'theme' = 'dark'`, the database must read the JSON of every single row. If you have 10 million users, this will be agonizingly slow.
+You can create an Index on a specific property *inside* the JSON!
+
+```sql
+-- Create a standard B-Tree index on a SPECIFIC JSON field!
+CREATE INDEX idx_user_theme 
+ON users ((preferences->>'theme'));
+
+-- Now this query is blazing fast!
+SELECT * FROM users WHERE preferences->>'theme' = 'dark';
+```
+
+**The GIN Index (Postgres Only):**
+What if you want to index the *entire* JSON document so you can search any random key?
+```sql
+CREATE INDEX idx_user_prefs_gin ON users USING GIN (preferences);
+
+-- The @> operator checks if the right JSON object is contained within the left!
+-- It uses the GIN index instantly!
+SELECT * FROM users WHERE preferences @> '{"notifications": {"sms": true}}';
+```
+
+## REAL_WORLD
+**When NOT to use JSON**
+Because JSON in SQL is so powerful, Junior Developers often abuse it by putting *everything* into a massive JSON column, turning Postgres into MongoDB. 
+This is an anti-pattern. JSON columns cannot enforce Foreign Keys (you can't guarantee an ID inside a JSON array actually exists in another table). They also consume drastically more hard drive space.
+
+**The Golden Rule:** If a piece of data is queried frequently, sorted frequently, or joined against other tables, it belongs in a strict Relational Column. If a piece of data is just a blob of key/value pairs that the frontend needs to render (like "User Settings" or "API Payload Logs") and the backend rarely queries it, put it in a JSONB column!
+
+## INTERVIEW
+**Q: I have a JSON column. I want to update Alice's theme to "light", but keep all her other notification preferences exactly the same. How do I do this?**
+A: Updating JSON is notoriously annoying in SQL. If you just run `UPDATE users SET preferences = '{"theme": "light"}'`, you will completely destroy her notification object! You must use specialized JSON manipulation functions to merge the new data.
+In Postgres, you use the `jsonb_set` function or the `||` concatenation operator:
+```sql
+-- Merges the new object over the old one, updating only the theme!
+UPDATE users 
+SET preferences = preferences || '{"theme": "light"}'::jsonb 
+WHERE username = 'alice123';
+```

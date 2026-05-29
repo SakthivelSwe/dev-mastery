@@ -1,0 +1,203 @@
+---
+slug: "http-client"
+title: "HttpClient"
+level: 2
+---
+
+## WHY
+Modern applications do not load data from local arrays; they fetch data from remote servers via REST APIs. In raw JavaScript, developers use the built-in `fetch()` API. However, `fetch()` is fundamentally flawed for Enterprise use: it cannot easily be canceled, it doesn't automatically parse JSON on errors, and it requires writing massive boilerplate wrappers to handle authentication headers and interceptors.
+
+Angular provides the `HttpClient` service. It is a highly robust, deeply integrated HTTP client that perfectly aligns with Angular's Dependency Injection system. More importantly, instead of using standard JavaScript Promises (which execute once and die), `HttpClient` uses **RxJS Observables**, allowing for incredibly powerful features like request cancellation, automated retries, and data stream manipulation.
+
+## THEORY
+### Providing the HttpClient
+In modern Angular (Standalone), the `HttpClient` is not available by default. You must explicitly configure the application to provide it during bootstrapping using `provideHttpClient()`.
+
+### The Observable Paradigm
+When you call `this.http.get()`, the network request is **NOT** sent immediately. This is the #1 mistake beginners make. Observables are "cold." They only execute when someone explicitly `.subscribe()`s to them. If you call `.get()` and forget to subscribe, the network tab in your browser will be completely empty.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "angular-http-client" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Setting up & GET Request)
+```typescript
+// 1. IN main.ts: You must provide the HttpClient globally!
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideHttpClient } from '@angular/common/http';
+import { AppComponent } from './app/app.component';
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    provideHttpClient() // MAGIC: Unlocks the HttpClient!
+  ]
+});
+```
+
+```typescript
+// 2. IN user.service.ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+
+export interface User { id: number; name: string; }
+
+@Injectable({ providedIn: 'root' })
+export class UserService {
+  
+  // Inject the HttpClient service!
+  private http = inject(HttpClient);
+
+  getUsers() {
+    // 1. We strictly type the expected JSON response to <User[]>
+    // 2. We return the Observable stream (we do NOT subscribe here!)
+    return this.http.get<User[]>('https://jsonplaceholder.typicode.com/users');
+  }
+}
+```
+
+```typescript
+// 3. IN user.component.ts
+import { Component, inject, OnInit } from '@angular/core';
+import { UserService, User } from './user.service';
+
+@Component({
+  selector: 'app-users',
+  template: `<ul><li *ngFor="let u of users">{{ u.name }}</li></ul>`
+})
+export class UserComponent implements OnInit {
+  private userService = inject(UserService);
+  users: User[] = [];
+
+  ngOnInit() {
+    // We MUST subscribe to trigger the network request!
+    this.userService.getUsers().subscribe({
+      next: (data) => {
+        this.users = data; // Success! Bind data to the UI.
+      },
+      error: (err) => {
+        console.error('API Failed!', err);
+      }
+    });
+  }
+}
+```
+
+### Level 2 — Building Blocks (POST, PUT, DELETE)
+The other HTTP verbs work exactly the same way.
+
+```typescript
+export class ProductService {
+  private http = inject(HttpClient);
+  private apiUrl = 'https://api.store.com/products';
+
+  createProduct(newProduct: any) {
+    // POST requires two arguments: URL and the JSON Body
+    return this.http.post(this.apiUrl, newProduct);
+  }
+
+  updateProduct(id: number, updatedProduct: any) {
+    // PUT targets a specific URL and replaces the body
+    return this.http.put(`${this.apiUrl}/${id}`, updatedProduct);
+  }
+
+  deleteProduct(id: number) {
+    // DELETE just hits the URL
+    return this.http.delete(`${this.apiUrl}/${id}`);
+  }
+}
+```
+
+### Level 3 — Intermediate (HttpParams and HttpHeaders)
+If you need to send query strings (e.g., `?category=laptops&limit=10`) or custom authentication headers, you use the built-in utility classes.
+
+```typescript
+import { HttpParams, HttpHeaders } from '@angular/common/http';
+
+export class CatalogService {
+  private http = inject(HttpClient);
+
+  searchProducts(category: string) {
+    
+    // 1. Construct immutable query parameters
+    let params = new HttpParams()
+      .set('category', category)
+      .set('limit', 10);
+      
+    // 2. Construct immutable headers
+    let headers = new HttpHeaders()
+      .set('Authorization', 'Bearer my-secret-jwt-token');
+
+    // 3. Pass them in the third options argument!
+    return this.http.get('https://api.store.com/search', { 
+      headers: headers, 
+      params: params 
+    });
+  }
+}
+```
+
+### Level 4 — Advanced (The async Pipe)
+Manually calling `.subscribe()` is dangerous because if you forget to call `.unsubscribe()` when the Component is destroyed, you create memory leaks. 
+
+The Enterprise standard is to never subscribe in TypeScript. Let the HTML `async` pipe do it for you.
+
+```typescript
+import { Component, inject } from '@angular/core';
+import { UserService, User } from './user.service';
+import { Observable } from 'rxjs';
+
+@Component({
+  selector: 'app-users',
+  template: `
+    <!-- MAGIC: The async pipe automatically subscribes to users$ -->
+    <!-- It renders the data, and automatically unsubscribes on destroy! -->
+    <ul *ngIf="users$ | async as users">
+      <li *ngFor="let u of users">{{ u.name }}</li>
+    </ul>
+  `
+})
+export class UserComponent {
+  private userService = inject(UserService);
+  
+  // We hold a reference to the STREAM ($ denotes an Observable)
+  // We NEVER subscribe in this file!
+  users$: Observable<User[]> = this.userService.getUsers();
+}
+```
+
+## REAL_WORLD
+In raw `fetch()`, writing an interceptor (a piece of code that runs on every single outgoing request, like attaching a JWT Token) is a horrible monkey-patching nightmare.
+
+In Angular, you simply provide an `HttpInterceptor`. This is a centralized function that intercepts every single `HttpClient` call just before it leaves the browser. You will write one of these on literally every Angular project you ever join to handle JWT Auth and global error handling (like redirecting the user to `/login` if any API returns a `401 Unauthorized`).
+
+```typescript
+// modern Angular 15+ functional interceptor
+export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  const token = localStorage.getItem('jwt_token');
+  
+  if (token) {
+    // Clone the immutable request and attach the header!
+    const clonedReq = req.clone({
+      setHeaders: { Authorization: `Bearer ${token}` }
+    });
+    return next(clonedReq);
+  }
+  
+  return next(req);
+};
+
+// Registered in main.ts: provideHttpClient(withInterceptors([authInterceptor]))
+```
+
+## INTERVIEW
+**Q: Why are `HttpParams` and `HttpHeaders` immutable?**
+A: If you call `params.set('a', 'b')`, it does NOT modify the original `params` object; it returns a brand new clone of the object. They are immutable because Interceptors might intercept the request, clone it, and retry it multiple times (e.g., if the network drops). If the headers were mutable, one interceptor could corrupt the headers for all subsequent retries.
+
+**Q: Can you convert an `HttpClient` Observable into a Promise?**
+A: Yes! You can use `firstValueFrom(this.http.get(...))`. This is very common in modern Angular if you want to use the `async/await` syntax instead of RxJS Observables. It fires the request, waits for the first response, completes the Promise, and automatically unsubscribes to prevent memory leaks.
+
+**Q: What is a "Cold" Observable?**
+A: A cold observable is a stream that does not execute its underlying logic until a consumer explicitly subscribes. All `HttpClient` methods return cold observables. If you write `this.http.post()`, it builds the network request in memory, but absolutely nothing hits the network card until `.subscribe()` is called.

@@ -1,0 +1,88 @@
+---
+slug: "partitioning-sql"
+title: "SQL Table Partitioning"
+level: 4
+---
+
+## WHY
+As your company grows, your `logs` or `transactions` table might grow from 1 million rows to 10 billion rows. At this scale, even basic index lookups become incredibly slow, and deleting old data (`DELETE FROM logs WHERE year = 2015`) will literally crash the database due to transaction log bloat.
+
+**Table Partitioning** is the architectural solution for massive scale. It allows you to trick the application into thinking it is talking to one massive table, while the database secretly splits the data into dozens of smaller, separate physical tables under the hood.
+
+## THEORY
+### Logical vs Physical
+When you partition a table, the `logs` table becomes a "Logical" table. It holds no data itself. It acts purely as a routing mechanism. The actual data is written to "Physical" partitions (e.g., `logs_2022`, `logs_2023`).
+
+### Types of Partitioning
+1. **Range Partitioning:** Splitting data based on ranges of values (e.g., Dates: One partition per month).
+2. **List Partitioning:** Splitting data based on an exact list of values (e.g., Countries: A partition for `USA`, a partition for `UK`).
+3. **Hash Partitioning:** Distributing data randomly but evenly using a mathematical hash (useful when you just want to split the disk I/O evenly across multiple hard drives).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "sql-partitioning" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Creating a Partitioned Table)
+*(Note: Syntax below is for PostgreSQL 10+ Declarative Partitioning).*
+
+You must define the exact column that the database will use to route the data (the Partition Key).
+```sql
+-- 1. Create the Logical Parent Table
+-- We tell it to route data based on the 'created_at' column using RANGES.
+CREATE TABLE orders (
+    id SERIAL,
+    customer_id INT,
+    amount DECIMAL(10,2),
+    created_at DATE NOT NULL
+) PARTITION BY RANGE (created_at);
+```
+If you try to `INSERT` into this table right now, it will crash because there are no physical partitions to hold the data yet!
+
+### Level 2 — Building Blocks (Creating the Partitions)
+You must explicitly create the physical child tables and define their strict boundaries.
+
+```sql
+-- 2. Create the Physical Partitions (One for each year)
+CREATE TABLE orders_2022 PARTITION OF orders
+    FOR VALUES FROM ('2022-01-01') TO ('2023-01-01');
+
+CREATE TABLE orders_2023 PARTITION OF orders
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+-- A "Catch-All" partition for any data that doesn't fit the rules!
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+```
+Now, if you run `INSERT INTO orders VALUES (1, 99, 50.00, '2023-06-15')`, the database intercepts it at the `orders` level and secretly writes it physically to the `orders_2023` table.
+
+### Level 3 — Intermediate (Partition Pruning)
+The entire point of partitioning is read performance. 
+If a user queries `SELECT * FROM orders WHERE created_at = '2022-05-05'`, the database looks at the query and says, "I know for an absolute mathematical fact that May 2022 data cannot exist in the 2023 partition!"
+
+The database will **Prune** (ignore) the `orders_2023` and `orders_default` tables entirely. It only scans the `orders_2022` table. You just eliminated billions of rows from the search space with zero index overhead!
+
+### Level 4 — Advanced (Instant Data Deletion)
+In enterprise environments, compliance laws often mandate that log data older than 5 years must be deleted.
+If you have an unpartitioned table and run `DELETE FROM logs WHERE created_at < '2019-01-01'`, the database has to lock the table, scan it, and write 500 million deletion logs. It might take 12 hours.
+
+If your table is partitioned by year, you do NOT run a `DELETE` statement. You run a `DROP TABLE` DDL statement!
+
+```sql
+-- Instantly destroy the 2018 partition!
+DROP TABLE logs_2018;
+```
+Because it is a DDL command, it drops the physical file from the hard drive instantly. It takes 1 millisecond and causes zero locks on the parent `logs` table! This is the primary reason DBAs use Range Partitioning.
+
+## REAL_WORLD
+**Global Indexes vs Local Indexes**
+When you add an Index to a partitioned table, what actually happens?
+- **Global Index (Oracle):** One massive B-Tree index is created that points to data across all the different physical partitions.
+- **Local Index (PostgreSQL):** The database automatically creates a separate, smaller B-Tree index on every single physical partition. 
+
+Local indexes are much easier to maintain. When you drop the `logs_2018` table, its local index is instantly dropped with it! However, it means if you search for an order by its `ID` (without providing the Date), the database is forced to search the local index of every single partition, ruining performance.
+
+## INTERVIEW
+**Q: I set up Range Partitioning by Month. Everything worked perfectly for a year. On January 1st of the next year, all inserts into the database suddenly started crashing with "No partition found for row". Why?**
+A: Partitions are not automatically created! You told the database exactly where to put data for `2022` and `2023`. When the clock struck midnight and the application tried to insert a row with `2024`, the database looked at its routing rules, found no matching partition, and threw an error. A standard DBA practice is to write a cron job (using an extension like `pg_partman`) that automatically runs on the 25th of every month, executing a `CREATE TABLE` script to build the physical partition for the *upcoming* month proactively.

@@ -1,0 +1,218 @@
+---
+title: arraylist-vs-linkedlist
+slug: arraylist-vs-linkedlist
+---
+
+# ArrayList vs LinkedList
+
+### Level: 3
+
+Choosing between `ArrayList` and `LinkedList` is a classic software engineering decision. While basic computer science theory suggests `LinkedList` excels at insertion and deletion, modern hardware architectures, CPU cache lines, and JVM memory layouts make `ArrayList` the superior choice in almost all real-world scenarios.
+
+---
+
+## Layer 1: Deep-Dive Architecture & Mechanical Sympathy
+
+To understand why `ArrayList` dominates in performance, we must compare their underlying physical memory layouts and how they interact with CPU cache hierarchies.
+
+```
+ArrayList Memory Layout (Contiguous Memory):
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│  Ref to Obj1 │  Ref to Obj2 │  Ref to Obj3 │  Ref to Obj4 │
+└──────────────┴──────────────┴──────────────┴──────────────┘
+▲              ▲              ▲              ▲
+[0]            [1]            [2]            [3]
+(Contiguous memory blocks loaded into CPU Cache Lines)
+
+LinkedList Memory Layout (Scattered Heap Nodes):
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│ Node 1       │      │ Node 2       │      │ Node 3       │
+│  - prev: null│      │  - prev: ptr │      │  - prev: ptr │
+│  - next: ptr ├─────►│  - next: ptr ├─────►│  - next: null│
+│  - item: ptr │◄─────┤  - item: ptr │◄─────┤  - item: ptr │
+└──────────────┘      └──────────────┘      └──────────────┘
+(Scattered across the heap, causing L1/L2 cache misses on traversal)
+```
+
+### Cache Locality and CPU Cache Lines
+Modern CPUs load memory into fast cache lines (typically 64 bytes) rather than reading individual bytes from RAM.
+*   **`java.util.ArrayList`**: Backed by a single contiguous `Object[]` array. When you access element `i`, the CPU pre-fetches adjacent elements (indices `i+1`, `i+2`, etc.) into the L1/L2 cache. Traversing an `ArrayList` is a highly sequential memory access pattern, allowing the CPU's hardware prefetcher to optimize throughput.
+*   **`java.util.LinkedList`**: A doubly-linked list composed of disjoint `LinkedList$Node` objects allocated dynamically across the JVM heap. Traversing the list requires pointer chasing (dereferencing `node.next`), which forces random memory lookups. This frequently misses the CPU cache, stalling the processor while it waits for main memory.
+
+### Growth Factor and System.arraycopy
+An `ArrayList` has a fixed capacity. When it runs out of space, it grows by **1.5x** its current size:
+$$\text{New Capacity} = \text{Old Capacity} + (\text{Old Capacity} \gg 1)$$
+This growth requires allocating a new, larger array and copying the elements over using `System.arraycopy()`. This operation is highly optimized in the JVM, compiling down to native assembly instructions (`memmove`/`memcpy`) that leverage SIMD (Single Instruction Multiple Data) registers to copy large blocks of memory almost instantly.
+
+---
+
+## Layer 2: Source Code Walkthrough & Execution Flow
+
+Let's look at the core growth and insertion logic in OpenJDK's `ArrayList` versus the pointer-linking logic in `LinkedList`.
+
+### ArrayList Resizing and Insertion Mechanics
+```java
+package java.util;
+
+public class ArrayList<E> extends AbstractList<E> implements List<E>, RandomAccess, Cloneable, java.io.Serializable {
+    transient Object[] elementData;
+    private int size;
+
+    private void add(E e, Object[] elementData, int s) {
+        if (s == elementData.length)
+            elementData = grow(); // Trigger capacity expansion
+        elementData[s] = e;
+        size = s + 1;
+    }
+
+    private Object[] grow() {
+        return grow(size + 1);
+    }
+
+    private Object[] grow(int minCapacity) {
+        int oldCapacity = elementData.length;
+        if (oldCapacity > 0 || elementData != DEFAULTCAPACITY_EMPTY_ELEMENTDATA) {
+            // Formula: oldCapacity * 1.5
+            int newCapacity = ArraysSupport.newLength(oldCapacity,
+                    minCapacity - oldCapacity, /* minimum growth */
+                    oldCapacity >> 1           /* preferred growth */);
+            return elementData = Arrays.copyOf(elementData, newCapacity);
+        } else {
+            return elementData = new Object[Math.max(10, minCapacity)];
+        }
+    }
+}
+```
+
+### LinkedList Doubly-Linked Node Insertion Mechanics
+```java
+package java.util;
+
+public class LinkedList<E> extends AbstractSequentialList<E> implements List<E>, Deque<E>, Cloneable, java.io.Serializable {
+    transient int size = 0;
+    transient Node<E> first; // Pointer to head sentinel/node
+    transient Node<E> last;  // Pointer to tail sentinel/node
+
+    private static class Node<E> {
+        E item;
+        Node<E> next;
+        Node<E> prev;
+
+        Node(Node<E> prev, E element, Node<E> next) {
+            this.item = element;
+            this.next = next;
+            this.prev = prev;
+        }
+    }
+
+    public void addLast(E e) {
+        linkLast(e);
+    }
+
+    void linkLast(E e) {
+        final Node<E> l = last;
+        // Allocate new node on heap, pointing its prev to current last
+        final Node<E> newNode = new Node<>(l, e, null);
+        last = newNode;
+        if (l == null)
+            first = newNode;
+        else
+            l.next = newNode;
+        size++;
+        modCount++;
+    }
+}
+```
+
+---
+
+## Layer 3: Real-World Engineering Patterns
+
+### Implementing a Sliding Window Rate Limiter
+A sliding window rate limiter requires fast insertions at the tail and fast deletions at the head (FIFO queue structure). 
+
+While `LinkedList` is structurally suited for this, `java.util.ArrayDeque` (a double-ended queue backed by a circular array) outperforms both `LinkedList` and `ArrayList` for queue operations. However, if we need random access to elements within the window, `ArrayList` remains highly efficient if managed correctly.
+
+Here is a high-performance sliding window implementation using a circular buffer approach (via `ArrayDeque` under the hood) to avoid the $O(N)$ node allocation overhead of `LinkedList`:
+
+```java
+import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class SlidingWindowRateLimiter {
+    private final int maxRequests;
+    private final long windowDurationMillis;
+    // Circular array-backed Deque - faster than LinkedList due to cache locality
+    private final Deque<Long> requestTimestamps; 
+
+    public SlidingWindowRateLimiter(int maxRequests, long windowDurationMillis) {
+        this.maxRequests = maxRequests;
+        this.windowDurationMillis = windowDurationMillis;
+        this.requestTimestamps = new ArrayDeque<>(maxRequests);
+    }
+
+    public synchronized boolean allowRequest() {
+        long now = Instant.now().toEpochMilli();
+        long threshold = now - windowDurationMillis;
+
+        // Evict expired timestamps from the head (extremely fast O(1) in ArrayDeque)
+        while (!requestTimestamps.isEmpty() && requestTimestamps.peekFirst() < threshold) {
+            requestTimestamps.pollFirst();
+        }
+
+        if (requestTimestamps.size() < maxRequests) {
+            requestTimestamps.addLast(now); // Fast O(1) tail insertion
+            return true;
+        }
+
+        return false; // Rate limit exceeded
+    }
+}
+```
+
+---
+
+## Layer 4: Anti-Patterns, Pitfalls & Production Disasters
+
+### The O(N²) Iterative Index Lookup Disaster
+Using a standard `for` loop with index-based retrieval on a `LinkedList` is a devastating anti-pattern. Because `LinkedList` does not implement `RandomAccess`, every call to `.get(i)` must traverse the list from the beginning (or the end, whichever is closer) to reach index `i`.
+
+#### Before (Catastrophic Performance: $O(N^2)$):
+```java
+public void processElements(LinkedList<Data> list) {
+    // get(i) traverses pointers from the head every iteration!
+    for (int i = 0; i < list.size(); i++) { 
+        Data data = list.get(i); 
+        data.process();
+    }
+}
+```
+
+#### After (Optimal Performance: $O(N)$):
+```java
+public void processElements(List<Data> list) {
+    // Uses the iterator (either via for-each or listIterator())
+    // which maintains a pointer to the current node
+    for (Data data : list) {
+        data.process();
+    }
+}
+```
+
+---
+
+## Layer 5: Performance Benchmarks & Hardware Alignment
+
+To quantify the difference, let's look at the algorithmic and hardware complexity profiles of both structures:
+
+| Operation | ArrayList | LinkedList | Hardware Reality (JVM JIT Optimized) |
+| :--- | :--- | :--- | :--- |
+| **Get (Random Access)** | $O(1)$ | $O(N)$ | `ArrayList` is a direct memory offset read (1 CPU instruction). |
+| **Insert/Delete at End** | $O(1)$ amortized | $O(1)$ | `ArrayList` might trigger a resize, but is otherwise faster due to contiguous allocation. |
+| **Insert/Delete at Head** | $O(N)$ | $O(1)$ | `ArrayList` shifts elements via `System.arraycopy`. For small lists ($N < 1000$), `ArrayList` can still be faster due to cache line efficiency. |
+| **Memory Footprint** | Low ($4$ bytes per ref) | High ($32$ bytes per node) | `LinkedList` puts significant pressure on the Garbage Collector due to high node instantiation rates. |
+
+### Memory Allocation Math
+For 100,000 Integer objects:
+*   **`ArrayList`**: $10

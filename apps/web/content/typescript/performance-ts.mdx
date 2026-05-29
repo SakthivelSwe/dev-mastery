@@ -1,0 +1,113 @@
+---
+slug: "performance-ts"
+title: "TypeScript Compiler Performance"
+level: 4
+---
+
+## WHY
+In a small project, running `tsc` (or getting red squigglies in VSCode) takes 50 milliseconds.
+In a massive enterprise monorepo with 5,000 files and heavy use of Generics and Redux, the TypeScript compiler can take 45 seconds to report an error! 
+When VSCode takes 10 seconds just to show Autocomplete, developer productivity dies. 
+A Senior Developer must understand what specific code patterns choke the TypeScript compiler and how to optimize the codebase for instant IDE feedback.
+
+## THEORY
+### How the Compiler Chokes
+The TypeScript compiler is a massive mathematical constraint solver. It slows down when it has to compute too many possibilities.
+1. **Excessive Unions:** `TypeA | TypeB | TypeC...` (Evaluating 100 possibilities for every variable).
+2. **Deep Recursion:** Recursive Conditional Types parsing massive data structures.
+3. **Module Resolution Graph:** Scanning `node_modules` thousands of times to resolve nested imports.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "performance" }
+```
+
+## CODE
+
+### Level 1 — Avoid Massive Unions
+If you generate a Union type with 10,000 strings, every time you assign a variable, TypeScript has to mathematically check the variable against all 10,000 strings.
+
+```typescript
+// BAD: Generating a massive union of every single RGB color combination!
+type RGB = `rgb(${number}, ${number}, ${number})`;
+// Do not do this! It completely destroys compiler memory!
+
+// GOOD: Just use a standard string if the validation is this complex.
+// Rely on runtime validation (like Zod) instead of compile-time generation.
+type RGBString = string; 
+```
+
+### Level 2 — Simplify Interfaces vs. Types
+In TypeScript, you can define objects using `interface` or `type`. For simple objects, they behave identically. However, for the compiler, **Interfaces are faster than Intersections (`&`)**.
+
+```typescript
+// BAD FOR PERFORMANCE (Intersections)
+// The compiler has to mathematically merge these types on the fly everywhere it's used.
+type BaseProps = { id: string };
+type UserProps = { name: string };
+type AdminProps = BaseProps & UserProps & { role: string };
+
+// GOOD FOR PERFORMANCE (Interfaces)
+// Interfaces declare a fixed shape. The compiler caches the shape immediately.
+interface BaseProps { id: string; }
+interface UserProps extends BaseProps { name: string; }
+interface AdminProps extends UserProps { role: string; }
+```
+*Rule of Thumb:* If you are building a deeply nested object hierarchy (like React component props), always use `interface` and `extends` instead of `type` and `&`.
+
+### Level 3 — Explicit Return Types
+Type Inference is amazing. If you write `function add(a, b) { return a + b }`, TypeScript infers it returns a number.
+However, in massive Codebases, deep inference chains destroy performance. 
+If Function A infers its type from Function B, which infers from Function C, the compiler must recursively evaluate the entire file just to figure out what Function A returns!
+
+```typescript
+// BAD: Implicit Return
+// The compiler must parse the entire body of the Redux reducer to figure out the State type!
+const rootReducer = (state = initialState, action: Action) => {
+    switch (action.type) {
+        // 500 lines of code...
+        default: return state;
+    }
+}
+
+// GOOD: Explicit Return
+// The compiler INSTANTLY knows what this function returns without reading the body!
+const rootReducer = (state = initialState, action: Action): AppState => {
+    // ...
+}
+```
+*Optimization:* Always explicitly annotate the Return Type of high-level boundary functions (Reducers, API calls, major React Components). It acts as a "firebreak" for the compiler, preventing deep recursive analysis!
+
+### Level 4 — Project References (Monorepos)
+If you have a Monorepo with a `frontend` package and a `backend` package sharing a `common` types package, compiling the frontend usually forces `tsc` to completely recompile `common` from scratch every time!
+
+You can use **Project References** to tell TypeScript: *"I already compiled `common`. Don't re-read the source code, just use the pre-compiled `.d.ts` cache!"*
+
+```json
+// tsconfig.json (Frontend Project)
+{
+  "compilerOptions": {
+    "composite": true // Required for references!
+  },
+  "references": [
+    // Points to the built 'common' folder. 
+    // TypeScript will instantly load the cached types!
+    { "path": "../common" } 
+  ]
+}
+```
+This is how massive companies keep compile times under 2 seconds. They shatter the app into 50 smaller projects and use Project References to cache the boundaries!
+
+## REAL_WORLD
+**Debugging Slow Compiles (Tracing)**
+If your VSCode is slow, how do you find out *which specific file or type* is causing the lag?
+TypeScript has a built-in Profiler!
+Run the compiler with the `--generateTrace` flag:
+`tsc --noEmit --generateTrace ./trace`
+This will dump a massive JSON file into the `./trace` folder. You can drag and drop this file into `chrome://tracing` (or Edge/Brave) to see a visual flamegraph of exactly what the compiler was doing. You might discover that a single massive `Zod` schema or `tRPC` router is consuming 90% of your compile time!
+
+## INTERVIEW
+**Q: A developer adds `skipLibCheck: true` to the `tsconfig.json` to improve compile times. It works, the compile time drops from 30s to 2s. However, later that week, the production build crashes because a completely unrelated third-party library had a type error inside its own `.d.ts` file. If we skipped the check, why did it crash in production?**
+A: **`skipLibCheck` only applies to TypeScript compilation, not Bundler/CI execution rules!**
+Actually, this is a trick question. If `skipLibCheck: true` is enabled, `tsc` will successfully pass. The reason the production build crashed is usually because the *Bundler* (like Webpack's `ForkTsCheckerWebpackPlugin` or an aggressive CI pipeline) was configured with a separate tsconfig or rule that still enforced full library checking, OR the third-party library's types were so fundamentally broken that they corrupted the exported types your application was actively importing.
+However, the most important point is that `skipLibCheck` is a tradeoff: You gain massive speed, but you accept the risk that if a third-party library updates its types and breaks its own internal logic, you won't know about it until you try to use the broken types directly in your own code!

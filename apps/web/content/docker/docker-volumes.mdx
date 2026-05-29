@@ -1,0 +1,135 @@
+---
+slug: "docker-volumes"
+title: "Docker Volumes"
+level: 2
+---
+
+## WHY
+Containers are ephemeral by design. When you delete a container, everything inside it disappears — including your database files, user-uploaded images, and application logs.
+If you store PostgreSQL data inside a container and that container is deleted (or crashes), your entire database is gone forever.
+**Docker Volumes** are the solution. They are Docker-managed storage locations that exist outside the container's lifecycle. Data written to a Volume persists even after the container is deleted, stopped, or replaced with a new version.
+
+## THEORY
+### Three Ways to Persist Data
+1. **Named Volumes:** Docker creates and manages a storage location on the host. You reference it by name. This is the recommended approach for persistent data like databases. (`docker volume create mydata`)
+2. **Bind Mounts:** You specify an exact path on the host machine to mount into the container. Perfect for development (mounting source code for live editing). Risky in production (relies on exact host directory structure).
+3. **tmpfs Mounts:** (Linux only) Data stored in the host's RAM, never written to disk. Perfect for temporary secrets.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-volumes" }
+```
+
+## CODE
+
+### Named Volumes (Production Data)
+```bash
+# Create a named volume
+docker volume create postgres_data
+
+# Mount the volume into a Postgres container at the path where Postgres stores data
+docker run -d \
+  --name my_postgres \
+  -v postgres_data:/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=secret \
+  postgres:15
+
+# Delete the container
+docker rm -f my_postgres
+
+# Create a NEW Postgres container with the SAME volume
+docker run -d \
+  --name my_postgres_v2 \
+  -v postgres_data:/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=secret \
+  postgres:15
+
+# Your data is still there! The volume survived the container deletion!
+```
+
+### Bind Mounts (Development)
+```bash
+# Mount your current directory into the container for live code editing
+# $(pwd) = current working directory on Mac/Linux
+docker run -d \
+  --name dev-server \
+  -p 3000:3000 \
+  -v $(pwd):/app \       # Bind mount: your local code is visible inside the container!
+  node:20-alpine \
+  npm run dev
+
+# When you edit a file in VS Code, the container sees the changes instantly
+# No rebuild needed!
+```
+
+### Volume Commands
+```bash
+# List all volumes
+docker volume ls
+
+# Inspect a volume (shows where Docker stores it on the host)
+docker volume inspect postgres_data
+# "Mountpoint": "/var/lib/docker/volumes/postgres_data/_data"
+
+# Remove a volume (will fail if a container is using it!)
+docker volume rm postgres_data
+
+# Remove ALL unused volumes
+docker volume prune
+```
+
+### Volumes in Docker Compose
+```yaml
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Named volume
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # Bind mount for init script
+
+  app:
+    build: .
+    volumes:
+      - ./src:/app/src  # Bind mount for development hot-reload
+
+volumes:
+  postgres_data:  # Declares the named volume (Compose creates it if missing)
+```
+
+## REAL_WORLD
+**Backup and Restore a Docker Volume**
+You can't just copy the raw files at `/var/lib/docker/volumes/...` because the database might be writing. Instead, use a temporary container:
+
+```bash
+# BACKUP: Run a temp Ubuntu container, mount the volume AND your local backup directory,
+# then use tar to create a compressed archive
+docker run --rm \
+  -v postgres_data:/source:ro \          # Mount the volume as read-only
+  -v $(pwd)/backups:/dest \              # Mount local backup folder
+  ubuntu \
+  tar czf /dest/backup-$(date +%Y%m%d).tar.gz -C /source .
+
+# RESTORE: Extract the archive back into the volume
+docker run --rm \
+  -v postgres_data:/target \
+  -v $(pwd)/backups:/src \
+  ubuntu \
+  tar xzf /src/backup-20240128.tar.gz -C /target
+```
+
+## INTERVIEW
+**Q: What is the difference between a Docker Named Volume and a Bind Mount? When would you use each?**
+A: 
+**Named Volumes:**
+- Docker manages the storage location (usually at `/var/lib/docker/volumes/`)
+- Portable — not tied to a specific host directory path
+- Works cross-platform (Mac, Linux, Windows) consistently
+- **Use for:** Production database files, application state that needs to survive container restarts
+
+**Bind Mounts:**
+- You specify the exact host path (e.g., `/home/user/myproject/src`)
+- Ties the container to a specific host directory structure
+- Changes on host are immediately reflected in the container
+- **Use for:** Development — mounting source code for live editing with hot-reload
+
+In production, **always prefer Named Volumes**. Bind mounts in production can cause subtle issues when deploying to different servers with different directory structures, and they expose your host filesystem to the container. Named volumes are managed by Docker and work consistently across environments.

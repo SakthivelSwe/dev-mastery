@@ -1,0 +1,140 @@
+---
+slug: "sd-caching-patterns"
+title: "Caching Patterns"
+level: 4
+---
+
+## WHY
+A cache saves a computed or fetched result so you don't have to recompute or re-fetch it. But deciding **how to fill the cache** and **how to keep it up-to-date** requires careful design. The wrong caching pattern leads to stale data, cache stampedes, or data loss on restarts.
+
+The four fundamental caching patterns — Cache-Aside, Write-Through, Write-Behind, and Read-Through — define the relationship between the cache, the application, and the database. Mastering them is essential for any System Design interview.
+
+## THEORY
+### The Cache Invalidation Problem
+"There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton
+
+The hardest part of caching is deciding when to evict (delete) an entry from the cache when the underlying data changes. If you don't invalidate the cache after an update, users will see stale data. If you invalidate too aggressively, your cache hit rate plummets and you lose the performance benefit.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "caching-patterns" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Cache-Aside / Lazy Loading)
+This is the most common pattern. The Application manages the cache. The cache only stores data that has actually been requested. 
+
+```
+READ:
+App → Cache → HIT? Return data.
+App → Cache → MISS? → App reads from DB → App writes to Cache → Return data.
+
+WRITE:
+App → DB (write) → App INVALIDATES (deletes) the cache entry.
+Next read will be a cache miss, triggering a fresh DB read and cache fill.
+```
+
+```python
+def get_user(user_id: int):
+    # 1. Try the cache first
+    cached = redis.get(f"user:{user_id}")
+    if cached:
+        return json.loads(cached) # Cache HIT!
+
+    # 2. Cache MISS — fetch from database
+    user = db.query("SELECT * FROM users WHERE id = %s", user_id)
+
+    # 3. Write to cache with a TTL (Time To Live)
+    redis.setex(f"user:{user_id}", 3600, json.dumps(user)) # Expires in 1 hour
+
+    return user
+
+def update_user(user_id: int, new_data: dict):
+    db.execute("UPDATE users SET ... WHERE id = %s", user_id)
+    
+    # INVALIDATE the cache! Next read will be fresh.
+    redis.delete(f"user:{user_id}")
+```
+
+### Level 2 — Building Blocks (Write-Through)
+Every write goes SIMULTANEOUSLY to both the cache AND the database.
+
+```
+WRITE:
+App → Cache (write) → DB (write synchronously) → Return success.
+The cache is always up-to-date. No stale reads!
+
+DOWNSIDE: Every write is slower (must wait for BOTH cache and DB to confirm).
+Best for: High read frequency + data that changes frequently and MUST be consistent.
+Examples: User profile data, product inventory.
+```
+
+### Level 3 — Intermediate (Write-Behind / Write-Back)
+The application writes to the cache ONLY. The cache asynchronously persists to the database in the background.
+
+```
+WRITE:
+App → Cache (write) → Immediately return success! (Ultra-fast!)
+Background worker → Reads dirty cache entries → Writes to DB.
+
+DOWNSIDE: Risk of data loss! If the cache server crashes before the background
+          worker flushes to DB, the writes in the cache are permanently lost!
+Best for: Non-critical, high-velocity writes where some loss is acceptable.
+Examples: Like counts, view counters, analytics events.
+```
+
+### Level 4 — Advanced (The Thundering Herd / Cache Stampede)
+When a very popular cache entry expires, thousands of concurrent requests simultaneously get a cache MISS and all try to query the database at the same moment, overwhelming it.
+
+```python
+# SOLUTION 1: Mutex Lock (Probabilistic Early Expiration)
+import threading
+
+_lock = threading.Lock()
+
+def get_popular_data(key: str):
+    cached = redis.get(key)
+    if cached:
+        return json.loads(cached)
+    
+    # Cache MISS — only let ONE thread populate the cache!
+    with _lock:
+        # Double-check: another thread might have filled it while we waited!
+        cached = redis.get(key)
+        if cached:
+            return json.loads(cached)
+        
+        data = db.query(...)
+        redis.setex(key, 3600, json.dumps(data))
+        return data
+
+# SOLUTION 2: Stale-While-Revalidate
+# Return the stale cached value immediately, refresh in the background!
+def get_with_stale_refresh(key: str):
+    entry = redis.get(key)
+    
+    if entry:
+        data = json.loads(entry)
+        if data["expires_at"] < time.time():
+            # Asynchronously refresh without blocking the request!
+            threading.Thread(target=refresh_cache, args=(key,)).start()
+        return data["value"] # Return stale but valid data immediately
+    
+    return fetch_and_cache(key) # Cold start: fetch and cache
+```
+
+## REAL_WORLD
+A sophisticated caching architecture layers multiple cache levels, called **Multi-Layer Caching** (inspired by CPU L1/L2/L3 caches):
+
+1. **L1 (In-Process Cache):** A small cache inside the application's own memory (e.g., `ConcurrentHashMap` in Java, `lru-cache` in Node.js). Single-digit microseconds. Evicted when the process restarts.
+2. **L2 (Distributed Cache — Redis):** Shared across all application instances. Single-digit milliseconds. Survives process restarts.
+3. **L3 (CDN — CloudFront/Fastly):** For static and semi-static content. Single-digit milliseconds from the nearest edge node worldwide.
+4. **L4 (Database Query Cache — pgBouncer/ProxySQL):** Caches frequent query results at the database connection layer.
+
+## INTERVIEW
+**Q: How do you cache paginated results?**
+A: Caching paginated results (e.g., `/api/products?page=2&limit=20`) is tricky because any insertion or deletion changes the pagination of ALL subsequent pages. A common approach is to cache only page 1 (the most requested), or to use cursor-based pagination (where the cache key is the cursor ID, not the page number), which is stable against insertions and deletions.
+
+**Q: What is a "Cache Warming" strategy?**
+A: Pre-populating the cache before traffic arrives, to avoid cold-start cache misses on deployment. Common strategies: replay recent production traffic against the new cache, pre-load popular item IDs from the DB into the cache during deployment, or use a blue-green deployment where the new instance pre-warms before receiving traffic.

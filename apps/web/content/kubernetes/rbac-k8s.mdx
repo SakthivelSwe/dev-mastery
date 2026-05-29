@@ -1,0 +1,195 @@
+---
+slug: "rbac-k8s"
+title: "Kubernetes RBAC"
+level: 4
+---
+
+## WHY
+By default, all authenticated users in a Kubernetes cluster can do anything — read secrets, delete deployments, even delete the cluster. This is a catastrophic security posture for production.
+**Role-Based Access Control (RBAC)** is Kubernetes' authorization system. It lets you define exactly what each person or application is allowed to do: "This developer can only view pods in the `dev` namespace but cannot delete anything" or "This CI/CD service account can deploy to `staging` but cannot touch `production`."
+
+## THEORY
+### RBAC Concepts
+- **ServiceAccount:** An identity for processes running inside Pods (not humans)
+- **Role:** Defines permissions WITHIN a specific namespace
+- **ClusterRole:** Defines permissions across ALL namespaces (or cluster-level resources)
+- **RoleBinding:** Assigns a Role to a user/group/ServiceAccount within a namespace
+- **ClusterRoleBinding:** Assigns a ClusterRole cluster-wide
+
+### Principle of Least Privilege
+Every user and application should have only the minimum permissions needed. A bug in your API application should not be able to read Kubernetes secrets or delete other deployments.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SecurityVisualizer", "state": "k8s-rbac" }
+```
+
+## CODE
+
+### Creating Roles and Bindings
+```yaml
+# Role: Allows reading pods and services in 'myapp' namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: myapp
+  name: pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "watch", "list"]    # Read-only!
+---
+# RoleBinding: Assign pod-reader role to a developer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: myapp
+subjects:
+  - kind: User
+    name: alice@company.com          # Developer's email
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### ServiceAccount for Applications
+```yaml
+# ServiceAccount for the API application
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-service-account
+  namespace: myapp
+---
+# Role: Allow API to read ConfigMaps (for dynamic config)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: myapp
+  name: config-reader
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-config-read
+  namespace: myapp
+subjects:
+  - kind: ServiceAccount
+    name: api-service-account
+    namespace: myapp
+roleRef:
+  kind: Role
+  name: config-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# Deployment uses the ServiceAccount
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      serviceAccountName: api-service-account  # Mount SA credentials!
+      containers:
+        - name: api
+          image: my-api:1.0.0
+```
+
+### Checking Permissions
+```bash
+# Check if you can do something
+kubectl auth can-i create deployments
+# yes
+
+kubectl auth can-i delete pods -n production
+# no
+
+# Check what a service account can do
+kubectl auth can-i get secrets \
+  --as=system:serviceaccount:myapp:api-service-account
+# no  ← Good! API can't read secrets
+```
+
+## REAL_WORLD
+**Namespace Isolation for Teams**
+In a shared cluster with multiple teams, RBAC + Namespaces creates isolated virtual clusters:
+
+```bash
+# Team A only has access to 'team-a' namespace
+kubectl create namespace team-a
+kubectl create namespace team-b
+
+# Team A developers can do anything in team-a namespace
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team-a-admin
+  namespace: team-a
+subjects:
+  - kind: Group
+    name: team-a-developers
+roleRef:
+  kind: ClusterRole
+  name: admin   # Built-in admin role
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# Team A cannot see Team B's resources:
+kubectl get pods -n team-b  # Forbidden!
+```
+
+## INTERVIEW
+**Q: Your CI/CD pipeline's service account accidentally has ClusterAdmin access. You want to reduce it to only what's needed: deploy to the `production` namespace, read secrets in `production`, and list nodes. How do you implement this?**
+
+A: Create a minimal ClusterRole/Role with exactly those permissions:
+
+```yaml
+# Role for namespace-scoped permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: ci-deployer
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+# ClusterRole for node listing (cluster-scoped resource)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+# Bind both to the CI service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer-binding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: ci-pipeline-sa
+    namespace: ci-system
+roleRef:
+  kind: Role
+  name: ci-deployer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Then remove the ClusterAdmin ClusterRoleBinding. The CI pipeline can now ONLY deploy to production and read its secrets — it cannot touch other namespaces, delete resources, or modify RBAC itself.

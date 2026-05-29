@@ -1,0 +1,105 @@
+---
+slug: "event-sourcing"
+title: "Event Sourcing"
+level: 4
+---
+
+## WHY
+In a traditional database (like a SQL database storing a User's bank account), when a user deposits $50, you update the `balance` row from `$100` to `$150`. The old state ($100) is gone forever. If a bug accidentally sets the balance to $0, or if an auditor asks *why* the balance is $150, you have no way to prove it. You only have the current state, not the history.
+
+**Event Sourcing** flips this entirely. Instead of storing the *current state* of an entity, you store every *event* that ever happened to it as an immutable log. To find the current state, you replay all the events from the beginning of time.
+
+## THEORY
+### Core Concepts
+1. **The Event Store:** A specialized database (or an append-only log like Kafka) that stores Events.
+2. **Immutability:** Events happened in the past. They can NEVER be updated or deleted. You cannot change history.
+3. **Rehydration / Projection:** The process of reading the event log and applying a `reduce()` function to calculate the current state.
+
+If you make a mistake (e.g., an event added $50 instead of $5), you do not edit the event. You append a *new* Compensating Event (e.g., "Deducted $45 for correction"). This is exactly how accounting ledgers have worked for centuries.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "event-sourcing" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Mental Model)
+Think of Event Sourcing like a massive Array `reduce()` function in JavaScript.
+
+```javascript
+// The Event Store (Immutable Log)
+const events = [
+  { type: 'ACCOUNT_OPENED', payload: { id: 1, name: 'Alice' }, timestamp: 1000 },
+  { type: 'DEPOSITED', payload: { amount: 100 }, timestamp: 1005 },
+  { type: 'WITHDRAWN', payload: { amount: 30 }, timestamp: 1010 },
+  { type: 'DEPOSITED', payload: { amount: 50 }, timestamp: 1015 }
+];
+
+// The Reducer (Rehydration)
+function calculateCurrentState(eventHistory) {
+  return eventHistory.reduce((state, event) => {
+    switch (event.type) {
+      case 'ACCOUNT_OPENED':
+        return { ...state, ...event.payload, balance: 0, status: 'OPEN' };
+      case 'DEPOSITED':
+        return { ...state, balance: state.balance + event.payload.amount };
+      case 'WITHDRAWN':
+        return { ...state, balance: state.balance - event.payload.amount };
+      default:
+        return state;
+    }
+  }, {}); // Start with empty object
+}
+
+// Current State: { id: 1, name: 'Alice', balance: 120, status: 'OPEN' }
+const currentState = calculateCurrentState(events);
+```
+
+### Level 2 — Building Blocks (Projections and Read Models)
+If calculating the current state requires reading 10,000 events, querying your application will be incredibly slow.
+Event Sourcing is almost always paired with **CQRS (Command Query Responsibility Segregation)**.
+
+1. **Write Side (Commands):** Appends events to the Event Store.
+2. **The Projector:** A background worker that listens for new events and updates a separate "Read Database" (like MongoDB or Redis).
+3. **Read Side (Queries):** The frontend queries the fast Read Database, which stores the pre-calculated current state.
+
+```text
+[User clicks Deposit] 
+    ---> [Command Service] 
+    ---> Appends {Type: DEPOSITED, amount: 50} to [Kafka / Event Store]
+
+[Projector Service] (Listens to Kafka)
+    ---> Hears DEPOSITED event.
+    ---> Executes: UPDATE read_db SET balance = balance + 50 WHERE id = 1
+
+[User visits Dashboard]
+    ---> [Query Service] 
+    ---> SELECT balance FROM read_db WHERE id = 1
+    ---> (Fast! No event replaying required for reads).
+```
+
+### Level 3 — Intermediate (Snapshots)
+Even with a Read Database, sometimes the Command side needs to know the current state before validating a new command (e.g., "Does the user have enough money to withdraw?"). Loading a 10-year history of 50,000 transactions is too slow.
+
+**Snapshots** solve this. Every 100 events, you save the current calculated state into a Snapshot table.
+When you need to rehydrate, you don't start from Event #1. You load the Snapshot at Event #100, and then only replay Events #101 to #105.
+
+### Level 4 — Advanced (Time Travel and Replaying)
+Because you have the raw events, you can create *new* projections that you didn't think of originally.
+
+Imagine management says: *"We want to build a Fraud Detection system that analyzes how fast users deposit and withdraw money on their first day."*
+In a traditional CRUD system, you can't do this. That data wasn't captured.
+
+In Event Sourcing, you write a new Projector for the Fraud Database, point it at Event #1 from five years ago, and let it run. It will replay history from the beginning of time, populating the new database as if the feature existed for five years. This is the ultimate superpower of Event Sourcing.
+
+## REAL_WORLD
+Event Sourcing is notoriously difficult to implement correctly. It introduces massive complexity:
+- **Eventual Consistency:** The Read Database is updated asynchronously. A user might deposit money, refresh the page instantly, and see their old balance because the Projector hasn't processed the event yet.
+- **Event Schema Evolution:** What happens if you need to change the payload structure of an event? You can't change the old events in the database! You have to write complex "Upcaster" functions that convert old event formats into new formats on the fly during rehydration.
+
+**Where is it used?** Banking, E-commerce Carts, Gaming, and Git. (Git is literally an Event Sourcing system: every commit is an immutable event, and your working directory is the projected read model!).
+
+## INTERVIEW
+**Q: How do you handle a scenario where a user legally requests all their data to be deleted (GDPR Right to Erasure) in an immutable Event Store?**
+A: This is one of the hardest problems in Event Sourcing. You cannot delete the `ACCOUNT_OPENED` event, because it breaks immutability and cryptographic hashes. The standard solution is **Crypto-Shredding**. You encrypt all Personally Identifiable Information (PII) inside the event payload using a unique encryption key for that specific user. When they request deletion, you do not touch the event store; you simply delete their encryption key from the Key Management System. The events remain, but the PII is permanently rendered as mathematically unreadable gibberish.

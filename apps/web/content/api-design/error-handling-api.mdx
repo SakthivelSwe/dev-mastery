@@ -1,0 +1,160 @@
+---
+slug: "error-handling-api"
+title: "API Error Handling & Standards"
+level: 3
+---
+
+## WHY
+If your API crashes because a user submitted an invalid email address, and your backend returns a generic HTTP `500 Internal Server Error` with a 200-line Java StackTrace in the body, you have failed as an API designer.
+
+The frontend developer (or third-party client) parsing your response has no idea *why* it failed. Was it a network glitch? Bad input? A database timeout? 
+**API Error Handling** is the art of returning predictable, structured, and actionable error messages using standard HTTP status codes. Proper error handling turns an API from a frustrating black box into a joyful developer experience.
+
+## THEORY
+### HTTP Status Code Categories
+The foundation of REST error handling is returning the correct HTTP status code. 
+- **2xx (Success):** Everything worked perfectly.
+- **4xx (Client Error):** The frontend messed up. (e.g., Bad syntax, unauthorized, resource not found). The client should *not* retry the exact same request because it will fail again.
+- **5xx (Server Error):** The backend messed up. (e.g., Database crashed, unhandled exception). The client *can* retry later, hoping the server has recovered.
+
+### RFC 7807: Problem Details for HTTP APIs
+Instead of inventing your own custom JSON error format, the industry standard is RFC 7807 (`application/problem+json`). It defines a standardized JSON structure for returning errors.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-error-handling" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Status Codes)
+Learn the core 4xx codes. Returning a `400 Bad Request` for an authentication failure is a rookie mistake.
+
+```json
+// HTTP 400 Bad Request
+// The client sent malformed JSON or failed basic validation (e.g., age = -5).
+
+// HTTP 401 Unauthorized
+// The client provided NO authentication token, or an EXPIRED token.
+// (Think: "Who are you?")
+
+// HTTP 403 Forbidden
+// The client provided a VALID token, but they do not have PERMISSION.
+// (e.g., A standard user trying to access the /admin dashboard).
+// (Think: "I know who you are, but you aren't allowed to do this.")
+
+// HTTP 404 Not Found
+// The requested resource does not exist (e.g., /users/9999).
+
+// HTTP 429 Too Many Requests
+// Rate limiting! The client is sending too many requests too quickly.
+```
+
+### Level 2 — Building Blocks (RFC 7807 Format)
+Instead of a random error string, return a structured RFC 7807 response.
+
+```json
+// Response Header: Content-Type: application/problem+json
+// HTTP Status: 400 Bad Request
+
+{
+  // A URI reference that identifies the problem type. 
+  // (Usually links to your API documentation!)
+  "type": "https://api.mycompany.com/errors/insufficient-funds",
+  
+  // A short, human-readable summary of the problem type
+  "title": "Insufficient Funds",
+  
+  // The HTTP status code (mirrored here for convenience)
+  "status": 400,
+  
+  // A human-readable explanation specific to THIS occurrence of the problem
+  "detail": "Your current balance is $30, but the item costs $50.",
+  
+  // A URI identifying the specific occurrence of the problem (for logging/debugging)
+  "instance": "/account/12345/transactions/trace-987"
+}
+```
+
+### Level 3 — Intermediate (Field-Level Validation Errors)
+What happens if the user submits a registration form, but the password is too short AND the email is already taken? 
+You should not return just one error. You must return a list of all validation failures so the frontend can highlight the specific input boxes in red!
+RFC 7807 allows you to add custom extension fields (like `invalidParams`).
+
+```json
+// Response Header: Content-Type: application/problem+json
+// HTTP Status: 400 Bad Request
+
+{
+  "type": "https://api.mycompany.com/errors/validation-failed",
+  "title": "Validation Failed",
+  "status": 400,
+  "detail": "The request payload failed validation. See 'invalidParams' for details.",
+  
+  // CUSTOM FIELD: Array of specific field errors!
+  "invalidParams": [
+    {
+      "field": "email",
+      "reason": "Email address 'john@com' is missing a valid TLD."
+    },
+    {
+      "field": "password",
+      "reason": "Password must be at least 8 characters long."
+    }
+  ]
+}
+```
+
+### Level 4 — Advanced (Global Exception Handlers)
+If your API has 100 endpoints, you DO NOT want to write `try/catch` blocks in every single controller to format these JSON responses manually.
+Modern backend frameworks (Express, Spring Boot, ASP.NET) support **Global Exception Handlers**.
+
+```java
+// Spring Boot Example (@ControllerAdvice)
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    // 1. Catch ALL exceptions of a specific type (e.g., UserNotFoundException)
+    @ExceptionHandler(UserNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleUserNotFound(UserNotFoundException ex) {
+        
+        // 2. Automatically format it into an RFC 7807 ProblemDetail object!
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.NOT_FOUND, 
+            ex.getMessage()
+        );
+        problem.setType(URI.create("https://api.mycompany.com/errors/not-found"));
+        problem.setTitle("Resource Not Found");
+        
+        // 3. Return the standardized JSON
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(problem);
+    }
+    
+    // Catch a generic Exception (The dreaded HTTP 500)
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ProblemDetail> handleGenericError(Exception ex) {
+        // DANGER: NEVER expose the StackTrace to the client in production!
+        // It exposes your internal architecture to hackers.
+        // Log the StackTrace internally, but return a generic message to the user!
+        log.error("Unhandled Exception: ", ex);
+        
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.INTERNAL_SERVER_ERROR, 
+            "An unexpected internal server error occurred. Please try again later."
+        );
+        return ResponseEntity.status(500).body(problem);
+    }
+}
+```
+
+## REAL_WORLD
+**Stripe API Errors**
+Stripe is widely considered to have the best developer experience (DX) in the world. A massive part of this is their error handling. 
+If your credit card charge fails, Stripe doesn't just return `400 Bad Request`. They return a highly structured error object with a `code` (e.g., `card_declined`), a `decline_code` (e.g., `insufficient_funds`), and a human-readable `message` that the developer can display directly to the end-user. 
+They also guarantee that their Error JSON schema will *never* change and provides a unique `request_id` in every single response. If a developer contacts Stripe Support, they just paste the `request_id`, and Stripe engineers can instantly find the exact internal logs for that exact failure.
+
+## INTERVIEW
+**Q: I am building an API. If the user searches for a specific ID (`GET /users/999`) and it doesn't exist, I return `404 Not Found`. However, if the user searches a list (`GET /users?status=active`) and there are no active users, should I return `404 Not Found` or `200 OK`?**
+A: **You should return `200 OK` with an empty array `[]`.**
+A `404 Not Found` means the *Resource URI* itself does not exist. The collection `/users` absolutely exists; it just happens to have zero elements in it at this moment. 
+Returning `404` for an empty array is a major anti-pattern. It forces the frontend developer to write a massive `try/catch` block just to handle an empty list, whereas returning `[]` with a `200 OK` allows the frontend to simply loop over the array (which will execute zero times safely) without throwing any JavaScript errors.

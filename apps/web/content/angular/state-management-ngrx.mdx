@@ -1,0 +1,190 @@
+---
+slug: "state-management-ngrx"
+title: "State Management: NgRx"
+level: 4
+---
+
+## WHY
+As an Angular application scales, Components begin passing data back and forth using complex chains of `@Input()` and `@Output()`. Soon, the `HeaderComponent` needs to know if the `CartComponent` (which is 15 levels deep in a completely different route) added an item.
+If you try to solve this with standard Angular Services holding `BehaviorSubjects`, the state becomes highly mutable, untraceable, and prone to race conditions.
+**NgRx** is the industry standard State Management library for massive Enterprise Angular applications. Based on Redux, it enforces a strict, unidirectional data flow, making state changes 100% predictable, traceable, and debuggable.
+
+## THEORY
+### The NgRx Architecture
+NgRx is built on 5 core concepts:
+1. **Store:** The single, massive JavaScript object that holds the entire global state of the application.
+2. **Actions:** Simple objects that describe *what* happened (e.g., `[Cart] Add Item`). Components dispatch Actions; they never modify the state directly!
+3. **Reducers:** Pure functions that take the current State and the Action, and mathematically calculate the *new* State.
+4. **Selectors:** Pure functions that extract specific slices of the state to feed into your components.
+5. **Effects:** Background services that listen for Actions, perform asynchronous side effects (like an HTTP request), and dispatch new Actions when finished.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "ngrx-flow" }
+```
+
+## CODE
+
+### Level 1 — Actions and Reducers
+Let's build a simple counter. First, we define what can happen (Actions). Then we define how the state changes (Reducer).
+
+```typescript
+// 1. actions.ts
+import { createAction, props } from '@ngrx/store';
+
+// We describe events that occurred in the UI
+export const increment = createAction('[Counter Component] Increment');
+export const decrement = createAction('[Counter Component] Decrement');
+export const setAmount = createAction('[Counter Component] Set Amount', props<{ value: number }>());
+
+// 2. reducer.ts
+import { createReducer, on } from '@ngrx/store';
+
+export const initialState = 0;
+
+export const counterReducer = createReducer(
+  initialState,
+  // If the 'increment' action is received, return state + 1
+  on(increment, (state) => state + 1),
+  
+  // If the 'decrement' action is received, return state - 1
+  on(decrement, (state) => state - 1),
+  
+  // If the 'setAmount' action is received, extract the payload and return it
+  on(setAmount, (state, action) => action.value)
+);
+```
+
+### Level 2 — Selectors and Components
+Components never read the raw state object directly. They use Selectors to subscribe to a tiny slice of it.
+
+```typescript
+// 3. selectors.ts
+import { createFeatureSelector, createSelector } from '@ngrx/store';
+
+// Grab the 'counter' slice from the massive global Store object
+export const selectCount = createFeatureSelector<number>('counter');
+
+// 4. component.ts
+import { Component, inject } from '@angular/core';
+import { Store } from '@ngrx/store';
+import { increment, decrement } from './counter.actions';
+import { selectCount } from './counter.selectors';
+
+@Component({
+  selector: 'app-counter',
+  template: `
+    <!-- The async pipe automatically subscribes and unsubscribes from the Observable! -->
+    <h1>Count: {{ count$ | async }}</h1>
+    
+    <button (click)="onIncrement()">Increment</button>
+    <button (click)="onDecrement()">Decrement</button>
+  `
+})
+export class CounterComponent {
+  private store = inject(Store);
+
+  // Read data from the Store! Returns an Observable stream.
+  count$ = this.store.select(selectCount);
+
+  onIncrement() {
+    // Send a message to the Store! The Reducer will catch it.
+    this.store.dispatch(increment());
+  }
+
+  onDecrement() {
+    this.store.dispatch(decrement());
+  }
+}
+```
+
+### Level 3 — Handling Asynchronous APIs (Effects)
+Reducers MUST be Pure Functions. They cannot execute `this.http.get()`.
+If a component needs to fetch a list of Users, it dispatches a `loadUsers` action. An **Effect** catches it in the background, executes the HTTP request, and then dispatches a *new* action with the result!
+
+```typescript
+// effects.ts
+import { Injectable, inject } from '@angular/core';
+import { Actions, createEffect, oType } from '@ngrx/effects';
+import { catchError, map, exhaustMap, of } from 'rxjs';
+import { UserService } from './user.service';
+import * as UserActions from './user.actions';
+
+@Injectable()
+export class UserEffects {
+  private actions$ = inject(Actions); // A stream of ALL actions in the app!
+  private userService = inject(UserService);
+
+  // Define the background process
+  loadUsers$ = createEffect(() => {
+    return this.actions$.pipe(
+      // 1. ONLY listen for the 'loadUsers' action
+      ofType(UserActions.loadUsers),
+      
+      // 2. Execute the HTTP Request (exhaustMap ignores rapid double-clicks)
+      exhaustMap(() => 
+        this.userService.getAll().pipe(
+          // 3. If it succeeds, dispatch a SUCCESS action with the payload!
+          map(users => UserActions.loadUsersSuccess({ users })),
+          
+          // 4. If it crashes, dispatch a FAILURE action with the error!
+          catchError(error => of(UserActions.loadUsersFailure({ error: error.message })))
+        )
+      )
+    );
+  });
+}
+```
+*The Magic:* The Component doesn't care about HTTP requests. It just screams `"I want users!"` (`dispatch(loadUsers)`). The Effect handles the network. The Reducer listens for `loadUsersSuccess` and updates the Store. The Component's Selector automatically updates the UI. Total decoupling!
+
+### Level 4 — NgRx SignalStore (The Modern Era)
+Classic NgRx (using RxJS Observables, Actions, and Reducers) requires a massive amount of boilerplate.
+With the release of Angular Signals, the NgRx team introduced **SignalStore**. It is a lightweight, ultra-modern alternative that uses Signals instead of Observables, dropping the Redux boilerplate entirely!
+
+```typescript
+import { signalStore, withState, withMethods } from '@ngrx/signals';
+
+// 1. Define the state
+type CounterState = { count: number };
+const initialState: CounterState = { count: 0 };
+
+// 2. Create the SignalStore!
+export const CounterStore = signalStore(
+  { providedIn: 'root' },
+  withState(initialState),
+  
+  // 3. Define the methods (Reducers and Effects bundled together!)
+  withMethods((store) => ({
+    increment() {
+      // Patch the state directly!
+      patchState(store, (state) => ({ count: state.count + 1 }));
+    },
+    decrement() {
+      patchState(store, (state) => ({ count: state.count - 1 }));
+    }
+  }))
+);
+
+// 4. In your Component:
+export class CounterComponent {
+  // Inject it just like a Service!
+  readonly store = inject(CounterStore);
+  
+  // Bind directly to the Signals!
+  // Template: <h1>{{ store.count() }}</h1>
+  // Template: <button (click)="store.increment()">+</button>
+}
+```
+
+## REAL_WORLD
+**The Redux DevTools Extension**
+The primary reason massive enterprises endure the heavy boilerplate of traditional NgRx is the tooling.
+If you install the Redux DevTools Chrome Extension, you gain superpowers. It records every single Action dispatched in your application in chronological order, alongside a snapshot of the exact Global State at that millisecond.
+If a QA tester finds a bug, they don't have to explain how to reproduce it. They can export a JSON file of the Redux sequence. You load the JSON into your DevTools, and you can literally **Time Travel**—scrubbing backwards and forwards through the application's timeline to see the exact moment the state became corrupted. 
+
+## INTERVIEW
+**Q: You dispatch a `[Data] Load Items` action. The Redux DevTools show the action was dispatched. The Effect catches it, makes an HTTP request, but the server returns a 500 Error. The Effect catches the error, but it DOES NOT dispatch a `loadItemsFailure` action. Instead, the entire Effect silently dies, and if you click the "Load Items" button again, nothing happens. Why did the Effect die permanently?**
+A: **The RxJS Error Completion Trap.**
+In RxJS, if an Error propagates into the main observable stream, the stream completes (dies) and will never listen to another event again. 
+If your `catchError` block is placed on the *outer* observable (the `this.actions$.pipe(...)`), the error destroys the entire Action Listener stream.
+*The Fix:* You MUST place the `catchError` block on the *inner* observable (inside the `exhaustMap` or `switchMap`, attached directly to the `this.userService.getAll().pipe(...)`). This way, the inner HTTP stream dies, but the outer Action Listener stream stays alive, ready to catch the next `[Data] Load Items` action!

@@ -1,0 +1,160 @@
+---
+slug: "change-detection"
+title: "Change Detection (Zone.js & OnPush)"
+level: 3
+---
+
+## WHY
+In modern SPAs, the golden rule is: **When the data changes, the UI must update to reflect that change.**
+
+But how does Angular *know* the data changed? If you type `this.username = 'Bob';` in a TypeScript function, how does the HTML template magically know it needs to re-render the `<h1>` tag? 
+
+Angular accomplishes this using an incredibly complex engine called **Change Detection**, powered historically by a library called `Zone.js`. Understanding how Change Detection works—and more importantly, how to optimize it—is the absolute dividing line between Junior and Senior Angular developers. A poorly optimized Change Detection tree will cause a massive enterprise application to freeze and stutter during every single mouse movement.
+
+## THEORY
+### Zone.js (The Magic Interceptor)
+Angular uses `Zone.js` to monkey-patch (hijack) every single asynchronous event in the browser. It overrides the browser's native `setTimeout`, `setInterval`, `Promise.then()`, and every DOM event (`click`, `mousemove`, `keyup`). 
+
+Whenever ANY asynchronous event finishes, `Zone.js` shouts: *"Hey Angular! Something happened! You better check if the data changed!"*
+
+Angular responds by triggering a **Change Detection Cycle**. It starts at the absolute root component (`app.component`) and walks down the *entire* component tree, checking every single data binding (`{{ variable }}`) in every single component to see if the value is different than it was a millisecond ago. If it's different, it re-renders that specific part of the DOM.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "angular-change-detection" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Performance Disaster)
+```typescript
+import { Component } from '@angular/core';
+
+@Component({
+  template: `
+    <!-- The user moves their mouse around the screen -->
+    <div (mousemove)="doNothing()">
+      
+      <!-- Angular executes this method on EVERY mouse movement! -->
+      <h1>{{ getExpensiveCalculation() }}</h1>
+      
+    </div>
+  `
+})
+export class SlowComponent {
+  
+  doNothing() {
+    // We do literally nothing. We don't even change a variable.
+  }
+
+  getExpensiveCalculation() {
+    console.log("Angular is checking for changes!");
+    // Imagine this is a heavy 500ms algorithm.
+    // If the user moves the mouse 60 times a second, this method runs 60 times a second!
+    // The browser will completely crash.
+    return 42; 
+  }
+}
+```
+Because the `mousemove` event triggered `Zone.js`, Angular frantically checked the entire application for changes, executing `getExpensiveCalculation()` over and over again, even though nothing actually changed!
+
+### Level 2 — Building Blocks (ChangeDetectionStrategy.OnPush)
+How do we stop Angular from checking the entire component tree on every single mouse click? We use `OnPush`.
+
+```typescript
+import { Component, ChangeDetectionStrategy, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-user-card',
+  template: `<h3>{{ user.name }}</h3>`,
+  
+  // MAGIC: We tell Angular: "STOP checking this component automatically!"
+  changeDetection: ChangeDetectionStrategy.OnPush
+})
+export class UserCardComponent {
+  
+  // Angular will NOW ONLY check this component if the memory reference 
+  // of this @Input() object physically changes!
+  @Input() user!: { name: string };
+}
+```
+
+If the Parent component does `this.user.name = 'Alice'`, the `OnPush` child **WILL NOT UPDATE**. The memory reference of the `user` object didn't change! 
+To trigger an update, the Parent must pass a brand new memory reference: `this.user = { name: 'Alice' }`. 
+This forces you to write **Immutable Code**, which results in astronomically faster applications.
+
+### Level 3 — Intermediate (Manually Triggering Change Detection)
+Sometimes, you are using `OnPush`, but you update a variable from an RxJS Subscription or a WebSocket. Angular won't notice. You must physically tell Angular to check the component!
+
+```typescript
+import { Component, ChangeDetectorRef, OnInit } from '@angular/core';
+
+@Component({
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `<h1>{{ livePrice }}</h1>`
+})
+export class StockTickerComponent implements OnInit {
+  livePrice = 0;
+
+  // 1. Inject the ChangeDetectorRef!
+  constructor(private cdr: ChangeDetectorRef) {}
+
+  ngOnInit() {
+    websocket.onMessage(data => {
+      this.livePrice = data.price; // We mutated a variable!
+      
+      // 2. Tell Angular: "Hey, I changed something! Please schedule a re-render 
+      // for this specific component!"
+      this.cdr.markForCheck(); 
+    });
+  }
+}
+```
+
+### Level 4 — Advanced (Zoneless Angular with Signals)
+In **Angular 18**, Google introduced the most massive architectural shift in the framework's history: **Zoneless Angular**.
+
+Because `Zone.js` is heavy (100KB) and checks the whole tree indiscriminately, Angular 18 allows you to turn `Zone.js` off entirely! Instead, you use **Signals**. 
+
+A Signal is a wrapper around a value that intrinsically knows when it has been updated, and exactly which HTML elements are bound to it.
+
+```typescript
+import { Component, signal } from '@angular/core';
+
+@Component({
+  template: `
+    <!-- The HTML specifically subscribes to the Signal by calling it like a function () -->
+    <h1>Count: {{ count() }}</h1>
+    <button (click)="increment()">Add</button>
+  `
+})
+export class ModernSignalComponent {
+  
+  // We wrap the primitive value in a Signal!
+  count = signal(0);
+
+  increment() {
+    // When we update the Signal...
+    this.count.update(c => c + 1);
+    
+    // ...Angular DOES NOT check the whole component tree!
+    // The Signal surgically reaches into the DOM and instantly updates ONLY the <h1> tag!
+    // Zone.js is completely bypassed!
+  }
+}
+```
+
+## REAL_WORLD
+If you join an Enterprise Angular team, you will likely see a Linting Rule strictly enforcing `ChangeDetectionStrategy.OnPush` on every single component. 
+
+By making every component `OnPush`, you guarantee that a button click in the Footer doesn't cause a massive Data Table in the Header to re-calculate its layout. This discipline is what allows Angular to scale to 10,000+ components in a single application without performance degradation.
+
+## INTERVIEW
+**Q: What is the difference between `cdr.detectChanges()` and `cdr.markForCheck()`?**
+A: `detectChanges()` forces Angular to synchronously re-render the component and all its children *immediately* on that exact line of code. It is extremely aggressive. `markForCheck()` is graceful; it simply flags the component as "dirty." When Angular runs its next scheduled global Change Detection cycle, it will see the flag and re-render the component. You should almost always use `markForCheck()`.
+
+**Q: Why does the `async` pipe work perfectly with `OnPush` components?**
+A: Under the hood, when the Observable emits a new value, the `async` pipe extracts the value, updates the HTML, and automatically calls `cdr.markForCheck()` on the component for you! This is why combining `OnPush` with Observables and the `async` pipe is the holy grail of Angular performance.
+
+**Q: How do you completely detach a component from the Change Detection tree?**
+A: You can call `this.cdr.detach()`. Angular will never check this component again, even if `Zone.js` fires. To update the UI, you must manually call `this.cdr.detectChanges()`. This is heavily used when wrapping highly complex, non-Angular DOM manipulators (like massive WebGL canvases) that manage their own rendering loops.

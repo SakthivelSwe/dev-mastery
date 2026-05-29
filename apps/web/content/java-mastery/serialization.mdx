@@ -1,0 +1,134 @@
+---
+slug: "serialization"
+title: "Serialization"
+level: 4
+---
+
+## WHY
+Imagine you have a `User` object living in the RAM of your Java server. You want to save this exact object to a hard drive so that if the server crashes, you can restart it and restore the user's state. Or, you want to send this object over a TCP network socket to a different Java server on the other side of the world.
+
+You cannot just copy the RAM bytes directly, because memory pointers are meaningless outside of the current JVM process. 
+**Serialization** is the process of converting a living Java object into a linear stream of bytes (a byte array). 
+**Deserialization** is the reverse: taking that stream of bytes and reconstructing a perfect, identical clone of the original object in a completely different JVM's memory.
+
+## THEORY
+### Native Java Serialization
+Java has a built-in mechanism for this. If you make your class implement the `java.io.Serializable` interface (which is a "Marker Interface" with zero methods), the JVM takes over. You can use an `ObjectOutputStream` to instantly blast the object into a file.
+
+### The Security Nightmare
+Native Java Serialization is widely considered the worst design flaw in the history of Java. 
+When the JVM deserializes an object, it reads the class name from the byte stream, loads the class, and blindly instantiates it using Reflection, bypassing constructors. If a hacker sends a malicious byte stream to your server, they can trick your JVM into instantiating dangerous classes (like `Runtime.exec()`) and execute arbitrary remote code on your server. This vulnerability (Insecure Deserialization) caused massive global breaches, including the Equifax hack. 
+
+Because of this, modern applications almost **never** use native Java Serialization. Instead, they serialize objects into human-readable text formats like JSON or XML using safe libraries like Jackson or GSON.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureDiagram", "type": "java-serialization-vulnerability" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Native Serialization)
+```java
+import java.io.Serializable;
+import java.io.FileOutputStream;
+import java.io.ObjectOutputStream;
+
+// 1. MUST implement Serializable, otherwise JVM throws NotSerializableException
+class GameSave implements Serializable {
+    String player = "Alice";
+    int level = 10;
+}
+
+public class SerializeDemo {
+    public static void main(String[] args) throws Exception {
+        GameSave save = new GameSave();
+        
+        // 2. Blast the object to a file!
+        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream("save.dat"))) {
+            out.writeObject(save);
+            System.out.println("Object serialized successfully!");
+        }
+    }
+}
+```
+
+### Level 2 — Building Blocks (Deserialization)
+```java
+import java.io.FileInputStream;
+import java.io.ObjectInputStream;
+
+public class DeserializeDemo {
+    public static void main(String[] args) throws Exception {
+        // 1. Read the raw bytes back from the file
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream("save.dat"))) {
+            
+            // 2. Reconstruct the object in memory!
+            // Notice: The constructor of GameSave is NEVER called!
+            GameSave restored = (GameSave) in.readObject();
+            
+            System.out.println("Restored Player: " + restored.player); // Alice
+            System.out.println("Restored Level: " + restored.level); // 10
+        }
+    }
+}
+```
+
+### Level 3 — Intermediate (The `transient` keyword)
+```java
+import java.io.Serializable;
+
+class UserProfile implements Serializable {
+    String username;
+    
+    // The 'transient' keyword tells the JVM: 
+    // "Do NOT include this field in the serialized byte stream!"
+    // When the object is deserialized, this field will just be null.
+    // Extremely important for passwords, API keys, or large cached data.
+    transient String plainTextPassword;
+    
+    // Static fields belong to the Class, not the Object, 
+    // so they are NEVER serialized.
+    static String companyName = "Acme Corp"; 
+}
+```
+
+### Level 4 — Advanced (serialVersionUID)
+```java
+import java.io.Serializable;
+
+class Document implements Serializable {
+    // If you don't define this, the JVM calculates a cryptographic hash of the class structure.
+    // If you add a new field later, the hash changes. 
+    // If you try to deserialize an old file, the JVM compares the hashes, sees they don't match, 
+    // and violently throws an InvalidClassException!
+    
+    // By hardcoding this ID, we guarantee backwards compatibility!
+    private static final long serialVersionUID = 1L;
+    
+    String title;
+    
+    // We added this field in Version 2. 
+    // Because the UID matches, old Version 1 files will still deserialize successfully 
+    // (the author field will just default to null).
+    String author; 
+}
+```
+
+## REAL_WORLD
+Because Native Serialization is a massive security vulnerability and produces a binary format that Python and JavaScript cannot read, the entire software industry shifted to **JSON Serialization**.
+
+In Spring Boot, when you return a `User` object from a `@RestController`, Spring does not use `Serializable`. It uses the **Jackson** library. 
+Jackson uses the Reflection API to read the fields of your `User` object, manually constructs a JSON String (`{"username":"Alice"}`), and sends the text over the HTTP network. When another microservice receives the JSON, its Jackson library parses the text and instantiates a new `User` object safely. 
+
+If you are caching data in Redis (using `Spring Data Redis`), you should configure the `RedisTemplate` to use the `GenericJackson2JsonRedisSerializer`. If you leave the default configuration, it will use Native Java Serialization, filling your Redis database with unreadable binary garbage that is highly vulnerable to deserialization attacks.
+
+## INTERVIEW
+**Q: What is the `transient` keyword used for?**
+A: It is used strictly in Native Java Serialization to mark a field that should NOT be serialized. When the object is written to a byte stream, the transient field is completely ignored. Upon deserialization, the field is initialized to its default value (e.g., `null` for objects, `0` for ints). 
+
+**Q: What is the `serialVersionUID`?**
+A: It is a version control ID used during deserialization to verify that the sender and receiver of a serialized object have loaded classes for that object that are compatible. If the receiver has loaded a class with a different `serialVersionUID` than the sender, deserialization results in an `InvalidClassException`. 
+
+**Q: Does the constructor get called during deserialization?**
+A: No! The JVM allocates memory and populates the fields directly from the byte stream using internal JVM magic (similar to Reflection). The constructor of the deserialized class is entirely bypassed. However, the no-arg constructor of the *first non-serializable superclass* in the hierarchy WILL be called.

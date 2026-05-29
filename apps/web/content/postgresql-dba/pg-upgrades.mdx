@@ -1,0 +1,108 @@
+---
+slug: "pg-upgrades"
+title: "PostgreSQL Upgrades & Migrations"
+level: 5
+---
+
+## WHY
+PostgreSQL releases a new Major Version (e.g., 14, 15, 16) every year, bringing massive performance improvements. However, a major version upgrade physically changes the binary format of the data files on the hard drive. 
+You cannot simply install Postgres 16, point it at a Postgres 14 data directory, and start it. It will crash instantly. 
+As a DBA, upgrading a massive 5-Terabyte database to a new major version with zero downtime (or minimal downtime) is one of the most complex, high-risk operations you will ever perform.
+
+## THEORY
+### Minor vs. Major Upgrades
+- **Minor Upgrades (e.g., 14.1 to 14.5):** These only contain security and bug fixes. The physical disk format does not change. To upgrade, you simply install the new binaries and restart the service. Downtime: 5 seconds.
+- **Major Upgrades (e.g., 14 to 15):** The physical disk layout changes. You must migrate the data from the old format to the new format. 
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-upgrades" }
+```
+
+## CODE
+
+### Level 1 — The Logical Dump & Restore (The Safe/Slow Way)
+The easiest way to upgrade is to extract the data out of Postgres 14 as standard SQL text (`pg_dump`), and inject it into an empty Postgres 15 database (`pg_restore`).
+
+*Pros:* It is perfectly clean. It reorganizes all indexes and removes all bloat.
+*Cons:* It requires massive downtime. A 1TB database might take 12 hours to dump and restore. Your application is entirely offline for 12 hours.
+
+```bash
+# 1. Stop the application (Downtime begins!)
+# 2. Dump the old v14 database
+pg_dumpall -U postgres -p 5432 > /backups/all_data.sql
+
+# 3. Shut down v14, Start the new empty v15 on port 5432
+# 4. Restore the data into v15
+psql -U postgres -p 5432 -f /backups/all_data.sql
+
+# 5. Start the application (Downtime ends).
+```
+
+### Level 2 — The Physical Upgrade (`pg_upgrade`)
+Instead of extracting the data as SQL text, what if we just modified the physical binary files on the hard drive to match the new v15 format?
+This is what the `pg_upgrade` utility does. 
+
+*Pros:* It is insanely fast. It doesn't copy the data; it just rewrites the metadata headers of the files. Upgrading a 5TB database takes **seconds**, not hours!
+*Cons:* It still requires downtime (you must shut down both databases during the process), and if it fails halfway, you might corrupt the data directory.
+
+```bash
+# Both Postgres 14 and Postgres 15 must be installed on the server!
+# 1. Shut down both databases (Downtime begins)
+sudo systemctl stop postgresql-14
+sudo systemctl stop postgresql-15
+
+# 2. Run pg_upgrade
+# You must provide the path to the old and new binaries (-b, -B) 
+# and the old and new data directories (-d, -D)
+/usr/lib/postgresql/15/bin/pg_upgrade \
+  -b /usr/lib/postgresql/14/bin \
+  -B /usr/lib/postgresql/15/bin \
+  -d /var/lib/postgresql/14/main \
+  -D /var/lib/postgresql/15/main \
+  --link
+
+# 3. Start the new v15 database (Downtime ends!)
+sudo systemctl start postgresql-15
+```
+*(The `--link` flag is the magic. Without it, pg_upgrade literally copies all 5TB of files, which takes hours. WITH the `--link` flag, it uses OS hard-links to point the new database at the old physical files instantly!)*
+
+### Level 3 — The Zero-Downtime Upgrade (Logical Replication)
+If you are Amazon or Netflix, you cannot afford 5 minutes of downtime to run `pg_upgrade`. 
+To achieve true **Zero-Downtime Upgrades**, you use Logical Replication (Publish/Subscribe).
+Remember: Logical Replication translates WAL into SQL statements, so it perfectly supports replicating data between *different major versions* of Postgres!
+
+**The Strategy:**
+1. Leave the old v14 Primary running (Application is online!).
+2. Spin up a brand new v15 server.
+3. Configure the v14 server as a Publisher. Configure the v15 server as a Subscriber.
+4. The v15 server downloads a snapshot of the v14 data, and then continuously streams all new `INSERT/UPDATES` happening on v14.
+5. Wait for the v15 server to perfectly catch up.
+6. **The Cutover:** Tell your HAProxy/PgBouncer to instantly redirect all web traffic from the v14 IP address to the v15 IP address!
+7. The application doesn't even notice. You just executed a major version upgrade with zero seconds of downtime!
+
+### Level 4 — Post-Upgrade Chaos (`ANALYZE`)
+*The Trap:* You successfully use `pg_upgrade` to migrate a 1TB database to Postgres 15 in 10 seconds. You start the database, the web app connects, and the entire database crashes under massive CPU load within 1 minute. What happened?
+
+When `pg_upgrade` migrates the files, **it destroys all internal Query Planner Statistics.**
+Postgres 15 boots up with absolutely zero mathematical knowledge of the data. It doesn't know that the `orders` table has 10 million rows. It assumes it has 0 rows. 
+When a query arrives, the Planner chooses terrible Execution Plans (like Nested Loop Joins on massive tables) because it has no statistics!
+
+**Rule:** Immediately after running `pg_upgrade` and starting the new database, before letting the web application connect, you MUST run a script to regenerate the statistics!
+```bash
+# This script is automatically generated by pg_upgrade!
+# It runs ANALYZE on every single table across multiple CPU cores to quickly rebuild the planner stats.
+./analyze_new_cluster.sh
+```
+
+## REAL_WORLD
+**Upgrading PostGIS**
+Upgrading PostgreSQL is hard. Upgrading PostgreSQL when you use the PostGIS extension is a nightmare.
+Because PostGIS uses custom C binaries and custom storage formats, the `pg_upgrade` utility often fails because the internal PostGIS pointers break between versions.
+If you use complex extensions, you often cannot use `pg_upgrade --link`. You are forced to do a "Hard Upgrade" (Logical Dump and Restore), or meticulously run specialized PostGIS upgrade scripts (`SELECT postgis_extensions_upgrade();`) both before and after the physical Postgres upgrade process. Always test extension upgrades on a staging clone first!
+
+## INTERVIEW
+**Q: You decide to use Logical Replication to execute a Zero-Downtime upgrade. You set up the Publisher on v14 and the Subscriber on v15. However, the replication completely fails to start. You check the logs and see: `ERROR: logical replication target relation "public.users" is missing some replicated columns`. Why did this happen?**
+A: **Logical Replication does not replicate Schema (DDL).**
+Physical Streaming Replication (`pg_basebackup`) clones everything perfectly. Logical Replication *only* replicates raw data (DML: `INSERT`, `UPDATE`, `DELETE`). It does NOT replicate table structures, indexes, or sequences. 
+Before you can start Logical Replication, you must manually run `pg_dump --schema-only` on the v14 server and restore that empty schema into the v15 server. Only once the exact table structure exists on v15 will the Logical Replication publisher successfully begin streaming the data into it!

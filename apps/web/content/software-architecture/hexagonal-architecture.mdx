@@ -1,0 +1,148 @@
+---
+slug: "hexagonal-architecture"
+title: "Hexagonal Architecture (Ports and Adapters)"
+level: 3
+---
+
+## WHY
+In traditional layered architecture (Controller -> Service -> Repository), the business logic (Service) is deeply coupled to the database (Repository) and the web framework (Controller). If you want to run your business logic in a background worker instead of a web controller, or if you want to swap MongoDB for PostgreSQL, you have to rewrite a massive amount of code because the dependencies point *downward* toward the infrastructure.
+
+**Hexagonal Architecture** (also known as Ports and Adapters), invented by Alistair Cockburn, fixes this by putting the Domain (Business Logic) at the absolute center of the application. Everything else (Web UI, Databases, 3rd Party APIs) connects to the center from the outside via strict interfaces.
+
+## THEORY
+### The Core Concepts
+1. **The Core (Domain):** Pure business logic. It has zero knowledge of databases, HTTP, or JSON. It only knows about business rules.
+2. **Ports:** Interfaces defined by the Core. They dictate *how* the outside world can talk to the Core (Inbound/Driving Ports) and *how* the Core talks to the outside world (Outbound/Driven Ports).
+3. **Adapters:** The concrete implementations that sit on the outside. A Web Adapter translates HTTP requests into method calls on an Inbound Port. A Database Adapter translates Outbound Port calls into SQL queries.
+
+*Why a Hexagon? The hexagon shape is just a visual metaphor. The six sides represent the idea that an application can have many different external connections (Web, CLI, Database, Message Queue, External API), rather than just the top/bottom of a layered architecture.*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "hexagonal" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Domain and The Port)
+Let's build a system that creates Users. First, we define the Core and the Port. Notice there is no HTTP or SQL here!
+
+```java
+// 1. The Domain Model (Inside the Hexagon)
+public class User {
+    private String email;
+    // pure business rules...
+}
+
+// 2. The Outbound PORT (Defined by the Core)
+// The Core says: "I don't care how you store this, but I need an implementation of this interface."
+public interface UserRepositoryPort {
+    void save(User user);
+    boolean existsByEmail(String email);
+}
+
+// 3. The Core Business Service (Implements Inbound Port, Uses Outbound Port)
+public class UserRegistrationService {
+    
+    // Dependency Injection! The core doesn't know what database it's using!
+    private final UserRepositoryPort repository;
+
+    public UserRegistrationService(UserRepositoryPort repository) {
+        this.repository = repository;
+    }
+
+    public void register(User user) {
+        if (repository.existsByEmail(user.getEmail())) {
+            throw new BusinessException("Email already exists!");
+        }
+        repository.save(user); // Send it out through the Port!
+    }
+}
+```
+
+### Level 2 — Building Blocks (The Adapters)
+Now we build the outside layer (the Adapters) that connect to the Ports.
+
+```java
+// 4. The Outbound ADAPTER (Database layer - Outside the Hexagon)
+// This implements the Port interface defined by the Core.
+@Component
+public class PostgresUserRepositoryAdapter implements UserRepositoryPort {
+    
+    private final SpringDataJpaRepository jpaRepo; // The actual DB library
+    
+    @Override
+    public void save(User user) {
+        // Translate Domain User to DB Entity
+        UserEntity entity = mapToEntity(user);
+        jpaRepo.save(entity);
+    }
+    
+    @Override
+    public boolean existsByEmail(String email) {
+        return jpaRepo.existsByEmail(email);
+    }
+}
+
+// 5. The Inbound ADAPTER (Web layer - Outside the Hexagon)
+@RestController
+public class UserControllerAdapter {
+    
+    // The web adapter calls the Core Service
+    private final UserRegistrationService coreService;
+
+    @PostMapping("/users")
+    public ResponseEntity<Void> createUser(@RequestBody UserDto dto) {
+        // Translate Web JSON DTO to Domain User
+        User user = new User(dto.getEmail());
+        coreService.register(user);
+        return ResponseEntity.ok().build();
+    }
+}
+```
+
+### Level 3 — Intermediate (The Power of Swappability)
+Because the Core is completely isolated, writing automated tests becomes incredibly fast. You don't need to spin up a Docker container with PostgreSQL to test your business logic! You just swap the Adapter.
+
+```java
+// A simple In-Memory Adapter for lightning-fast Unit Testing
+public class InMemoryUserRepositoryAdapter implements UserRepositoryPort {
+    
+    private Map<String, User> db = new HashMap<>();
+    
+    @Override
+    public void save(User user) {
+        db.put(user.getEmail(), user);
+    }
+    
+    @Override
+    public boolean existsByEmail(String email) {
+        return db.containsKey(email);
+    }
+}
+
+// In your Test File:
+@Test
+public void testUserRegistration() {
+    // Inject the fake adapter! 
+    UserRepositoryPort mockDb = new InMemoryUserRepositoryAdapter();
+    UserRegistrationService service = new UserRegistrationService(mockDb);
+    
+    service.register(new User("test@test.com"));
+    assertTrue(mockDb.existsByEmail("test@test.com"));
+}
+```
+
+### Level 4 — Advanced (Clean Architecture vs Hexagonal)
+Hexagonal Architecture is the direct predecessor to "Clean Architecture" (by Uncle Bob) and "Onion Architecture" (by Jeffrey Palermo).
+They all share the exact same fundamental rule: **The Dependency Rule**.
+Source code dependencies must only point INWARD toward the domain. The Domain must NEVER import code from the Adapters (like `java.sql.*` or `org.springframework.web.*`). 
+
+If your Domain class has an `@Entity` or `@Table` annotation on it, you have broken Hexagonal Architecture, because you have coupled your business model directly to your database framework.
+
+## REAL_WORLD
+Netflix heavily utilizes Hexagonal Architecture for its backend services. They need to ensure that their core algorithms (like recommending movies) are completely separated from the delivery mechanisms (HTTP APIs, gRPC, internal message queues) and data stores (Cassandra, Elasticsearch). By strictly enforcing Ports and Adapters, a Netflix engineer can rewrite the entire database layer of a microservice without touching a single line of the business logic.
+
+## INTERVIEW
+**Q: What is the main drawback of Hexagonal Architecture?**
+A: Boilerplate code and mapping. In a simple CRUD application, Hexagonal Architecture is overkill. You have to create a Web DTO, map it to a Domain Object, pass it through a Port, map it to a Database Entity, and save it. That's three different classes representing the same "User", just to create a row in a database. It shines in complex domains with heavy business rules, but it slows down development for simple data-entry applications.

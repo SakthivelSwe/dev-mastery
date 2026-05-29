@@ -1,0 +1,148 @@
+---
+slug: "component-library-setup"
+title: "Component Library Architecture"
+level: 4
+---
+
+## WHY
+If your company has three different React applications (e.g., a Customer Dashboard, an Admin Portal, and a Marketing Site), and they all need the same `<Button>` component, how do you share the code?
+If developers copy-paste the Button into all three repositories, updates become a nightmare. If you decide to change the hover state, you have to open three different projects, make the same change three times, and submit three Pull Requests.
+
+A **Component Library** is an independent, versioned, NPM package that houses your Design System's code. All three applications install it via `npm install @mycompany/ui`. When the Design System team updates the Button, they publish a new version (`v1.2.0`), and the consumer applications simply upgrade the package!
+
+## THEORY
+### Monorepos vs. Polyrepos
+- **Polyrepo (Multi-repo):** The Component Library lives in `github.com/company/ui-library`. The dashboard lives in `github.com/company/dashboard`. This creates friction. To test a button change in the dashboard, you have to publish a beta NPM package or use complex `npm link` commands.
+- **Monorepo:** Both the Component Library and the 3 consumer applications live in the exact same GitHub repository (using tools like Turborepo or Nx). This is the modern industry standard. You can change the Button code and instantly see the results in the Dashboard application without publishing to NPM!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DesignSystemVisualizer", "state": "component-library" }
+```
+
+## CODE
+
+### Level 1 — The Monorepo Structure (Turborepo)
+A typical modern monorepo structure looks like this:
+
+```text
+my-company-monorepo/
+├── apps/
+│   ├── customer-dashboard/   (Next.js App)
+│   ├── admin-portal/         (Vite React App)
+│   └── docs/                 (Storybook/Nextra Documentation)
+├── packages/
+│   ├── ui/                   (THE COMPONENT LIBRARY!)
+│   ├── eslint-config/        (Shared Linting rules)
+│   └── typescript-config/    (Shared TS config)
+└── package.json
+```
+
+Inside `packages/ui/package.json`, we define the name of our library:
+```json
+{
+  "name": "@mycompany/ui",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "dependencies": {
+    "react": "^18.2.0"
+  }
+}
+```
+
+### Level 2 — Exporting Components (The Barrel File)
+Inside the `packages/ui` folder, we create our components. 
+Crucially, we use an `index.ts` file (a Barrel File) to export everything cleanly.
+
+```tsx
+// packages/ui/src/Button.tsx
+export const Button = ({ children }) => <button className="btn">{children}</button>;
+
+// packages/ui/src/Input.tsx
+export const Input = () => <input className="input" />;
+
+// packages/ui/src/index.ts (THE BARREL FILE)
+export { Button } from './Button';
+export { Input } from './Input';
+```
+
+Now, inside the `apps/customer-dashboard`, the developer can import components beautifully:
+```tsx
+import { Button, Input } from '@mycompany/ui';
+```
+
+### Level 3 — Tree Shaking (Performance Optimization)
+*The Danger of Barrel Files:* If the `customer-dashboard` only imports the `Button` from `@mycompany/ui`, does the bundler also include the massive `DatePicker` component in the final JavaScript payload just because they are in the same barrel file?
+
+If your Component Library is configured incorrectly, YES. Your web app will download megabytes of unused UI code.
+
+To enable **Tree Shaking** (Dead Code Elimination), you must ensure your Component Library compiles to **ES Modules (ESM)**, and you must add the `"sideEffects": false` flag to your `package.json`!
+
+```json
+// packages/ui/package.json
+{
+  "name": "@mycompany/ui",
+  // Tells Webpack/Vite: "None of these files execute global logic. 
+  // If an app doesn't import a specific component, delete it from the bundle safely!"
+  "sideEffects": false,
+  "module": "./dist/index.mjs" // Point to the ESM output!
+}
+```
+
+### Level 4 — Peer Dependencies
+If your Component Library installs `React v18`, and the `customer-dashboard` installs `React v17`, NPM will install TWO different versions of React in your `node_modules` folder. When the dashboard tries to render the Button, React will crash with an "Invalid Hook Call" error because multiple React instances exist in memory.
+
+A Component Library should **NEVER** list React in `"dependencies"`. It must list it in `"peerDependencies"`.
+
+```json
+// packages/ui/package.json
+{
+  "name": "@mycompany/ui",
+  
+  // Dependencies are packages YOUR library downloads and bundles (e.g., classnames, framer-motion)
+  "dependencies": {
+    "clsx": "^2.0.0"
+  },
+  
+  // Peer Dependencies are the rules!
+  // It tells the consuming app: "I expect YOU to provide React v18. I am not downloading it."
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  },
+  
+  // DevDependencies are just for local development of the library (e.g., testing)
+  "devDependencies": {
+    "react": "^18.2.0"
+  }
+}
+```
+
+## REAL_WORLD
+**Semantic Versioning (SemVer)**
+When you publish updates to the Component Library, you must strictly follow SemVer (`MAJOR.MINOR.PATCH`).
+- **Patch (`1.0.1`):** You fixed a bug in the Button's padding. Consuming apps can auto-upgrade safely.
+- **Minor (`1.1.0`):** You added a brand new `<Accordion>` component. Consuming apps can auto-upgrade safely.
+- **Major (`2.0.0`):** You changed the `variant` prop on the Button from `primary` to `brand`. **THIS IS A BREAKING CHANGE.** If a consuming app auto-upgrades, their UI will break. You must bump the Major version so apps don't pull it automatically!
+
+To manage this painlessly, modern teams use tools like **Changesets** or **Semantic Release**. When a developer submits a PR, the tool forces them to declare the impact of their change. When the PR is merged, the tool automatically calculates the new SemVer version, creates a GitHub Release, writes the Changelog, and publishes to NPM!
+
+## INTERVIEW
+**Q: We built our Component Library using Tailwind CSS. When we install `@mycompany/ui` into our Next.js dashboard app, the components render, but all the styling is missing! The buttons are just plain unstyled HTML. What went wrong?**
+A: **The Purge/Content configuration in Tailwind.**
+Tailwind is a utility-first framework that scans your source code for class names (like `bg-blue-500`) and removes any classes it doesn't see to keep the CSS file tiny.
+When the Next.js app runs its Tailwind compiler, it only scans the `apps/customer-dashboard/src` folder. It does NOT scan the `node_modules/@mycompany/ui` folder! Therefore, it assumes those Tailwind classes aren't used and deletes them from the final CSS!
+To fix this, you must explicitly tell the consuming app's `tailwind.config.js` to scan the Component Library's files for class names:
+```javascript
+// apps/customer-dashboard/tailwind.config.js
+module.exports = {
+  content: [
+    "./src/**/*.{js,ts,jsx,tsx}",
+    // YOU MUST ADD THE COMPONENT LIBRARY PATH!
+    "../../packages/ui/src/**/*.{js,ts,jsx,tsx}" 
+  ],
+  // ...
+}
+```
+*(Alternatively, the Component Library can compile its own CSS file during the build step, and the consuming app simply imports `import '@mycompany/ui/dist/styles.css'` in its root file).*

@@ -1,0 +1,71 @@
+---
+slug: "pg-storage"
+title: "PostgreSQL Storage Internals"
+level: 3
+---
+
+## WHY
+Most developers treat a database as a magical black box that saves their data. However, when your database reaches terabytes in size and queries slow to a crawl, standard SQL tuning is no longer enough. You must understand exactly how PostgreSQL writes data to the physical hard drive (disk). Understanding "Pages", "Tuples", and the impact of "Bloat" is the dividing line between a developer and a Database Administrator (DBA).
+
+## THEORY
+### The Page (The Fundamental Unit of Storage)
+PostgreSQL does not save rows to disk individually. It divides the physical hard drive into fixed-size blocks called **Pages** (the default size is 8KB). 
+
+When you insert a row, Postgres packs it into a Page. When the Page is full (reaches 8KB), it creates a new Page. When you run a query, Postgres does not load individual rows from disk into RAM; it loads the entire 8KB Page.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "postgres-pages" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Tuples and Pages)
+In Postgres terminology, a "Row" is called a **Tuple**.
+
+Imagine a single 8KB Page.
+- It has a header (containing metadata).
+- Tuples (rows) are inserted starting from the end of the page and growing backward.
+- Item Pointers (an array pointing to the exact location of each Tuple) are inserted at the front of the page and grow forward.
+
+If your Tuples are 1KB each, a single Page can hold roughly 7 Tuples. If you run `SELECT * FROM users WHERE id = 1`, Postgres fetches the 1 Page containing that Tuple, loading all 7 Tuples into RAM simultaneously.
+
+### Level 2 — Building Blocks (MVCC and Immutability)
+PostgreSQL uses **MVCC (Multi-Version Concurrency Control)**. 
+Because hundreds of transactions might be reading and writing to the database simultaneously, Postgres must guarantee Isolation (the 'I' in ACID).
+
+**The Golden Rule:** Tuples in PostgreSQL are completely immutable. They can NEVER be updated.
+
+When you run `UPDATE users SET age = 30 WHERE id = 1`:
+1. Postgres does not change the existing Tuple.
+2. It marks the existing Tuple as "Dead" (expired).
+3. It creates a brand new Tuple with the updated data and inserts it into the Page.
+
+This allows other transactions to keep reading the old "Dead" Tuple if their transaction started before the update occurred, guaranteeing perfectly isolated reads without locking the database!
+
+### Level 3 — Intermediate (Table Bloat)
+Because Postgres never actually updates rows (it only marks them dead and creates new ones), what happens when you run `UPDATE` on 1,000,000 rows? 
+You now have 1,000,000 active Tuples and 1,000,000 Dead Tuples sitting on the hard drive. 
+
+These Dead Tuples take up physical disk space. This is called **Table Bloat**. If a table becomes heavily bloated, sequential scans become incredibly slow because Postgres has to load millions of Dead Tuples from disk into RAM, only to realize they are expired and throw them away.
+
+### Level 4 — Advanced (TOAST)
+We said a Page is exactly 8KB. What happens if you try to insert a massive JSON string or a large text block that is 10KB? It literally cannot fit inside the Page!
+
+PostgreSQL solves this using **TOAST** (The Oversized-Attribute Storage Technique).
+If a Tuple is too large for an 8KB page, Postgres automatically:
+1. Compresses the large column data.
+2. If it's still too large, it chops the data into smaller chunks and moves it to a completely separate, hidden "TOAST Table".
+3. It replaces the large data in the original Tuple with a tiny pointer to the TOAST table.
+
+This means you can store massive JSONB payloads in Postgres without destroying the read performance of your standard queries, because the massive text is stored in a separate file!
+
+## REAL_WORLD
+**The Danger of `SELECT *`**
+If you have a table with a massive `description` column (which has been pushed to a TOAST table), and you run `SELECT id, name FROM products`, it is incredibly fast. Postgres scans the main 8KB pages.
+
+If you run `SELECT * FROM products`, Postgres scans the main 8KB pages, sees the TOAST pointers, and is then forced to perform secondary disk reads to fetch the massive chunks from the TOAST table, decompress them, and send them over the network. Never use `SELECT *` in production on tables with large text or JSON columns.
+
+## INTERVIEW
+**Q: How does PostgreSQL clean up Dead Tuples (Bloat)?**
+A: Through a background process called **Autovacuum**. The autovacuum daemon constantly scans tables for Dead Tuples. When it finds them, it doesn't delete them and shrink the file (that would require a massive database lock). Instead, it simply marks the space occupied by the Dead Tuple as "Available for Re-use". The next time you `INSERT` a row, Postgres will write the new row into the empty space left by the autovacuumed Dead Tuple, preventing the table size from growing indefinitely.

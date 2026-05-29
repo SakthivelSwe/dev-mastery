@@ -1,0 +1,138 @@
+---
+slug: "garbage-collection"
+title: "Garbage Collection (GC)"
+level: 4
+---
+
+## WHY
+In C and C++, developers must manually manage memory. When you create an object, you must explicitly call `free()` or `delete` to destroy it when you are done. If you forget, the object sits in memory forever, causing a "Memory Leak". Eventually, the server exhausts all RAM and violently crashes. 
+Worse, if you accidentally delete an object but continue using its pointer, you cause a "Dangling Pointer" or "Use-After-Free" vulnerability, which is the root cause of 70% of all software security exploits.
+
+Java completely eliminated this class of bugs by introducing **Garbage Collection (GC)**. The JVM runs a background thread that automatically scans the heap, identifies objects that are no longer being used by the application, and destroys them to free up memory. You never write a single line of memory management code. 
+
+## THEORY
+### GC Roots and Reachability
+How does the JVM know if an object is "in use"? It uses a Directed Graph algorithm starting from **GC Roots**. 
+GC Roots include:
+1. Active local variables currently executing on Thread Stacks.
+2. Static variables (which live for the life of the class).
+3. Active Java Threads.
+
+The GC traces the pointers from the GC Roots to all connected objects, and then to all objects connected to *those* objects. Any object that is successfully reached is marked as "Alive". Any object that is unreachable (severed from the root tree) is considered "Garbage" and is instantly annihilated.
+
+### Generational Hypothesis
+The JVM memory heap is not a single giant pool. Decades of research proved the "Weak Generational Hypothesis": **98% of all objects die extremely young.** (Think about loop variables or temporary strings).
+The JVM physically divides the Heap into two main areas:
+1. **Young Generation**: Where all new objects are born. It fills up quickly and is cleaned constantly (Minor GC). It is extremely fast because almost everything is dead.
+2. **Old Generation (Tenured)**: If an object survives multiple Minor GCs, it is promoted to the Old Gen. These are long-lived objects (like Spring Services or active HTTP Sessions). Cleaning the Old Gen requires a "Major GC", which is much slower and requires freezing the application.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureDiagram", "type": "jvm-generational-heap" }
+```
+
+## CODE
+
+### Level 1 — Beginner
+```java
+public class BasicGC {
+    public static void main(String[] args) {
+        String name = new String("Alice");
+        
+        // We severed the connection! 
+        // The String "Alice" is no longer connected to any GC Root.
+        // It is now eligible for Garbage Collection.
+        name = null; 
+        
+        // You can politely ASK the JVM to run the Garbage Collector.
+        // The JVM is allowed to completely ignore you. (Never do this in production).
+        System.gc(); 
+    }
+}
+```
+
+### Level 2 — Building Blocks
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class OutOfMemoryDemo {
+    public static void main(String[] args) {
+        // A static list is a GC Root!
+        // Anything attached to it will NEVER be garbage collected.
+        List<byte[]> memoryLeak = new ArrayList<>();
+        
+        try {
+            while (true) {
+                // We keep generating 1MB chunks and attaching them to the root.
+                // The GC sees they are attached to 'memoryLeak' and refuses to delete them.
+                // This will crash the JVM with an OutOfMemoryError in seconds.
+                memoryLeak.add(new byte[1024 * 1024]); 
+            }
+        } catch (OutOfMemoryError e) {
+            System.out.println("JVM Heap completely exhausted!");
+        }
+    }
+}
+```
+
+### Level 3 — Intermediate (Soft and Weak References)
+```java
+import java.lang.ref.WeakReference;
+import java.lang.ref.SoftReference;
+
+public class References {
+    public static void main(String[] args) {
+        Object strong = new Object(); // Standard strong reference. Will never be collected.
+        
+        // WEAK REFERENCE: 
+        // If the GC runs, it will instantly destroy the object, even if memory is plentiful.
+        // Used extensively internally by WeakHashMap to prevent memory leaks in caches.
+        WeakReference<Object> weak = new WeakReference<>(new Object());
+        
+        // SOFT REFERENCE:
+        // The GC will leave this alone normally. It will ONLY destroy it as an absolute 
+        // last resort right before throwing an OutOfMemoryError.
+        // Perfect for caching massive images or database results.
+        SoftReference<Object> soft = new SoftReference<>(new Object());
+    }
+}
+```
+
+### Level 4 — Advanced (JVM Flags & Tuning)
+```bash
+# How to tune the Garbage Collector in Production via JVM Flags:
+
+# 1. Set the initial Heap Size to 4GB (-Xms) and Max Heap Size to 4GB (-Xmx).
+# Setting them equal prevents expensive OS memory reallocation pauses at runtime.
+java -Xms4g -Xmx4g -jar app.jar
+
+# 2. Select the G1 Garbage Collector (The default in modern Java).
+# G1 is designed to divide the heap into thousands of small regions to keep pause times low.
+java -XX:+UseG1GC -jar app.jar
+
+# 3. Set a strict Maximum Pause Time Goal. 
+# The GC will dynamically adjust itself to guarantee it never freezes the app for more than 200ms.
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar app.jar
+
+# 4. Use ZGC (The ultimate low-latency collector in Java 21+).
+# ZGC guarantees sub-millisecond pause times, even on 10-Terabyte heaps!
+java -XX:+UseZGC -jar app.jar
+```
+
+## REAL_WORLD
+The "Stop-The-World" (STW) pause is the most feared event in Java engineering.
+When a Major GC triggers, the JVM must physically freeze all 200 of your Tomcat worker threads to safely reorganize memory and update pointers. If you have a massive 32GB Heap and use an old GC algorithm, this STW pause could take **15 seconds**.
+For 15 seconds, your Spring Boot application is completely paralyzed. It will not accept HTTP requests. External microservices trying to call your API will encounter connection timeouts. Kubernetes health checks will fail, assuming your pod is dead, and Kubernetes will violently terminate and restart your container!
+
+This is why GC Tuning is a highly paid specialty. Modern Java introduced **G1GC** (Java 9 default) and **ZGC** (Java 21 scalable low-latency). ZGC is a phenomenal engineering marvel: it performs almost all of its memory compaction concurrently in the background, mathematically guaranteeing that the Stop-The-World pause will never exceed 1 millisecond, effectively eliminating GC lag from the Java ecosystem entirely.
+
+## INTERVIEW
+**Q: Can you force the Garbage Collector to run?**
+A: No. You can call `System.gc()`, but this is merely a "suggestion" to the JVM. The JVM's internal heuristics dictate exactly when it runs based on memory pressure. Calling `System.gc()` is considered a massive anti-pattern because if the JVM *does* listen to you, it usually triggers a full Stop-The-World Major GC, crushing application performance.
+
+**Q: What is a Memory Leak in Java?**
+A: A memory leak in Java occurs when you maintain a Strong Reference to an object that you no longer need, preventing the Garbage Collector from destroying it. The most common cause is adding objects to a static `List` or `Map` and forgetting to remove them. Over weeks of uptime, the collection grows infinitely until the heap is exhausted and the JVM throws an `OutOfMemoryError`.
+
+**Q: What is the purpose of the Survivor Spaces?**
+A: The Young Generation is split into three zones: Eden, Survivor 0 (S0), and Survivor 1 (S1). When Eden fills up, living objects are copied to S0, and Eden is wiped clean instantly. On the next GC, survivors from Eden and S0 are copied to S1, and both Eden and S0 are wiped. This alternating "Ping-Pong" copying mechanism prevents memory fragmentation without ever needing to perform expensive compaction algorithms on the Young Generation.

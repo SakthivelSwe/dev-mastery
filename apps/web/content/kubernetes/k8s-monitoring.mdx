@@ -1,0 +1,184 @@
+---
+slug: "k8s-monitoring"
+title: "Kubernetes Monitoring"
+level: 4
+---
+
+## WHY
+Running applications in Kubernetes without monitoring is flying blind. When something goes wrong — high latency, error spikes, OOM kills, pending Pods — you need to know immediately, not when a user reports it.
+The **Prometheus + Grafana** stack is the de facto standard for Kubernetes monitoring: Prometheus scrapes and stores metrics; Grafana visualizes them. Combined with AlertManager, you get automated alerting when metrics cross thresholds.
+
+## THEORY
+### The Prometheus Architecture
+- **Prometheus Server:** Scrapes HTTP `/metrics` endpoints from configured targets, stores time-series data
+- **Node Exporter:** DaemonSet that exposes hardware/OS metrics from each Node
+- **kube-state-metrics:** Exposes K8s object state (Pod status, Deployment replicas)
+- **AlertManager:** Handles alerts: deduplication, grouping, routing to PagerDuty/Slack
+- **Grafana:** Visualization dashboards that query Prometheus via PromQL
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-monitoring" }
+```
+
+## CODE
+
+### Installing Prometheus Stack with Helm
+```bash
+# The kube-prometheus-stack Helm chart installs EVERYTHING at once:
+# Prometheus, Grafana, AlertManager, Node Exporter, kube-state-metrics
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --set grafana.adminPassword=admin123
+
+# Access Grafana UI
+kubectl port-forward svc/monitoring-grafana -n monitoring 3000:80
+# Open http://localhost:3000 (admin/admin123)
+
+# Access Prometheus UI
+kubectl port-forward svc/monitoring-kube-prometheus-prometheus -n monitoring 9090:9090
+```
+
+### Exposing Your Application's Metrics
+```java
+// Spring Boot: Add Actuator + Micrometer Prometheus
+// pom.xml:
+// spring-boot-starter-actuator
+// micrometer-registry-prometheus
+
+// application.yml:
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus  # Expose /actuator/prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+// GET /actuator/prometheus → Prometheus-format metrics!
+```
+
+```yaml
+# ServiceMonitor: Tell Prometheus to scrape your app!
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-monitor
+  namespace: production
+  labels:
+    release: monitoring  # Must match Prometheus operator selector!
+spec:
+  selector:
+    matchLabels:
+      app: api
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 30s  # Scrape every 30 seconds
+```
+
+### PromQL: Querying Metrics
+```promql
+# CPU usage of all API pods
+rate(container_cpu_usage_seconds_total{pod=~"api-.*"}[5m])
+
+# Memory usage by pod
+container_memory_working_set_bytes{pod=~"api-.*"} / 1024 / 1024
+
+# HTTP request rate
+rate(http_server_requests_seconds_count{app="api"}[1m])
+
+# HTTP error rate (5xx)
+rate(http_server_requests_seconds_count{app="api", status=~"5.."}[5m])
+
+# P95 latency
+histogram_quantile(0.95, rate(http_server_requests_seconds_bucket{app="api"}[5m]))
+
+# Pod restart count
+kube_pod_container_status_restarts_total{namespace="production"}
+```
+
+### AlertManager Rules
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-alerts
+spec:
+  groups:
+    - name: api
+      rules:
+        - alert: HighErrorRate
+          expr: rate(http_server_requests_seconds_count{status=~"5.."}[5m]) > 0.05
+          for: 2m            # Must be true for 2 minutes before firing
+          labels:
+            severity: critical
+          annotations:
+            summary: "High error rate detected"
+            description: "API error rate is {{ $value | humanize }} req/s"
+        
+        - alert: PodRestarting
+          expr: kube_pod_container_status_restarts_total > 5
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.pod }} is restarting frequently"
+```
+
+## REAL_WORLD
+**The Golden Signals**
+Google's SRE book defines four golden signals to monitor for every service:
+1. **Latency:** Time to serve a request (P50, P95, P99 percentiles)
+2. **Traffic:** Requests per second
+3. **Errors:** Rate of failed requests (5xx errors)
+4. **Saturation:** How "full" the service is (CPU %, memory %, queue depth)
+
+Every microservice should have a Grafana dashboard showing these four signals with alert thresholds.
+
+## INTERVIEW
+**Q: Your Kubernetes Pod is OOMKilled repeatedly. The current memory limit is 512Mi. How do you investigate the right memory limit to set?**
+
+A: Multi-step investigation:
+
+1. **Check current actual memory usage** in Prometheus/Grafana:
+```promql
+# Max memory usage of the pod over the last 7 days
+max_over_time(container_memory_working_set_bytes{pod=~"api-.*"}[7d]) / 1024 / 1024
+```
+
+2. **Analyze the memory growth pattern:**
+   - Gradual growth over hours → Memory leak (application bug)
+   - Spike under load → Need more limit or fix the load pattern
+   - Steady but above limit → Limit too low
+
+3. **If it's a memory leak:** Fix the application. Increasing the limit just delays the next OOM kill.
+
+4. **If the limit is genuinely too low:**
+```promql
+# Check p99 memory usage to set a comfortable limit
+quantile_over_time(0.99, container_memory_working_set_bytes{pod=~"api-.*"}[7d]) / 1024 / 1024
+```
+Set the limit to 120-150% of the p99 usage. If p99 is 400Mi, set limit to 512Mi (128%).
+
+5. **Use VPA for automatic right-sizing:**
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  updatePolicy:
+    updateMode: Recommendation  # Don't auto-apply, just recommend
+```
+VPA observes actual usage and recommends the correct limit after 24-48 hours of data.

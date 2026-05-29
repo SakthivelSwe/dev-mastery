@@ -1,0 +1,178 @@
+---
+slug: "rxjs-advanced"
+title: "Advanced RxJS in Angular"
+level: 5
+---
+
+## WHY
+Most developers know how to use RxJS `subscribe()` to fetch data from `HttpClient`. But what happens when the user clicks a "Search" button 5 times in 1 second? If you just subscribe 5 times, you send 5 concurrent HTTP requests to the backend, causing massive server load and race conditions (Request #4 might resolve *after* Request #5, showing the wrong data!).
+**Advanced RxJS Operators** are the secret weapon of Senior Angular Developers. They allow you to choreograph complex, multi-step asynchronous workflows (like typeaheads, polling, and retry logic) declaratively, without writing a single nested `if/else` statement.
+
+## THEORY
+### Higher-Order Mapping Operators
+The most confusing part of RxJS is flattening. If you have an Observable of a String (from a search input), and you want to use that String to make an HTTP request (which returns an Observable of an Array), you end up with an `Observable<Observable<Array>>`. 
+You must "flatten" the inner Observable. The four critical flattening operators dictate *how* concurrent requests are handled:
+1. **`switchMap`:** Cancels the previous request if a new one arrives.
+2. **`concatMap`:** Queues requests in order. Waits for the first to finish before starting the second.
+3. **`mergeMap`:** Runs all requests concurrently (simultaneously) without caring about order.
+4. **`exhaustMap`:** Ignores all new requests while the current one is still running.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "rxjs-operators" }
+```
+
+## CODE
+
+### Level 1 — The Perfect Typeahead Search (`switchMap`)
+A user is typing into a search bar: "A", then "Ap", then "App", then "Apple". We want to fetch results from the API, but we don't want to make an HTTP request for every single keystroke.
+
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { FormControl } from '@angular/forms';
+import { HttpClient } from '@angular/common/http';
+import { debounceTime, distinctUntilChanged, switchMap, catchError } from 'rxjs/operators';
+import { of, Observable } from 'rxjs';
+
+export class SearchComponent implements OnInit {
+  searchInput = new FormControl('');
+  results$!: Observable<any[]>;
+
+  constructor(private http: HttpClient) {}
+
+  ngOnInit() {
+    // valueChanges is an Observable of the user's keystrokes!
+    this.results$ = this.searchInput.valueChanges.pipe(
+      
+      // 1. Wait 300ms after they STOP typing before continuing.
+      debounceTime(300),
+      
+      // 2. If they type 'a', backspace, and type 'a' again within 300ms, ignore it.
+      distinctUntilChanged(),
+      
+      // 3. MAGIC! Execute the HTTP request. 
+      // If they type 'Apple', the request fires. If they immediately type 's' ('Apples'),
+      // switchMap will CANCEL the pending 'Apple' HTTP request, and start the 'Apples' request!
+      switchMap(searchTerm => this.http.get<any[]>(`/api/search?q=${searchTerm}`).pipe(
+        // 4. CRITICAL: Catch errors on the INNER observable so the outer stream doesn't die!
+        catchError(() => of([]))
+      ))
+    );
+  }
+}
+```
+
+### Level 2 — Safe Database Saves (`concatMap`)
+If a user is editing a document and it auto-saves every few seconds, you cannot use `switchMap`. If you cancel a "Save" request halfway through, the database might become corrupted!
+You must use `concatMap` to queue the saves strictly in order.
+
+```typescript
+import { Subject } from 'rxjs';
+import { concatMap } from 'rxjs/operators';
+
+export class DocumentEditor {
+  private saveQueue$ = new Subject<DocumentData>();
+
+  constructor(private http: HttpClient) {
+    
+    this.saveQueue$.pipe(
+      // If 5 saves are requested simultaneously, concatMap processes them one by one.
+      // Save 2 will not start the HTTP request until Save 1 completely finishes.
+      concatMap(data => this.http.post('/api/save', data))
+    ).subscribe();
+    
+  }
+
+  triggerAutoSave(data: DocumentData) {
+    this.saveQueue$.next(data); // Push into the queue!
+  }
+}
+```
+
+### Level 3 — Preventing Double-Submissions (`exhaustMap`)
+A user is impatient and clicks the "Login" button 5 times rapidly. We only want to process the first click and completely ignore the rest until the login finishes.
+
+```typescript
+import { Subject } from 'rxjs';
+import { exhaustMap } from 'rxjs/operators';
+
+export class LoginComponent {
+  private loginClicks$ = new Subject<Credentials>();
+
+  constructor(private authService: AuthService) {
+    
+    this.loginClicks$.pipe(
+      // exhaustMap executes the first request.
+      // While the HTTP request is pending, it aggressively IGNORES all subsequent clicks!
+      exhaustMap(creds => this.authService.login(creds))
+    ).subscribe(result => console.log('Login successful!'));
+    
+  }
+
+  onLoginButtonClicked(creds: Credentials) {
+    this.loginClicks$.next(creds);
+  }
+}
+```
+
+### Level 4 — Retry Logic with Exponential Backoff
+If the user's mobile connection drops for 2 seconds, the HTTP request shouldn't instantly fail and show an error screen. We should silently retry 3 times, waiting longer between each attempt.
+
+```typescript
+import { retry, timer, throwError } from 'rxjs';
+
+export class WeatherService {
+  
+  getWeather() {
+    return this.http.get('/api/weather').pipe(
+      // Modern RxJS 7+ retry operator!
+      retry({
+        count: 3, // Try a maximum of 3 times
+        delay: (error, retryCount) => {
+          // If it's a 404 Not Found, don't retry! It will never work.
+          if (error.status === 404) return throwError(() => error);
+          
+          console.log(`Attempt ${retryCount} failed. Retrying...`);
+          // Exponential backoff: Wait 1s, then 2s, then 3s!
+          return timer(retryCount * 1000); 
+        }
+      })
+    );
+  }
+}
+```
+
+## REAL_WORLD
+**Memory Leaks and `takeUntil`**
+The number one cause of memory leaks in Angular is subscribing to an infinite Observable (like `Router.events` or a WebSocket) inside a component, and forgetting to unsubscribe when the component is destroyed.
+If the user navigates back and forth to the component 50 times, 50 invisible subscriptions are created in memory, crashing the browser.
+*The Classic Fix:* Use `takeUntil` and `ngOnDestroy`.
+```typescript
+private destroy$ = new Subject<void>();
+
+ngOnInit() {
+  this.infiniteStream$.pipe(
+    takeUntil(this.destroy$) // Kills the stream when destroy$ emits!
+  ).subscribe();
+}
+
+ngOnDestroy() {
+  this.destroy$.next(); // Emit!
+  this.destroy$.complete();
+}
+```
+*The Modern Fix (Angular 16+):* Use `takeUntilDestroyed()`. It automatically ties the stream to the Component's lifecycle, requiring zero `ngOnDestroy` boilerplate!
+```typescript
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+
+constructor() {
+  this.infiniteStream$.pipe(takeUntilDestroyed()).subscribe();
+}
+```
+
+## INTERVIEW
+**Q: You have two Observables: `user$` (which fetches user details from the API) and `posts$` (which fetches the user's posts from a different API). You need to combine them so the template can render `<h1>{{ user.name }} - {{ posts.length }} Posts</h1>`. Both HTTP requests should execute simultaneously to save time. Which RxJS combination operator should you use: `combineLatest`, `zip`, or `forkJoin`?**
+A: **`forkJoin`!**
+- `combineLatest`: Emits whenever *any* of the streams emit. Excellent for UI filters (e.g., search text + category dropdown), but unnecessary for single HTTP requests.
+- `zip`: Waits for both streams to emit index 1, then emits. Waits for both to emit index 2, then emits. Usually used for strict pairing of infinite streams.
+- `forkJoin`: This is the RxJS equivalent of `Promise.all()`. It fires both HTTP requests simultaneously. It waits for BOTH observables to fully complete, and then emits exactly once with the final array of results `[userData, postsData]`. Because HTTP requests are finite observables that complete immediately after returning data, `forkJoin` is mathematically the perfect, most performant operator for combining multiple API calls!

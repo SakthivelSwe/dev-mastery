@@ -1,0 +1,152 @@
+---
+slug: "docker-registries"
+title: "Docker Registries"
+level: 3
+---
+
+## WHY
+When you build a Docker image on your laptop, it only exists on your machine. To share it with your team, deploy it to production servers, or use it in CI/CD pipelines, you need to store it somewhere accessible to all.
+A **Docker Registry** is a storage and distribution system for Docker images. It works exactly like GitHub does for code — you push images to it, and anyone with access can pull them.
+
+## THEORY
+### Public vs Private Registries
+- **Public registries (Docker Hub):** Anyone can push/pull. Free tier available. Used for official images (nginx, postgres, redis). Not suitable for proprietary application code.
+- **Private registries:** Access-controlled. Required for proprietary application images. Hosted by cloud providers or self-hosted.
+
+### Popular Registries
+- **Docker Hub** (`docker.io`): The default public registry
+- **Amazon ECR** (Elastic Container Registry): AWS-native, integrates with ECS/EKS
+- **Google Artifact Registry**: GCP-native, integrates with GKE
+- **Azure Container Registry (ACR)**: Azure-native
+- **GitHub Container Registry (GHCR)** (`ghcr.io`): Integrates with GitHub Actions
+- **Harbor**: Self-hosted, open source registry
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-registry" }
+```
+
+## CODE
+
+### Docker Hub
+```bash
+# Login to Docker Hub
+docker login
+
+# Build and tag for Docker Hub (format: username/image:tag)
+docker build -t myusername/my-app:1.0.0 .
+docker tag my-app:1.0.0 myusername/my-app:latest
+
+# Push
+docker push myusername/my-app:1.0.0
+docker push myusername/my-app:latest
+
+# Pull from Docker Hub (from any machine)
+docker pull myusername/my-app:1.0.0
+```
+
+### GitHub Container Registry (GHCR)
+```bash
+# Login using a GitHub Personal Access Token
+echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+
+# Tag for GHCR (format: ghcr.io/owner/image:tag)
+docker tag my-app:1.0.0 ghcr.io/myorg/my-app:1.0.0
+
+# Push
+docker push ghcr.io/myorg/my-app:1.0.0
+```
+
+### AWS Elastic Container Registry (ECR)
+```bash
+# Login (ECR tokens expire after 12 hours)
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin 123456789.dkr.ecr.us-east-1.amazonaws.com
+
+# Create ECR repository (one-time)
+aws ecr create-repository --repository-name my-app
+
+# Tag
+docker tag my-app:1.0.0 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:1.0.0
+
+# Push
+docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:1.0.0
+```
+
+### GitHub Actions: Build and Push
+```yaml
+# .github/workflows/docker.yml
+name: Build and Push Docker Image
+
+on:
+  push:
+    tags: ['v*']  # Trigger on version tags
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          cache-from: type=gha     # GitHub Actions cache for faster builds
+          cache-to: type=gha,mode=max
+```
+
+## REAL_WORLD
+**Immutable Tags in Production**
+Never use `latest` as your production tag. If you deploy `myapp:latest` and run it on 10 servers, then push a new `latest` image, different servers might run different versions depending on when they last pulled.
+
+Use **immutable, versioned tags** in production:
+```bash
+# Use git commit SHA for unique, traceable tags
+TAG=$(git rev-parse --short HEAD)
+docker build -t myapp:$TAG .
+docker push myapp:$TAG
+
+# Deploy to production with the specific SHA tag
+kubectl set image deployment/myapp myapp=myapp:abc1234
+```
+Now every deployment is reproducible and traceable to the exact code that was deployed.
+
+## INTERVIEW
+**Q: Your team pushes a new version of the Docker image to ECR every 5 minutes during active development. After 6 months, you have 4,000+ images stored and AWS costs are increasing significantly. How do you manage this?**
+A: **Implement ECR Lifecycle Policies.**
+
+AWS ECR supports Lifecycle Policies — rules that automatically delete old or unused images:
+
+```json
+{
+  "rules": [{
+    "rulePriority": 1,
+    "description": "Keep only last 30 images",
+    "selection": {
+      "tagStatus": "tagged",
+      "tagPrefixList": ["dev-"],
+      "countType": "imageCountMoreThan",
+      "countNumber": 30
+    },
+    "action": { "type": "expire" }
+  }]
+}
+```
+
+You can configure policies to:
+- Keep only the last N images
+- Delete images older than N days
+- Keep specific tagged images (production releases) indefinitely
+- Expire untagged (dangling) images after 1 day
+
+You should also differentiate registries: keep a **dev registry** with aggressive cleanup policies (keep last 10) and a **production registry** with conservative policies (keep all tagged releases for 1 year for rollback capability).

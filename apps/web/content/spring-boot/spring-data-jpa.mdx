@@ -1,0 +1,146 @@
+---
+slug: "spring-data-jpa"
+title: "Spring Data JPA"
+level: 4
+---
+
+## WHY
+Writing raw JDBC SQL in Java is brutal. To fetch a single User, you write 20 lines of boilerplate: get a connection, prepare a statement, execute the query, map each column to a Java field, close the connection, handle SQLExceptions...
+
+**Spring Data JPA** eliminates this entirely. It builds on top of Hibernate (the industry standard JPA implementation) and provides a magic Repository abstraction. Instead of writing any SQL, you define a Java Interface, and Spring Data automatically generates all the database interaction code at startup.
+
+## THEORY
+### The JPA Stack
+- **JDBC:** The raw Java API for talking to databases (low-level, verbose boilerplate).
+- **JPA (Jakarta Persistence API):** A specification that defines how Java Objects map to database Tables (`@Entity`, `@Column`). It is just an Interface — not an implementation!
+- **Hibernate:** The most popular JPA implementation. It's the actual engine that converts your Java objects into SQL queries.
+- **Spring Data JPA:** A layer on top of Hibernate that auto-generates CRUD methods and eliminates boilerplate.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-data-jpa" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Entity and the Repository)
+First, annotate your Java class as a JPA `@Entity` to tell Hibernate it maps to a database table.
+
+```java
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "users") // Maps to the 'users' table in the DB
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY) // Auto-increment PK
+    private Long id;
+
+    @Column(nullable = false, unique = true, length = 50)
+    private String username;
+
+    @Column(nullable = false)
+    private String email;
+
+    // Getters, Setters, Constructors...
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+
+// The Repository Interface. That's it. 
+// Spring Data generates the implementation at startup!
+// JpaRepository<EntityType, PrimaryKeyType>
+public interface UserRepository extends JpaRepository<User, Long> {
+    // findById, findAll, save, delete, count — all FREE!
+}
+```
+
+### Level 2 — Building Blocks (Query Derivation / Method Name Queries)
+Spring Data JPA can parse your method names and automatically generate SQL!
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    // SELECT * FROM users WHERE email = ?
+    Optional<User> findByEmail(String email);
+
+    // SELECT * FROM users WHERE username = ? AND is_active = ?
+    List<User> findByUsernameAndIsActive(String username, boolean isActive);
+
+    // SELECT * FROM users WHERE username LIKE '%?%'
+    List<User> findByUsernameContainingIgnoreCase(String keyword);
+
+    // SELECT * FROM users ORDER BY created_at DESC LIMIT 10
+    List<User> findTop10ByOrderByCreatedAtDesc();
+
+    // SELECT COUNT(*) FROM users WHERE is_active = true
+    long countByIsActiveTrue();
+}
+```
+
+### Level 3 — Intermediate (Custom JPQL & Native Queries with @Query)
+Method name queries fail when the query logic is complex. In those cases, use `@Query` to write the SQL yourself.
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    // 1. JPQL (Object-Oriented query — uses Entity/Field names, not table/column names!)
+    @Query("SELECT u FROM User u WHERE u.email = :email AND u.isActive = true")
+    Optional<User> findActiveByEmail(@Param("email") String email);
+
+    // 2. Native SQL (plain SQL that runs on your specific database)
+    @Query(value = "SELECT * FROM users WHERE city = :city LIMIT :limit", nativeQuery = true)
+    List<User> findUsersByCity(@Param("city") String city, @Param("limit") int limit);
+
+    // 3. UPDATE/DELETE also works! Must be paired with @Modifying and @Transactional
+    @Modifying
+    @Transactional
+    @Query("UPDATE User u SET u.isActive = false WHERE u.id = :id")
+    int deactivateUser(@Param("id") Long id);
+}
+```
+
+### Level 4 — Advanced (Pagination and Sorting)
+For any endpoint that returns a list (like a users table), you **must** implement Pagination. Returning all 10 million users in one response will crash the server.
+
+```java
+import org.springframework.data.domain.*;
+
+@Service
+public class UserService {
+    
+    private final UserRepository userRepository;
+
+    public Page<User> getPaginatedUsers(int page, int size, String sortBy) {
+        // 1. Create a Pageable object: which page, how many per page, sort by what
+        Pageable pageable = PageRequest.of(page, size, Sort.by(sortBy).descending());
+
+        // 2. Spring Data automatically adds LIMIT and OFFSET to the SQL!
+        Page<User> userPage = userRepository.findAll(pageable);
+
+        // 3. The Page object contains the data AND pagination metadata
+        System.out.println("Total pages: " + userPage.getTotalPages());
+        System.out.println("Total users: " + userPage.getTotalElements());
+        System.out.println("Is last page: " + userPage.isLast());
+        
+        return userPage;
+    }
+}
+```
+
+## REAL_WORLD
+The most catastrophic Spring JPA anti-pattern is the **N+1 Query Problem** caused by lazy-loading relationships. 
+
+If `User` has a `@OneToMany` relationship to `List<Order>`, and you fetch 100 Users, Hibernate will execute 1 query for the Users, and then 100 MORE queries (one per User) to fetch each user's Orders. 
+
+**The Fix:** Use `@EntityGraph` or a `JOIN FETCH` in `@Query` to load the entire object graph in a single query. ALWAYS check the generated SQL in development (`spring.jpa.show-sql=true`).
+
+## INTERVIEW
+**Q: What is the difference between `save()` for an existing entity vs a new entity?**
+A: Spring Data JPA's `save()` is "upsert" logic. If the entity's `@Id` is `null`, it calls `entityManager.persist()` (INSERT). If the `@Id` has a value, it calls `entityManager.merge()` (UPDATE or re-attach a detached entity).
+
+**Q: What is the `@Transactional` annotation and when is it required on a Repository?**
+A: `@Transactional` ensures that a group of database operations either ALL succeed or ALL fail atomically. Spring Data JPA Repository methods like `save()` and `delete()` are `@Transactional` by default. However, if you write a custom `@Modifying @Query`, you MUST add `@Transactional` explicitly, or the operation will fail.

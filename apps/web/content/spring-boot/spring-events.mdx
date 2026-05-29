@@ -1,0 +1,161 @@
+---
+slug: "spring-events"
+title: "Spring Events (ApplicationEvent & @EventListener)"
+level: 2
+---
+
+## WHY
+Imagine you have a `UserService`. When a new user registers, you need to:
+1. Save the user to the database.
+2. Send a Welcome Email.
+3. Update the Analytics Dashboard.
+4. Issue a Promo Code.
+
+If you write this standardly, your `UserService` must inject the `EmailService`, `AnalyticsService`, and `PromoCodeService`. Every time you add a new feature, you have to modify the `UserService` class. This violates the **Single Responsibility Principle** and tightly couples your code.
+
+**Spring Events** solve this by implementing the **Observer/Pub-Sub Pattern**. The `UserService` simply shouts: *"A user registered!"* into the void, and any other Service that cares about that event can listen for it and react independently.
+
+## THEORY
+### The Event Architecture
+There are three components to the Spring Event system:
+1. **The Event Object**: A simple Java POJO that holds the data about what happened.
+2. **The Publisher**: A Bean that uses the `ApplicationEventPublisher` to broadcast the Event Object.
+3. **The Listener**: A method annotated with `@EventListener` inside any Bean, which automatically executes when the Event is published.
+
+*Note: Spring Events are strictly **synchronous** by default. They run in the exact same thread as the Publisher. If the Listener crashes, the Publisher crashes.*
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-events" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The Event Object & The Listener)
+```java
+// 1. THE EVENT OBJECT
+// This is just a plain Java record or class holding data!
+public record UserRegisteredEvent(String username, String email) {
+}
+
+// ----------------------------------------------------
+
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+// 2. THE LISTENER
+@Service
+public class EmailNotificationListener {
+
+    // The @EventListener annotation tells Spring: "Whenever ANYONE publishes a 
+    // UserRegisteredEvent, immediately execute this method and pass the event data to me!"
+    
+    @EventListener
+    public void handleUserRegistration(UserRegisteredEvent event) {
+        System.out.println("Sending Welcome Email to: " + event.email());
+    }
+}
+```
+
+### Level 2 — Building Blocks (The Publisher)
+```java
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Service;
+
+// 3. THE PUBLISHER
+@Service
+public class UserService {
+
+    // Spring automatically provides the Event Publisher to anyone who asks for it!
+    private final ApplicationEventPublisher publisher;
+
+    public UserService(ApplicationEventPublisher publisher) {
+        this.publisher = publisher;
+    }
+
+    public void registerUser(String username, String email) {
+        System.out.println("Saving " + username + " to database...");
+
+        // We create the Event POJO...
+        UserRegisteredEvent event = new UserRegisteredEvent(username, email);
+        
+        // ...and broadcast it to the entire Spring ApplicationContext!
+        // The EmailNotificationListener will immediately catch this and run!
+        publisher.publishEvent(event);
+        
+        System.out.println("Registration complete!");
+    }
+}
+```
+
+### Level 3 — Intermediate (Asynchronous Events)
+Because Spring Events are synchronous by default, if the Welcome Email takes 5 seconds to send, the `UserService` is frozen for 5 seconds. We can fix this using `@Async`.
+
+```java
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+@Service
+public class AsyncEmailListener {
+
+    // @Async tells Spring to run this method in a completely separate Background Thread!
+    // The publisher (UserService) will NOT wait for this method to finish.
+    
+    @Async
+    @EventListener
+    public void handleEvent(UserRegisteredEvent event) {
+        try {
+            Thread.sleep(5000); // Simulate network delay
+            System.out.println("Async Email Sent!");
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+// CRITICAL REQUIREMENT:
+// For @Async to work, you MUST place the @EnableAsync annotation on your 
+// main Application class or Configuration class!
+```
+
+### Level 4 — Advanced (Transactional Event Listeners)
+Imagine the `UserService` publishes the event, the `EmailListener` sends the email, but then the database transaction *rolls back* due to a sudden crash! The user wasn't saved, but the Welcome Email was already sent!
+
+To solve this, Spring provides the `@TransactionalEventListener`.
+
+```java
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+@Service
+public class SafeEmailListener {
+
+    // This listener intercepts the event immediately, but DELAYS its execution 
+    // until the Database Transaction successfully commits!
+    // If the database rolls back, this method is never executed.
+    
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void sendEmailOnlyIfSaved(UserRegisteredEvent event) {
+        System.out.println("DB Transaction committed! Now sending email.");
+    }
+}
+```
+
+## REAL_WORLD
+Spring Events are an elegant, in-memory implementation of the Event-Driven Architecture pattern. However, they are strictly limited to the **boundaries of the JVM memory**. 
+
+If you have 5 instances of your Spring Boot microservice running behind a Load Balancer, and Instance #1 publishes a Spring Event, *only* the listeners inside Instance #1 will hear it. Instances #2 through #5 will remain oblivious.
+
+In modern enterprise architectures, Spring Events are used purely for internal decoupling. If you need to broadcast an event across multiple microservices, you must graduate from in-memory Spring Events to a distributed message broker like **Apache Kafka** or **RabbitMQ**.
+
+## INTERVIEW
+**Q: What happens if an `@EventListener` method throws a RuntimeException?**
+A: Because standard events are synchronous, the Exception will violently bubble back up the call stack into the `publisher.publishEvent()` method. If the Publisher doesn't catch it, the entire Business Transaction (like user registration) will fail and crash.
+
+**Q: In older versions of Spring, how did you create an Event?**
+A: Before Spring 4.2, your Event POJO was forced to `extend ApplicationEvent` and your listener class was forced to `implements ApplicationListener<MyEvent>`. Modern Spring uses raw POJOs and annotations, which is significantly cleaner.
+
+**Q: Can you order multiple listeners listening to the same event?**
+A: Yes! If you have 5 different `@EventListener` methods listening to `UserRegisteredEvent`, you can annotate them with `@Order(1)`, `@Order(2)`, etc. Spring will execute them sequentially in that exact order.

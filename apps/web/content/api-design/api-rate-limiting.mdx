@@ -1,0 +1,77 @@
+---
+slug: "api-rate-limiting"
+title: "API Rate Limiting"
+level: 3
+---
+
+## WHY
+If your API successfully becomes popular, you will inevitably face a major crisis: A single client (perhaps a poorly written script, or a malicious bot) will send 10,000 requests per second to your server. Your database CPU will spike to 100%, and your entire platform will crash for all other legitimate users. 
+
+**Rate Limiting** is the ultimate defense mechanism for an API. It restricts how many requests a client can make within a specific time window, ensuring fair usage and protecting the backend infrastructure from DDoS (Distributed Denial of Service) attacks.
+
+## THEORY
+### Where does the Limit happen?
+Rate limiting should ideally happen as early in the network stack as possible. If a request makes it all the way through your Node.js application layer just to be rejected, you've already wasted CPU cycles. In enterprise architectures, rate limiting is usually handled by the **API Gateway** (like Kong or AWS API Gateway) or a **Reverse Proxy** (like Nginx) before the request ever touches your application code.
+
+### How do we identify the client?
+To limit a user, you must know who they are.
+1. **Authenticated APIs:** You limit based on the user's `userId` (extracted from their JWT or API Key). This is accurate and fair.
+2. **Public Unauthenticated APIs:** You must limit based on the client's `IP Address`. This is dangerous because 1,000 users inside a corporate office might all share the exact same public IP Address, meaning they will quickly exhaust the limit and block each other!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-rate-limiting" }
+```
+
+## CODE
+
+### Level 1 — Beginner (HTTP Headers)
+When a client hits a rate-limited API, they need to know the rules. A professional API communicates these limits using standard HTTP Response Headers on *every single request*.
+
+```text
+// The server responds with these headers:
+X-RateLimit-Limit: 100        (You are allowed 100 requests per hour)
+X-RateLimit-Remaining: 99     (You have 99 requests left)
+X-RateLimit-Reset: 1672531200 (A Unix timestamp when your quota resets back to 100)
+```
+If the client ignores these headers and exceeds the limit, the API must immediately reject the request with the specific status code: **429 Too Many Requests**.
+
+### Level 2 — Building Blocks (Fixed Window Algorithm)
+The simplest algorithm to implement. You divide time into fixed windows (e.g., 1:00 PM to 2:00 PM). You keep a counter in a fast, in-memory database like **Redis**.
+
+When Alice makes a request at 1:05 PM, you increment the Redis key `alice:1PM-2PM`. If the counter exceeds 100, you reject her. At 2:00 PM, a brand new Redis key is created, and her limit resets.
+
+**The Flaw (The Spike):** Alice can make 100 requests at 1:59:59 PM, and then immediately make another 100 requests at 2:00:01 PM. She just hit your server with 200 requests in two seconds, completely bypassing your intended "100 per hour" limit!
+
+### Level 3 — Intermediate (Sliding Window Log Algorithm)
+To fix the "Spike" problem, you use a Sliding Window. 
+
+Instead of keeping a simple counter, you use Redis to store a log (an array) of the exact timestamp of every single request Alice has made.
+When Alice makes a request at 1:30 PM:
+1. You delete all timestamps in her array that are older than 12:30 PM.
+2. You count how many timestamps are left in the array.
+3. If there are fewer than 100, you accept the request and add 1:30 PM to the array.
+
+**The Flaw:** It is extremely memory-intensive. If Alice is allowed 10,000 requests per hour, you have to store 10,000 massive timestamp arrays in Redis memory!
+
+### Level 4 — Advanced (Token Bucket Algorithm)
+This is the industry standard (used by Amazon and Stripe) because it uses almost zero memory and allows for "burst" traffic.
+
+Imagine a literal bucket that holds a maximum of 10 Tokens. 
+A background process automatically drops 1 new token into the bucket every minute.
+When Alice makes an API request, she must take 1 token out of the bucket. If the bucket is empty, her request is rejected with a 429.
+
+This algorithm is brilliant because it only requires storing 2 numbers in Redis per user:
+1. The current number of tokens in the bucket.
+2. The exact timestamp of the last request (to mathematically calculate how many new tokens should be added since they last checked).
+
+## REAL_WORLD
+**Throttling vs Rate Limiting**
+These terms are often used interchangeably, but have distinct architectural meanings:
+- **Rate Limiting:** A hard wall. If you exceed 100 requests, the server instantly returns a 429 error and refuses to process it. The client must handle the error.
+- **Throttling:** A queue. If you exceed the limit, the server does not reject the request. Instead, it artificially slows the request down (queuing it in memory) and processes it slowly over time. This provides a smoother experience for the client, but is dangerous for the server as holding thousands of queued connections open will quickly exhaust server memory.
+
+## INTERVIEW
+**Q: I have 5 identical Node.js servers running behind a Load Balancer. I implemented Rate Limiting using an array in my Node.js memory. Why isn't it working correctly?**
+A: Because the state is distributed! If your limit is 100 requests per minute, a hacker could send 500 requests per minute. The Load Balancer distributes those requests evenly (100 to Server A, 100 to Server B, etc.). Because each server has its own isolated memory, none of them realize the user has exceeded the global limit of 100! 
+In a distributed architecture, Rate Limiting state must be stored in a centralized, external, lightning-fast database (like Redis) so all 5 servers are incrementing the exact same counter.

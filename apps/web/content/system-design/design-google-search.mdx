@@ -1,0 +1,75 @@
+---
+slug: "design-google-search"
+title: "Design Google Search (Web Crawler)"
+level: 5
+---
+
+## WHY
+"Design a Web Crawler" (or Design Google Search) tests your ability to handle massive, unbounded scale. The internet contains trillions of web pages. Your system must download them, extract their links, parse their text, and index them—without crashing, without infinite loops, and without accidentally DDoS-ing a small blogger's website. 
+
+This problem tests your knowledge of **Graph Traversal (BFS/DFS)**, **Distributed Task Queues**, and **Idempotency**.
+
+## THEORY
+### The Core Architecture
+A Web Crawler is fundamentally a massive **Breadth-First Search (BFS)** across the graph of the internet.
+1. Start with a list of Seed URLs (e.g., `nytimes.com`, `wikipedia.org`).
+2. Download the HTML of those pages.
+3. Parse the HTML and extract all the `<a href="...">` links.
+4. Add those new links back into the queue to be crawled.
+5. Repeat infinitely.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "web-crawler" }
+```
+
+## CODE
+
+*(In a System Design interview, you draw the architecture diagram and explain the data flow!)*
+
+### Level 1 — The Naive Approach (The Infinite Loop)
+If you write a simple Python script to do this, it will fail in 5 minutes.
+*The Interviewer Trap:* "What happens if Website A links to Website B, and Website B links back to Website A?"
+**Your Answer:** "The crawler gets stuck in an infinite loop, endlessly downloading A and B until it runs out of memory (The Spider Trap)."
+
+### Level 2 — The URL Frontier & Seen Index (Idempotency)
+To fix the infinite loop, we must remember every URL we have ever seen.
+
+**The Explanation:**
+1. **The URL Frontier:** A massive distributed queue (Kafka or RabbitMQ) holding URLs waiting to be downloaded.
+2. **The Seen Index:** Before we add a URL to the Frontier, we MUST check if we have seen it before. 
+3. "Because there are trillions of URLs, we cannot store the Seen Index in a standard database or HashSet (it would require Terabytes of RAM). We use a **Bloom Filter**."
+*(A Bloom Filter is a probabilistic data structure. It uses tiny amounts of RAM to answer the question 'Have I seen this string before?' If it says NO, it is 100% accurate. If it says YES, it might be wrong, but we accept skipping a few pages to save Terabytes of RAM).*
+
+### Level 3 — The Downloader Workers & DNS
+**The Explanation:**
+1. "We have thousands of **Downloader Worker Nodes** consuming URLs from the URL Frontier."
+2. "The bottleneck of downloading a page is often the DNS Resolution (turning `google.com` into `142.250.190.46`). A standard DNS lookup takes 10-50ms. If we do this for a trillion pages, it takes years."
+3. "We solve this by caching DNS lookups directly on the Worker Nodes (or using a custom ultra-fast DNS resolver)."
+4. "The Worker downloads the HTML, saves the raw file to Cloud Storage (AWS S3) for indexing later, and passes the HTML to the **Link Extractor**."
+
+### Level 4 — Politeness (Do Not DDoS the Internet)
+*The Interviewer Trap:* "You have 10,000 Worker Nodes. What happens if all 10,000 workers pull a URL from `smallblog.com` out of the queue at the exact same second?"
+**Your Answer:** "We just accidentally executed a massive Distributed Denial of Service (DDoS) attack and took their website offline."
+
+**The Solution: Politeness Queues**
+"We cannot process the URL Frontier strictly as a FIFO (First In, First Out) queue. We must group URLs by their Domain."
+1. "The URL Frontier is actually thousands of smaller queues, one for each Domain (e.g., Queue 1 is `nytimes.com`, Queue 2 is `smallblog.com`)."
+2. "A single Downloader Worker is assigned to exactly ONE queue."
+3. "The worker downloads a page from `smallblog.com`, and then **intentionally sleeps for 5 seconds** before pulling the next URL from the queue."
+4. "This mathematically guarantees that our crawler will never hit a single website more than once every 5 seconds, ensuring perfect politeness."
+
+## REAL_WORLD
+**Updating the Index (Freshness)**
+The internet changes constantly. How does Google know a news article was updated 5 minutes ago?
+You cannot crawl the entire internet every single day.
+Crawlers use **Freshness Heuristics**. 
+When a worker finishes crawling a page, it calculates the next time it should crawl it. 
+- If the page is `cnn.com/latest-news`, the crawler notices that the content changes every hour. It schedules the URL to be re-added to the queue in 1 hour.
+- If the page is `wikipedia.org/wiki/History_of_Rome`, the crawler notices it hasn't changed in 3 years. It schedules the URL to be re-added to the queue in 6 months.
+
+## INTERVIEW
+**Q: A malicious website owner notices your crawler. They generate a dynamic website where every page contains a link to a slightly different URL (e.g., `/page/1`, `/page/2`, infinitely). Because the URLs are always unique, your Bloom Filter never stops them. Your crawler gets stuck infinitely downloading garbage pages from this one domain. How do you prevent this Spider Trap?**
+A: **Depth Limits and URL Normalization.**
+First, we enforce a strict **Maximum Depth Limit**. When a URL is added to the queue, we attach its depth (Seed URLs are Depth 0. Links found on them are Depth 1). If a URL reaches Depth 15, we simply drop it and refuse to crawl deeper.
+Second, we implement strict **URL Normalization** and pattern matching. We strip useless query parameters (`?session_id=123`), and if our metrics detect that we have crawled 50,000 pages from `evil.com` and they all look structurally identical, our central Brain Service dynamically blacklists the domain and flushes its queue.

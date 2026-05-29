@@ -1,0 +1,292 @@
+---
+title: design-url-shortener
+slug: design-url-shortener
+---
+
+# Design a URL Shortener (bit.ly) | Level: 5
+
+## 1. Requirements Gathering
+
+In a system design interview, starting immediately with a solution is a red flag. An expert candidate must clarify constraints, expectations, and edge cases through structured questioning.
+
+### Candidate-Interviewer Dialogue
+
+*   **Candidate:** "To design this URL shortener, I want to clarify the scale first. What is our target for new URL creations (writes) and redirection requests (reads) per day?"
+*   **Interviewer:** "We should design for 100 million new URLs generated per day, and a 10:1 read-to-write ratio, meaning 1 billion redirection requests per day."
+*   **Candidate:** "Understood. That is a read-heavy system. What is the expected lifespan of these shortened URLs? Do they expire, or do they live forever?"
+*   **Interviewer:** "By default, they should live for 5 years. However, we also need to support custom expiration times set by the user, as well as custom aliases (e.g., `bit.ly/my-custom-link`)."
+*   **Candidate:** "What are the latency requirements for the redirection path? Since this sits in the critical path of user navigation, I assume we need sub-50ms or even sub-10ms p99 response times."
+*   **Interviewer:** "Yes, the redirection must be as close to instantaneous as possible. Let's aim for a p99 redirection latency of less than 10ms from our application layer."
+*   **Candidate:** "Are there any analytical requirements? Do we need to track click counts, referrer headers, user-agent, IP geolocation, and timestamps?"
+*   **Interviewer:** "Yes, we need near real-time analytics for each shortened URL, accessible via a dashboard."
+*   **Candidate:** "Lastly, what are our availability and consistency guarantees? For a global redirector, high availability (99.99%) is likely more critical than immediate consistency across all regions."
+*   **Interviewer:** "Correct. High availability and low latency are our top priorities. Eventual consistency for analytics and newly created links is acceptable."
+
+### Requirements Summary
+
+#### Functional Requirements
+*   **Shorten URL:** Generate a highly compacted alias for a given long URL.
+*   **Redirect:** HTTP 302/301 redirection from the short URL to the original destination.
+*   **Custom Alias:** Allow users to define their own short path (e.g., `bit.ly/dev-mastery`).
+*   **Expiry:** Default TTL of 5 years; support user-defined custom expiration.
+*   **Analytics:** Track click events, geolocations, referrers, and device types.
+
+#### Non-Functional Requirements
+*   **Scale:** 100M writes/day, 1B reads/day.
+*   **Latency:** < 10ms p99 read latency at the application boundary.
+*   **Availability:** 99.99% uptime (four nines).
+*   **Security:** Prevent URL enumeration attacks (no sequential guessing of short URLs).
+
+---
+
+## 2. Back-of-the-Envelope Estimation
+
+Let's convert our scale requirements into concrete engineering metrics: QPS, bandwidth, storage, and memory footprint.
+
+### Query Per Second (QPS)
+*   **Write QPS:**
+    $$\text{Write QPS} = \frac{100,000,000 \text{ writes}}{86,400 \text{ seconds}} \approx 1,157 \text{ writes/sec}$$
+    $$\text{Peak Write QPS (3x average)} \approx 3,471 \text{ writes/sec}$$
+*   **Read QPS:**
+    $$\text{Read QPS} = \frac{1,000,000,000 \text{ reads}}{86,400 \text{ seconds}} \approx 11,574 \text{ reads/sec}$$
+    $$\text{Peak Read QPS (3x average)} \approx 34,722 \text{ reads/sec}$$
+
+### Storage Calculations
+Let's define the average size of a URL record in our database:
+*   `id` (Internal auto-increment/unique key): 8 bytes (64-bit integer)
+*   `short_url` (Base62 string, max 7 chars): 7 bytes
+*   `original_url` (Average length of a URL): 512 bytes
+*   `user_id` (UUID or BigInt): 8 bytes
+*   `created_at` (Timestamp): 8 bytes
+*   `expires_at` (Timestamp, nullable): 8 bytes
+*   **Total record size:** $\approx 551 \text{ bytes}$ (Let's round up to **600 bytes** to account for indexing overhead and database engine metadata).
+
+*   **Daily Storage Growth:**
+    $$100,000,000 \times 600 \text{ bytes} = 60 \text{ GB/day}$$
+*   **Annual Storage Growth:**
+    $$60 \text{ GB/day} \times 365 \approx 21.9 \text{ TB/year}$$
+*   **5-Year Storage Capacity:**
+    $$21.9 \text{ TB/year} \times 5 \approx 109.5 \text{ TB}$$
+
+### Cache Requirements
+We apply the Pareto Principle (80/20 rule): 20% of the shortened URLs generate 80% of the redirection traffic. We want to keep these 20% hot links in memory.
+*   Daily unique reads to cache: $20\% \text{ of } 1\text{B reads} = 200\text{M URLs/day}$.
+*   To cache the mapping of `short_url` (7 bytes) to `original_url` (512 bytes), each cache entry is roughly 520 bytes.
+*   **Total Memory Required for Cache:**
+    $$200,000,000 \times 520 \text{ bytes} \approx 104 \text{ GB}$$
+    Using standard Redis instance profiles, we can easily run this on a single high-memory node (e.g., 128 GB RAM) or shard it across a small 3-node Redis cluster (approx. 35 GB per node) for high availability.
+
+---
+
+## 3. Design Options & Justifications
+
+### Storage Engine: SQL vs. NoSQL
+We must evaluate where to persist our 110 TB of URL mappings over 5 years.
+
+| Metric / Feature | Relational (PostgreSQL / MySQL) | NoSQL (Cassandra / ScyllaDB) | Key-Value (DynamoDB) |
+| :--- | :--- | :--- | :--- |
+| **Write Performance** | Moderate (B-Tree index updates slow down at TB scale) | Extremely High (LSM-Tree, append-only writes) | High (Fully managed, auto-scaling partition limits) |
+| **Read Performance** | High (with proper indexing) | High (if queried by partition key) | Extremely High (sub-10ms) |
+| **Scalability** | Hard (requires manual sharding, master-slave lag) | Out-of-the-box horizontal sharding | Fully managed horizontal scaling |
+| **Schema Flexibility**| Rigid, but structured | Flexible, wide-column | Schema-less |
+
+*   **Decision:** We will use **PostgreSQL with horizontal sharding** or **Cassandra**. Given the simple query pattern (lookup by `short_url`), **Cassandra** is highly optimized for this scale because of its masterless architecture, linear scalability, and LSM-tree write path. However, if we need ACID transactions for custom aliases or user account management, a sharded **PostgreSQL** cluster is highly reliable. We will choose **PostgreSQL with application-level sharding** based on the hash of the short URL ID, ensuring relational integrity for user accounts while scaling horizontally.
+
+### ID Generation Scheme
+To represent 100M URLs/day for 5 years ($1.825 \times 10^{11}$ total records), we need an identifier space. 
+Using Base62 encoding (`[a-z, A-Z, 0-9]`):
+*   6 characters: $62^6 \approx 56.8 \text{ Billion}$ combinations (insufficient for 5 years).
+*   7 characters: $62^7 \approx 3.52 \text{ Trillion}$ combinations (more than enough).
+
+How do we generate these unique 64-bit integers before converting them to Base62?
+
+1.  **UUIDv4:** 128-bit. Too long when encoded to Base62 (approx 22 characters). Fails the non-functional requirement of highly compacted links.
+2.  **Central Database Auto-Increment:** Simple, but introduces a single point of failure (SPOF) and a massive write bottleneck.
+3.  **Distributed Counter (Valkey/Redis INCR):** Fast, but if Valkey crashes and persists stale data to disk, we risk ID collision.
+4.  **Snowflake-like ID Generator (Recommended):** Generates unique 64-bit integers in a distributed fashion without coordination. 41 bits for timestamp, 10 bits for machine ID, 12 bits for sequence number. This guarantees unique, ordered IDs that we can encode to Base62.
+
+---
+
+## 4. System Architecture
+
+Below is the end-to-end architecture of our high-scale URL shortener.
+
+```mermaid
+graph TD
+    User([User Client]) -->|1. Request /short_url| CDN[Cloudflare CDN]
+    CDN -->|Cache Miss| ALB[Application Load Balancer]
+    ALB -->|Route Read/Write| APIGW[API Gateway]
+    
+    subgraph Write Path
+        APIGW -->|POST /api/v1/urls| WriteService[Write Service]
+        WriteService -->|Request Unique ID| Snowflake[Snowflake ID Generator]
+        WriteService -->|Write Mapping| DBCluster[(Sharded PostgreSQL)]
+        WriteService -->|Invalidate/Write Cache| Valkey[Valkey Cache Cluster]
+    end
+
+    subgraph Read Path
+        APIGW -->|GET /:short_url| ReadService[Read Service]
+        ReadService -->|1. Query Cache| Valkey
+        ReadService -->|2. DB Fallback on Miss| DBCluster
+    end
+
+    subgraph Analytics Pipeline
+        ReadService -->|3. Publish Redirect Event| Kafka[Kafka Event Bus]
+        Kafka -->|Consume Events| StreamProcessor[Flink Analytics Engine]
+        StreamProcessor -->|Aggregate & Write| ClickHouse[(ClickHouse OLAP DB)]
+    end
+```
+
+### Component Descriptions
+
+*   **Cloudflare CDN:** Edge servers cache the redirection mappings for highly viral links. If a link goes viral, the request never reaches our origin servers.
+*   **API Gateway:** Handles SSL termination, rate limiting, authentication for registered users, and routes requests to the appropriate microservices (Read vs. Write).
+*   **Write Service:** Stateless microservice handling incoming long URLs, checking for custom aliases, requesting a unique ID from the Snowflake cluster, persisting the record to the PostgreSQL shard, and updating the Valkey cache.
+*   **Read Service:** Ultra-fast, lightweight service optimized for speed. It checks Valkey first; if it's a miss, it queries PostgreSQL, populates the cache, and returns an HTTP 302/301 redirect.
+*   **Snowflake ID Generator:** Highly available cluster of nodes generating unique 64-bit integers.
+*   **Valkey Cache Cluster:** Distributed key-value cache running in cluster mode with master-replica replication. Stores `short_url -> original_url` mappings.
+*   **Sharded PostgreSQL:** Relational database sharded by `hash(short_url_id) % N` to distribute write and storage loads.
+*   **Kafka + Flink + ClickHouse:** The asynchronous analytics pipeline. Redirection events are pushed to Kafka to avoid blocking the user redirect response. Flink processes the stream in real-time, and aggregates are written to ClickHouse for fast dashboard queries.
+
+---
+
+## 5. Deep-Dives into Complex Sub-Problems
+
+### Deep Dive 1: Snowflake ID Generation & Base62 Encoding
+
+To construct a 7-character Base62 string, we must first generate a unique 64-bit ID. We use a modified Snowflake ID format:
+
+| Bit Range | Size (Bits) | Purpose |
+| :--- | :--- | :--- |
+| `0` | 1 bit | Unused (sign bit, always 0) |
+| `1 - 41` | 41 bits | Epoch timestamp in milliseconds (gives us ~69 years of range) |
+| `42 - 51` | 10 bits | Machine ID (supports up to 1,024 independent generator nodes) |
+| `52 - 63` | 12 bits | Sequence number (increments up to 4,096 per millisecond per machine) |
+
+#### Base62 Encoding Algorithm
+Once we obtain the 64-bit integer (e.g., `1543210987654321`), we convert it to Base62.
+
+```python
+BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def encode_base62(num: int) -> str:
+    if num == 0:
+        return BASE62_ALPHABET[0]
+    arr = []
+    base = len(BASE62_ALPHABET)
+    while num:
+        num, rem = divmod(num, base)
+        arr.append(BASE62_ALPHABET[rem])
+    arr.reverse()
+    return ''.join(arr)
+
+def decode_base62(string: str) -> int:
+    base = len(BASE62_ALPHABET)
+    limit = len(string)
+    num = 0
+    for i, char in enumerate(string):
+        power = limit - i - 1
+        num += BASE62_ALPHABET.index(char) * (base ** power)
+    return num
+```
+
+*   **Security Mitigation (Preventing Enumeration):** If our Snowflake IDs are monotonically increasing, the resulting Base62 short URLs will also follow a predictable pattern (e.g., `abcd01`, `abcd02`). Attackers could crawl all our shortened URLs. To prevent this, we **cryptographically obfuscate the ID** using a Feistel cipher or apply a bit-shuffling step before encoding it to Base62.
+
+### Deep Dive 2: Redirect Mechanics (301 vs. 302 HTTP Status Codes)
+
+Choosing the correct HTTP redirect status code significantly impacts both system performance and business metrics.
+
+```
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/target-destination
+Cache-Control: private, max-age=86400
+```
+*   **301 Moved Permanently:** The browser caches this redirection. Subsequent requests for the short URL are handled locally by the browser without hitting our servers.
+    *   *Pros:* Drastically reduces traffic to our system, lowering operational costs and latency for repeat visits.
+    *   *Cons:* We lose analytics data for cached redirects. We cannot count clicks, track referrers, or gather user-agent data after the first redirect.
+
+```
+HTTP/1.1 302 Found
+Location: https://example.com/target-destination
+Cache-Control: no-cache, no-store, must-revalidate
+```
+*   **302 Found (or 307 Temporary Redirect):** The browser is forced to query our servers every single time.
+    *   *Pros:* We capture 100% of redirection analytics.
+    *   *Cons:* Every single click hits our infrastructure, requiring a highly scalable read path.
+
+*   **The Production Solution:** We use **HTTP 302 Redirects** by default to fulfill the analytical requirement of tracking every click. To optimize performance, we configure downstream CDN edge nodes (like Cloudflare) to cache the 302 response for a very short duration (e.g., 1 to 5 minutes). This absorbs massive traffic spikes from viral links while still delivering highly accurate analytics.
+
+### Deep Dive 3: Custom Aliases & Race Conditions
+
+When a user requests a custom alias (e.g., `bit.ly/google`), we cannot use our Snowflake generator. We must check if the alias already exists in the database.
+
+#### The Race Condition
+If two users try to claim `bit.ly/exclusive-deal` at the exact same millisecond:
+1.  User A's request checks DB: "Does `exclusive-deal` exist?" -> No.
+2.  User B's request checks DB: "Does `exclusive-deal` exist?" -> No.
+3.  User A inserts `exclusive-deal` mapped to `destinationA.com`.
+4.  User B inserts `exclusive-deal` mapped to `destinationB.com` (overwriting or conflicting).
+
+#### The Solution
+We enforce a **Unique Constraint** on the `short_url` column in our PostgreSQL database. 
+To optimize the write path and prevent database locks under heavy concurrent load, we use a **distributed lock** in Valkey using the `SETNX` command or a Redlock algorithm before attempting the DB write.
+
+```python
+def create_custom_url(alias: str, long_url: str, user_id: str) -> bool:
+    lock_key = f"lock:alias:{alias}"
+    # Acquire lock with a 5-second TTL
+    acquired = valkey_client.set(lock_key, user_id, nx=True, ex=5)
+    if not acquired:
+        return False # Alias is currently being processed or already taken
+    
+    try:
+        # Check database for existence
+        if db.exists(alias):
+            return False
+        
+        # Insert into DB (wrapped in try-except for unique constraint violation)
+        db.insert(alias, long_url, user_id)
+        # Populate cache
+        valkey_client.set(f"url:{alias}", long_url, ex=86400)
+        return True
+    except UniqueViolationException:
+        return False
+    finally:
+        # Release lock safely using a Lua script to ensure we only release our own lock
+        release_lock_lua(lock_key, user_id)
+```
+
+---
+
+## 6. Failure Scenarios & Mitigation
+
+*   **Valkey Cache Node Crash (Cold Start Problem):** If our primary cache cluster crashes, millions of read requests will cascade directly to our PostgreSQL database shards, causing a database-level denial of service (DB Overload).
+    *   *Mitigation:* We use a **highly available Valkey Cluster** with master-replica failover. We also implement **Cache Warm-up scripts** that pre-populate the new cache nodes with the top 100,000 most active URLs before directing live traffic to them. Additionally, we use a **circuit breaker pattern** (e.g., using Resilience4j or custom middleware) in the Read Service to rate-limit database fallbacks during a cache outage.
+*   **Database Partitioning / Hot Shard Problem:** If a highly viral short URL is assigned to Shard 4, Shard 4 will experience extremely high read/write loads while other shards remain idle.
+    *   *Mitigation:* Our read path is heavily shielded by CDN and Valkey caching. However, for write paths (e.g., updating access times or creating custom aliases), we ensure that we never write analytics counters back to the transactional PostgreSQL database. Instead, all analytics are streamed via Kafka to ClickHouse, keeping PostgreSQL writes strictly sequential and evenly distributed.
+*   **Database Expiry Cleanup (The Tombstone Problem):** With 100M entries per day, deleting expired URLs via a simple `DELETE FROM urls WHERE expires_at < NOW()` will lock tables, bloat transaction logs, and degrade read/write performance.
+    *   *Mitigation:* We do not run bulk deletes on the live transactional database. Instead, we use **range-based partitioning** by month on the `expires_at` or `created_at` column. When a month's URLs expire completely, we can drop the entire partition instantaneously with zero lock overhead: `DROP TABLE urls_y2025m03;`.
+
+---
+
+## 7. Scaling to 10x
+
+If our traffic increases 10x (1 Billion writes/day, 10 Billion reads/day):
+
+*   **Storage Scale:** 1.1 PB of data over 5 years. Standard sharded PostgreSQL will become complex to manage. We would migrate the URL mapping storage to **ScyllaDB** or **Cassandra**, which handles petabyte-scale key-value lookups with zero downtime and automatic re-sharding.
+*   **Global Low Latency (Multi-Region Active-Active):** To achieve <10ms latency globally, we must deploy our Read Service and Valkey cache in multiple AWS regions (e.g., us-east-1, eu-west-1, ap-southeast-1). We use **Geographic DNS routing** (Route 53) to route users to the nearest regional deployment.
+*   **Multi-Region Data Replication:** We use a globally replicated database like **DynamoDB Global Tables** or **Cassandra Multi-Region Replication**. When a URL is created in the US, it is asynchronously replicated to Europe and Asia within seconds. The local Valkey caches in Europe/Asia are invalidated upon receiving replication events.
+
+---
+
+## 8. 45-Minute Interview Walkthrough
+
+1.  **00:00 - 05:00 | Requirements Gathering:** Clarify scale, read/write ratios, custom aliases, analytics, and latency expectations. Establish functional and non-functional boundaries.
+2.  **05:00 - 12:00 | Back-of-the-Envelope Calculations:** Write down the math for QPS, daily/annual storage, and cache memory sizes. State assumptions clearly (e.g., 80/20 rule, average URL size).
+3.  **12:00 - 20:00 | High-Level Architecture:** Draw the core components (API Gateway, Read/Write Services, Cache, DB, Analytics). Walk through the end-to-end path of a write request and a read request.
+4.  **20:00 - 35:00 | Deep Dives:** Explain Snowflake ID generation, show Base62 encoding/decoding logic, discuss 301 vs. 302 redirects, and explain how to prevent custom alias race conditions using distributed locks.
+5.  **35:00 - 40:00 | Failure Scenarios & Scalability:** Address database hot shards, cache stampedes, and partition drops for expired URLs. Discuss scaling up to 10x using multi-region active-active deployments.
+6.  **40:00 - 45:00 | Summary & Q&A:** Summarize the trade-offs chosen (Availability over Consistency, 302 over 301) and answer any follow-up questions from the interviewer.
+
+---
+---

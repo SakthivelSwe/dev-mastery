@@ -1,0 +1,156 @@
+---
+slug: "jwt-authentication"
+title: "JWT Authentication"
+level: 4
+---
+
+## WHY
+Traditional server-side session authentication stores the user's login state in the server's memory. If you have 50 horizontally scaled web servers, Server A stores User #123's session, but User #123's next request might hit Server B, which knows nothing about the session, and logs the user out.
+
+**JWT (JSON Web Token)** eliminates this by making authentication completely stateless. After login, the server generates a cryptographically signed token containing the user's identity (e.g., user ID, roles) and sends it to the client. On every subsequent request, the client includes the token. Any server in the cluster can independently verify the token's mathematical signature, confirming the user's identity without needing to consult a central session store.
+
+## THEORY
+### Anatomy of a JWT
+A JWT is a Base64-encoded string with exactly three parts, separated by dots: `xxxxx.yyyyy.zzzzz`
+
+1. **Header:** The algorithm used for signing (`"alg": "HS256"`).
+2. **Payload (Claims):** The actual data — user ID, roles, expiration time. Anyone can decode and read this! **Never put sensitive data here.**
+3. **Signature:** `HMACSHA256(Base64(header) + "." + Base64(payload), secretKey)`. This is the mathematical proof of authenticity. If anyone tampers with the payload, the signature will no longer match!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "jwt-flow" }
+```
+
+## CODE
+
+### Level 1 — Beginner (The JWT Flow)
+```
+Client ──── POST /api/auth/login {username, password} ────► Server
+Client ◄─── {"accessToken": "eyJhbGci...", "expiresIn": 900} ── Server
+
+Client ──── GET /api/users/me
+            Authorization: Bearer eyJhbGci... ──────────────► Server
+Client ◄─── {"id": 1, "username": "Alice"} ─────────────────── Server
+```
+
+### Level 2 — Building Blocks (Generating a JWT Token)
+Using the `java-jwt` library (by Auth0):
+
+```java
+// pom.xml
+// <dependency>
+//     <groupId>com.auth0</groupId>
+//     <artifactId>java-jwt</artifactId>
+//     <version>4.4.0</version>
+// </dependency>
+
+@Service
+public class JwtService {
+
+    // In production, store this in environment variables, NEVER in source code!
+    @Value("${app.jwt.secret}")
+    private String jwtSecret;
+
+    @Value("${app.jwt.expiration-ms:900000}") // Default: 15 minutes
+    private long expirationMs;
+
+    // Generate a signed JWT after successful login
+    public String generateToken(User user) {
+        return JWT.create()
+                .withSubject(user.getId().toString())          // User ID
+                .withClaim("username", user.getUsername())
+                .withClaim("role", user.getRole().name())
+                .withIssuedAt(new Date())
+                .withExpiresAt(new Date(System.currentTimeMillis() + expirationMs))
+                .sign(Algorithm.HMAC256(jwtSecret));
+    }
+
+    // Verify and decode a token
+    public DecodedJWT verifyToken(String token) {
+        JWTVerifier verifier = JWT.require(Algorithm.HMAC256(jwtSecret))
+                .build();
+        return verifier.verify(token); // Throws JWTVerificationException if invalid!
+    }
+}
+```
+
+### Level 3 — Intermediate (The JWT Filter)
+```java
+import jakarta.servlet.*;
+import jakarta.servlet.http.*;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+@Component
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+        
+        // 1. Extract the token from the Authorization header
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response); // Pass through if no token
+            return;
+        }
+        String token = authHeader.substring(7); // Strip "Bearer "
+
+        try {
+            // 2. Verify the token cryptographically
+            DecodedJWT decoded = jwtService.verifyToken(token);
+            String userId = decoded.getSubject();
+            String role = decoded.getClaim("role").asString();
+
+            // 3. Create Spring Security authentication object & set in context
+            UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
+                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + role)));
+            SecurityContextHolder.getContext().setAuthentication(auth);
+
+        } catch (JWTVerificationException e) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.getWriter().write("{\"error\": \"Invalid or expired token\"}");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+### Level 4 — Advanced (Refresh Tokens)
+A JWT Access Token expires after 15 minutes for security. But you don't want to force the user to log in again every 15 minutes. 
+
+The industry solution is **Refresh Tokens**:
+- **Access Token:** Short-lived (15 minutes). Used for API requests. Stored in memory.
+- **Refresh Token:** Long-lived (7 days). Used ONLY to request new access tokens. Stored in a secure `HttpOnly` cookie.
+
+```
+Client ──── POST /api/auth/refresh-token ──────────────────► Server
+            (sends Refresh Token via secure cookie)
+Client ◄─── {"accessToken": "new_eyJhbGci..."} ──────────── Server
+```
+
+The Refresh Token is stored in the database. If a user "logs out," you delete their Refresh Token from the database. Even if someone steals the Refresh Token, you can invalidate it!
+
+## REAL_WORLD
+**JWT Best Practices for Production:**
+1. **Store Access Tokens in memory** (e.g., a React variable), NOT in `localStorage`. `localStorage` is vulnerable to XSS attacks.
+2. **Store Refresh Tokens in `HttpOnly` cookies**. JavaScript cannot read `HttpOnly` cookies, making them immune to XSS.
+3. **Use short expiration times** for access tokens (15-60 minutes max).
+4. **Never store sensitive data** (like a password or SSN) in the JWT payload. Anyone can decode it with Base64.
+5. **Use asymmetric keys** (RS256 — RSA key pair) instead of symmetric keys (HS256 — shared secret) in distributed systems. With RS256, microservices only need the public key to verify tokens; only the auth service holds the private key.
+
+## INTERVIEW
+**Q: How do you invalidate a JWT before it expires?**
+A: A properly stateless JWT cannot be invalidated — that's the trade-off! However, there are workarounds:
+1. **Token Blacklist in Redis:** Store invalidated token IDs in Redis with the token's TTL. The Filter checks Redis before accepting any token.
+2. **Short Expiration + Refresh Tokens:** Use 15-minute access tokens. To "log out," just delete the Refresh Token from the database.
+
+**Q: What is the difference between `HS256` and `RS256`?**
+A: `HS256` uses a single shared secret key for both signing and verification. This is a problem in a microservices architecture — every microservice needs the secret to verify tokens, increasing the attack surface. `RS256` uses a public/private RSA key pair. Only the Auth Service holds the private key to sign tokens. All other microservices only need the public key to verify them, which can be safely shared publicly.

@@ -1,0 +1,147 @@
+---
+title: dependency-injection
+slug: dependency-injection
+---
+
+# Dependency Injection — Constructor vs Field vs Setter
+
+## 1. Deep-Dive Architectural Overview
+
+Dependency Injection (DI) is the concrete implementation of Inversion of Control (IoC). In Spring, the container populates the dependencies of a bean during its instantiation phase. While Spring supports Field, Setter, and Constructor injection, the mechanics under the hood differ radically, impacting application stability, testability, and performance.
+
+```
++-----------------------------------------------------------------------------------+
+|                               DI Mechanism Comparison                             |
++-----------------------------------------------------------------------------------+
+|  CONSTRUCTOR INJECTION:                                                           |
+|  Container calls Constructor -> Instantiation & Injection happen atomically       |
+|  - Fields can be 'final' (Immutable)                                              |
+|  - No reflection required during instantiation                                    |
+|  - Guaranteed to be fully initialized upon creation                               |
++-----------------------------------------------------------------------------------+
+|  FIELD INJECTION:                                                                 |
+|  Container calls default Constructor -> Uses Reflection (ReflectionUtils)         |
+|  to bypass access modifiers and mutate fields directly                            |
+|  - Fields cannot be 'final' (Mutable)                                             |
+|  - Requires active Spring Application Context (Untestable in isolation)           |
++-----------------------------------------------------------------------------------+
+|  SETTER INJECTION:                                                                |
+|  Container calls default Constructor -> Calls setter methods sequentially        |
+|  - Fields cannot be 'final'                                                       |
+|  - Allows optional dependencies and reconfiguration at runtime                    |
++-----------------------------------------------------------------------------------+
+```
+
+### Constructor Injection Mechanics
+Constructor injection is processed during the bean instantiation phase. When `AbstractAutowireCapableBeanFactory` attempts to create a bean instance:
+1.  It resolves the appropriate constructor using `ConstructorResolver`.
+2.  It looks up the argument types in the `BeanFactory`.
+3.  It instantiates the bean atomically using Java's reflection API (`Constructor.newInstance()`).
+
+Because instantiation and dependency resolution happen simultaneously, fields can be marked as `final`. This guarantees immutability and thread-safety. Furthermore, the JVM itself ensures that the object is not exposed to any thread in an incomplete state.
+
+### Field Injection Mechanics
+Field injection occurs *after* the bean has been instantiated via its default constructor.
+1.  The `AutowiredAnnotationBeanPostProcessor` scans the class for fields annotated with `@Autowired`.
+2.  It retrieves the matching beans from the context.
+3.  It uses `ReflectionUtils.makeAccessible(Field field)` to bypass Java access modifiers (forcing private fields to be accessible).
+4.  It calls `field.set(beanInstance, dependencyInstance)`.
+
+This approach completely bypasses standard Java encapsulation rules, makes the class impossible to instantiate cleanly without a Spring container or deep reflection hacks in unit tests, and prevents fields from being declared `final`.
+
+### Circular Dependencies and the Three-Stage Cache
+Circular dependencies occur when Bean A requires Bean B, and Bean B requires Bean A. How Spring handles this depends entirely on the DI mechanism used:
+
+*   **Constructor Injection**: If both beans use constructor injection, Spring is forced to fail during startup, throwing a `BeanCurrentlyInCreationException`. This is because Spring cannot call Constructor A without arguments, but to resolve those arguments, it must call Constructor B, which requires Bean A—creating an unresolvable chicken-and-egg paradox at the bytecode execution level.
+*   **Field/Setter Injection**: Spring can resolve circular dependencies for singleton beans using its **three-stage cache** in `DefaultSingletonBeanRegistry`:
+    1.  `singletonObjects` (First Cache): Fully initialized singleton beans.
+    2.  `earlySingletonObjects` (Second Cache): Partially initialized beans (instantiated, but properties not yet populated).
+    3.  `singletonFactories` (Third Cache): `ObjectFactory` instances capable of producing early references (often used for AOP proxies).
+
+When Bean A is instantiated, its early reference is placed in the third cache. When Bean B is injected with Bean A, it resolves the early reference from the third cache (moving it to the second cache). Bean B completes its initialization and is put into the first cache. Finally, Bean A can resolve Bean B and complete its own initialization.
+
+### The `@Lazy` Annotation Escape Hatch
+If constructor injection must be used, but a circular reference is unavoidable, the `@Lazy` annotation acts as an escape hatch. When Spring encounters `@Lazy` on a constructor parameter, it does not resolve the actual bean immediately. Instead, it generates a dynamic proxy (using CGLIB) that implements the dependency's interface. The actual target bean is only looked up and resolved from the context when a method on the proxy is invoked for the first time.
+
+---
+
+## 2. Lifecycle & Internal Mechanics
+
+The following flowchart details how Spring's container resolves dependencies during the creation of a bean, showing the distinct decision path for Constructor vs Field/Setter injection.
+
+```
+[Start: Populate Bean]
+       |
+       v
+Is there a parameterized constructor?
+       |
+  +----+----+
+  |         |
+ (Yes)     (No) -> Instantiate via Default Constructor
+  |         |
+  |         v
+  |      Are there @Autowired fields or setters?
+  |         |
+  |    +----+----+
+  |    |         |
+  |   (Yes)     (No) -> Instantiation complete (No DI needed)
+  |    |
+  |    v
+  |  Execute AutowiredAnnotationBeanPostProcessor
+  |  - Scan metadata
+  |  - Lookup dependencies in BeanFactory
+  |  - Use ReflectionUtils to inject fields/setters
+  |    |
+  |    v
+  |  [Properties Populated]
+  |
+  v
+Resolve constructor arguments in BeanFactory
+  |
+  v
+Instantiate bean atomically via Constructor.newInstance(args)
+  |
+  v
+[Properties Populated (Atomic)]
+```
+
+---
+
+## 3. Production-Grade Configuration
+
+To enforce robust dependency design and prevent circular references from being silently resolved (which is an architectural code smell), we configure Spring Boot to explicitly disallow circular references.
+
+```yaml
+spring:
+  main:
+    # Explicitly prohibit circular references. If any circular reference exists,
+    # the application will fail-fast at startup, forcing developers to refactor.
+    allow-circular-references: false
+
+logging:
+  level:
+    org.springframework.beans.factory.annotation: DEBUG
+```
+
+---
+
+## 4. Complete, Robust Implementation
+
+Here is a complete, runnable Spring Boot 3.2 application illustrating constructor injection (best practice), the circular dependency failure, and how to resolve it using `@Lazy`.
+
+```java
+package com.devmastery.di;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+
+import java.util.Objects;
+
+// --- SERVICE INTERFACES ---
+public interface OrderService {

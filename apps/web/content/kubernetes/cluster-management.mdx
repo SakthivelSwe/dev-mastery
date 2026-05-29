@@ -1,0 +1,134 @@
+---
+slug: "cluster-management"
+title: "Cluster Management"
+level: 5
+---
+
+## WHY
+A Kubernetes cluster requires ongoing maintenance: node upgrades, cluster upgrades, node pool scaling, certificate rotation, etcd backups, and capacity planning. Poor cluster management leads to unplanned downtime, security vulnerabilities from outdated software, and unpredictable performance.
+
+## THEORY
+### Key Management Areas
+- **Upgrades:** Kubernetes releases every 4 months. Clusters must stay within N-2 versions of latest.
+- **Node operations:** Draining nodes for maintenance, adding/removing node pools
+- **etcd:** The cluster's data store — must be backed up regularly
+- **Certificate rotation:** API server certificates expire; must be rotated before expiry
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "cluster-management" }
+```
+
+## CODE
+
+### Node Operations
+```bash
+# View all nodes
+kubectl get nodes -o wide
+
+# Check node conditions
+kubectl describe node worker-01
+# Conditions:
+#   MemoryPressure: False    ← OK
+#   DiskPressure:  False    ← OK
+#   Ready:         True     ← Node is healthy
+
+# Drain a node (for maintenance — safely evict all Pods)
+kubectl drain worker-01 \
+  --ignore-daemonsets \      # DaemonSet Pods can stay
+  --delete-emptydir-data \   # Delete emptyDir volumes
+  --grace-period=60          # Give Pods 60s to shutdown gracefully
+
+# After maintenance, uncordon (allow scheduling again)
+kubectl uncordon worker-01
+
+# Cordon WITHOUT draining (prevent new Pods but keep existing)
+kubectl cordon worker-01
+```
+
+### etcd Backup
+```bash
+# Take etcd snapshot (run on a control-plane node)
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%Y%m%d-%H%M%S).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/peer.crt \
+  --key=/etc/kubernetes/pki/etcd/peer.key
+
+# Verify the snapshot
+etcdctl snapshot status /backup/etcd-20240128.db
+
+# Automate with a CronJob
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: kube-system
+spec:
+  schedule: "0 2 * * *"  # 2 AM daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: bitnami/etcd:latest
+              command: ["etcdctl", "snapshot", "save", "/backup/etcd.db"]
+          restartPolicy: OnFailure
+EOF
+```
+
+### Cluster Upgrade (kubeadm)
+```bash
+# Check available versions
+sudo apt-get update
+apt-cache madison kubeadm
+
+# Upgrade control plane
+sudo kubeadm upgrade apply v1.29.0
+
+# Upgrade kubeadm, kubelet, kubectl on each node
+sudo apt-get update && sudo apt-get install -y kubeadm=1.29.0-00
+sudo apt-mark hold kubeadm
+
+# Upgrade worker nodes one at a time (to maintain availability)
+kubectl drain worker-01 --ignore-daemonsets
+# On worker-01:
+sudo apt-get update && sudo apt-get install -y kubelet=1.29.0-00 kubectl=1.29.0-00
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
+# Back on control plane:
+kubectl uncordon worker-01
+```
+
+## REAL_WORLD
+**Managed K8s vs Self-Managed**
+EKS (AWS), GKE (Google), AKS (Azure) handle:
+- Control plane management and upgrades (automated)
+- etcd management (you never touch it)
+- High availability of API server
+
+Self-managed (kubeadm, Rancher):
+- Full control and customization
+- You manage ALL of the above
+- Significant operational burden
+
+For most teams, managed Kubernetes is strongly recommended unless you have specific compliance or customization needs.
+
+## INTERVIEW
+**Q: Your Kubernetes cluster is 2 minor versions behind the latest (K8s 1.27 when latest is 1.29). What is the upgrade path and what risks must you manage?**
+
+A: Kubernetes doesn't support skipping minor versions — you must upgrade 1.27 → 1.28 → 1.29 (one minor version at a time).
+
+**Upgrade process:**
+1. Review the changelog for each version — check for deprecated API removals!
+2. Test the upgrade in staging first (mirroring production workloads)
+3. Check your workload API compatibility: `kubectl convert -f my-deployment.yaml --output-version apps/v1`
+4. Upgrade control plane first (with kubeadm or via managed service)
+5. Upgrade worker nodes one-by-one (drain, upgrade, uncordon)
+
+**Risks to manage:**
+- **Deprecated APIs:** APIs removed in newer K8s versions will cause apply failures. Audit all YAML manifests and Helm charts before upgrading.
+- **Addon compatibility:** Check that your CNI, ingress controller, cert-manager, etc. support the target K8s version
+- **Service disruption:** Rolling node upgrades with drain/uncordon can cause brief unavailability if replicas=1. Ensure 2+ replicas for all production workloads.
+- **etcd backup:** Always take a snapshot before upgrading — this is your rollback point if the upgrade fails.

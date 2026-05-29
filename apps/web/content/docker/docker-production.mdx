@@ -1,0 +1,146 @@
+---
+slug: "docker-production"
+title: "Docker in Production"
+level: 4
+---
+
+## WHY
+Running Docker in development (with `docker compose up`) is forgiving. Containers crash? Restart them manually. Image outdated? Rebuild and restart.
+Production is completely different. You need **zero-downtime deployments**, automatic container restarts, resource limits to prevent runaway containers from killing the host, health checks to detect and replace unhealthy containers, and centralized logging.
+**Docker in Production** is a set of practices that make containerized deployments reliable, observable, and maintainable at scale.
+
+## THEORY
+### Restart Policies
+Docker can automatically restart containers when they exit. Configure this with `--restart`:
+- `no` (default): Never restart
+- `always`: Always restart, even on manual stop
+- `on-failure`: Restart only on non-zero exit code
+- `unless-stopped`: Always restart except when manually stopped
+
+### Health Checks
+Docker can periodically run a test command inside the container. If the test fails repeatedly, Docker marks the container as "unhealthy." Orchestrators (Compose, Swarm, K8s) can then automatically replace unhealthy containers.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-production" }
+```
+
+## CODE
+
+### Restart Policies and Resource Limits
+```bash
+# Production-grade docker run command
+docker run -d \
+  --name api \
+  --restart=unless-stopped \      # Auto-restart on crash
+  --memory=512m \                 # Hard memory limit (OOM kill if exceeded)
+  --memory-reservation=256m \     # Soft memory limit (suggestion to scheduler)
+  --cpus=1.5 \                    # Limit to 1.5 CPU cores
+  --pids-limit=100 \              # Limit number of processes (prevent fork bombs!)
+  -p 8080:8080 \
+  -e NODE_ENV=production \
+  my-api:1.0.0
+```
+
+### Health Checks in Dockerfile
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY . .
+RUN npm ci --only=production
+
+# Define health check
+HEALTHCHECK --interval=30s \      # Check every 30 seconds
+            --timeout=10s \       # Fail if no response in 10s
+            --start-period=60s \  # Grace period for startup
+            --retries=3 \         # Mark unhealthy after 3 consecutive failures
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+CMD ["node", "server.js"]
+```
+
+```bash
+# Watch health status
+docker ps
+# CONTAINER ID   ...   STATUS                   NAMES
+# abc123         ...   Up 5 min (healthy)        api
+# def456         ...   Up 10 min (unhealthy)     api-v2  ← Will be replaced!
+
+# Health check details
+docker inspect api --format '{{json .State.Health}}'
+```
+
+### Zero-Downtime Deployments with Docker Compose
+```bash
+# Update service with zero downtime using rolling update
+docker compose up -d --no-deps --build api
+
+# Or manually: start new, verify, stop old
+docker compose up -d --scale api=2   # Run 2 instances
+# Wait and verify new version works
+docker compose stop api_1            # Stop old instance
+```
+
+### Production Docker Compose with Health Checks
+```yaml
+# docker-compose.prod.yml
+version: '3.9'
+
+services:
+  api:
+    image: myregistry/my-api:${IMAGE_TAG}  # Always use exact version tags!
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"     # Rotate logs at 10MB
+        max-file: "3"       # Keep last 3 files
+```
+
+## REAL_WORLD
+**Blue-Green Deployment with Docker**
+The safest production deployment strategy:
+1. Blue (v1.0.0) is serving production traffic
+2. Start Green (v2.0.0) alongside Blue
+3. Run smoke tests against Green
+4. Switch load balancer to point to Green
+5. Keep Blue running for 30 minutes (easy rollback)
+6. If everything works, shut down Blue
+
+```bash
+# Start green deployment on different port
+docker run -d --name api-green -p 8081:8080 my-api:2.0.0
+
+# Run smoke tests against port 8081
+./scripts/smoke-tests.sh http://localhost:8081
+
+# If tests pass, update nginx to route to port 8081
+# If tests fail, just stop api-green — no impact to users!
+docker rm -f api-green
+```
+
+## INTERVIEW
+**Q: In production, a Docker container is consuming all available RAM and causing the host server to become unresponsive. Once the server recovers, how do you prevent this from happening again?**
+A: Set **hard memory limits** on the container:
+```bash
+docker run --memory=512m my-app
+```
+
+When a container exceeds its memory limit, Linux's OOM (Out-of-Memory) killer terminates the container process, and Docker restarts it (if `restart=on-failure` is set). This keeps the host server stable because Docker enforces the limit at the cgroup level — the container literally cannot allocate more memory.
+
+You should also:
+1. Set `--memory-reservation` (soft limit) for memory pressure hints to the scheduler
+2. Enable `--memory-swap` to control swap usage (set equal to `--memory` to disable swap for the container)
+3. Monitor with `docker stats` to establish normal memory usage baselines before setting limits
+4. Alert when a container is consistently near its memory limit (it needs a higher limit or there's a memory leak)

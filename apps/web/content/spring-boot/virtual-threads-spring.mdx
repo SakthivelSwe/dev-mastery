@@ -1,0 +1,102 @@
+---
+slug: "virtual-threads-spring"
+title: "Virtual Threads in Spring Boot 3.2+"
+level: 5
+---
+
+## WHY
+Historically, Java web servers (like Tomcat in Spring Boot) use a **Thread-Per-Request** model. If 1,000 users make a request simultaneously, Tomcat spins up 1,000 Operating System (OS) Threads.
+OS Threads are incredibly heavy. Each thread consumes ~1MB of RAM just to exist. Your server can realistically only handle a few thousand concurrent threads before it runs out of memory.
+Worse, if your Controller makes a 2-second database query, the OS Thread just sits there *blocked* and doing absolutely nothing for 2 seconds. It cannot handle other requests. 
+This is why reactive programming (Spring WebFlux) was invented—to handle millions of connections using only 4 threads. But WebFlux forces you to write ugly, complex, chaining callback code (`Mono` and `Flux`).
+**Virtual Threads (Project Loom)**, introduced in Java 21 and fully integrated in Spring Boot 3.2, are a revolutionary paradigm shift. They allow you to write simple, beautiful, blocking code, but the JVM automatically handles scaling to *millions* of concurrent requests with zero performance penalty!
+
+## THEORY
+### OS Threads vs Virtual Threads
+- **OS Threads (Platform Threads):** Managed by the Operating System kernel. Heavy, slow to create, expensive. Max limit: ~10,000.
+- **Virtual Threads:** Managed entirely by the JVM in RAM. Incredibly lightweight, practically free to create. Max limit: Millions!
+
+### The Magic of "Unmounting"
+When a Virtual Thread executes a blocking operation (like `restTemplate.getForObject()` or a database query), the JVM notices it is about to wait for the network.
+The JVM magically "unmounts" the Virtual Thread from the physical CPU, saving its state in the heap. The JVM immediately reuses that physical CPU core to process a *different* user's request! 
+When the database finally responds 2 seconds later, the JVM "remounts" the original Virtual Thread, and it continues executing. 
+To the developer, the code looks completely synchronous and blocking. To the CPU, it is 100% asynchronous and non-blocking!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "virtual-threads-unmounting" }
+```
+
+## CODE
+
+Integrating Virtual Threads in Spring Boot is so easy it almost feels like cheating.
+
+### 1. The Prerequisites
+You must be using **Java 21** (or newer) and **Spring Boot 3.2** (or newer).
+
+### 2. Enabling Virtual Threads
+By default, Tomcat still uses heavy OS threads. You can switch the entire Tomcat web server to use Virtual Threads by adding a *single line* to your `application.properties`!
+
+```properties
+# application.properties
+
+# That's it! Tomcat will now use Virtual Threads for all incoming requests!
+spring.threads.virtual.enabled=true
+```
+
+### 3. Writing Code (It's exactly the same!)
+You do not need to learn `Mono`, `Flux`, `async/await`, or reactive programming. You write standard, blocking Java code!
+
+```java
+@RestController
+public class HeavyController {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    @GetMapping("/api/aggregate")
+    public String aggregateData() {
+        
+        // This is a blocking network call! It takes 3 seconds!
+        // In Java 17, this would block a precious OS Thread.
+        // In Java 21 with Virtual Threads, the JVM instantly parks this thread in RAM,
+        // and uses the CPU to serve other users! The CPU is never idle!
+        String user = restTemplate.getForObject("http://user-service/api", String.class);
+        String orders = restTemplate.getForObject("http://order-service/api", String.class);
+        
+        return user + " - " + orders;
+    }
+}
+```
+
+### 4. Running Async Tasks on Virtual Threads
+If you use the `@Async` annotation to run background tasks, Spring Boot 3.2 automatically reconfigures the `TaskExecutor` to use Virtual Threads instead of a fixed thread pool!
+
+```java
+@Service
+public class EmailService {
+
+    // With spring.threads.virtual.enabled=true, this automatically runs on a lightweight Virtual Thread!
+    // You can safely spawn 100,000 of these simultaneously without crashing the server!
+    @Async
+    public void sendEmail(String address) {
+        // Slow SMTP blocking network call...
+    }
+}
+```
+
+## REAL_WORLD
+**The Death of WebFlux?**
+For the last 5 years, if you wanted to build a massive, high-throughput API gateway or a chat application handling 50,000 concurrent WebSockets, you were forced to use Spring WebFlux (Project Reactor). WebFlux is notoriously difficult to debug (stack traces are useless) and hard to test.
+With the release of Java 21 Virtual Threads, the need for WebFlux has drastically plummeted. You can achieve almost the exact same high-concurrency throughput using standard Spring MVC (Tomcat) by simply enabling Virtual Threads!
+However, WebFlux is still relevant for *Streaming* data (e.g., Server-Sent Events, or dealing with infinite streams of real-time market data), but for standard request/response REST APIs, Virtual Threads are the undisputed future of Java.
+
+## INTERVIEW
+**Q: You upgrade your Spring Boot application to Java 21 and enable `spring.threads.virtual.enabled=true`. You test an endpoint that executes a heavy database transaction. However, profiling shows that the Virtual Thread is NOT unmounting during the database query; it is completely blocking the underlying OS Carrier Thread, ruining performance! What concept is causing the Virtual Thread to get "stuck" to the OS thread?**
+A: **Thread Pinning.**
+This is the single biggest gotcha with Virtual Threads.
+A Virtual Thread cannot unmount from the physical OS Thread (it becomes "pinned") if it executes a blocking operation while holding a native monitor lock. 
+The most common cause of this in Java is the `synchronized` keyword, or executing native C/C++ code via JNI.
+If your code (or a third-party library, like an older JDBC Database Driver) uses a `synchronized` block, and makes a network call *inside* that block, the JVM is physically prevented from unmounting the Virtual Thread. The OS Thread blocks, and your high-concurrency architecture collapses.
+*The Fix:* 
+1. The Java ecosystem is rapidly updating. You must ensure you are using modern libraries (e.g., modern PostgreSQL JDBC drivers) that have replaced `synchronized` blocks with `ReentrantLock` (which works perfectly with Virtual Threads).
+2. You can run the JVM with a special flag: `-Djdk.tracePinnedThreads=full`. Whenever a Virtual Thread gets pinned and blocks, the JVM will print a stack trace, allowing you to identify exactly which library is using `synchronized` and causing the bottleneck!

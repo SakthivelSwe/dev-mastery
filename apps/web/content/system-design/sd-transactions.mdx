@@ -1,0 +1,87 @@
+---
+slug: "sd-transactions"
+title: "Distributed Transactions (System Design)"
+level: 5
+---
+
+## WHY
+In a system design interview, if you propose a microservices architecture for an E-commerce platform, the interviewer will inevitably ask: *"A user clicks checkout. The Payment Service deducts $100. The Inventory Service attempts to reserve the item, but crashes. How do you prevent the user from losing their money?"*
+
+If your answer is "I will use a standard SQL transaction," you have failed the interview. Standard transactions (ACID) only work on a single database. Understanding how to handle Distributed Transactions across independent microservices is a cornerstone of senior-level system design.
+
+## THEORY
+### 1. Two-Phase Commit (2PC) - The Anti-Pattern
+Historically, databases used a protocol called 2PC. A central coordinator asks all databases: "Are you ready to commit?" (Phase 1). If all say yes, it sends the "Commit" command (Phase 2).
+**Do not propose 2PC in a modern interview.** It is synchronous, blocking, and scales horribly. If one database locks up during Phase 1, the entire global transaction stalls.
+
+### 2. The Saga Pattern - The Modern Standard
+A Saga breaks the global transaction down into a sequence of local, independent transactions. 
+Service A updates its local DB and publishes an event to a message broker (Kafka). Service B listens to the event, updates its local DB, and publishes another event.
+If Service B fails, it cannot magically "rollback" Service A's database. Instead, Service B publishes a Failure Event. Service A listens to this and executes a **Compensating Transaction** (a specific function written to reverse the previous action, e.g., a Refund).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "saga-pattern" }
+```
+
+## CODE
+
+*(No code is written in a System Design interview, but you must draw and explain the flow!)*
+
+### Level 1 — Choreography Saga (Event-Driven)
+**How it works:** There is no central boss. Every service listens to events and reacts independently.
+
+**The Interview Explanation:**
+1. "The **Order Service** receives the request. It creates a `PENDING` order in its database and publishes an `OrderCreated` event to Kafka."
+2. "The **Payment Service** listens to Kafka. It charges the user's credit card. If successful, it publishes a `PaymentSucceeded` event."
+3. "The **Inventory Service** listens to `PaymentSucceeded`. It tries to deduct the item. But wait, the item is out of stock! It publishes an `InventoryFailed` event."
+4. "The **Payment Service** listens to `InventoryFailed`. It triggers its Compensating Transaction: it refunds the user's credit card and publishes a `RefundCompleted` event."
+5. "The **Order Service** listens to `InventoryFailed` and updates the order status in its database to `CANCELLED`."
+
+*Pros:* Highly decoupled. No single point of failure.
+*Cons:* Extremely difficult to track the overall status of the business process. Adding a new step requires updating multiple independent services.
+
+### Level 2 — Orchestration Saga (The Controller)
+**How it works:** A centralized "Orchestrator" service explicitly tells the other services what to do via direct API calls or command messages.
+
+**The Interview Explanation:**
+1. "Instead of services shouting into the void, we introduce an **Order Orchestrator Service**. It holds a State Machine."
+2. "The Orchestrator explicitly sends a command to the Payment Service: *Charge this user.*"
+3. "The Payment Service replies *Success*."
+4. "The Orchestrator then explicitly commands the Inventory Service: *Deduct this item.*"
+5. "The Inventory Service replies *Failed (Out of Stock)*."
+6. "The Orchestrator looks at its state machine, realizes it must rollback, and explicitly commands the Payment Service: *Refund the user.*"
+
+*Pros:* The entire business flow is visible in one place. Perfect for complex workflows with 10+ steps.
+*Cons:* The Orchestrator can become a massive, monolithic "God Service" that holds too much business logic.
+
+### Level 3 — Handling Dual-Write Failures (The Outbox Pattern)
+*The Interviewer Trap:* "You said the Order Service saves to the database, and then publishes to Kafka. What if the server's power cord is pulled out *exactly* between those two lines of code?"
+If this happens, the DB is updated, but Kafka never gets the message. The system is permanently stuck in a PENDING state!
+
+**The Solution: The Transactional Outbox Pattern.**
+1. "We cannot rely on a network call (Kafka) succeeding immediately after a DB write."
+2. "Instead, inside a single local SQL Transaction, we insert the Order into the `orders` table, AND we insert the Event into an `outbox` table in the exact same database."
+3. "Because both inserts are in the same local transaction, they are guaranteed to both succeed or both fail (Atomicity)."
+4. "A separate, continuous background worker reads the `outbox` table. It grabs pending events, safely pushes them to Kafka over the network, and then deletes them from the `outbox` table."
+
+### Level 4 — Idempotency (Exactly-Once Delivery)
+*The Interviewer Trap:* "Kafka guarantees At-Least-Once delivery. What if a network glitch causes Kafka to deliver the `OrderCreated` event to the Payment Service twice? Will you charge the user twice?"
+
+**The Solution: Idempotency Keys.**
+1. "Every event must have a globally unique `Idempotency-Key` (e.g., the UUID of the Order)."
+2. "Before the Payment Service charges the card, it checks its local database: *Have I seen this Idempotency Key before?*"
+3. "If it exists, the service simply ignores the event and returns a 200 OK."
+4. "If it doesn't exist, it processes the payment, and safely stores the Idempotency Key in its database so it is never processed again."
+
+## REAL_WORLD
+**Temporal and AWS Step Functions**
+Writing Orchestrator logic manually is brutal. You have to write complex `try/catch` blocks, manual retry loops with exponential backoff, and state recovery logic (what if the Orchestrator itself crashes halfway through?).
+Modern tech giants use specialized Workflow Engines like **Temporal** (open source, used by Stripe/Netflix) or **AWS Step Functions**.
+Temporal allows you to write workflow code sequentially. Under the hood, it persists the state of every variable to a database after every single line of code executes. If the Orchestrator server is destroyed by a meteor mid-execution, Temporal instantly boots it up on another server and resumes execution from the exact line of code where it died, perfectly restoring all variables in memory.
+
+## INTERVIEW
+**Q: We are building a crypto exchange. A user trades 1 Bitcoin for $50,000. Should we use an Event-Driven Choreography Saga to update the Bitcoin Ledger and the USD Ledger?**
+A: **No, financial ledgers should avoid distributed transactions whenever possible.**
+Sagas guarantee *Eventual Consistency*. During a Saga, the system is temporarily in an inconsistent state (the Bitcoin is gone, but the USD hasn't arrived yet). If a user queries their balance during those 500 milliseconds, they will see missing funds and panic. 
+For critical financial trades, the absolute best architectural decision is to **not distribute the transaction**. You should design the schema so that the Bitcoin Ledger and USD Ledger live in the exact same physical database (or a strongly consistent distributed SQL database like CockroachDB/Spanner). This allows you to use a standard ACID SQL transaction, guaranteeing that the swap happens atomically with zero window of inconsistency.

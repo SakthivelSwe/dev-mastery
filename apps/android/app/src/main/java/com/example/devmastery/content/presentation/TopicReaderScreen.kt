@@ -9,6 +9,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.jeziellago.compose.markdowntext.MarkdownText
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -38,27 +39,85 @@ fun TopicReaderScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState())
         ) {
             when (val state = topicState) {
                 is TopicState.Loading -> {
-                    CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .padding(top = 32.dp)
+                    )
                 }
                 is TopicState.Success -> {
-                    Text(
-                        text = state.topic.markdownContent,
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+                    val topic = state.topic
+                    val selectedIndex = state.selectedLayerIndex
+
+                    ScrollableTabRow(
+                        selectedTabIndex = selectedIndex,
+                        edgePadding = 8.dp
+                    ) {
+                        topic.lessons.forEachIndexed { index, lesson ->
+                            Tab(
+                                selected = selectedIndex == index,
+                                onClick = { viewModel.selectLayer(index) },
+                                text = { Text(lesson.title) }
+                            )
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        val currentLesson = topic.lessons.getOrNull(selectedIndex)
+                        if (currentLesson != null) {
+                            when (currentLesson.sectionType) {
+                                "feynman" -> {
+                                    MarkdownText(markdown = currentLesson.contentMdx)
+                                    FeynmanCheckPanel(
+                                        onComplete = { viewModel.completeLayer(topic.id, "feynman") }
+                                    )
+                                }
+                                "build" -> {
+                                    MarkdownText(markdown = currentLesson.contentMdx)
+                                    BuildChallengePanel(
+                                        onComplete = { viewModel.completeLayer(topic.id, "build") }
+                                    )
+                                }
+                                "spacedreview" -> {
+                                    SpacedReviewWidget(
+                                        onSubmitReview = { rating -> 
+                                            viewModel.submitSpacedReview(topic.id, rating)
+                                            viewModel.completeLayer(topic.id, "spacedreview")
+                                        }
+                                    )
+                                }
+                                else -> {
+                                    MarkdownText(
+                                        markdown = currentLesson.contentMdx,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 is TopicState.Error -> {
                     Text(
                         text = state.message,
                         color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .padding(top = 32.dp)
                     )
                     Spacer(modifier = Modifier.height(16.dp))
-                    Button(onClick = onBack) {
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    ) {
                         Text("Go Back")
                     }
                 }

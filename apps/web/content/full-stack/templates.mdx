@@ -1,0 +1,320 @@
+---
+title: templates
+slug: templates
+---
+
+# Architectural Deep Dive: Angular Template Syntax & Compile Mechanics
+
+## 1. Architectural Foundations & Core Mechanics
+
+Angular templates are not parsed at runtime. Instead, the Angular compiler (`@angular/compiler`) parses HTML templates into highly optimized JavaScript execution instructions during compile time. This process is part of the **Ahead-of-Time (AOT)** compilation phase.
+
+### Compilation Pipeline: HTML to Ivy Instructions
+
+```
+[HTML Template File]
+         │
+         ▼
+[Lexical Analysis & Parsing] ──> AST (Abstract Syntax Tree)
+         │
+         ▼
+[Optimization Phase] ──> Static analysis, dead code elimination
+         │
+         ▼
+[Code Generation] ──> Ivy Instruction Functions (ɵɵelementStart, ɵɵproperty, etc.)
+```
+
+When you compile a component, the compiler generates a static `template` function in the component's output definition (`ɵcmp`). This function contains direct calls to the Ivy instructional engine.
+
+For example, a template like:
+```html
+<div class="card" [id]="cardId">
+  <span>{{ title }}</span>
+</div>
+```
+
+Compiles to instructions structurally similar to:
+```javascript
+function Component_Template(rf, ctx) {
+  if (rf & 1) { // Creation Phase (rf === RenderFlags.Create)
+    ɵɵelementStart(0, "div", 0);
+    ɵɵelementStart(1, "span");
+    ɵɵtext(2);
+    ɵɵelementEnd();
+    ɵɵelementEnd();
+  }
+  if (rf & 2) { // Update Phase (rf === RenderFlags.Update)
+    ɵɵproperty("id", ctx.cardId);
+    ɵɵadvance(2);
+    ɵɵtextInterpolate(ctx.title);
+  }
+}
+```
+
+### The Render Flag Architecture (`rf`)
+
+*   **`RenderFlags.Create` (rf = 1)**: Executed exactly once when the component is created. It instantiates the DOM structure, registers event listeners, and sets up static attributes.
+*   **`RenderFlags.Update` (rf = 2)**: Executed on every change detection cycle. It evaluates expressions, compares values with the previous state (stored in `LView`), and updates changed DOM properties.
+
+---
+
+## 2. Deep-Dive API & Declarative Synthesis
+
+Angular 17+ introduces the **Built-in Control Flow** syntax, which deprecates legacy structural directives (`*ngIf`, `*ngFor`, `*ngSwitch`) in favor of direct compiler integration. This built-in control flow has zero runtime overhead and significantly reduces bundle size.
+
+### Built-in Control Flow Syntaxes
+
+#### `@if` / `@else if` / `@else`
+
+```html
+@if (status === 'loading') {
+  <app-spinner />
+} @else if (status === 'success') {
+  <app-data-view [data]="payload" />
+} @else {
+  <app-error-state />
+}
+```
+
+#### `@for` with `@empty`
+
+The `@for` block requires a `track` expression. This expression is compiled into a tracking function that replaces the legacy `trackBy` function, allowing Ivy to optimize DOM reuse when lists change.
+
+```html
+<ul class="user-list">
+  @for (user of users; track user.id; let idx = $index; let total = $count) {
+    <li [class.first]="idx === 0">
+      {{ idx + 1 }}/{{ total }}: {{ user.name }}
+    </li>
+  } @empty {
+    <li class="no-data">No users found.</li>
+  }
+</ul>
+```
+
+#### `@switch`
+
+```html
+@switch (role) {
+  @case ('admin') { <app-admin-dashboard /> }
+  @case ('manager') { <app-manager-dashboard /> }
+  @default { <app-user-dashboard /> }
+}
+```
+
+### Template Interaction Syntax Reference
+
+| Syntax | Type | Description |
+| :--- | :--- | :--- |
+| `{{ expr }}` | Interpolation | Renders expression as string in the DOM. |
+| `[prop]="val"` | Property Binding | Binds an expression to a DOM property or directive input. |
+| `(event)="handler()"` | Event Binding | Subscribes to DOM event or directive output. |
+| `[(model)]="val"` | Two-Way Binding | Syntactic sugar combining property binding and output event. |
+| `#ref` | Template Reference | Exposes DOM element or directive instance inside the template. |
+
+---
+
+## 3. Advanced Implementation & Production Patterns
+
+Let's build a highly optimized, type-safe data grid that uses the modern `@for` control flow, structural templates, and dynamic property bindings.
+
+### `data-table.component.ts`
+
+```typescript
+import { Component, Input, Output, EventEmitter, ChangeDetectionStrategy } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+export interface ColumnDef<T> {
+  key: keyof T;
+  header: string;
+  type?: 'text' | 'currency' | 'date';
+}
+
+@Component({
+  selector: 'app-data-table',
+  standalone: true,
+  imports: [CommonModule],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            @for (col of columns; track col.key) {
+              <th>{{ col.header }}</th>
+            }
+          </tr>
+        </thead>
+        <tbody>
+          @for (row of data; track row[idKey]) {
+            <tr (click)="onRowClick(row)">
+              @for (col of columns; track col.key) {
+                <td>
+                  @switch (col.type) {
+                    @case ('currency') {
+                      {{ row[col.key] | currency }}
+                    }
+                    @case ('date') {
+                      {{ row[col.key] | date:'shortDate' }}
+                    }
+                    @default {
+                      {{ row[col.key] }}
+                    }
+                  }
+                </td>
+              }
+            </tr>
+          } @empty {
+            <tr>
+              <td [attr.colspan]="columns.length" class="empty-cell">
+                No matching records found.
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  `,
+  styles: [`
+    .table-container { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
+    tr:hover { background-color: #f9f9f9; cursor: pointer; }
+    .empty-cell { text-align: center; color: #888; }
+  `]
+})
+export class DataTableComponent<T> {
+  @Input({ required: true }) data: T[] = [];
+  @Input({ required: true }) columns: ColumnDef<T>[] = [];
+  @Input({ required: true }) idKey!: keyof T;
+
+  @Output() rowSelected = new EventEmitter<T>();
+
+  protected onRowClick(row: T): void {
+    this.rowSelected.emit(row);
+  }
+}
+```
+
+---
+
+## 4. Diagnostics, Performance, & Memory Management
+
+### Why Built-in Control Flow is Faster than `*ngIf` / `*ngFor`
+
+Legacy structural directives (`*ngIf`, `*ngFor`) are implemented as components/directives that inject `TemplateRef` and `ViewContainerRef`. This creates parent-child dependency injection lookups, instantiates runtime directive classes, and registers structural bindings in the template context.
+
+The new `@if` and `@for` compile directly to simple JavaScript conditional logic and direct Ivy runtime virtual-DOM instructions. This yields:
+1.  **Up to 30% faster** execution times during creation and diffing.
+2.  Significant reductions in the runtime bundle footprint.
+3.  No need to import `CommonModule` or individual structural directives.
+
+### Tracking Expressions Memory and DOM Reuse
+
+Using an incorrect tracking property (such as index) inside a `@for` loop when elements can be reordered or filtered causes Angular to destroy and recreate DOM elements instead of reordering them. Always track by a unique database identifier (`id`).
+
+---
+
+## 5. Enterprise Testing & Verification Matrix
+
+Testing template rendering behavior with modern control flows:
+
+```typescript
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { DataTableComponent, ColumnDef } from './data-table.component';
+import { By } from '@angular/platform-browser';
+
+interface TestUser {
+  id: number;
+  name: string;
+  balance: number;
+  joined: Date;
+}
+
+describe('DataTableComponent', () => {
+  let component: DataTableComponent<TestUser>;
+  let fixture: ComponentFixture<DataTableComponent<TestUser>>;
+
+  const columns: ColumnDef<TestUser>[] = [
+    { key: 'name', header: 'User Name' },
+    { key: 'balance', header: 'Balance', type: 'currency' },
+    { key: 'joined', header: 'Joined Date', type: 'date' }
+  ];
+
+  const mockData: TestUser[] = [
+    { id: 1, name: 'Alice', balance: 1500, joined: new Date('2023-01-15') },
+    { id: 2, name: 'Bob', balance: 2500, joined: new Date('2023-03-20') }
+  ];
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [DataTableComponent]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(DataTableComponent<TestUser>);
+    component = fixture.componentInstance;
+    component.columns = columns;
+    component.idKey = 'id';
+  });
+
+  it('should render correct empty state template when data is empty', () => {
+    component.data = [];
+    fixture.detectChanges();
+
+    const emptyCell = fixture.debugElement.query(By.css('.empty-cell'));
+    expect(emptyCell).toBeTruthy();
+    expect(emptyCell.nativeElement.textContent).toContain('No matching records found.');
+  });
+
+  it('should render table rows and parse custom formats', () => {
+    component.data = mockData;
+    fixture.detectChanges();
+
+    const rows = fixture.debugElement.queryAll(By.css('tbody tr'));
+    expect(rows.length).toBe(2);
+
+    const firstRowCells = rows[0].queryAll(By.css('td'));
+    expect(firstRowCells[0].nativeElement.textContent.trim()).toBe('Alice');
+    expect(firstRowCells[1].nativeElement.textContent.trim()).toBe('$1,500.00');
+  });
+});
+```
+
+---
+
+## 6. Anti-Patterns, Refactoring, & Decoupling
+
+### Anti-Pattern: Executing Method Calls inside Templates
+
+```html
+<!-- BAD: Component's calculateDiscount() method is executed on EVERY single change detection cycle! -->
+<div class="discount">{{ calculateDiscount(item) }}</div>
+```
+
+If `calculateDiscount()` contains complex calculations, it will block the main thread and degrade rendering performance.
+
+#### Refactoring Solution: Use a Pure Pipe
+
+Pure pipes are only re-evaluated when their input arguments change by reference.
+
+```typescript
+import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({
+  name: 'discount',
+  pure: true, // This is true by default
+  standalone: true
+})
+export class DiscountPipe implements PipeTransform {
+  transform(item: { price: number; discountRate: number }): number {
+    return item.price * (1 - item.discountRate);
+  }
+}
+```
+
+```html
+<!-- GOOD: Calculation only executes when the item reference changes -->
+<div class="discount">{{ item | discount }}</div>
+```
+
+---

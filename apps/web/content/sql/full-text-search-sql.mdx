@@ -1,0 +1,105 @@
+---
+slug: "full-text-search-sql"
+title: "Full-Text Search in SQL"
+level: 4
+---
+
+## WHY
+If a user searches your blog for "run", a standard SQL `LIKE '%run%'` query will find "running", but it will also inappropriately find "crunch" and "brunch". Furthermore, `LIKE '%...%'` cannot use standard B-Tree indexes, meaning it will scan every single row in the database, locking up your CPU.
+
+To build a professional Google-style search bar (that handles stemming, ranking, and typos), you historically had to install Elasticsearch. Today, modern SQL databases have native **Full-Text Search (FTS)** engines built right in.
+
+## THEORY
+### Lexemes and Stemming
+Human languages are complex. "Run", "Running", and "Ran" are mathematically different strings, but linguistically the exact same concept. 
+A Full-Text Search engine uses a Dictionary to convert raw words into their root form, known as a **Lexeme**. (e.g., "running" becomes "run"). It also completely strips out useless "Stop Words" (like "the", "and", "a").
+
+By comparing the lexemes of the search query against the lexemes of the database text, FTS provides incredibly accurate results at blazing speeds.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeRunner", "state": "sql-fts" }
+```
+
+## CODE
+
+*(Note: Every database implements FTS completely differently. The code below focuses on PostgreSQL's industry-leading FTS implementation).*
+
+### Level 1 — Beginner (Vectors and Queries)
+Postgres uses two special data types for FTS:
+- `tsvector`: A sorted list of lexemes representing the document.
+- `tsquery`: The search terms you are looking for.
+
+```sql
+-- 1. Convert the raw text into a tsvector
+SELECT to_tsvector('english', 'The quick foxes are jumping over the lazy dogs');
+-- Result: 'dog':9 'fox':3 'jump':5 'lazi':8 'quick':2
+-- Notice that "The" and "are" were deleted! "jumping" became "jump"!
+
+-- 2. Convert the user's search input into a tsquery
+SELECT to_tsquery('english', 'foxes & jumping');
+-- Result: 'fox' & 'jump'
+
+-- 3. Match them together using the @@ operator!
+SELECT to_tsvector('english', 'The quick foxes are jumping') @@ to_tsquery('english', 'jump');
+-- Returns TRUE!
+```
+
+### Level 2 — Building Blocks (Searching a Table)
+Instead of converting the text on the fly, you query actual table columns.
+
+```sql
+SELECT title, body 
+FROM articles
+WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english', 'postgres & performance');
+```
+
+### Level 3 — Intermediate (Indexing for Speed)
+The query above works, but it has to run `to_tsvector` on every single row every time you search. It is painfully slow.
+You must pre-compute the vector and create a **GIN (Generalized Inverted Index)**.
+
+**Approach 1: A Generated Column (Postgres 12+)**
+```sql
+ALTER TABLE articles 
+ADD COLUMN search_vector tsvector 
+GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+
+-- Create the massive GIN index!
+CREATE INDEX idx_fts_articles ON articles USING GIN (search_vector);
+
+-- Now the search is instantaneous!
+SELECT title FROM articles 
+WHERE search_vector @@ to_tsquery('english', 'postgres');
+```
+
+### Level 4 — Advanced (Ranking / Relevance)
+If a user searches for "Postgres", and 500 articles match, which one should be at the top of the list?
+You need to **Rank** the results. Postgres provides `ts_rank()`, which calculates how often the search terms appear in the document.
+
+```sql
+SELECT 
+    title, 
+    ts_rank(search_vector, to_tsquery('english', 'postgres')) AS relevance_score
+FROM articles
+WHERE search_vector @@ to_tsquery('english', 'postgres')
+ORDER BY relevance_score DESC -- Highest relevance first!
+LIMIT 10;
+```
+
+**Weighting:**
+You can even assign weights! A match in the `title` (Weight A) should be worth drastically more points than a match buried deep in the `body` (Weight D). You configure this using `setweight()`.
+
+## REAL_WORLD
+**FTS vs Elasticsearch**
+If PostgreSQL can do all of this, why does Elasticsearch exist?
+PostgreSQL FTS is incredible and handles 95% of use cases flawlessly, completely eliminating the architectural nightmare of keeping two different databases perfectly synchronized.
+
+However, you should migrate to Elasticsearch if:
+1. You have hundreds of millions of massive documents.
+2. You need complex "Fuzzy Matching" (automatically correcting severe typos: e.g., mapping `pstrges` to `postgres`). Postgres handles roots (jumping -> jump), but struggles with pure typos.
+3. You need advanced aggregations and highlighting (returning the exact snippet of text with the search term bolded in HTML).
+
+## INTERVIEW
+**Q: I used `to_tsquery('english', 'express backend')` and it threw a syntax error. Why?**
+A: `to_tsquery` is extremely strict. It expects explicit boolean operators between words (e.g., `'express & backend'` or `'express | backend'`). Because the raw string `'express backend'` has a space instead of an operator, it crashes. 
+When taking raw input directly from a user's search bar, you should always use `plainto_tsquery('english', 'express backend')`. This function safely takes raw, messy user input, strips out the punctuation, and automatically inserts the `&` (AND) operators between the words for you!

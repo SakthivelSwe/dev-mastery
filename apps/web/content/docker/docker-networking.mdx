@@ -1,0 +1,131 @@
+---
+slug: "docker-networking"
+title: "Docker Networking"
+level: 2
+---
+
+## WHY
+Containers are isolated by default — they can't talk to each other or the outside world unless you explicitly configure networking.
+When you run a web app container that needs to talk to a database container, you need to connect them. When you want users on the internet to access your container, you need to expose ports.
+**Docker Networking** is the mechanism that controls how containers communicate with each other, with the host, and with the external network.
+
+## THEORY
+### Docker Network Drivers
+1. **bridge (default):** Creates a virtual network on the host. Containers on the same bridge network can communicate using their container names as hostnames. The default network for containers without a specified network.
+2. **host:** Removes network isolation — container uses the host's network directly. No port mapping needed, but no isolation. Linux only.
+3. **overlay:** Connects containers across multiple Docker hosts (for Docker Swarm / distributed systems).
+4. **none:** Completely disables networking. For maximum isolation or batch jobs that don't need network.
+
+### Custom Networks (Best Practice)
+The **default bridge network** has a limitation: containers can't resolve each other by name. You must create a **custom bridge network** to enable automatic DNS resolution between containers.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-networking" }
+```
+
+## CODE
+
+### Creating and Using Custom Networks
+```bash
+# Create a custom bridge network
+docker network create my-app-network
+
+# Run a Postgres container on this network
+docker run -d \
+  --name postgres-db \
+  --network my-app-network \
+  -e POSTGRES_PASSWORD=secret \
+  postgres:15
+
+# Run your API container on the SAME network
+docker run -d \
+  --name api \
+  --network my-app-network \
+  -p 8080:8080 \
+  my-api-image
+
+# Inside the API container, 'postgres-db' is a valid hostname!
+# Connection string: jdbc:postgresql://postgres-db:5432/mydb
+```
+
+### Port Publishing
+```bash
+# -p hostPort:containerPort
+# Publish container port 3000 as port 8080 on the host
+docker run -p 8080:3000 my-app
+
+# Bind to a specific host IP (only accept connections from localhost)
+docker run -p 127.0.0.1:8080:3000 my-app
+
+# Publish to a RANDOM available port
+docker run -P my-app  # Docker picks a random available port
+docker port my-app    # Show what port was assigned
+```
+
+### Inspecting Networks
+```bash
+# List all Docker networks
+docker network ls
+# NETWORK ID     NAME               DRIVER    SCOPE
+# abc123         bridge             bridge    local
+# def456         host               host      local
+# ghi789         my-app-network     bridge    local
+
+# Inspect a network to see connected containers
+docker network inspect my-app-network
+
+# Connect a running container to a network
+docker network connect my-app-network existing-container
+
+# Disconnect
+docker network disconnect my-app-network existing-container
+```
+
+### Inter-Container Communication
+```bash
+# Two containers on the same custom network can ping each other by name!
+docker run -it --rm --network my-app-network alpine sh
+
+# Inside the alpine container:
+ping postgres-db   # Works! Docker DNS resolves 'postgres-db' to the container's IP
+wget http://api:8080/health  # Works! 'api' resolves to the API container
+```
+
+## REAL_WORLD
+**Multi-Tier Network Architecture**
+Production applications should have isolated networks for each tier:
+
+```yaml
+# docker-compose.yml
+services:
+  nginx:          # Public-facing reverse proxy
+    networks: [frontend]
+    ports: ["80:80", "443:443"]
+
+  api:            # Application tier - bridges both networks
+    networks: [frontend, backend]
+
+  db:             # Database - ONLY on backend network, not accessible from internet!
+    networks: [backend]
+
+networks:
+  frontend:       # Public network: nginx → api
+  backend:        # Private network: api → db (db not exposed to internet!)
+```
+
+This architecture ensures the database is never directly accessible from the public internet — it's on a completely separate Docker network that only the API can reach.
+
+## INTERVIEW
+**Q: You run two containers without specifying a network. Both are on the default `bridge` network. Why can't they communicate using container names? And how do you fix it?**
+
+A: The **default bridge network** (`bridge`) uses static IP assignments but does NOT enable automatic **DNS-based service discovery** between containers. Containers on the default bridge network can only reach each other via IP address (found with `docker inspect`), which is fragile because IPs change.
+
+The fix is to create a **custom bridge network**:
+```bash
+docker network create mynet
+docker run --network mynet --name db postgres
+docker run --network mynet --name api my-api
+```
+
+On a custom bridge network, Docker runs an embedded DNS server that resolves container names to their IPs. So `api` can now connect to `db` using the hostname `db` — the DNS resolution is automatic. This is also what Docker Compose does automatically: it creates a custom network for all services in the compose file, which is why Compose services can reference each other by service name.

@@ -1,0 +1,155 @@
+---
+slug: "stored-procedures"
+title: "Stored Procedures & Functions"
+level: 4
+---
+
+## WHY
+If your application needs to transfer $100 from Account A to Account B, you could write a backend script in Node.js or Java that reads the balance, does the math, and writes it back. 
+However, this requires sending multiple network requests back and forth between your API and the Database. If the network drops halfway through, the database is left in a corrupted state.
+
+**Stored Procedures** and **Functions** allow you to write actual programming logic (IF statements, loops, variables) and save it directly inside the Database engine. When you execute it, the logic runs on the database server itself, eliminating network latency and ensuring maximum transactional security.
+
+## THEORY
+### Procedures vs. Functions
+Though they sound similar, they have strict differences in SQL:
+- **Functions:** Must ALWAYS return a value (or table). They are designed for computations and can be used directly inside a `SELECT` query (e.g., `SELECT calculate_tax(salary) FROM employees`).
+- **Procedures:** Do NOT have to return a value. They are designed for performing actions (like Batch Updates, Data Migration, or complex Transaction Management). You cannot use them in a `SELECT` statement; you must explicitly `CALL` them.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SQLVisualizer", "state": "stored-procedures" }
+```
+
+## CODE
+
+*(Note: The exact syntax for procedures varies heavily between PostgreSQL (PL/pgSQL), SQL Server (T-SQL), and Oracle (PL/SQL). The examples below use standard PostgreSQL PL/pgSQL syntax).*
+
+### Level 1 — Beginner (Creating a Basic Function)
+Let's create a reusable function that calculates the final price of an item after applying a discount percentage.
+
+```sql
+-- Create or replace a function that takes two numeric arguments and returns a numeric
+CREATE OR REPLACE FUNCTION calculate_discounted_price(original_price NUMERIC, discount_percent NUMERIC)
+RETURNS NUMERIC 
+LANGUAGE plpgsql -- Specify the procedural language
+AS $$
+DECLARE
+    -- You can declare local variables here!
+    discount_amount NUMERIC;
+    final_price NUMERIC;
+BEGIN
+    -- The core logic
+    discount_amount := original_price * (discount_percent / 100);
+    final_price := original_price - discount_amount;
+    
+    RETURN final_price;
+END;
+$$;
+
+-- Usage: Use it directly in a standard SELECT query!
+SELECT id, calculate_discounted_price(price, 20) AS sale_price FROM products;
+```
+
+### Level 2 — Building Blocks (Control Flow & IF Statements)
+Because we are inside a procedural language, we can use standard programming control structures.
+
+```sql
+CREATE OR REPLACE FUNCTION get_employee_status(years_worked INT)
+RETURNS VARCHAR
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Standard IF / ELSIF / ELSE logic
+    IF years_worked < 1 THEN
+        RETURN 'Rookie';
+    ELSIF years_worked >= 1 AND years_worked < 5 THEN
+        RETURN 'Experienced';
+    ELSE
+        RETURN 'Veteran';
+    END IF;
+END;
+$$;
+
+SELECT name, get_employee_status(years_at_company) FROM employees;
+```
+
+### Level 3 — Intermediate (Creating a Stored Procedure)
+Procedures are used to perform actions. Let's write a procedure that safely transfers money between two users, ensuring the sender actually has enough money first!
+
+```sql
+CREATE OR REPLACE PROCEDURE transfer_funds(sender_id INT, receiver_id INT, amount NUMERIC)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    sender_balance NUMERIC;
+BEGIN
+    -- 1. Get the current balance of the sender
+    SELECT balance INTO sender_balance FROM accounts WHERE user_id = sender_id;
+    
+    -- 2. Validate sufficient funds!
+    IF sender_balance < amount THEN
+        RAISE EXCEPTION 'Insufficient funds! Sender has %, but tried to send %', sender_balance, amount;
+    END IF;
+    
+    -- 3. Perform the actual transfer
+    UPDATE accounts SET balance = balance - amount WHERE user_id = sender_id;
+    UPDATE accounts SET balance = balance + amount WHERE user_id = receiver_id;
+    
+    -- Note: Procedures automatically handle transactions depending on how they are called!
+END;
+$$;
+
+-- Usage: We cannot use SELECT. We must CALL the procedure!
+CALL transfer_funds(101, 202, 50.00);
+```
+
+### Level 4 — Advanced (Cursors and Loops)
+If you need to iterate through 1 million rows and perform complex conditional updates on each one, doing it in application code (Java/Python) will crash your server's RAM. Doing it in a Stored Procedure using a **Cursor** allows the database to process the rows efficiently without sending the massive dataset across the network.
+
+```sql
+CREATE OR REPLACE PROCEDURE archive_old_records()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    -- A cursor is a pointer that fetches a few rows at a time
+    record_cursor CURSOR FOR SELECT * FROM logs WHERE created_at < NOW() - INTERVAL '1 year';
+    log_record RECORD;
+BEGIN
+    -- Open the cursor to start reading
+    OPEN record_cursor;
+    
+    LOOP
+        -- Fetch the very next row into our local variable
+        FETCH record_cursor INTO log_record;
+        
+        -- If there are no more rows left, break the infinite loop!
+        EXIT WHEN NOT FOUND;
+        
+        -- Insert the old record into the archive table
+        INSERT INTO logs_archive VALUES (log_record.*);
+        
+        -- Delete the old record from the main table
+        DELETE FROM logs WHERE id = log_record.id;
+    END LOOP;
+    
+    -- Clean up
+    CLOSE record_cursor;
+END;
+$$;
+
+CALL archive_old_records();
+```
+
+## REAL_WORLD
+**Financial Systems and Data Gravity**
+Why do banks love Stored Procedures, while Silicon Valley startups hate them? 
+Startups prefer all business logic to live in the application code (Node.js/Ruby) so it can be easily tested, version-controlled, and deployed.
+Banks, however, suffer from **Data Gravity**. If a bank needs to calculate end-of-day interest for 50 million accounts, pulling those 50 million rows across the network into a Java application, doing the math, and sending 50 million `UPDATE` statements back over the network will take 8 hours and completely saturate the internal network bandwidth.
+By writing a Stored Procedure, the logic is pushed *down* to where the data naturally lives. The database server churns through the math internally using a Cursor, completing the batch job in 15 minutes with zero network overhead.
+
+## INTERVIEW
+**Q: I have a massive block of business logic inside a Stored Procedure. How do I write an automated Unit Test for it?**
+A: **This is the biggest downside of Stored Procedures.** 
+Testing application code in Java/Python is incredibly easy using frameworks like JUnit or Jest. Testing a Stored Procedure requires spinning up a real database, running the SQL procedure, querying the table to assert the state changed, and then wiping the database clean for the next test. 
+While frameworks like `pgTAP` (for PostgreSQL) or `tSQLt` (for SQL Server) exist to write tests entirely in SQL, they are clunky and difficult to integrate into modern CI/CD pipelines. This exact lack of testability and version control visibility is why modern architectures heavily prefer keeping logic in the application layer whenever performance allows.

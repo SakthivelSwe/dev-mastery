@@ -1,0 +1,137 @@
+---
+slug: "pg-locks-and-concurrency"
+title: "PostgreSQL Locks & Concurrency"
+level: 4
+---
+
+## WHY
+In a highly concurrent system, thousands of users might attempt to read, update, or delete the exact same row in a database simultaneously. If the database doesn't manage these simultaneous actions perfectly, data gets corrupted (e.g., two people buy the last ticket on a flight).
+PostgreSQL uses a highly complex Locking system and **MVCC (Multi-Version Concurrency Control)** to ensure ACID compliance. As a DBA, if you do not understand locking, a single stray `UPDATE` command can instantly freeze your entire database, bringing production to a halt.
+
+## THEORY
+### MVCC (Multi-Version Concurrency Control)
+In older databases (like early MySQL), if User A was writing to a table, User B was physically blocked from *reading* that table until the write finished. This destroyed performance.
+PostgreSQL uses MVCC: **"Readers never block writers, and writers never block readers."**
+When you UPDATE a row in Postgres, it does NOT overwrite the existing row. It creates a completely *new* version of the row, invisible to everyone else. Other users continue to read the old version of the row until your transaction commits!
+
+### The Two Categories of Locks
+1. **Row-Level Locks:** Automatically acquired when you `UPDATE`, `DELETE`, or explicitly `SELECT ... FOR UPDATE`. They only lock specific rows, allowing other users to modify different rows in the exact same table simultaneously.
+2. **Table-Level Locks:** Acquired when you alter the schema (`ALTER TABLE`), create indexes (`CREATE INDEX`), or aggressively lock the table (`LOCK TABLE`). These are extremely dangerous and can block all read/write traffic to the entire table.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-locks" }
+```
+
+## CODE
+
+### Level 1 — Explicit Row Locking (Pessimistic Concurrency)
+Imagine a ticketing system. If User A clicks "Checkout", you must ensure User B cannot buy the exact same ticket. 
+You must explicitly lock the row so User B is forced to wait.
+
+```sql
+-- User A starts a transaction
+BEGIN;
+
+-- User A selects the ticket, but tells Postgres to LOCK it!
+-- This acquires a RowShareLock. 
+SELECT * FROM tickets WHERE ticket_id = 100 FOR UPDATE;
+
+-- At this EXACT moment, if User B runs the exact same query, 
+-- User B's query will FREEZE and WAIT.
+
+-- User A finishes the purchase
+UPDATE tickets SET status = 'SOLD' WHERE ticket_id = 100;
+
+-- User A commits the transaction. The lock is released!
+COMMIT;
+-- (Now User B's query unfreezes, reads the new 'SOLD' state, and fails appropriately).
+```
+
+### Level 2 — The Dreaded Deadlock
+A Deadlock occurs when two transactions are waiting for each other to release a lock. They will wait for infinity. Postgres has a `deadlock_timeout` (default 1 second) that detects this circle and violently kills one of the transactions to free the system.
+
+```sql
+-- Transaction A
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1; -- Locks Row 1
+
+-- Transaction B (Happening simultaneously in another session)
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 2; -- Locks Row 2
+
+-- Transaction A (Continues...)
+UPDATE accounts SET balance = balance + 100 WHERE id = 2; -- WAITING on B!
+
+-- Transaction B (Continues...)
+UPDATE accounts SET balance = balance + 100 WHERE id = 1; -- WAITING on A!
+
+-- BOOM! DEADLOCK DETECTED. Postgres kills Transaction B.
+```
+*The Fix:* Always lock rows in the exact same alphabetical or numerical order in your application code. If both transactions lock `id = 1` first, a deadlock is mathematically impossible.
+
+### Level 3 — Table-Level Locks (The Production Killer)
+As a DBA, a developer might ask you: "I need to add a new column to the massive `users` table."
+If you just run `ALTER TABLE users ADD COLUMN phone VARCHAR(20);`, you acquire an `AccessExclusiveLock`. 
+**An AccessExclusiveLock blocks EVERYTHING.** It blocks `SELECT`, `UPDATE`, `INSERT`. If the table is 500GB, adding the column might take 10 seconds. For those 10 seconds, your entire application is down. 
+
+If there is a long-running `SELECT` query currently happening on the `users` table, the `ALTER TABLE` must *wait* in a queue for that `SELECT` to finish. But because `ALTER TABLE` is now at the front of the queue, every subsequent `SELECT` query from the web app piles up behind it! In 5 seconds, you run out of database connections and the site crashes.
+
+### Level 4 — Diagnosing Locks (The DBA Superpower)
+When the database is frozen, you have 60 seconds to find the query causing the lock and kill it. You use the `pg_locks` and `pg_stat_activity` views.
+
+```sql
+-- Find exactly who is blocking who right now!
+SELECT
+    blocked_locks.pid     AS blocked_pid,
+    blocked_activity.usename  AS blocked_user,
+    blocking_locks.pid     AS blocking_pid,
+    blocking_activity.usename AS blocking_user,
+    blocked_activity.query    AS blocked_statement,
+    blocking_activity.query   AS current_statement_in_blocking_process
+FROM  pg_catalog.pg_locks         blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity  ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks         blocking_locks 
+    ON blocking_locks.locktype = blocked_locks.locktype
+    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+    AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;
+```
+Once you identify the `blocking_pid` (e.g., `PID 1234`), you aggressively terminate it to save the database:
+`SELECT pg_terminate_backend(1234);`
+
+## REAL_WORLD
+**Advisory Locks (Application Level Locks)**
+Sometimes you don't want to lock a database row; you want to lock an *application process* across multiple servers. 
+For example, you have 5 background workers pulling jobs from a queue, and you need to ensure only ONE worker runs a specific daily report.
+You can use Postgres **Advisory Locks**. These are fake, fast, in-memory locks managed by Postgres that have no relation to actual tables!
+
+```sql
+-- Worker 1 requests a lock on the arbitrary number "999"
+-- Postgres returns TRUE (Success)
+SELECT pg_try_advisory_lock(999);
+
+-- Worker 2 requests a lock on the number "999" at the same time
+-- Postgres returns FALSE (Worker 2 knows to skip the job!)
+SELECT pg_try_advisory_lock(999);
+
+-- Worker 1 finishes the report and releases the lock
+SELECT pg_advisory_unlock(999);
+```
+
+## INTERVIEW
+**Q: A developer runs `CREATE INDEX CONCURRENTLY` on a massive 1TB table. Two hours later, it fails due to a uniqueness violation. Now, every query on the database is mysteriously slow, but CPU and Memory look fine. What happened?**
+A: **An Invalid Index is poisoning the system.**
+When `CREATE INDEX CONCURRENTLY` fails, it does not rollback the transaction like a normal query. It leaves behind an `INVALID` index in the database. 
+While Postgres knows not to *use* the invalid index for `SELECT` queries, it STILL forces every single `INSERT` and `UPDATE` on that table to write to the broken index! This causes massive write amplification and slows down all inserts.
+As a DBA, you must immediately find the broken index:
+`SELECT indexrelid::regclass FROM pg_index WHERE indisvalid = false;`
+And manually `DROP INDEX broken_index_name;` to restore write performance!

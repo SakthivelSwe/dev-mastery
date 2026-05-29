@@ -1,0 +1,149 @@
+---
+slug: "memory-management-js"
+title: "JS Memory Management & GC"
+level: 5
+---
+
+## WHY
+In low-level languages like C or C++, when you create an object, you must explicitly ask the Operating System for RAM (`malloc`). When you are done with it, you MUST explicitly give that RAM back (`free`). If you forget, the RAM is permanently locked until the computer reboots—this is called a **Memory Leak**.
+
+JavaScript, like Java and Python, is a **Garbage Collected** language. The V8 engine automatically allocates memory when you create an object, and automatically destroys the object when you are done with it. However, if you do not understand *how* V8 decides an object is "done", you will accidentally create massive Memory Leaks in your React or Node.js applications, causing the browser tab to crash or your backend server to run out of memory (`OOM`).
+
+## THEORY
+### The Stack vs The Heap
+JavaScript utilizes two distinct memory areas:
+1. **The Call Stack**: Stores primitive values (Numbers, Strings, Booleans) and function execution frames. The Stack is incredibly fast, highly organized, and automatically cleans itself up the exact millisecond a function finishes executing.
+2. **The Memory Heap**: A massive, unorganized pool of RAM. It stores all Complex Objects (Arrays, Functions, Objects). Because objects can live forever, the Heap does NOT clean itself up automatically. This is where the Garbage Collector lives.
+
+### Mark-and-Sweep Garbage Collection
+How does V8 know it's safe to destroy an object in the Heap? It uses the **Mark-and-Sweep** algorithm.
+1. V8 starts at the **Roots** (the global `window` object in the browser, or `global` in Node).
+2. It traces every single variable attached to the root, then traces everything those variables point to, drawing a massive web of connections. Every object it touches is "Marked" as ALIVE.
+3. Once the trace is complete, V8 looks at the entire Heap. Any object that is NOT Marked is declared "Unreachable". V8 "Sweeps" through and permanently deletes them, returning the RAM to the OS.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mark-and-sweep-gc" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Allocation and Reachability)
+```javascript
+// 1. ALLOCATION: V8 allocates memory in the Heap for this massive array
+let massiveData = new Array(1000000).fill("Data"); 
+
+// At this point, `massiveData` is attached to the global scope. 
+// It is REACHABLE. The Garbage Collector will NOT touch it.
+
+// 2. SEVERING THE POINTER
+massiveData = null; 
+
+// By reassigning the variable to null, the pointer to the array in the Heap is severed!
+// The massive array still physically exists in the RAM, but it is now UNREACHABLE.
+// The next time the Mark-and-Sweep algorithm runs, it will sweep the array away!
+```
+
+### Level 2 — Building Blocks (The Closure Memory Leak)
+```javascript
+// Closures are powerful, but they are the #1 cause of Memory Leaks in JS.
+
+function createCache() {
+  // This massive object is trapped inside the function scope.
+  const privateCache = new Array(1000000).fill("Secret");
+  
+  // We return a function that references the privateCache (A Closure!)
+  return function getCacheItem(index) {
+    return privateCache[index];
+  }
+}
+
+// `myFunction` now holds a reference to the inner returned function.
+const myFunction = createCache();
+
+// THE PROBLEM: Because `myFunction` is alive in the global scope, 
+// and `myFunction` holds a Closure reference to `privateCache`, 
+// V8's Mark-and-Sweep considers `privateCache` ALIVE AND REACHABLE!
+// The massive 1-million item array can NEVER be Garbage Collected as long as `myFunction` exists.
+
+// To fix the leak, you must explicitly sever the function pointer when you're done:
+// myFunction = null;
+```
+
+### Level 3 — Intermediate (The Event Listener Leak)
+```javascript
+// The #2 cause of Memory Leaks: Forgotten Event Listeners (Massive issue in React!)
+
+class HeavyComponent {
+  constructor() {
+    this.hugeData = new Array(1000000).fill("Data");
+    
+    // We attach an event listener to the Global Window object!
+    // We bind 'this' so the callback has access to our class.
+    window.addEventListener('resize', this.handleResize.bind(this));
+  }
+
+  handleResize() {
+    console.log(this.hugeData.length);
+  }
+}
+
+let component = new HeavyComponent();
+
+// Later, the user navigates away from the page, so we destroy the component!
+component = null;
+
+// DISASTER! The global `window` object STILL holds a reference to the `handleResize` function.
+// Because the function is bound to `this`, it holds a reference to the ENTIRE HeavyComponent!
+// The component is completely invisible, but it is permanently locked in memory!
+
+// THE FIX: You MUST call removeEventListener before destroying the component!
+```
+
+### Level 4 — Advanced (WeakMap and FinalizationRegistry)
+```javascript
+// Modern JS introduced WeakMap to solve object-reference memory leaks!
+
+// A normal Map holds a STRONG reference. 
+// If you put an object in a Map, it can NEVER be garbage collected.
+const normalMap = new Map();
+
+// A WeakMap holds a WEAK reference. 
+// If the ONLY thing pointing to an object is a WeakMap, the Garbage Collector 
+// will ignore the WeakMap and aggressively destroy the object anyway!
+const cache = new WeakMap();
+
+let user = { name: "Alice" };
+cache.set(user, "User Profile Data"); // Caching some heavy data related to Alice
+
+// Later, the user logs out, so we delete the user variable.
+user = null;
+
+// MAGIC! Because 'user' is null, the object is unreachable. 
+// The WeakMap instantly drops the key and the "User Profile Data" without you doing anything!
+
+// You can actually prove this happens using the new FinalizationRegistry (ES2021)
+const registry = new FinalizationRegistry((message) => {
+  console.log("GARBAGE COLLECTED:", message);
+});
+
+// We register an object. When V8 destroys it, the callback will run!
+// (Note: You cannot force the GC to run, it happens randomly in the background).
+// registry.register(someObject, "someObject was deleted from RAM!");
+```
+
+## REAL_WORLD
+In **Single Page Applications (SPAs)** like React or Angular, memory management is absolutely critical. 
+In a traditional website, clicking a link loads a brand new HTML page. When the new page loads, the browser completely wipes the JavaScript Heap clean. Memory leaks don't matter because the memory is constantly flushed!
+
+In an SPA, the browser never actually changes pages. The JavaScript Heap stays alive for the entire 3-hour session while the user navigates around. If your React Component fetches 5MB of JSON data, and you forget to sever the references when the component unmounts (e.g., leaving a `setInterval` running, or leaving a Redux subscription active), that 5MB is permanently trapped. If the user clicks back and forth 20 times, your app will quietly consume 100MB of RAM, causing the browser fan to spin up, the UI to stutter, and the tab to eventually crash with an "Aw, Snap!" Out-of-Memory error.
+
+## INTERVIEW
+**Q: Does JavaScript pass by Value or pass by Reference?**
+A: JavaScript ALWAYS passes Primitives (Numbers, Strings, Booleans) by Value. It copies the actual data into a new slot on the Call Stack. However, JavaScript passes Objects and Arrays by **"Copy of a Reference"**. It does not copy the massive object in the Heap; it simply creates a new pointer on the Call Stack that points to the exact same memory address in the Heap. If you modify the object inside a function, the original object is permanently modified.
+
+**Q: What is a "Memory Leak" in a Garbage Collected language?**
+A: A memory leak occurs when an object is no longer needed by the application's business logic, but it is still technically "Reachable" via an accidental reference (like a forgotten closure, a global variable, or an uncleared interval). Because it is reachable, the Garbage Collector's Mark-and-Sweep algorithm is mathematically forbidden from deleting it, causing it to consume RAM forever.
+
+**Q: Why does the V8 Garbage Collector cause UI stuttering?**
+A: The Mark-and-Sweep algorithm is a "Stop-The-World" event. Because V8 must map the entire memory graph, it must forcefully PAUSE your JavaScript execution to ensure the graph doesn't change while it's looking at it. If your Heap is massive (1GB of data), the GC might take 50 milliseconds to sweep it. Since the browser requires 16ms to render a 60FPS frame, a 50ms pause results in 3 dropped frames, appearing as a visible "stutter" or "jank" on the user's screen.

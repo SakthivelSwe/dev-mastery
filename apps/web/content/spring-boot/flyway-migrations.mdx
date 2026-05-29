@@ -1,0 +1,106 @@
+---
+slug: "flyway-migrations"
+title: "Flyway Migrations"
+level: 4
+---
+
+## WHY
+In the "Entity Mapping" module, you learned that using `spring.jpa.hibernate.ddl-auto = update` dynamically changes your database schema to match your Java code. 
+This is fine for solo developers. But in an enterprise with 20 developers, it is a catastrophe.
+If Alice renames a Java field from `firstName` to `first_name`, Hibernate might blindly create a brand new empty column `first_name` and permanently delete the old `firstName` column, erasing 10,000 users' real names!
+Furthermore, you cannot guarantee the Staging database and the Production database have the exact same schema.
+**Database Migrations (Flyway / Liquibase)** solve this. They bring Version Control (Git) to your Database Schema. Every single structural change to the database is strictly written as a raw SQL file. Flyway guarantees these SQL files are executed in exact chronological order across every database environment on Earth, ensuring 100% perfect, immutable synchronization.
+
+## THEORY
+### How Flyway Works
+1. You write a raw SQL script (e.g., `V1__Create_users_table.sql`).
+2. When Spring Boot starts, Flyway intercepts the boot process.
+3. Flyway looks at the physical database and checks a secret tracking table called `flyway_schema_history`.
+4. Flyway sees that `V1` has never been executed on this database!
+5. Flyway executes the `V1` SQL script, and permanently records "V1 was successfully run" in the tracking table.
+6. The next time you boot the app, Flyway sees `V1` is already in the history table, so it skips it!
+
+### Immutability
+Once a migration script is merged into GitHub and executed in production, **you can never edit that file again!** If Flyway detects that a previously executed file was modified, it will violently crash the application on startup! To make a change, you must write a brand new `V2` script.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "TerminalVisualizer", "state": "flyway-migration-logs" }
+```
+
+## CODE
+
+Implementing Flyway in Spring Boot is completely automated.
+
+### 1. Adding the Dependency
+Add the Flyway library to your `pom.xml`.
+
+```xml
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-core</artifactId>
+</dependency>
+```
+
+### 2. Disabling Hibernate Auto-DDL
+You must explicitly stop Hibernate from messing with your physical database schema!
+
+```properties
+# application.properties
+
+# DO NOT touch the schema! Let Flyway handle it!
+spring.jpa.hibernate.ddl-auto=validate 
+
+# Enable Flyway
+spring.flyway.enabled=true
+```
+
+### 3. Writing the Migration Scripts
+Create a specific folder in your Spring project: `src/main/resources/db/migration`.
+Inside this folder, you place your strict SQL files. The naming convention is critical: `V` + `VersionNumber` + `__` (Two Underscores) + `Description.sql`.
+
+**File 1: `V1__Create_users_table.sql`**
+```sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 4. Evolving the Schema (V2)
+Three weeks later, the business requires a new feature. Users need a "status" column.
+You do NOT edit `V1`! You create a brand new file!
+
+**File 2: `V2__Add_status_to_users.sql`**
+```sql
+-- Alter the existing table safely!
+ALTER TABLE users ADD COLUMN status VARCHAR(20) DEFAULT 'ACTIVE';
+
+-- Backfill data (Optional)
+UPDATE users SET status = 'ACTIVE' WHERE status IS NULL;
+```
+
+When you deploy this code to Production, Spring Boot boots up. Flyway checks the history table, sees `V1` is already done, notices `V2` is missing, executes `V2`, updates the history table, and *then* hands control over to Spring to start the web server!
+
+## REAL_WORLD
+**Continuous Deployment and Destructive Changes**
+Imagine you want to rename a column from `full_name` to `first_name`.
+You write a `V3__Rename_column.sql` script: `ALTER TABLE users RENAME COLUMN full_name TO first_name;`
+You deploy the backend to AWS. The CI/CD pipeline runs Flyway, the database column is instantly renamed, and the new Spring Boot V2 container boots up.
+*BUT WAIT!* For 30 seconds during a Zero-Downtime Blue/Green deployment, the OLD Spring Boot V1 containers are still actively handling live user traffic! 
+The V1 code is desperately trying to execute `INSERT INTO users (full_name)`, but the Flyway script just destroyed the `full_name` column! Every live user request instantly crashes with a 500 Server Error!
+*The Fix (Expand and Contract Pattern):* You can never perform destructive migrations (Rename or Delete) in a single deployment!
+1. **Deployment 1 (Expand):** Add the *new* column `first_name`. Both old and new code save data to both columns.
+2. **Backfill:** Write a script to copy old data to the new column.
+3. **Deployment 2 (Contract):** Two weeks later, safely execute `ALTER TABLE DROP COLUMN full_name` once you guarantee no active code is pointing to it!
+
+## INTERVIEW
+**Q: You write a Flyway migration script `V4__Insert_Master_Data.sql` which contains 50 `INSERT` statements to populate a new lookup table. During deployment, the script executes successfully up to statement 49. Statement 50 has a typo and fails. The deployment crashes. You fix the typo in V4, commit the code, and redeploy. What happens when Flyway tries to run V4 again?**
+A: **It will fail violently with a "Duplicate Key" or integrity error (unless you are using a database with DDL Transactions).**
+If a Flyway script fails halfway through, the database is left in a dirty, halfway-corrupted state. The first 49 rows were successfully inserted! 
+When you fix the typo and redeploy, Flyway attempts to run the `V4` script from the very beginning. Statement 1 will attempt to INSERT a row that already physically exists in the database, causing the SQL engine to throw a fatal Duplicate Primary Key error, completely blocking the deployment!
+*The Fix:* 
+1. **PostgreSQL Privilege:** If you use PostgreSQL, it magically supports "DDL Transactions". Flyway wraps the entire V4 script in a transaction. If statement 50 fails, Postgres automatically rolls back the entire script, making it look like the first 49 statements never happened, allowing you to cleanly try again!
+2. **MySQL / Oracle:** These databases do NOT support DDL Transactions. The database is permanently corrupted. You must manually connect to the production database, manually delete the 49 rows, manually delete the failed entry from the `flyway_schema_history` table, and only then redeploy!

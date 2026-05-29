@@ -1,0 +1,152 @@
+---
+slug: "concurrency-utilities"
+title: "Concurrency Utilities"
+level: 4
+---
+
+## WHY
+Using the `synchronized` keyword and `.wait()` / `.notify()` is the primitive, low-level way to manage threads. It is incredibly error-prone. If you forget to release a lock, or if an exception occurs inside a synchronized block, you can instantly deadlock the entire server.
+
+Java 5 revolutionized threading by introducing the `java.util.concurrent` package (designed by Doug Lea). Instead of forcing developers to write complex locking mechanisms from scratch, it provides high-level, rock-solid **Concurrency Utilities**. These tools allow threads to coordinate, wait for each other, and share resources safely without ever needing to write a single `synchronized` block manually.
+
+## THEORY
+### 1. CountDownLatch
+A countdown timer. It initializes with a count (e.g., 3). One thread calls `.await()` and freezes. Other threads do their work and call `.countDown()`. When the count hits exactly zero, the frozen thread instantly wakes up and proceeds. (It cannot be reset).
+
+### 2. CyclicBarrier
+A synchronization point where a group of threads must all wait for each other. Imagine 4 friends agreeing to meet at a restaurant. Friend 1 arrives and waits. Friend 2 arrives and waits. Only when the 4th friend arrives can they all enter the restaurant together. (It *can* be reset and reused).
+
+### 3. Semaphore
+A bouncer at a nightclub. The club (the resource) only allows 5 people inside simultaneously. If a thread wants to enter, it must `.acquire()` a permit. If 5 threads are already inside, the 6th thread must wait outside until someone leaves and calls `.release()`. Perfect for rate-limiting.
+
+### 4. ReentrantLock
+An advanced alternative to the `synchronized` keyword. It provides much more control, allowing you to try acquiring a lock for 5 seconds and giving up if it fails (preventing deadlocks!), or checking if a lock is currently held by another thread.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ConcurrencyVisualizer", "state": "countdown-latch" }
+```
+
+## CODE
+
+### Level 1 — Beginner (CountDownLatch)
+```java
+import java.util.concurrent.CountDownLatch;
+
+public class LatchDemo {
+    public static void main(String[] args) throws InterruptedException {
+        // We need 3 services to start before the Main App can boot
+        CountDownLatch latch = new CountDownLatch(3);
+        
+        Runnable serviceTask = () -> {
+            System.out.println("Service started.");
+            latch.countDown(); // Decrement the count
+        };
+        
+        new Thread(serviceTask).start();
+        new Thread(serviceTask).start();
+        new Thread(serviceTask).start();
+        
+        System.out.println("Main App waiting for services...");
+        latch.await(); // Freezes the main thread until count == 0
+        System.out.println("All services up! Booting Main App!");
+    }
+}
+```
+
+### Level 2 — Building Blocks (Semaphore)
+```java
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class SemaphoreDemo {
+    // Only 2 threads can access the database at the same time
+    private static final Semaphore dbConnections = new Semaphore(2);
+
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newFixedThreadPool(5);
+        
+        for (int i = 0; i < 5; i++) {
+            pool.submit(() -> {
+                try {
+                    dbConnections.acquire(); // Request a permit
+                    System.out.println("Executing heavy DB query...");
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                } finally {
+                    dbConnections.release(); // ALWAYS release in a finally block!
+                    System.out.println("DB Connection released.");
+                }
+            });
+        }
+        pool.shutdown();
+    }
+}
+```
+
+### Level 3 — Intermediate (ReentrantLock)
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class LockDemo {
+    private static final ReentrantLock lock = new ReentrantLock();
+    private static int counter = 0;
+    
+    public static void safeIncrement() {
+        lock.lock(); // Explicitly acquire the lock
+        try {
+            counter++;
+        } finally {
+            // If an exception occurs during counter++, the finally block
+            // guarantees the lock is released, preventing a server deadlock.
+            lock.unlock(); 
+        }
+    }
+}
+```
+
+### Level 4 — Advanced (Try-Locking)
+```java
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.TimeUnit;
+
+public class TryLockDemo {
+    private static final ReentrantLock lock = new ReentrantLock();
+    
+    public static void attemptProcess() {
+        try {
+            // Instead of waiting forever, try to get the lock for exactly 2 seconds.
+            // If we get it, returns true. If it's still held by someone else after 2s, returns false.
+            if (lock.tryLock(2, TimeUnit.SECONDS)) {
+                try {
+                    System.out.println("Lock acquired! Processing data.");
+                } finally {
+                    lock.unlock();
+                }
+            } else {
+                System.out.println("System is too busy. Returning HTTP 503 Service Unavailable.");
+            }
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+## REAL_WORLD
+When building microservices with Spring Cloud Gateway, you often need to protect your backend APIs from being crushed by a sudden flood of 10,000 requests. 
+
+The industry standard library for this is **Resilience4j**. One of its core features is the `@Bulkhead` annotation, which isolates failures. Under the hood, a Bulkhead is literally just a `Semaphore`!
+If your Payment API can only handle 50 concurrent transactions, Resilience4j wraps the endpoint in a Semaphore initialized with 50 permits. When the 51st request hits the server, the Semaphore `.tryAcquire()` returns false instantly. Instead of queuing the request and eventually crashing the server with an OutOfMemoryError, Resilience4j immediately rejects it and returns an `HTTP 429 Too Many Requests`. This concept (Load Shedding) relies entirely on `java.util.concurrent.Semaphore`.
+
+## INTERVIEW
+**Q: What is the difference between a `CountDownLatch` and a `CyclicBarrier`?**
+A: A `CountDownLatch` counts down to zero, wakes up waiting threads, and is then permanently destroyed (it cannot be reset or reused). A `CyclicBarrier` waits for a specific number of threads to arrive at a barrier; once they all arrive, they are released, and the barrier automatically resets itself, allowing the exact same group of threads to sync up again in a loop.
+
+**Q: Why is it called a `ReentrantLock`?**
+A: "Reentrant" means that if Thread A currently holds the lock, Thread A is allowed to acquire the lock *again* without deadlocking itself (for example, if a locked method calls a second method that also requires the same lock). It maintains a hold count internally; it will only fully release the lock when Thread A calls `.unlock()` the same number of times it called `.lock()`.
+
+**Q: What happens if you forget to call `.unlock()` on a ReentrantLock?**
+A: Catastrophe. The lock will remain held forever. Any other thread in the application that attempts to call `.lock()` will freeze infinitely. This is why you must ALWAYS place `.unlock()` inside a `finally` block to guarantee its execution even if an exception is thrown in the `try` block.

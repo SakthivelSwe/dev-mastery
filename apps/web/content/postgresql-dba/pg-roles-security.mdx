@@ -1,0 +1,112 @@
+---
+slug: "pg-security-and-roles"
+title: "PostgreSQL Security, Roles & RLS"
+level: 3
+---
+
+## WHY
+If your web application connects to PostgreSQL using the default `postgres` superuser, you are one SQL Injection attack away from losing your entire company. An attacker can run `DROP DATABASE`, read the `/etc/passwd` file from the underlying Linux server, or deploy ransomware directly into your tables.
+
+A DBA must enforce **Least Privilege**. The web application should only be able to read and write the exact tables it needs. It should never be able to alter schemas, drop tables, or access administrative statistics. PostgreSQL's Role-Based Access Control (RBAC) and Row-Level Security (RLS) make this possible.
+
+## THEORY
+### Roles vs. Users
+In older databases, there was a distinction between "Users" (people who log in) and "Groups" (collections of permissions).
+In modern PostgreSQL, they are exactly the same thing: **Roles**.
+A Role can act as a User (if it has `LOGIN` permission and a password) or a Group (if it has no login permission). You assign permissions to the Group Role, and then grant the Group Role to the User Roles!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "DBVisualizer", "state": "pg-security" }
+```
+
+## CODE
+
+### Level 1 — The Principle of Least Privilege
+Never grant permissions directly to a user (e.g., `alice`). If Alice leaves the company, and `bob` joins, you have to manually copy hundreds of permissions.
+Create functional roles instead!
+
+```sql
+-- 1. Create a generic Group Role with NO login ability
+CREATE ROLE web_app_readonly;
+
+-- 2. Grant specific permissions to the Group
+GRANT CONNECT ON DATABASE production TO web_app_readonly;
+GRANT USAGE ON SCHEMA public TO web_app_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_app_readonly;
+
+-- 3. Create the actual User Role (with a password)
+CREATE ROLE analytics_bot WITH LOGIN PASSWORD 'SuperSecret123';
+
+-- 4. Assign the Group to the User!
+GRANT web_app_readonly TO analytics_bot;
+```
+Now, `analytics_bot` can `SELECT` from the database, but if it attempts an `INSERT` or `DROP TABLE`, Postgres immediately blocks it.
+
+### Level 2 — Default Privileges (The Hidden Trap)
+*The Trap:* You run `GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_app_readonly`. Tomorrow, a developer creates a brand new table: `CREATE TABLE new_logs ...`. 
+Will `web_app_readonly` be able to read `new_logs`?
+**NO.** `GRANT ALL TABLES` only applies to tables that *currently exist*.
+
+To fix this, you must alter the **Default Privileges**. This tells Postgres to automatically apply permissions to any tables created in the future!
+
+```sql
+-- This ensures that ANY table created by the 'db_admin' role in the future
+-- will automatically grant SELECT to the 'web_app_readonly' role!
+ALTER DEFAULT PRIVILEGES FOR ROLE db_admin IN SCHEMA public 
+GRANT SELECT ON TABLES TO web_app_readonly;
+```
+
+### Level 3 — pg_hba.conf (Host-Based Authentication)
+Roles control what you can do *after* you get into the database. `pg_hba.conf` controls *if* you can get in at all.
+It acts as an internal firewall for PostgreSQL. It evaluates rules from top to bottom and stops at the first match.
+
+```text
+# pg_hba.conf
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# Rule 1: Allow the local 'postgres' user to connect without a password (peer auth)
+local   all             postgres                                peer
+
+# Rule 2: Allow the 'analytics' user to connect, BUT ONLY from a specific IP!
+host    production      analytics       10.0.5.123/32           md5
+
+# Rule 3: Allow 'web_app' to connect from the Kubernetes subnet
+host    production      web_app         10.42.0.0/16            scram-sha-256
+
+# Rule 4: Reject everything else! (Implicit default, but good to be explicit)
+host    all             all             0.0.0.0/0               reject
+```
+*(Always use `scram-sha-256` for new deployments! The older `md5` method is cryptographically broken and vulnerable to dictionary attacks).*
+
+### Level 4 — Row-Level Security (RLS)
+Traditionally, security stopped at the Table level. If you can `SELECT FROM users`, you can read *every* user.
+If you are building a Multi-Tenant SaaS application (e.g., Salesforce), you have 1,000 different companies sharing the same `customers` table. A bug in your Node.js code could accidentally expose Company A's customers to Company B.
+
+**Row-Level Security (RLS)** pushes the security directly into the Database Engine. You write SQL rules that physically prevent a row from being read or updated based on the current database user!
+
+```sql
+-- 1. Enable RLS on the table
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+
+-- 2. Create the Policy (The Rule)
+-- This mathematically forces Postgres to append `WHERE tenant_id = current_user` 
+-- to EVERY query executed against this table, invisibly!
+CREATE POLICY tenant_isolation_policy ON customers
+    FOR ALL
+    USING (tenant_id = current_user);
+```
+Now, if a Node.js app authenticates to Postgres as the role `company_a`, and executes `SELECT * FROM customers;`, Postgres intercepts the query and only returns rows where `tenant_id = 'company_a'`. It is mathematically impossible for Company A to steal Company B's data, regardless of how bad the backend application code is!
+
+## REAL_WORLD
+**PostgREST & Supabase**
+In traditional web architectures, the web application connects to Postgres as a single powerful user (e.g., `web_admin`), and the application code (Node/Java) handles the security checks to see if User A can read Row B.
+Modern architectures (like **Supabase** or **PostgREST**) flip this entirely. 
+The web browser (React) sends a JWT directly to the Database! Postgres decodes the JWT, assumes the role of the individual user (e.g., `user_123`), and relies *entirely* on Row-Level Security to filter the data. This eliminates the need for an entire backend API layer, as the database itself acts as the secure, API-accessible data store!
+
+## INTERVIEW
+**Q: You notice that a junior developer connected to the production database and ran `DROP TABLE users;`. Fortunately, they didn't have the permissions, and the query failed. You want to audit exactly who logs into the database and every single query they run. How do you do this?**
+A: **The pgAudit Extension.**
+PostgreSQL's default logging is not designed for strict compliance (like HIPAA or SOC2). It logs errors, but it does not cleanly log every single `SELECT` or `UPDATE` in a structured, parseable format.
+You must install the **pgAudit (PostgreSQL Audit Extension)**.
+pgAudit intercepts queries deep inside the Postgres execution engine. It logs the exact query, the user who ran it, the timestamp, and the class of the query (DDL, DML, READ, WRITE) into a structured format (usually JSON) that can be easily ingested by a SIEM tool (like Splunk or Datadog) for security monitoring and compliance auditing.

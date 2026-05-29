@@ -1,0 +1,109 @@
+---
+slug: "incremental-static-regen"
+title: "Incremental Static Regeneration (ISR)"
+level: 3
+---
+
+## WHY
+Static Site Generation (SSG) is fast but doesn't handle updates well — you have to rebuild the entire site to change a single typo. Server-Side Rendering (SSR) handles updates perfectly but is slow, as it re-renders the page on every single request.
+**Incremental Static Regeneration (ISR)** gives you the best of both worlds. It serves static HTML from the CDN for ultimate speed, but it *automatically rebuilds* the HTML in the background after a certain time interval or on-demand when data changes.
+
+## THEORY
+### Time-Based Revalidation
+You specify a `revalidate` time (e.g., 60 seconds). 
+1. User 1 visits the page. They get the cached HTML.
+2. 60 seconds pass.
+3. User 2 visits the page. They *still* get the old cached HTML immediately.
+4. But, because the cache is "stale" (> 60s), Next.js triggers a background rebuild of the page.
+5. Once the rebuild is finished, the cache is updated.
+6. User 3 gets the brand-new HTML.
+
+### On-Demand Revalidation
+Instead of waiting 60 seconds, you can trigger a rebuild the exact moment the data changes in your database via an API route or Server Action using `revalidatePath()` or `revalidateTag()`.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "incremental-static-regen" }
+```
+
+## CODE
+
+### Time-Based ISR (Route Segment Config)
+```tsx
+// app/blog/page.tsx
+import { db } from '@/lib/db';
+
+// Revalidate this page every 3600 seconds (1 hour)
+export const revalidate = 3600;
+
+export default async function BlogIndex() {
+  const posts = await db.post.findMany();
+  
+  return (
+    <ul>
+      {posts.map(post => <li key={post.id}>{post.title}</li>)}
+    </ul>
+  );
+}
+```
+
+### Time-Based ISR (Fetch Cache Config)
+If you are using `fetch()`, you can set the revalidation time directly on the request.
+
+```tsx
+// app/weather/page.tsx
+export default async function WeatherPage() {
+  // Cache the weather data for 5 minutes (300 seconds)
+  const res = await fetch('https://api.weather.com/v1/current', {
+    next: { revalidate: 300 }
+  });
+  const data = await res.json();
+
+  return <div>Current Temperature: {data.temp}°F</div>;
+}
+```
+
+### On-Demand Revalidation (The Modern Way)
+This is usually triggered inside a Server Action after you update the database.
+
+```tsx
+// app/actions.ts
+'use server'
+import { revalidatePath, revalidateTag } from 'next/cache'
+import { db } from '@/lib/db'
+
+export async function updatePost(id: string, newTitle: string) {
+  // 1. Update the database
+  await db.post.update({
+    where: { id },
+    data: { title: newTitle }
+  });
+
+  // 2. Tell Next.js to immediately purge the cache for the blog page!
+  // The next visitor will instantly see the new title.
+  revalidatePath('/blog');
+  
+  // Alternatively, if you used next: { tags: ['posts'] } in a fetch request:
+  // revalidateTag('posts');
+}
+```
+
+## REAL_WORLD
+**The E-Commerce Sweet Spot**
+Imagine an Amazon-like product page (`/product/[id]`).
+- You can't use SSR: Too slow. Millions of visitors would crash the database.
+- You can't use SSG: Prices change, and inventory drops to 0. A rebuild takes 2 hours.
+
+ISR is the perfect solution.
+```tsx
+// Cache the product for 60 seconds
+export const revalidate = 60;
+```
+Now, the database only receives *one query per minute per product*, regardless of whether 10 people or 10,000 people visit the page. The CDN handles all the traffic, serving static HTML. If the price changes, the maximum amount of time a user sees the wrong price is 60 seconds.
+
+## INTERVIEW
+**Q: A user visits an ISR page that has `revalidate = 60`. It has been 5 minutes since the last visit. Does the user experience a slow page load while the server rebuilds the HTML?**
+
+A: **No.** This is the genius of ISR (specifically the `stale-while-revalidate` cache control header).
+
+The user is served the *stale* HTML immediately from the CDN. Their page load is instantaneous. The background rebuild is triggered asynchronously. Only the *subsequent* visitors will see the updated content. This ensures that no single user ever pays the performance penalty of waiting for the server to generate the page.

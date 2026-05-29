@@ -1,0 +1,256 @@
+---
+title: spring-beans
+slug: spring-beans
+---
+
+# Spring Beans — @Component, @Service, @Repository, @Controller | Level: 2
+
+---
+
+## 1. Architectural Deep Dive & Internal Mechanics
+
+In Spring, the IoC (Inversion of Control) container manages the lifecycle of application objects, known as **Beans**. The core of this container is the `BeanFactory`, with `ApplicationContext` serving as its advanced, enterprise-grade extension. 
+
+```
+[ Classpath Scanning ] 
+       │
+       ▼
+[ ClassPathScanningCandidateComponentProvider ]
+       │
+       ▼ (Discovers @Component stereotypes)
+[ BeanDefinitionRegistry ]
+       │
+       ▼ (Registers BeanDefinition metadata)
+[ BeanFactoryPostProcessor ] (e.g., ConfigurationClassPostProcessor parses @Configuration)
+       │
+       ▼
+[ DefaultListableBeanFactory ] (Instantiates beans via Constructor/Reflection)
+       │
+       ▼
+[ BeanPostProcessor ] (Applies AOP proxies, e.g., @Repository Exception Translation)
+       │
+       ▼
+[ Fully Initialized Singleton Bean ]
+```
+
+### Stereotype Annotations and Classpath Scanning
+The annotations `@Component`, `@Service`, `@Repository`, and `@Controller` are **stereotypes**. Under the hood, `@Service`, `@Repository`, and `@Controller` are meta-annotated with `@Component`. 
+
+During bootstrap, the class `ClassPathScanningCandidateComponentProvider` scans the designated base packages. It uses an ASM-based metadata reader (`SimpleMetadataReaderFactory`) to parse class files directly without loading them into the JVM ClassLoader first. This phase produces `BeanDefinition` objects (typically `ScannedGenericBeanDefinition`), which describe the bean's metadata (scope, lazy-init settings, constructor arguments, and autowiring requirements).
+
+These `BeanDefinition` instances are registered within the `BeanDefinitionRegistry` (implemented by `DefaultListableBeanFactory`) using a unique bean name as the key.
+
+### Semantic Differences and AOP Hooks
+While all four stereotypes register beans in the application context, their semantic differences determine how Spring’s AOP (Aspect-Oriented Programming) infrastructure intercepts them:
+
+1. **`@Component`**: The generic stereotype for any Spring-managed component. It has no special post-processing behavior beyond standard lifecycle management.
+2. **`@Repository`**: Indicates that the class acts as a Data Access Object (DAO). Spring registers a `PersistenceExceptionTranslationPostProcessor` in the context. This post-processor automatically scans for beans annotated with `@Repository` and adds an AOP advisor (`PersistenceExceptionTranslationInterceptor`). If a JPA/Hibernate or JDBC exception occurs inside a `@Repository` bean, it is translated into Spring's data access exception hierarchy (e.g., translating `javax.persistence.EntityNotFoundException` to `org.springframework.dao.DataRetrievalFailureException`).
+3. **`@Service`**: Represents business logic. While it currently does not introduce unique post-processing behavior out-of-the-box, it serves as an ideal pointcut for custom transaction boundaries and security aspects.
+4. **`@Controller`**: Identifies web controllers. The `RequestMappingHandlerMapping` scans the application context specifically for beans annotated with `@Controller` or `@RestController` to register endpoints in the routing table.
+
+---
+
+## 2. Blueprint & Production-Ready Code
+
+The following complete, runnable Spring Boot 3.2 application illustrates the functional differences of these stereotypes, including the exception translation mechanism triggered by `@Repository`.
+
+```java
+package com.devmastery.beans;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.dao.annotation.PersistenceExceptionTranslationPostProcessor;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Repository;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceException;
+import jakarta.persistence.PersistenceContext;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.UUID;
+
+@SpringBootApplication
+public class BeanApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(BeanApplication.class, args);
+    }
+}
+
+@Configuration
+class PersistenceConfig {
+    @Bean
+    public PersistenceExceptionTranslationPostProcessor exceptionTranslationPostProcessor() {
+        return new PersistenceExceptionTranslationPostProcessor();
+    }
+}
+
+@Component
+class SystemHealthMonitor {
+    public String checkHealth() {
+        return "System operational: " + UUID.randomUUID();
+    }
+}
+
+@Repository
+class UserPersistenceRepository {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Transactional
+    public void executeInvalidQuery() {
+        // Force an invalid operation to trigger PersistenceException
+        entityManager.createNativeQuery("SELECT * FROM NON_EXISTENT_TABLE_XYZ").getResultList();
+    }
+}
+
+@Service
+class UserService {
+
+    private final UserPersistenceRepository repository;
+    private final SystemHealthMonitor healthMonitor;
+
+    public UserService(UserPersistenceRepository repository, SystemHealthMonitor healthMonitor) {
+        this.repository = repository;
+        this.healthMonitor = healthMonitor;
+    }
+
+    public String processUserData() {
+        try {
+            repository.executeInvalidQuery();
+        } catch (org.springframework.dao.DataAccessException ex) {
+            // Spring's AOP translates the JPA/Hibernate exception into a DataAccessException
+            return "Handled translated exception: " + ex.getClass().getName() + " | " + healthMonitor.checkHealth();
+        }
+        return "Success";
+    }
+}
+
+@RestController
+class UserController {
+
+    private final UserService userService;
+
+    public UserController(UserService userService) {
+        this.userService = userService;
+    }
+
+    @GetMapping("/api/test-exception")
+    public String runTest() {
+        return userService.processUserData();
+    }
+}
+```
+
+---
+
+## 3. Configuration & Properties
+
+```yaml
+spring:
+  application:
+    name: spring-beans-deepdive
+  datasource:
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: password
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+logging:
+  level:
+    org.springframework.web: INFO
+    org.springframework.orm.jpa: DEBUG
+    org.springframework.dao: DEBUG
+```
+
+### Property Explanations
+* `spring.datasource.url`: Uses an in-memory H2 database to allow the `@Repository` bean to execute queries and trigger database interactions.
+* `spring.jpa.hibernate.ddl-auto`: Automatically updates the schema.
+* `logging.level.org.springframework.dao`: Set to `DEBUG` to trace the translation process executed by the `PersistenceExceptionTranslationInterceptor`.
+
+---
+
+## 4. Advanced Patterns & Pitfalls (SonarQube Compliant)
+
+### Common Pitfall: Missing `@Repository` on DAO Implementations
+Developers often use `@Component` instead of `@Repository` for custom DAO implementations. While the bean is still scanned and injected, it **bypasses the exception translation mechanism**. If a raw database driver exception is thrown, it propagates up the stack untranslated, coupling upper layers directly to the persistence technology (e.g., Hibernate-specific exceptions).
+
+### SonarQube Compliance: S2139 (Logging and throwing exceptions)
+Do not log an exception and then immediately rethrow it. The example code catches the translated `DataAccessException`, processes it, and returns a clean state without polluting the logs with duplicate stack traces.
+
+### Performance Consideration: Heavy Bean Initialization
+Using `@PostConstruct` or constructor-based initialization for heavy operations (like establishing network connections or loading large datasets) blocks application startup. 
+
+*Correction*: Implement `SmartInitializingSingleton` or listen to `ApplicationReadyEvent` asynchronously.
+
+```java
+@Component
+class DeferredTaskRunner implements org.springframework.context.event.EventListenerFactory {
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(DeferredTaskRunner.class);
+
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        log.info("Application is ready. Executing heavy background initialization tasks.");
+        // Heavy logic here runs asynchronously or safely after startup completes
+    }
+}
+```
+
+---
+
+## 5. Verification & Testing
+
+To verify the exception translation pattern, we use an integration test configured with `@SpringBootTest`.
+
+```java
+package com.devmastery.beans;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataAccessException;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+@SpringBootTest(classes = BeanApplication.class)
+class BeanIntegrationTest {
+
+    @Autowired
+    private UserPersistenceRepository repository;
+
+    @Test
+    void testRepositoryExceptionTranslation() {
+        // Assert that the native JPA exception is translated to Spring's DataAccessException
+        Exception exception = assertThrows(DataAccessException.class, () -> {
+            repository.executeInvalidQuery();
+        });
+
+        assertTrue(exception.getMessage().contains("StatementCallback"));
+    }
+}
+```
+
+---
+
+## 6. Reference & Core Classes
+
+| Class/Interface | Source Package | Core Responsibility |
+| :--- | :--- | :--- |
+| `ClassPathScanningCandidateComponentProvider` | `org.springframework.context.annotation` | Scans classpath, reads metadata using ASM, identifies `@Component` candidates. |
+| `BeanDefinition` | `org.springframework.beans.factory.config` | Holds configuration metadata of a bean instance (scope, lazy-init status, class name). |
+| `DefaultListableBeanFactory` | `org.springframework.beans.factory.support` | The primary implementation of `BeanFactory`, registry for all bean definitions. |
+| `PersistenceExceptionTranslationPostProcessor` | `org.springframework.dao.annotation` | AOP processor that wraps `@Repository` classes to translate technology-specific exceptions. |
+
+---
+---

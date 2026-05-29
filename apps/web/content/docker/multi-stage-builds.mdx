@@ -1,0 +1,140 @@
+---
+slug: "multi-stage-builds"
+title: "Multi-Stage Builds"
+level: 3
+---
+
+## WHY
+A Java Spring Boot application needs Maven (huge build tool), the JDK (development kit), and all your source code to *compile*. But at *runtime*, you only need the compiled `.jar` file and the JRE (runtime).
+Without multi-stage builds, your production Docker image would contain Maven (350 MB), the full JDK (300 MB), all source code, all test files, and intermediate build artifacts. The final image could be 700-800 MB.
+**Multi-Stage Builds** let you use multiple `FROM` statements in a single Dockerfile. The first stages build the application; the final stage copies only the necessary artifacts into a minimal runtime image. Result: a production image that's 80-90% smaller.
+
+## THEORY
+### How It Works
+Each `FROM` statement starts a new build stage. You can name stages with `AS stagename`. In a later stage, you use `COPY --from=stagename` to selectively copy files from an earlier stage. Only the final stage becomes the actual Docker Image — all intermediate stages are discarded.
+
+### Why Image Size Matters
+- **Security:** Smaller images have a smaller attack surface (fewer packages = fewer potential vulnerabilities).
+- **Speed:** Smaller images pull faster from registries (faster deployments, faster scaling).
+- **Storage:** Hundreds of images in a registry multiply quickly. 500 MB vs 50 MB per image is massive.
+- **Startup time:** Smaller images start faster.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "multi-stage-build" }
+```
+
+## CODE
+
+### Spring Boot Multi-Stage Build
+```dockerfile
+# ============================================
+# STAGE 1: Build (large image, not in production)
+# ============================================
+FROM maven:3.9-eclipse-temurin-21 AS build
+# This image is ~650 MB — way too big for production!
+
+WORKDIR /app
+
+# Cache Maven dependencies (optimization: copy pom.xml first)
+COPY pom.xml .
+RUN mvn dependency:go-offline -q
+
+# Copy source code and build the .jar
+COPY src ./src
+RUN mvn package -DskipTests -q
+
+# ============================================
+# STAGE 2: Runtime (tiny image, this IS production)
+# ============================================
+FROM eclipse-temurin:21-jre-alpine AS runtime
+# JRE Alpine is only ~80 MB!
+
+WORKDIR /app
+
+# Copy ONLY the compiled jar from the 'build' stage
+# Everything else (Maven, source code, test files) stays in stage 1 and is DISCARDED!
+COPY --from=build /app/target/*.jar app.jar
+
+# Run as non-root for security!
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+```
+
+### Node.js Multi-Stage Build
+```dockerfile
+# STAGE 1: Install ALL dependencies (including devDependencies for build)
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json .
+RUN npm ci  # Installs ALL deps including TypeScript, webpack, etc.
+
+# STAGE 2: Build the application (TypeScript compilation, webpack bundle)
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build  # Compiles TypeScript → JavaScript, creates /dist
+
+# STAGE 3: Production runtime
+FROM node:20-alpine AS runtime
+WORKDIR /app
+# Only copy the compiled output and production dependencies!
+COPY --from=builder /app/dist ./dist
+COPY package*.json .
+RUN npm ci --only=production  # Only production deps, no TypeScript compiler!
+
+USER node  # Don't run as root
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+```
+
+### Image Size Comparison
+```bash
+# Build both versions
+docker build -t spring-naive -f Dockerfile.naive .    # Simple single-stage
+docker build -t spring-optimized -f Dockerfile.multi .  # Multi-stage
+
+# Compare sizes
+docker images | grep spring
+# spring-naive       latest   850MB   ← Almost 1GB!
+# spring-optimized   latest    82MB   ← Just 82MB!
+```
+
+## REAL_WORLD
+**React Frontend Multi-Stage (Nginx)**
+```dockerfile
+# Stage 1: Build React app (needs Node.js + all dev dependencies)
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json .
+RUN npm ci
+COPY . .
+RUN npm run build  # Creates /app/dist with static HTML/CSS/JS
+
+# Stage 2: Serve with Nginx (just a static file server — no Node.js at all!)
+FROM nginx:alpine
+# Copy the built static files into Nginx's web root
+COPY --from=build /app/dist /usr/share/nginx/html
+# Copy custom Nginx config (for SPA routing)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+The final image is just Nginx (23 MB) + your static files! Node.js, React, webpack — all gone.
+
+## INTERVIEW
+**Q: You build a multi-stage Docker image for your Spring Boot app. The final image is 82 MB instead of 850 MB. A security scan of the 82 MB image still reports vulnerabilities. Where are these vulnerabilities, and how would you minimize them further?**
+
+A: Even the minimal JRE Alpine image includes the Linux Alpine OS packages, the JVM itself, and any libraries it depends on. Vulnerabilities come from:
+1. **Base OS packages:** Alpine includes busybox, musl libc, etc. — these occasionally have CVEs.
+2. **JVM libraries:** Certain JVM bundled libraries can have known vulnerabilities.
+
+To minimize further:
+1. **Use distroless images:** Google's distroless images contain ONLY the JVM runtime with no shell, no package manager, no OS utilities — massively reducing the attack surface: `FROM gcr.io/distroless/java21-debian12`
+2. **Keep base images updated:** Regularly rebuild your images with `docker build --no-cache` to pull the latest patched base image.
+3. **Use Jlink:** For Java 11+ applications, use `jlink` to create a custom minimal JRE containing only the exact JDK modules your app uses, further reducing the image.
+4. **Scan regularly:** Integrate `trivy` or `snyk` into your CI pipeline to fail builds when critical CVEs are found.

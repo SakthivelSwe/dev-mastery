@@ -1,0 +1,103 @@
+---
+slug: "api-security"
+title: "API Security"
+level: 4
+---
+
+## WHY
+You successfully build an API and deploy it to AWS. 
+The next morning, you wake up to find your entire database has been deleted, replaced with a single record demanding a Bitcoin ransom. Your AWS bill is $50,000 because someone hijacked your server to mine cryptocurrency. Your company's user data is currently being sold on the dark web.
+**API Security** is not a feature; it is the absolute baseline requirement of software engineering. Hackers run automated bots that scan every public IP address on the internet 24/7, actively looking for open ports, missing authentication, and unprotected database queries. If you don't secure your API, it will be compromised within hours of deployment.
+
+## THEORY
+### The Big Three Vulnerabilities (OWASP Top 10)
+1. **Broken Access Control:** A user logs in perfectly (Authentication works). They then change the URL from `/api/users/12/receipts` to `/api/users/99/receipts`. The server blindly returns User 99's receipts because it forgot to check if User 12 is *authorized* to view User 99's data!
+2. **Injection (SQL & NoSQL):** The server blindly trusts user input and concatenates it directly into database queries or shell commands. 
+3. **Cross-Site Scripting (XSS):** A hacker leaves a comment on a blog: `<script>stealCookies()</script>`. The server saves it. When innocent users view the blog, their browser executes the hacker's JavaScript, stealing their session tokens!
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "SecurityVisualizer", "state": "xss-attack" }
+```
+
+## CODE
+
+### 1. Fixing Broken Access Control (Authorization)
+Authentication proves *who* they are. Authorization proves *what they are allowed to touch*. Every single endpoint MUST verify ownership!
+
+```javascript
+// Express.js Route
+app.get('/api/users/:targetId/documents', authenticateJWT, async (req, res) => {
+    // req.user comes from our JWT Bouncer middleware!
+    const loggedInUserId = req.user.id; 
+    const targetUserId = req.params.targetId;
+
+    // AUTHORIZATION CHECK: Are they trying to look at someone else's data?
+    // And do they lack the 'Admin' role?
+    if (loggedInUserId !== targetUserId && req.user.role !== 'Admin') {
+        // 403 Forbidden: I know who you are, but you are not allowed to do this!
+        return res.status(403).json({ error: "Access Denied." });
+    }
+
+    // Safe to fetch the documents!
+    const docs = await db.documents.find({ owner: targetUserId });
+    res.json(docs);
+});
+```
+
+### 2. Fixing XSS (Input Sanitization)
+Never trust user input. If a user types HTML/JS into an input box, you must **Sanitize** (escape) it before saving it or rendering it!
+
+```javascript
+// Install a sanitization library: npm install dompurify jsdom
+const DOMPurify = require('dompurify');
+const { JSDOM } = require('jsdom');
+const window = new JSDOM('').window;
+const purify = DOMPurify(window);
+
+app.post('/api/comments', (req, res) => {
+    const rawComment = req.body.text; // "<script>alert('Hacked!')</script> Hello!"
+
+    // 1. SANITIZE! This strips out all malicious <script> tags!
+    const safeComment = purify.sanitize(rawComment); // " Hello!"
+
+    // 2. Safe to save to the database!
+    db.comments.save({ text: safeComment });
+    res.status(201).send();
+});
+```
+*Note: Modern Frontend Frameworks (like React) automatically sanitize all data injected via `{}` brackets, making them incredibly resistant to XSS!*
+
+### 3. Rate Limiting (Preventing DDoS & Brute Force)
+If a hacker wants to guess a password, they will write a Python script to hit your `/api/login` endpoint 10,000 times a second. You must throttle them!
+
+```javascript
+// npm install express-rate-limit
+const rateLimit = require('express-rate-limit');
+
+// Create a Limiter rule
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 5, // Limit each IP to 5 requests per windowMs
+    message: "Too many login attempts from this IP, please try again after 15 minutes."
+});
+
+// Apply the rule ONLY to the login route!
+app.post('/api/login', loginLimiter, async (req, res) => {
+    // Handle login logic...
+});
+```
+
+## REAL_WORLD
+**HTTPS (TLS/SSL Encryption)**
+You build a perfect API with JWTs, Rate Limiting, and Input Sanitization.
+But you deploy it using standard `HTTP` (Port 80).
+When Alice logs in from a coffee shop WiFi, her password and her JWT travel through the air as plain, readable text. A hacker sitting in the corner running a "Packet Sniffer" (like Wireshark) intercepts the WiFi radio waves and reads her password in plain English.
+**HTTPS (Hypertext Transfer Protocol Secure)** solves this. It encrypts the HTTP data using advanced TLS cryptography *before* it leaves the laptop. The data traveling through the air looks like absolute gibberish. Only the backend server has the mathematical Private Key required to decrypt the gibberish back into a usable password. You must NEVER deploy an API to production without an SSL Certificate enabling HTTPS!
+
+## INTERVIEW
+**Q: An interviewer asks: "We want to store user passwords in our database. Should we encrypt them using a two-way encryption algorithm like AES-256, so we can decrypt them if the user forgets their password?"**
+A: **No! Never store passwords using two-way encryption!**
+If you use two-way encryption, the server must store the decryption key. If a hacker breaches the database, they will also steal the decryption key, allowing them to decrypt every single password instantly!
+Passwords MUST be stored using **One-Way Hashing** (specifically slow hashing algorithms like `Bcrypt` or `Argon2`).
+A hash is a mathematical meat-grinder. It turns `"password123"` into a chaotic string of characters, but it is mathematically impossible to reverse the process! The server *never* knows the user's actual password. When the user logs in, the server hashes their input, and simply checks if the resulting hashes match! If they forget their password, they cannot recover it; you must send them a secure email link to generate a brand new one.

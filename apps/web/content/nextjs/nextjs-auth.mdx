@@ -1,0 +1,182 @@
+---
+slug: "nextjs-auth"
+title: "Authentication in Next.js"
+level: 4
+---
+
+## WHY
+Authentication is one of the most security-critical parts of any web application. Implemented incorrectly, it can expose user data, allow account takeovers, and create XSS vulnerabilities.
+Next.js's App Router + React Server Components create a unique authentication model — you can verify sessions on the server before even rendering a page, preventing unauthorized flickers of protected content.
+
+## THEORY
+### Authentication Options
+- **NextAuth.js (Auth.js):** The most popular open-source auth library for Next.js. Supports 50+ OAuth providers (Google, GitHub, etc.), email/password, and more.
+- **Clerk:** Managed auth service. Easiest setup, but paid for scale.
+- **Lucia Auth:** Lightweight, database-agnostic auth library for fine-grained control.
+- **Custom JWT:** Roll your own — maximum control, maximum risk.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "nextjs-auth-flow" }
+```
+
+## CODE
+
+### NextAuth.js Setup (Auth.js v5)
+```typescript
+// auth.ts (root level)
+import NextAuth from 'next-auth';
+import Google from 'next-auth/providers/google';
+import Credentials from 'next-auth/providers/credentials';
+import { prisma } from '@/lib/db';
+import bcrypt from 'bcrypt';
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+    Credentials({
+      credentials: {
+        email: { label: 'Email', type: 'email' },
+        password: { label: 'Password', type: 'password' },
+      },
+      async authorize(credentials) {
+        const user = await prisma.user.findUnique({
+          where: { email: credentials.email as string }
+        });
+        
+        if (!user || !user.password) return null;
+        
+        const valid = await bcrypt.compare(
+          credentials.password as string,
+          user.password
+        );
+        
+        return valid ? user : null;
+      }
+    })
+  ],
+  
+  callbacks: {
+    // Add custom data to the session
+    session({ session, token }) {
+      session.user.id = token.sub!;
+      session.user.role = token.role as string;
+      return session;
+    },
+    jwt({ token, user }) {
+      if (user) token.role = (user as any).role;
+      return token;
+    }
+  }
+});
+```
+
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import { handlers } from '@/auth';
+export const { GET, POST } = handlers;
+```
+
+### Protecting Pages in Server Components
+```tsx
+// app/dashboard/page.tsx
+import { auth } from '@/auth';
+import { redirect } from 'next/navigation';
+
+export default async function DashboardPage() {
+  const session = await auth();
+  
+  // No session → redirect to login!
+  if (!session) {
+    redirect('/login');
+  }
+  
+  // Session exists → render the protected page
+  return (
+    <div>
+      <h1>Welcome, {session.user.name}!</h1>
+      <p>Your email: {session.user.email}</p>
+    </div>
+  );
+}
+```
+
+### Protecting with Middleware (Best — Runs Before Rendering)
+```typescript
+// middleware.ts
+import { auth } from '@/auth';
+
+export default auth((req) => {
+  const isLoggedIn = !!req.auth;
+  const isProtected = req.nextUrl.pathname.startsWith('/dashboard');
+  
+  if (isProtected && !isLoggedIn) {
+    return Response.redirect(new URL('/login', req.nextUrl));
+  }
+});
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+};
+```
+
+### Sign In / Sign Out
+```tsx
+// app/components/AuthButtons.tsx
+'use client';
+import { signIn, signOut } from 'next-auth/react';
+
+export function SignInButton() {
+  return (
+    <button onClick={() => signIn('google', { callbackUrl: '/dashboard' })}>
+      Sign in with Google
+    </button>
+  );
+}
+
+export function SignOutButton() {
+  return (
+    <button onClick={() => signOut({ callbackUrl: '/' })}>
+      Sign Out
+    </button>
+  );
+}
+```
+
+## REAL_WORLD
+**Role-Based Authorization**
+```tsx
+// Check roles in Server Components
+export default async function AdminPage() {
+  const session = await auth();
+  
+  if (!session) redirect('/login');
+  if (session.user.role !== 'ADMIN') redirect('/unauthorized');
+  
+  return <AdminDashboard />;
+}
+```
+
+## INTERVIEW
+**Q: How does NextAuth.js store session information? What are the tradeoffs between JWT sessions and database sessions?**
+
+A: NextAuth.js supports two session strategies:
+
+**JWT Strategy (default):**
+- Session data is encoded in a signed, httpOnly cookie
+- The cookie is sent with every request; the server decodes it without any database lookup
+- **Pros:** Fast (no DB query), works without a database, scales horizontally easily
+- **Cons:** Can't immediately revoke a session (token is valid until it expires), storing sensitive data in JWT is risky if the signing secret is compromised
+
+**Database Strategy:**
+- A session record is stored in the database with a random token
+- The cookie contains only the session token; every request looks up the session in the DB
+- **Pros:** Immediate revocation (delete the DB row), session data not exposed in cookies
+- **Cons:** Database query on every request (mitigated with Redis caching), adds latency
+
+**When to use each:**
+- JWT: Simple apps, read-heavy, horizontal scaling, when DB latency is a concern
+- Database: Apps requiring immediate logout (banking, healthcare), fine-grained session control, when you need to see active sessions in an admin dashboard

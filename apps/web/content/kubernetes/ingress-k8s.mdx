@@ -1,0 +1,178 @@
+---
+slug: "ingress-k8s"
+title: "Kubernetes Ingress"
+level: 4
+---
+
+## WHY
+LoadBalancer Services provision one cloud load balancer per Service. If you have 20 microservices all exposed to the internet, you'd need 20 load balancers at $20-30/month each = $400-600/month just for load balancers!
+**Kubernetes Ingress** is an API object that manages external HTTP/HTTPS routing to internal services using a single cloud load balancer. It provides:
+- Host-based routing (`api.myapp.com` → API service, `app.myapp.com` → frontend service)
+- Path-based routing (`/api/*` → API service, `/` → frontend service)
+- TLS termination (HTTPS with automatic certificate management)
+- All from a single load balancer!
+
+## THEORY
+### Ingress vs Ingress Controller
+- **Ingress:** A Kubernetes resource that defines routing rules (YAML)
+- **Ingress Controller:** The actual software that implements the rules (must be installed separately!)
+
+Popular Ingress Controllers:
+- **Nginx Ingress Controller** (most popular, free)
+- **Traefik** (auto-discovers services, built-in Let's Encrypt)
+- **AWS ALB Ingress Controller** (creates an AWS Application Load Balancer)
+- **Google Cloud Load Balancing** (for GKE)
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-ingress" }
+```
+
+## CODE
+
+### Install Nginx Ingress Controller
+```bash
+# Install using Helm
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace
+
+# Wait for the LoadBalancer external IP
+kubectl get service -n ingress-nginx ingress-nginx-controller
+# NAME                       TYPE           EXTERNAL-IP
+# ingress-nginx-controller   LoadBalancer   52.14.83.21  ← ONE load balancer for everything!
+```
+
+### Ingress Resource
+```yaml
+# ingress.yml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /  # Strip path prefix
+    cert-manager.io/cluster-issuer: letsencrypt-prod  # Auto TLS certificate!
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.myapp.com
+        - app.myapp.com
+      secretName: myapp-tls-cert  # cert-manager creates this Secret automatically!
+  rules:
+    # Host-based routing
+    - host: api.myapp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+
+    - host: app.myapp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+
+    # Path-based routing on same host
+    - host: myapp.com
+      http:
+        paths:
+          - path: /api       # https://myapp.com/api/* → API service
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+          - path: /          # https://myapp.com/* → Frontend
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+```
+
+### TLS with cert-manager (Automatic Let's Encrypt Certificates!)
+```bash
+# Install cert-manager
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set installCRDs=true
+
+# Create a ClusterIssuer for Let's Encrypt
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@mycompany.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+EOF
+```
+
+Now any Ingress with the `cert-manager.io/cluster-issuer` annotation automatically gets a free, auto-renewing TLS certificate from Let's Encrypt!
+
+## REAL_WORLD
+**Rate Limiting and Authentication in Ingress**
+Nginx Ingress supports many security features via annotations:
+```yaml
+metadata:
+  annotations:
+    # Rate limiting: max 100 requests per minute per IP
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    
+    # Basic Authentication
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth-secret
+    
+    # CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://myapp.com"
+```
+
+## INTERVIEW
+**Q: You have 50 microservices, each requiring HTTPS. How do you manage TLS certificates at scale in Kubernetes without manually renewing 50 certificates?**
+A: **cert-manager + Ingress with wildcard certificates.**
+
+The solution:
+1. Install cert-manager (already shown above)
+2. Create a wildcard certificate for `*.myapp.com` using DNS-01 challenge (Let's Encrypt can validate domain ownership by checking DNS records, so you can get wildcard certs):
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-tls
+spec:
+  secretName: wildcard-tls-secret
+  dnsNames:
+    - "*.myapp.com"      # Wildcard covers ALL subdomains!
+    - "myapp.com"
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+```
+
+Now all 50 Ingress resources can reference the same `wildcard-tls-secret`. cert-manager automatically renews this certificate every 60 days (Let's Encrypt certificates expire after 90 days). Zero manual certificate management for all 50 services!

@@ -1,0 +1,96 @@
+---
+slug: "pg-vacuum"
+title: "Vacuum and Autovacuum"
+level: 3
+---
+
+## WHY
+Because PostgreSQL uses MVCC (Multi-Version Concurrency Control), when you run an `UPDATE` or `DELETE` statement, the database does not actually delete the old row from the hard drive. It simply marks it as a "Dead Tuple". 
+
+If you update a row 10,000 times, you will have 1 active row and 10,000 dead rows sitting on your hard drive, consuming massive amounts of storage and destroying query performance. The `VACUUM` process is the garbage collector of PostgreSQL. If it is not configured correctly, your database will eventually slow to a halt and die.
+
+## THEORY
+### What Vacuum Actually Does
+A standard `VACUUM` does **not** shrink the size of the database file on the hard drive.
+It simply scans the table pages, finds the Dead Tuples, and marks that exact physical space as "Available for Re-use" in the Free Space Map (FSM). The next time you `INSERT` a row, Postgres will write it into that empty hole instead of appending it to the end of the file.
+
+### Autovacuum
+In the early days of Postgres, DBAs had to set up cron jobs to run `VACUUM` every night. Today, Postgres uses an **Autovacuum Daemon**. It constantly monitors tables in the background, and when a table accumulates too many dead tuples (usually 20% of the table size), it automatically triggers a vacuum on that specific table.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "postgres-vacuum" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Manual Vacuuming)
+While Autovacuum handles 99% of workloads, you can manually trigger a vacuum if you know you just performed a massive bulk delete.
+
+```sql
+-- Vacuum a specific table (Safe to run in production, does not lock the table)
+VACUUM users;
+
+-- Vacuum and update statistics for the query planner
+VACUUM ANALYZE users;
+
+-- Extremely verbose output showing exactly how many dead tuples were found
+VACUUM VERBOSE users;
+```
+
+### Level 2 — Building Blocks (Vacuum Full)
+If a standard `VACUUM` doesn't shrink the file size, what happens if you delete 1 billion rows and want to reclaim that 500GB of hard drive space back to the operating system?
+
+You must run a **VACUUM FULL**. 
+A `VACUUM FULL` physically rewrites the entire table from scratch, perfectly packing the live tuples together and deleting the old bloated file.
+
+**WARNING:** `VACUUM FULL` requires an **Exclusive Lock** on the table. No one can read or write to the table while it runs. If it takes 3 hours to rewrite the 500GB table, your application is down for 3 hours. Never run `VACUUM FULL` in production without a planned maintenance window!
+
+```sql
+-- DANGER: Locks the table completely!
+VACUUM FULL users;
+```
+
+### Level 3 — Intermediate (Tuning Autovacuum)
+The default Autovacuum settings in Postgres are incredibly conservative so they don't impact server performance. For a massive database, they are often too slow, meaning tables bloat faster than the Autovacuum can clean them.
+
+You can tune Autovacuum in `postgresql.conf`:
+```ini
+# By default, autovacuum kicks in when 20% of the tuples are dead.
+# For a 100-million row table, that means it waits until 20 million rows are dead!
+# That is too much bloat. We lower the scale factor to 5% or 2%.
+autovacuum_vacuum_scale_factor = 0.05
+
+# How many background worker threads can run vacuum simultaneously? (Default is 3)
+autovacuum_max_workers = 5
+
+# The maximum cost before a vacuum worker forces itself to sleep (to avoid CPU spiking).
+# Default is 200. Increase it to make vacuum run much faster and aggressively.
+autovacuum_vacuum_cost_limit = 2000
+```
+
+### Level 4 — Advanced (Transaction ID Wraparound)
+This is the most terrifying event in PostgreSQL.
+Postgres gives every transaction a sequential ID (XID). It uses these IDs to determine which rows are visible to which transactions (MVCC). 
+
+The XID is a 32-bit integer, meaning it maxes out at **2.1 billion**.
+What happens when you hit 2.1 billion transactions? The ID wraps around back to 0. Suddenly, Postgres looks at a row from yesterday (ID 2.1B) and compares it to a transaction today (ID 1). It thinks the row from yesterday is in the *future*, and makes it invisible to everyone. The entire database appears to have deleted all of its data!
+
+**The Savior (Vacuum Freeze):**
+When Autovacuum scans a table, it looks for very old rows. It replaces their XID with a special "Frozen" XID, meaning "This row is permanently visible to everyone forever." This prevents wraparound.
+
+If your database is processing massive amounts of transactions and the Autovacuum is too slow to freeze old rows, Postgres will completely shut down and refuse to accept any new queries to protect your data from Wraparound. You must manually boot it in single-user mode and run a desperate vacuum.
+
+## REAL_WORLD
+**Tuning per-table**
+You shouldn't always change Autovacuum settings globally in `postgresql.conf`. If you have a specific `sessions` table that gets updated aggressively and constantly bloats, you can change the autovacuum rules for *just that table*!
+
+```sql
+-- Tell autovacuum to trigger on the sessions table when 
+-- only 1% of the rows are dead!
+ALTER TABLE sessions SET (autovacuum_vacuum_scale_factor = 0.01);
+```
+
+## INTERVIEW
+**Q: I have a massive table. I deleted half the rows, but the database file on disk didn't shrink. I know I shouldn't use `VACUUM FULL` because it locks the table. How can I safely reclaim the disk space in production without downtime?**
+A: You use an open-source extension called **`pg_repack`**. It creates a brand new physical table in the background, copies all the live data into it, tracks any real-time changes using triggers, and then executes a millisecond swap of the table names at the very end. It achieves the exact same result as `VACUUM FULL` but requires almost zero locking, allowing your application to stay completely online!

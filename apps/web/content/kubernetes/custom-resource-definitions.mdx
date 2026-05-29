@@ -1,0 +1,158 @@
+---
+slug: "custom-resource-definitions"
+title: "Custom Resource Definitions"
+level: 5
+---
+
+## WHY
+Kubernetes has built-in resources: Pods, Deployments, Services. But what if you want to model domain-specific concepts in Kubernetes — like `PostgreSQLCluster`, `CertificateRequest`, or `KafkaTopic`?
+**Custom Resource Definitions (CRDs)** let you extend the Kubernetes API with your own resource types. They're the foundation of the Kubernetes Operator pattern — programs that automate operational tasks using custom resources.
+
+## THEORY
+### How CRDs Work
+1. You define a CRD (the schema for your new resource type)
+2. Kubernetes API server registers the new resource type
+3. Users create instances of your custom resource (Custom Resources)
+4. An **Operator/Controller** watches for these resources and acts on them
+
+This is how tools like cert-manager (CertificateRequest), ArgoCD (Application), and Prometheus Operator (PrometheusRule) extend Kubernetes.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "crd" }
+```
+
+## CODE
+
+### Defining a Custom Resource Definition
+```yaml
+# database-crd.yml — Define the "Database" resource type
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.mycompany.io   # Must be: plural.group
+spec:
+  group: mycompany.io
+  names:
+    kind: Database              # The kind used in YAML: kind: Database
+    listKind: DatabaseList
+    plural: databases           # URL: /apis/mycompany.io/v1/databases
+    singular: database          # kubectl get database
+    shortNames: [db]            # kubectl get db  ← short name!
+  scope: Namespaced             # Or: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [engine, version, storage]
+              properties:
+                engine:
+                  type: string
+                  enum: [postgresql, mysql, redis]
+                version:
+                  type: string
+                storage:
+                  type: string
+                  pattern: '^[0-9]+Gi$'   # Validation!
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                  default: 1
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                connectionString:
+                  type: string
+```
+
+### Using the Custom Resource
+```bash
+# Apply the CRD
+kubectl apply -f database-crd.yml
+
+# Verify
+kubectl get crd databases.mycompany.io
+
+# Create a Database instance!
+kubectl apply -f - <<EOF
+apiVersion: mycompany.io/v1
+kind: Database
+metadata:
+  name: production-db
+  namespace: production
+spec:
+  engine: postgresql
+  version: "15.4"
+  storage: 50Gi
+  replicas: 3
+EOF
+
+# Works like any built-in resource!
+kubectl get database -n production
+kubectl get db                         # Short name!
+kubectl describe database production-db
+kubectl delete database production-db
+```
+
+## REAL_WORLD
+**Real-World CRDs You Use Every Day**
+```bash
+# cert-manager adds:
+kubectl get certificaterequest       # CR = request for a TLS certificate
+kubectl get certificate              # CR = desired TLS certificate
+kubectl get issuer                   # CR = certificate authority
+
+# ArgoCD adds:
+kubectl get application -n argocd    # CR = deployment definition
+
+# Prometheus Operator adds:
+kubectl get prometheus               # CR = Prometheus instance
+kubectl get alertmanager             # CR = AlertManager config
+kubectl get servicemonitor           # CR = scrape target definition
+
+# All of these are CRDs installed by their respective tools!
+```
+
+## INTERVIEW
+**Q: You want to create a Kubernetes Operator that automatically creates read replicas when a `Database` CR has `spec.replicas > 1`. What components do you need to build?**
+
+A: A Kubernetes Operator has two components:
+
+1. **Custom Resource Definition (CRD):** Define the `Database` schema (done above)
+
+2. **Controller:** A program that watches for `Database` objects and reconciles them:
+```go
+// Written in Go using controller-runtime (simplest approach: kubebuilder)
+func (r *DatabaseReconciler) Reconcile(ctx context.Context, req Request) (Result, error) {
+    // 1. Fetch the Database CR
+    db := &mycompanyv1.Database{}
+    r.Get(ctx, req.NamespacedName, db)
+    
+    // 2. Calculate desired state
+    desiredReplicas := db.Spec.Replicas  // e.g., 3
+    
+    // 3. Create/update StatefulSet with desired replicas
+    sts := buildStatefulSet(db)
+    r.Create(ctx, sts)  // Or Update if it exists
+    
+    // 4. Update the CR's status
+    db.Status.Phase = "Running"
+    db.Status.ConnectionString = fmt.Sprintf("postgres://primary.%s.svc.cluster.local", db.Namespace)
+    r.Status().Update(ctx, db)
+    
+    return Result{}, nil
+}
+```
+
+The controller uses Kubernetes' watch mechanism — whenever a `Database` CR is created/updated/deleted, the reconciliation loop runs. This is the same mechanism that built-in controllers (ReplicaSet controller, Deployment controller) use.
+
+Tools like **kubebuilder** and **operator-sdk** generate the boilerplate so you focus on the reconciliation logic.

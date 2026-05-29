@@ -1,0 +1,134 @@
+---
+slug: "testing-react"
+title: "Testing React Components"
+level: 4
+---
+
+## WHY
+If you change the CSS class on a Button, how do you know you didn't accidentally break the submission logic for the Checkout form? 
+Manual testing (clicking around the app) is slow, unreliable, and cannot scale as an application grows to 500+ components. 
+Automated testing ensures that every feature works exactly as expected, acting as a safety net that allows developers to refactor and deploy code aggressively on Fridays without fear.
+
+## THEORY
+### The Testing Pyramid in React
+1. **Unit Tests:** Testing pure Javascript functions (like utility math functions or Redux reducers). Fast, cheap, but don't prove the UI works.
+2. **Integration / Component Tests:** Rendering a single React component in a fake browser environment (JSDOM) and simulating user clicks. This is the sweet spot for React.
+3. **End-to-End (E2E) Tests:** Firing up a real Chrome browser and driving it with a robot (Cypress/Playwright) to test the entire system, from Database to UI. Slow, expensive, but highly realistic.
+
+In React, the absolute industry standard for Component Testing is **Vitest (or Jest)** paired with **React Testing Library (RTL)**.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "react-testing" }
+```
+
+## CODE
+
+### Level 1 — The Philosophy of React Testing Library
+Historically (with tools like Enzyme), developers tested the *implementation details* of a component: *"Check if the `isActive` state variable equals true."*
+React Testing Library changed the entire industry by enforcing a new rule: **Test the software exactly how the user interacts with it.**
+Users don't know what state variables are. They look for text on the screen, and they click buttons.
+
+```jsx
+// Counter.jsx
+export function Counter() {
+  const [count, setCount] = useState(0);
+  return (
+    <div>
+      <p>Current count: {count}</p>
+      <button onClick={() => setCount(c => c + 1)}>Increment</button>
+    </div>
+  );
+}
+```
+
+```jsx
+// Counter.test.jsx
+import { render, screen, fireEvent } from '@testing-library/react';
+import { expect, test } from 'vitest';
+import { Counter } from './Counter';
+
+test('Counter increments when the button is clicked', () => {
+  // 1. Arrange: Render the component into the fake DOM
+  render(<Counter />);
+
+  // 2. Act: Find the button (like a user would, by its text) and click it
+  const button = screen.getByText('Increment');
+  fireEvent.click(button);
+
+  // 3. Assert: Verify the text on the screen updated!
+  // We don't check state; we check the actual HTML output!
+  expect(screen.getByText('Current count: 1')).toBeInTheDocument();
+});
+```
+
+### Level 2 — ARIA Queries (The Best Way to Find Elements)
+`getByText` is good, but `getByRole` is vastly superior. It forces you to write Accessible HTML (a11y). If a screen reader cannot find the button, React Testing Library cannot find it either!
+
+```jsx
+test('Testing an accessible form', () => {
+  render(<LoginForm />);
+
+  // Find the input associated with the "Email" label!
+  const emailInput = screen.getByRole('textbox', { name: /email/i });
+  
+  // Type into the input (userEvent is vastly superior to fireEvent!)
+  userEvent.type(emailInput, 'test@example.com');
+
+  // Find the submit button
+  const submitButton = screen.getByRole('button', { name: /login/i });
+  userEvent.click(submitButton);
+});
+```
+
+### Level 3 — Testing Asynchronous Behavior
+What if your component fetches data from an API? The component will render a loading spinner, then a fraction of a second later, the data appears.
+You must use `findBy...` queries, which automatically wait and retry until the element appears!
+
+```jsx
+test('Displays user data after fetching', async () => {
+  render(<UserProfile userId={1} />);
+
+  // 'getBy' fails instantly if the element isn't there.
+  // 'findBy' returns a Promise and waits (up to 1000ms) for the element to appear!
+  const userName = await screen.findByText('John Doe');
+  
+  expect(userName).toBeInTheDocument();
+});
+```
+
+### Level 4 — Mocking APIs (MSW)
+If your component fetches data using `fetch` or `axios`, running the test will actually make an HTTP request to the real database! This is terrible (slow, flaky, and corrupts production data).
+You must intercept the network request using **Mock Service Worker (MSW)**.
+
+```javascript
+// setupTests.js
+import { setupServer } from 'msw/node';
+import { http, HttpResponse } from 'msw';
+
+// Create a fake server that intercepts requests!
+export const server = setupServer(
+  http.get('/api/users/1', () => {
+    // Return fake JSON data instantly!
+    return HttpResponse.json({ name: 'John Doe', role: 'Admin' });
+  })
+);
+
+beforeAll(() => server.listen());
+afterAll(() => server.close());
+```
+Now, when your React component runs `fetch('/api/users/1')` during the test, MSW intercepts the request at the network level and instantly returns the fake John Doe data. The test completes in 10 milliseconds without ever touching the internet!
+
+## REAL_WORLD
+**Testing Coverage vs. Confidence**
+Many enterprise managers obsess over "100% Test Coverage" (meaning every single line of code was executed by a test). 
+This leads to developers writing useless tests just to hit the metric, like testing if a `div` has a specific CSS class.
+The goal of testing is **Confidence**. 
+If a payment checkout flow breaks, the company loses money instantly. You should write 10 exhaustive tests for the Checkout Component. If a typo occurs on the "About Us" page footer, nobody cares. You don't need to write tests for static UI components. Focus your testing entirely on complex logic, forms, and state transitions!
+
+## INTERVIEW
+**Q: You wrote a test that clicks a button, which updates some state and renders a new `<div>`. However, the test throws a massive warning: `Warning: An update to MyComponent inside a test was not wrapped in act(...)`. What does this mean and how do you fix it?**
+A: **The `act` Warning.**
+When a React state update occurs, React batches the updates and schedules a re-render. In a test environment, if your test finishes checking assertions *before* React has finished flushing those state updates to the DOM, React throws this warning because the test environment is leaking active operations.
+`act()` is a React helper function that guarantees all state updates and DOM renders are fully flushed and settled before the next line of code executes.
+*The Fix:* Fortunately, you almost never need to write `act()` manually anymore! Every single method in React Testing Library (`fireEvent`, `userEvent`, `findBy`) automatically wraps its operations in `act()` under the hood. If you are seeing this warning today, it usually means your component is executing an asynchronous state update (like a `setTimeout` or an un-mocked Promise) that RTL doesn't know about, and you need to `await` a `findBy` query to ensure the test waits for the async operation to complete!

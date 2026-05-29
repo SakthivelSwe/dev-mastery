@@ -1,0 +1,110 @@
+---
+slug: "api-caching"
+title: "API Caching Strategies"
+level: 3
+---
+
+## WHY
+If your database takes 500 milliseconds to calculate a complex aggregate report, and 10,000 users request that report simultaneously, your database will collapse. Caching is the art of storing the result of an expensive operation in incredibly fast memory so that subsequent requests can be served instantly (in <10 milliseconds) without ever touching the database.
+
+However, as the famous engineering proverb goes: *"There are only two hard things in Computer Science: cache invalidation and naming things."*
+
+## THEORY
+### Where does Caching happen?
+Caching does not just happen in your backend server. A properly designed REST API utilizes the entire network infrastructure to cache data at multiple layers:
+1. **Client Caching:** The user's browser stores the API response.
+2. **CDN Caching:** A Content Delivery Network (like Cloudflare) intercepts the request and serves it from a server geographically close to the user.
+3. **Gateway Caching:** An API Gateway intercepts the request before it hits your backend.
+4. **Application Caching:** Your backend code (Node.js/Spring) stores the data in Redis to avoid querying the database.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "api-caching" }
+```
+
+## CODE
+
+### Level 1 — Beginner (HTTP Cache-Control)
+The easiest way to implement caching requires exactly zero changes to your backend logic. You simply return the standard HTTP `Cache-Control` header.
+
+```text
+// Request:
+GET /api/public-statistics HTTP/1.1
+
+// Response:
+HTTP/1.1 200 OK
+Cache-Control: max-age=3600
+```
+When the browser sees `max-age=3600`, it saves the JSON response on the user's physical hard drive. If the user refreshes the page 5 minutes later, the browser **does not even make a network request to your server!** It instantly loads the JSON from its own hard drive, because the API promised the data would remain fresh for 3,600 seconds (1 hour).
+
+### Level 2 — Building Blocks (The ETag)
+What if the data changes unpredictably? You can't set a `max-age` of 1 hour if the data might change in 5 minutes.
+You use an **ETag (Entity Tag)**.
+
+1. The server generates a hash of the JSON response (e.g., `W/"1a2b3c"`) and sends it in the `ETag` header.
+2. The browser caches the response.
+3. When the browser requests the data again, it sends a header: `If-None-Match: "1a2b3c"`.
+4. The backend calculates the hash of the *current* data. 
+   - If the hashes match, the server returns a `304 Not Modified` with NO body. The browser knows it's safe to use its cached copy! 
+   - If they don't match, the server returns a `200 OK` with the brand new JSON data.
+
+*Why is this useful?* The server still had to query the database to calculate the hash, so you didn't save database CPU. But you saved massive amounts of **Bandwidth** by returning an empty body instead of a 5MB JSON payload!
+
+### Level 3 — Intermediate (Redis Application Caching)
+If you want to protect the Database CPU, you must cache the data inside your application layer using an in-memory datastore like **Redis**.
+
+The standard pattern is the **Cache-Aside Pattern**:
+```javascript
+async function getUserProfile(userId) {
+    // 1. Check the fast Cache first!
+    const cacheKey = `user:${userId}:profile`;
+    const cachedData = await redis.get(cacheKey);
+    
+    if (cachedData) {
+        return JSON.parse(cachedData); // Cache Hit! (2ms)
+    }
+    
+    // 2. Cache Miss. Do the slow database query. (500ms)
+    const dbData = await database.query("SELECT * FROM profiles WHERE user_id = ?", userId);
+    
+    // 3. Save the result in the Cache for the NEXT user! 
+    // Set a TTL (Time To Live) so it expires automatically after 5 minutes.
+    await redis.set(cacheKey, JSON.stringify(dbData), 'EX', 300);
+    
+    return dbData;
+}
+```
+
+### Level 4 — Advanced (Cache Invalidation)
+The hardest problem in caching. If you cache a user's profile in Redis for 1 hour, and the user updates their profile picture, they will stare at their screen and wonder why their old picture is still showing! The cache is **Stale**.
+
+**Pattern 1: TTL (Time To Live)**
+You simply wait. You set the Redis cache to expire after 5 minutes, accepting that users will see stale data for up to 5 minutes. (Eventual Consistency).
+
+**Pattern 2: Write-Through / Active Invalidation**
+When the user updates their profile picture, your backend explicitly deletes the old data from Redis!
+```javascript
+async function updateProfilePicture(userId, newPic) {
+    // 1. Update the database
+    await database.query("UPDATE profiles SET pic = ? WHERE user_id = ?", [newPic, userId]);
+    
+    // 2. INVALIDATE THE CACHE!
+    // The very next time the user fetches their profile, it will be a Cache Miss, 
+    // forcing the backend to fetch the fresh data from the database!
+    await redis.del(`user:${userId}:profile`);
+}
+```
+
+## REAL_WORLD
+**The Cache Stampede (Thundering Herd)**
+Imagine you cache the "Global Top 10 High Scores" in Redis, with a TTL of 10 minutes. Your app is massive, receiving 5,000 requests per second for this scoreboard.
+At exactly 10:00:00 AM, the Redis cache expires.
+At 10:00:01 AM, 5,000 requests hit your Node.js server simultaneously.
+Every single request checks Redis, sees a Cache Miss, and instantly triggers a massive `SELECT` query on the database. 5,000 massive queries hit the database at the exact same millisecond, instantly crashing your entire platform.
+
+This is a **Cache Stampede**. 
+To fix it, you implement **Distributed Locking** (using a Redis Mutex). When the cache expires, only the *first* request is allowed to query the database. The other 4,999 requests are forced to wait in memory for a few milliseconds until the first request finishes and repopulates the Redis cache.
+
+## INTERVIEW
+**Q: Can you cache POST or PUT requests using HTTP Cache-Control headers?**
+A: **No.** The HTTP specification strictly defines `GET` and `HEAD` as "Safe" and "Idempotent" methods, meaning they do not modify state and can be safely cached by browsers and CDNs. `POST`, `PUT`, `PATCH`, and `DELETE` requests mutate state on the server. If a browser cached a `POST /checkout` request, it would never actually send the payment to the server the second time you clicked the button!

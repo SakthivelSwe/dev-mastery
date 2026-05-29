@@ -23,6 +23,7 @@ public class GamificationService {
     private final UserStreakRepository streakRepository;
     private final UserXpEventRepository xpEventRepository;
     private final UserBadgeRepository badgeRepository;
+    private final SpacedReviewRepository reviewRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final XpProperties xpProperties;
 
@@ -51,8 +52,53 @@ public class GamificationService {
                 .build();
         xpEventRepository.save(event);
 
-        // 5. Check Badges
+    // 5. Check Badges
         checkAndAwardBadges(userId, streak);
+    }
+
+    @Transactional
+    public void processLayerCompletion(UUID userId, UUID topicId, String layerName) {
+        log.info("Processing layer completion for user {} layer {}", userId, layerName);
+        
+        int xpEarned = switch (layerName.toLowerCase()) {
+            case "feynman" -> 50;
+            case "build" -> 100;
+            case "spacedreview" -> 20;
+            default -> 10;
+        };
+
+        UserStreak streak = updateStreak(userId);
+        streak.setTotalXp(streak.getTotalXp() + xpEarned);
+        updateBadgeLevel(streak);
+        streakRepository.save(streak);
+
+        UserXpEvent event = UserXpEvent.builder()
+                .userId(userId)
+                .eventType("layer_complete_" + layerName)
+                .xpAmount(xpEarned)
+                .referenceId(topicId)
+                .description("Completed layer: " + layerName)
+                .build();
+        xpEventRepository.save(event);
+
+        checkAndAwardLayerBadges(userId, streak);
+    }
+
+    private void checkAndAwardLayerBadges(UUID userId, UserStreak streak) {
+        long feynmanCount = xpEventRepository.countByUserIdAndEventType(userId, "layer_complete_feynman");
+        if (feynmanCount >= 10) {
+            awardBadgeIfNotExists(userId, "the-explainer");
+        }
+
+        long buildCount = xpEventRepository.countByUserIdAndEventType(userId, "layer_complete_build");
+        if (buildCount >= 5) {
+            awardBadgeIfNotExists(userId, "the-builder");
+        }
+
+        long reviewCount = xpEventRepository.countByUserIdAndEventType(userId, "layer_complete_spacedreview");
+        if (reviewCount >= 20) {
+            awardBadgeIfNotExists(userId, "memory-master");
+        }
     }
 
     private UserStreak updateStreak(UUID userId) {

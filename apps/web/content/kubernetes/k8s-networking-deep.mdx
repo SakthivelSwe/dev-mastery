@@ -1,0 +1,117 @@
+---
+slug: "k8s-networking-deep"
+title: "Kubernetes Networking Deep Dive"
+level: 5
+---
+
+## WHY
+Kubernetes networking is often treated as a black box. When a microservice can't reach another, or an Ingress route isn't working, or you have mysterious connection timeouts, you need to understand how packets actually flow through the cluster.
+Deep understanding of K8s networking helps you debug connectivity issues, implement security policies, and architect applications correctly.
+
+## THEORY
+### The Kubernetes Networking Model
+Kubernetes has a flat networking model — every Pod can communicate with every other Pod without NAT. This requires:
+1. Each Pod gets a unique IP address (no port conflicts between Pods)
+2. No NAT between Pods on different Nodes
+3. The Container Network Interface (CNI) plugin implements this (Calico, Flannel, Cilium, etc.)
+
+### Components
+- **CNI Plugin:** Assigns Pod IPs and sets up routing rules between Nodes
+- **kube-proxy:** Configures iptables/IPVS rules for Service VIP routing
+- **CoreDNS:** Resolves Service names to Cluster IPs
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-networking-deep" }
+```
+
+## CODE
+
+### Network Policies (Kubernetes Firewall)
+```yaml
+# By default: ALL Pods can talk to ALL Pods!
+# NetworkPolicy restricts this.
+
+# Allow only the api-service to reach postgres:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres        # This policy applies to postgres pods
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api   # Only allow ingress from pods with app=api label
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress: []               # No egress from postgres (it shouldn't initiate connections)
+```
+
+### Debugging Network Connectivity
+```bash
+# Can Pod A reach Pod B?
+# From inside Pod A:
+kubectl exec -it pod-a -- sh
+> nc -zv pod-b-ip 8080   # Test TCP connection
+> curl http://api-service:80/health  # Test via Service DNS
+
+# Check Service endpoints (Pods the Service routes to)
+kubectl get endpoints api-service
+# NAME          ENDPOINTS
+# api-service   10.244.1.5:3000,10.244.2.8:3000,10.244.3.2:3000
+
+# Test DNS resolution
+kubectl exec -it pod-a -- nslookup api-service
+kubectl exec -it pod-a -- nslookup api-service.production.svc.cluster.local
+
+# Check kube-proxy iptables rules
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+kubectl logs -n kube-system kube-proxy-abc123
+
+# Deploy a debugging pod (curl, nslookup, ping)
+kubectl run debug --image=nicolaka/netshoot --rm -it --restart=Never
+```
+
+### Service CIDR vs Pod CIDR
+```bash
+# Service ClusterIPs are from the SERVICE CIDR (virtual IPs)
+kubectl cluster-info dump | grep -m 1 service-cluster-ip-range
+# --service-cluster-ip-range=10.96.0.0/12
+
+# Pod IPs are from the POD CIDR (real IPs assigned to Pods)
+kubectl cluster-info dump | grep -m 1 cluster-cidr
+# --cluster-cidr=10.244.0.0/16
+
+# The ranges must not overlap!
+```
+
+## REAL_WORLD
+**Cilium: Next-Generation CNI**
+Traditional kube-proxy uses iptables rules that scale poorly with thousands of Services (O(n) lookups). Cilium uses eBPF (extended Berkeley Packet Filter) — a kernel-level technology that:
+- Achieves O(1) Service routing (independent of number of rules)
+- Provides deep observability (Hubble UI shows real-time traffic flows)
+- Enables L7 NetworkPolicies (filter by HTTP path, method, headers)
+- Better performance: 30-40% less latency than iptables-based kube-proxy
+
+## INTERVIEW
+**Q: Pod A sends a request to Service B. Describe the complete network path the packet takes from Pod A's process to Pod B's container.**
+
+A: 
+1. Pod A's process sends a packet to Service B's Cluster IP (e.g., 10.96.0.100:80)
+2. The packet leaves Pod A's network namespace through a virtual ethernet pair (veth) to the node's network
+3. **iptables/IPVS (kube-proxy):** The packet hits the PREROUTING chain. kube-proxy has set up DNAT rules — it rewrites the destination from the Service VIP (10.96.0.100:80) to one of the actual Pod IPs (e.g., 10.244.2.8:3000), chosen by round-robin
+4. The packet is now destined for 10.244.2.8. The CNI plugin has set up routing rules: traffic for 10.244.2.x goes to Node 2 (e.g., 172.16.0.5)
+5. The packet is encapsulated (VXLAN/IP-in-IP depending on CNI) and sent across the physical network to Node 2
+6. Node 2 decapsulates the packet, routes it through another veth pair into Pod B's network namespace
+7. Pod B's container receives the packet on port 3000
+
+The response follows the reverse path. kube-proxy's conntrack (connection tracking) handles the reverse NAT to rewrite the source back to the Service VIP.

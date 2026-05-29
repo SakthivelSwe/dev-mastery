@@ -1,0 +1,149 @@
+---
+slug: "docker-swarm"
+title: "Docker Swarm"
+level: 4
+---
+
+## WHY
+Docker Compose is great for running multiple containers on a single machine. But what happens when you need to run your application across multiple servers for high availability and scalability?
+**Docker Swarm** is Docker's built-in container orchestration system. It turns a group of Docker hosts into a single, unified cluster. You define services declaratively, and Swarm handles distributing containers across nodes, automatic rescheduling when a node fails, rolling updates, and load balancing — all built into Docker itself.
+Note: While Kubernetes has become the industry standard for large-scale orchestration, Docker Swarm is simpler, faster to set up, and excellent for teams that don't need Kubernetes' complexity.
+
+## THEORY
+### Swarm Concepts
+- **Node:** A machine (physical or VM) running Docker. Can be a **Manager** (orchestrates the cluster) or **Worker** (runs containers).
+- **Service:** The definition of how to run a containerized application (image, replicas, ports). Services are deployed to the Swarm, not individual containers.
+- **Task:** A single container instance running as part of a Service.
+- **Stack:** A collection of Services defined in a Compose-like YAML file.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-swarm" }
+```
+
+## CODE
+
+### Setting Up a Swarm
+```bash
+# Initialize Swarm on the first machine (manager node)
+docker swarm init --advertise-addr 192.168.1.100
+
+# Output:
+# Swarm initialized: current node (abc123) is now a manager.
+# To add a worker to this swarm, run the following command:
+#     docker swarm join --token SWMTKN-1-abc123... 192.168.1.100:2377
+
+# On each worker machine, join the swarm
+docker swarm join --token SWMTKN-1-abc123... 192.168.1.100:2377
+
+# View all nodes in the swarm
+docker node ls
+# ID       HOSTNAME       STATUS    AVAILABILITY   MANAGER STATUS
+# abc123   manager-01     Ready     Active         Leader
+# def456   worker-01      Ready     Active
+# ghi789   worker-02      Ready     Active
+```
+
+### Deploying Services
+```bash
+# Deploy a service with 3 replicas (containers) across the swarm
+docker service create \
+  --name api \
+  --replicas 3 \
+  --publish published=8080,target=3000 \
+  --update-delay 10s \              # Wait 10s between rolling update steps
+  --update-parallelism 1 \          # Update 1 replica at a time
+  my-api:1.0.0
+
+# List services
+docker service ls
+
+# See which node each task (container) is running on
+docker service ps api
+# ID         NAME    IMAGE        NODE         STATE     PORTS
+# task1      api.1   my-api:1.0  worker-01    Running
+# task2      api.2   my-api:1.0  worker-02    Running
+# task3      api.3   my-api:1.0  manager-01   Running
+
+# Scale to 5 replicas
+docker service scale api=5
+
+# Rolling update to new version
+docker service update --image my-api:2.0.0 api
+# Swarm updates 1 container at a time, waiting 10s between each!
+```
+
+### Deploying a Stack (Compose-Style)
+```yaml
+# docker-stack.yml
+version: '3.9'
+
+services:
+  api:
+    image: my-api:1.0.0
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback   # Rollback automatically if update fails!
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    ports:
+      - "8080:3000"
+
+  db:
+    image: postgres:15-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]  # Run only on manager node
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
+```
+
+```bash
+# Deploy the stack
+docker stack deploy -c docker-stack.yml myapp
+
+# View stacks
+docker stack ls
+
+# View services in the stack
+docker stack services myapp
+
+# Remove the stack
+docker stack rm myapp
+```
+
+## REAL_WORLD
+**Swarm vs Kubernetes: When to Choose**
+
+Choose Docker Swarm when:
+- Team is small (1-10 engineers) with limited DevOps resources
+- Simple application with predictable scaling needs
+- Quick setup without the steep Kubernetes learning curve
+- Budget is limited (no managed Kubernetes service)
+
+Choose Kubernetes when:
+- Large-scale application (100+ services, complex orchestration)
+- Team has dedicated DevOps/Platform engineers
+- Need advanced features: Custom Resources, Operators, Service Mesh, Pod Disruption Budgets
+- Using cloud providers (managed Kubernetes: EKS, GKE, AKS)
+
+## INTERVIEW
+**Q: In Docker Swarm, a manager node goes down during peak traffic. What happens to the services running on that node, and how does Swarm ensure high availability?**
+A: Swarm handles this automatically through its **Raft consensus algorithm**.
+
+If the failed node was running service tasks (containers), Swarm detects this within seconds (via heartbeat timeouts). The remaining manager nodes reach consensus and reschedule the failed tasks on available worker nodes. Users experience minimal disruption if the rebalancing completes quickly.
+
+However, Swarm has a critical requirement for Manager Node High Availability:
+- **With 1 manager:** Any manager failure = full Swarm outage (no quorum)
+- **With 3 managers:** Can tolerate 1 manager failure (quorum = 2/3)
+- **With 5 managers:** Can tolerate 2 manager failures (quorum = 3/5)
+
+This is why production Swarms always run 3 or 5 manager nodes distributed across different availability zones. Manager nodes use Raft consensus, requiring a quorum (majority) of managers to be available to accept commands. If quorum is lost, the Swarm enters read-only mode — existing containers keep running, but you can't deploy changes.

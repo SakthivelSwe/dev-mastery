@@ -1,0 +1,114 @@
+---
+slug: "angular-universal"
+title: "Angular SSR (Universal)"
+level: 4
+---
+
+## WHY
+Angular is traditionally a **Client-Side Rendering (CSR)** framework. When a user visits `yoursite.com`, the server sends a completely blank HTML file (`<body><app-root></app-root></body>`) and a massive JavaScript bundle. 
+The user's browser has to download the JS, execute it, and build the DOM in real-time. This is terrible for SEO (Search Engine Optimization), because Twitter bots and older Google crawlers will just see a blank page. It is also terrible for performance on slow 3G mobile networks.
+**Angular SSR (formerly Angular Universal)** solves this by executing the Angular application on the Node.js server! The server renders the fully populated HTML page and sends it to the browser. The user sees the content instantly, and SEO crawlers can read it perfectly!
+
+## THEORY
+### SSR vs. Hydration
+1. **Server-Side Rendering (SSR):** The Node.js server runs your Angular code, makes database calls, generates pure HTML, and sends it to the browser.
+2. **Non-Interactive State:** The user sees the fully rendered page (e.g., a list of articles and a "Like" button), but because the JavaScript hasn't loaded yet, clicking the "Like" button does nothing.
+3. **Hydration:** The browser downloads the Angular JavaScript bundle in the background. Once downloaded, Angular "wakes up", attaches event listeners (like `(click)`) to the existing HTML, and the page becomes fully interactive.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "angular-ssr" }
+```
+
+## CODE
+
+### Level 1 — Enabling SSR
+In modern Angular (v17+), enabling SSR is incredibly easy. When creating a new project, you just run `ng new my-app --ssr`.
+If you have an existing project, you can add it via the CLI:
+```bash
+ng add @angular/ssr
+```
+This single command modifies your `angular.json`, updates your `main.ts`, and generates a `server.ts` file (an Express.js server) that listens for incoming requests and renders your Angular application dynamically.
+
+### Level 2 — The Browser vs. Server Dilemma
+If your component uses `window.localStorage` or `document.getElementById()`, it will work perfectly in the browser.
+However, when Node.js attempts to render the component on the server, it will crash instantly: *"ReferenceError: window is not defined"*. Node.js does not have a DOM!
+You must conditionally execute browser-specific code using `isPlatformBrowser`.
+
+```typescript
+import { Component, Inject, PLATFORM_ID, OnInit } from '@angular/core';
+import { isPlatformBrowser, isPlatformServer } from '@angular/common';
+
+@Component({
+  selector: 'app-dashboard',
+  template: `<h1>Dashboard</h1>`
+})
+export class DashboardComponent implements OnInit {
+  
+  // Inject the PLATFORM_ID token to determine where this code is running!
+  constructor(@Inject(PLATFORM_ID) private platformId: Object) {}
+
+  ngOnInit() {
+    if (isPlatformBrowser(this.platformId)) {
+      // Safe! This code ONLY executes in the user's Chrome/Safari browser.
+      const theme = window.localStorage.getItem('theme');
+      console.log("Running in Browser!");
+    }
+    
+    if (isPlatformServer(this.platformId)) {
+      // Safe! This code ONLY executes on the Node.js Server.
+      console.log("Running on the Server!");
+    }
+  }
+}
+```
+
+### Level 3 — The Flicker Problem (TransferState)
+Imagine your component fetches a list of 100 products from an API during `ngOnInit`.
+1. The Server runs `ngOnInit`, makes the API call, renders the 100 products into HTML, and sends it to the user.
+2. The user sees the 100 products.
+3. The Browser downloads Angular, Hydrates the page, runs `ngOnInit` *again*, makes the API call *again*, and briefly empties the list before rendering it again. The screen visibly "flickers"!
+
+**The Fix: TransferState.**
+The server must fetch the data, embed the JSON directly into the HTML document, and the browser must read the JSON from the HTML instead of making a duplicate HTTP request!
+
+*Note: In Angular 18+, the `provideHttpClient(withFetch())` API automatically handles TransferState for basic HTTP GET requests out of the box! You no longer have to write the horrific `TransferState` boilerplate manually!*
+
+### Level 4 — Non-Destructive Hydration
+Historically, when Angular "hydrated" an SSR page, it was destructive. It would literally delete the beautiful HTML the server generated, and recreate the entire DOM from scratch in the browser, causing a massive performance bottleneck.
+Angular 16 introduced **Non-Destructive Hydration**.
+Angular compares the server HTML to the client DOM, realizes they are identical, and surgically attaches the event listeners without deleting the DOM!
+
+To enable this, simply add `provideClientHydration()` to your app config:
+```typescript
+// app.config.ts
+import { ApplicationConfig } from '@angular/core';
+import { provideClientHydration } from '@angular/platform-browser';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideClientHydration() // MAGIC: Enables non-destructive hydration!
+  ]
+};
+```
+
+## REAL_WORLD
+**Pre-Rendering (SSG)**
+SSR generates the HTML *dynamically* every time a user requests the page. If you have 10,000 users hitting your homepage simultaneously, your Node.js server has to boot up Angular and render the HTML 10,000 times, which is incredibly CPU intensive.
+If your homepage is a Marketing Page that rarely changes, you should use **Pre-Rendering** (Static Site Generation / SSG).
+Instead of rendering on a Node.js server at runtime, Angular SSR can render the HTML exactly once during the `ng build` process on your CI/CD pipeline!
+It outputs physical `index.html`, `about.html`, and `pricing.html` files. You host these files on a dirt-cheap CDN (like AWS S3 or Firebase Hosting). They load instantly, have perfect SEO, and cost zero CPU power to serve!
+
+## INTERVIEW
+**Q: You implement SSR. Your page renders perfectly on the server. However, you notice that a third-party charting library (`Chart.js`) is causing the Node.js server to crash because it tries to access the `window` object the moment it is imported. You can't use `isPlatformBrowser` because the crash happens at the `import` statement at the top of the file. How do you fix this?**
+A: **Dynamic Imports or Deferrable Views.**
+Because static `import { Chart } from 'chart.js';` statements are executed immediately by Node.js, you must delay the execution of the library until you are safely in the browser context.
+*The Modern Fix (Angular 17+):* Use the `@defer` block in your template!
+```html
+@defer (on viewport) {
+  <app-heavy-chart></app-heavy-chart>
+} @placeholder {
+  <div>Loading chart...</div>
+}
+```
+When you use `@defer`, Angular automatically splits the component (and its `Chart.js` dependency) into a separate JavaScript chunk. The Node.js server will ONLY render the `@placeholder` HTML. The browser will render the placeholder, and only download/execute the heavy Chart logic when the user actually scrolls to it on the screen, completely bypassing the server-side crash!

@@ -1,0 +1,132 @@
+---
+title: Component API Design
+slug: component-api-design
+---
+
+## WHY
+
+A Design System is ultimately a product consumed by other developers. If your Component APIs are inconsistent, overly restrictive, or bloated with hundreds of props, developers will refuse to use them and instead build rogue, non-compliant UI components.
+
+Designing a great Component API is like designing a great REST API. It requires strict naming conventions, predictable behavior, inversion of control, and a deep understanding of TypeScript's advanced utility types to ensure the compiler catches bad props before the code ever runs.
+
+---
+
+## THEORY
+
+### 1. The "Ape" Principle (Avoid Prop Exhaustion)
+Junior developers solve problems by adding booleans: `<Button isPrimary isLarge hasIcon isLoading isDanger isFullWidth />`. This scales terribly. 
+A Senior developer uses categorical strings or enums: `<Button variant="primary" size="lg" state="loading" width="full" />`. This guarantees mutually exclusive states (a button cannot be both `isPrimary` and `isGhost` simultaneously).
+
+### 2. Inversion of Control (IoC) & Render Props
+When a component becomes too complex, don't pass massive configuration objects into a single prop (e.g., `<Dropdown menuItems={[{id: 1, text: 'A', icon: 'B'}]} />`). 
+Instead, invert control to the consumer using Compound Components or Render Props. Let the consumer render the children:
+```tsx
+<Dropdown>
+  <Dropdown.Trigger>Click me</Dropdown.Trigger>
+  <Dropdown.Menu>
+    <Dropdown.Item icon="user">Profile</Dropdown.Item>
+  </Dropdown.Menu>
+</Dropdown>
+```
+
+### 3. Native Prop Spreading (The ...rest pattern)
+If you build an `<Input>` component but forget to expose `onFocus`, `onBlur`, `maxLength`, or `pattern`, developers will abandon your component. 
+Your components must *always* extend native HTML interfaces and spread `...rest` to the underlying DOM node.
+
+---
+
+## IMPLEMENTATION
+
+Let's look at how to properly type and structure a Component API using TypeScript to enforce strict design token constraints while maintaining maximum flexibility.
+
+```tsx
+import React, { forwardRef } from 'react';
+
+// --- 1. STRICT TOKEN TYPES ---
+// Instead of accepting any string, restrict sizes to exact tokens
+type BoxSize = 'sm' | 'md' | 'lg' | 'xl';
+type IntentColor = 'primary' | 'success' | 'warning' | 'danger';
+
+// --- 2. EXTENDING NATIVE ELEMENTS ---
+// Omit 'color' from native div attributes because we want to override it with our IntentColor
+export interface BoxProps extends Omit<React.HTMLAttributes<HTMLDivElement>, 'color'> {
+  size?: BoxSize;
+  color?: IntentColor;
+  // Use generic ReactNode for maximum compositional freedom
+  children: React.ReactNode; 
+  // Allow passing an 'as' prop for polymorphism (rendering as section, article, etc.)
+  as?: React.ElementType; 
+}
+
+// --- 3. FORWARDING REFS & SPREADING PROPS ---
+export const Box = forwardRef<HTMLDivElement, BoxProps>(({
+  size = 'md',
+  color = 'primary',
+  children,
+  as: Component = 'div',
+  className,
+  ...rest // Captures onClick, aria-*, data-*, style, etc.
+}, ref) => {
+  
+  // Construct predictable class names that map to CSS/Tailwind
+  const classes = [
+    'ds-box',
+    `ds-box--size-${size}`,
+    `ds-box--color-${color}`,
+    className
+  ].filter(Boolean).join(' ');
+
+  return (
+    <Component ref={ref} className={classes} {...rest}>
+      {children}
+    </Component>
+  );
+});
+
+Box.displayName = 'Box';
+```
+
+### 4. Asymmetric Prop Dependencies
+Sometimes, a prop is only valid if another prop is provided. We can enforce this at compile time using TypeScript Discriminated Unions.
+
+```tsx
+// If 'asLink' is true, 'href' is REQUIRED. 
+// If 'asLink' is false/undefined, 'href' is FORBIDDEN.
+
+type BaseActionProps = {
+  label: string;
+};
+
+type LinkAction = BaseActionProps & {
+  asLink: true;
+  href: string; // Required!
+};
+
+type ButtonAction = BaseActionProps & {
+  asLink?: false;
+  href?: never; // Forbidden!
+  onClick: () => void;
+};
+
+type ActionProps = LinkAction | ButtonAction;
+
+export const Action = (props: ActionProps) => {
+  if (props.asLink) {
+    return <a href={props.href}>{props.label}</a>;
+  }
+  return <button onClick={props.onClick}>{props.label}</button>;
+};
+
+// COMPILER ENFORCEMENT:
+// <Action label="Go" asLink /> // ❌ Error: Property 'href' is missing!
+// <Action label="Go" asLink={false} href="/home" /> // ❌ Error: 'href' is not allowed!
+```
+
+---
+
+## SYSTEM_DESIGN
+
+### Versioning Component APIs
+Breaking changes in Component APIs destroy consumer trust. 
+- **Deprecation:** Never delete a prop immediately. Mark it as `@deprecated` in JSDoc, add a `console.warn` in development mode, and remove it in the next major version release.
+- **Codemods:** For massive API overhauls (e.g., migrating `<Button type="primary">` to `<Button variant="primary">`), provide AST-based codemods (using `jscodeshift`) that automatically rewrite the consumer's source code during the upgrade process.

@@ -33,4 +33,12 @@ class AppContainer(private val context: Context) {
     val contentRepository by lazy { 
         ContentRepository(retrofit.create(ContentApi::class.java)) 
     }
+
+    val progressApi by lazy {
+        retrofit.create(com.example.devmastery.progress.data.remote.ProgressApi::class.java)
+    }
+
+    val progressRepository by lazy {
+        com.example.devmastery.progress.data.remote.ProgressRepository(progressApi)
+    }
 }

@@ -1,0 +1,196 @@
+---
+title: garbage-collection-mechanics
+slug: garbage-collection-mechanics
+---
+
+## WHY
+In managed runtimes like the JVM, developers are freed from manual memory allocation and deallocation (e.g., `malloc` and `free` in C/C++). However, this abstraction comes at a cost. If memory allocation and reclamation are not managed efficiently, applications suffer from memory leaks, fragmentation, and unpredictable latency spikes known as "Stop-The-World" (STW) pauses.
+
+As applications scale to handle hundreds of gigabytes of heap memory and require sub-millisecond response times, understanding the mechanics of Garbage Collection (GC) becomes paramount. A senior engineer must understand how different collectors balance the trade-offs between **throughput** (the percentage of total time spent executing application code versus GC code), **latency** (the duration of GC-induced pauses), and **footprint** (the physical memory overhead of the GC metadata). Choosing or tuning a collector without understanding its internal mechanics (such as card tables, write barriers, and tri-color marking) leads to misconfigured systems that crash under load due to `OutOfMemoryError` or experience latency degradation that violates SLAs.
+
+## THEORY
+Modern JVM garbage collectors are built upon the **Weak Generational Hypothesis**:
+1. Most objects die young (they are allocated, used briefly within a method scope, and quickly become unreachable).
+2. The strength of references between old objects and young objects is relatively low.
+
+To exploit this, the JVM divides the heap into generations: the **Young Generation** (further subdivided into Eden, Survivor 0, and Survivor 1) and the **Old Generation** (Tenured).
+
+```
++-------------------------------------------------------------------------+
+|                               Java Heap                                 |
++-----------------------------------+-------------------------------------+
+|         Young Generation          |           Old Generation            |
+|  +--------+-----------+--------+  |                                     |
+|  |  Eden  |  S0 (To)  | S1(Fr) |  |               Tenured               |
+|  +--------+-----------+--------+  |                                     |
++-----------------------------------+-------------------------------------+
+```
+
+### Tri-Color Marking Algorithm
+Most concurrent and parallel collectors use some variation of the Tri-Color Marking algorithm during their marking phase:
+* **White**: Unvisited objects. Candidates for garbage collection.
+* **Grey**: Visited objects, but their referenced objects have not yet been fully scanned.
+* **Black**: Visited objects, and all their direct references have been scanned. They are proven to be alive.
+
+The marking process begins by marking GC Roots as Grey. The collector then recursively processes Grey objects, turning them Black and their White children Grey. The phase ends when there are no Grey objects left; any remaining White objects are reclaimed.
+
+### The Concurrent Mutation Problem & Write Barriers
+In a concurrent collector (like G1, ZGC, or Shenandoah), application threads (mutators) continue to run while the GC is marking. This introduces a race condition: a mutator could sever a reference from a Grey object to a White object and attach that White object to a Black object. Because the Black object has already been scanned, the collector would never visit the White object, incorrectly leaving it White at the end of marking and leading to premature reclamation (silent data corruption).
+
+To prevent this, concurrent collectors use **Write Barriers** (interceptors on reference writes):
+* **SATB (Snapshot-At-The-Beginning)**: Used by G1. If a reference is overwritten, the write barrier intercepts the old value and pushes it to a local buffer, preserving the object graph as it existed when GC marking started.
+* **Load Barriers**: Used by ZGC. Instead of intercepting writes, ZGC intercepts *reads* of references. If a thread loads a reference pointing to an object that hasn't been relocated yet, the load barrier intercepts the execution, relocates the object immediately, updates the reference, and returns the new address.
+
+### Garbage First (G1) Mechanics
+G1 partitions the heap into equal-sized virtual regions (1MB to 32MB). Regions are dynamically assigned to act as Eden, Survivor, or Old spaces.
+* **Remembered Sets (RSets)**: To collect a region without scanning the entire heap, G1 maintains an RSet for each region. The RSet tracks all incoming references pointing into that region from other regions.
+* **Card Table**: The heap is mapped to an array of bytes called a Card Table, where each byte (card) represents 512 bytes of heap memory. When a reference write occurs, a write barrier marks the corresponding card as "dirty". A background thread processes dirty cards to update the RSets.
+
+### Z Garbage Collector (ZGC) Mechanics
+ZGC is a scalable, low-latency garbage collector designed to handle heaps up to multiple terabytes with pause times consistently under 1 millisecond.
+* **Colored Pointers**: ZGC stores metadata directly in the upper bits of reference pointers (on 64-bit architectures). It uses bits to track whether an object has been relocated, marked, or is finalized.
+* **Load Barriers**: As mentioned, ZGC's load barrier checks these metadata bits on every reference load. If the pointer is "bad" (i.e., points to an object that has been moved but not yet updated), the load barrier resolves the new address in a lock-free manner via a "forwarding table" and updates the reference in place.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "diagramType": "sequence",
+  "timeline": [
+    {"event": "Mutator Allocates Object in Eden", "thread": "Application"},
+    {"event": "Eden Fills Up", "thread": "JVM"},
+    {"event": "Stop-The-World (STW) Pause Initiated", "thread": "GC Thread"},
+    {"event": "Marking GC Roots", "thread": "GC Thread"},
+    {"event": "Evacuating Live Objects to Survivor (S0)", "thread": "GC Thread"},
+    {"event": "Updating References via Card Table", "thread": "GC Thread"},
+    {"event": "STW Resumed / Application Continues", "thread": "Application"}
+  ]
+}
+```
+
+## CODE_IMPLEMENTATION
+```java
+package com.devmastery.gc;
+
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Demonstrates heap allocation patterns that trigger GC cycles,
+ * monitors GC activity programmatically via MXBeans, and
+ * showcases a classic memory leak scenario (unintentional retention in static collection).
+ */
+public class GCMonitorAndLeakSimulator {
+
+    // Intentional memory leak vector: objects placed here are never reclaimed
+    private static final List<LeakedObject> LEAK_RESERVOIR = new ArrayList<>();
+
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("Starting GC Monitor & Simulator...");
+        printGCStats();
+
+        // Spawn a thread to continuously monitor GC activity
+        Thread monitorThread = new Thread(GCMonitorAndLeakSimulator::monitorLoop);
+        monitorThread.setDaemon(true);
+        monitorThread.start();
+
+        // Simulate application workload with transient allocations and a steady leak
+        for (int i = 0; i < 500; i++) {
+            allocateTransientObjects();
+            simulateLeak();
+            Thread.sleep(50); // Control throughput
+        }
+
+        System.out.println("Simulation complete. Final GC Stats:");
+        printGCStats();
+    }
+
+    private static void allocateTransientObjects() {
+        // These objects have a short lifespan and will be collected in Young Gen (Eden)
+        List<String> transientList = new ArrayList<>();
+        for (int i = 0; i < 10000; i++) {
+            transientList.add(UUID.randomUUID().toString());
+        }
+    }
+
+    private static void simulateLeak() {
+        // These objects will bypass Young Gen collection over time and promote to Old Gen
+        for (int i = 0; i < 100; i++) {
+            LEAK_RESERVOIR.add(new LeakedObject(UUID.randomUUID().toString()));
+        }
+    }
+
+    private static void monitorLoop() {
+        try {
+            while (true) {
+                Thread.sleep(2000);
+                printGCStats();
+            }
+        } catch (InterruptedException ignored) {}
+    }
+
+    private static void printGCStats() {
+        List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean bean : gcBeans) {
+            System.out.printf("Collector: %-15s | Collections: %-5d | Total Time: %d ms%n",
+                    bean.getName(), bean.getCollectionCount(), bean.getCollectionTime());
+        }
+    }
+
+    static class LeakedObject {
+        private final byte[] padding = new byte[1024]; // 1KB payload per object
+        private final String id;
+
+        public LeakedObject(String id) {
+            this.id = id;
+        }
+    }
+}
+```
+
+## ARCHITECTURE_PATTERNS
+In low-latency architectures, minimizing GC impact is achieved by adopting **Object Pooling** and **Off-Heap Memory Allocations**.
+
+### Off-Heap Memory (Direct ByteBuffers / Unsafe)
+By allocating memory outside the Java Heap boundary using `ByteBuffer.allocateDirect()` or direct memory addresses through `sun.misc.Unsafe`, the data is completely hidden from the Garbage Collector. The GC does not scan off-heap memory, meaning millions of records can be stored in memory without adding a single nanosecond to GC pause times. This is the foundation of high-performance libraries like Netty, Aeron, and Apache Cassandra.
+
+```java
+// Allocating and writing to off-heap memory to bypass GC
+public class OffHeapDataStore {
+    private static final sun.misc.Unsafe unsafe;
+    static {
+        try {
+            java.lang.reflect.Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            unsafe = (sun.misc.Unsafe) field.get(null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public long allocateRecord(int sizeInBytes) {
+        // Memory allocated here is NOT managed by JVM GC
+        return unsafe.allocateMemory(sizeInBytes);
+    }
+
+    public void freeRecord(long address) {
+        // MUST manually release to prevent OS-level memory leak
+        unsafe.freeMemory(address);
+    }
+}
+```
+
+## INTERVIEW_MASTERCLASS
+### 1. What is the "Promotion Failure" or "To-Space Overflow" in Young Generation GC, and how does it relate to fragmentation?
+A promotion failure occurs during a minor GC (Young Gen collection) when live objects in Eden/Survivor need to be evacuated (promoted) to the Old Generation, but the Old Generation does not have a contiguous block of free memory large enough to accommodate them. This can occur even if the total free space in the Old Gen is theoretically sufficient, but due to severe memory fragmentation, no single contiguous slot fits the promoted object. 
+
+When this happens, the JVM is forced to trigger a fallback major GC (often a single-threaded Full GC using a Mark-Sweep-Compact algorithm) to defragment the Old Gen, resulting in a severe, highly disruptive Stop-The-World pause.
+
+### 2. How does the G1 GC avoid the fragmentation issues commonly seen in CMS (Concurrent Mark Sweep)?
+CMS used a free-list design to manage the Old Generation without compaction, which made it highly susceptible to memory fragmentation over time, eventually triggering catastrophic Full GC pauses. 
+
+G1 avoids this by partitioning the heap into thousands of discrete, equal-sized regions. When G1 performs a garbage collection cycle (both Mixed and Young GCs), it utilizes a copy-and-evacuate algorithm. It selects a set of regions with the highest amount of garbage (hence "Garbage First"), copies the remaining live objects into a single, clean, empty region, and reclaims the source regions completely. This process inherently compacts the memory on the fly, eliminating fragmentation without requiring a global STW compaction phase.
+
+---

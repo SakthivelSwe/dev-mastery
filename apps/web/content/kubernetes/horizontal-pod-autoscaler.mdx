@@ -1,0 +1,167 @@
+---
+slug: "horizontal-pod-autoscaler"
+title: "Horizontal Pod Autoscaler (HPA)"
+level: 4
+---
+
+## WHY
+Traffic is never constant. An e-commerce site gets 10x normal traffic during Black Friday. A news site spikes during breaking news. A gaming platform peaks in evenings.
+Running enough Pods for the peak load 24/7 is wasteful and expensive. Running only for average load means crashes during peaks.
+**Horizontal Pod Autoscaler (HPA)** automatically scales the number of Pods based on observed CPU, memory, or custom metrics. When traffic increases, HPA adds Pods. When traffic drops, it removes them. You only pay for what you use.
+
+## THEORY
+### How HPA Works
+HPA runs as a control loop (every 15 seconds by default):
+1. Queries the Metrics Server for current CPU/memory usage of all Pods in a Deployment
+2. Compares actual usage to the target threshold
+3. Calculates the desired replica count: `desiredReplicas = ceil(currentReplicas * (currentMetric / desiredMetric))`
+4. Updates the Deployment's replica count if needed
+
+### Prerequisites
+HPA requires the **Metrics Server** to be installed in the cluster (collects CPU/memory from each Node).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "hpa-scaling" }
+```
+
+## CODE
+
+### Install Metrics Server
+```bash
+# Install Metrics Server (prerequisite for HPA)
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Verify it's running
+kubectl top nodes              # Node CPU/memory usage
+kubectl top pods               # Pod CPU/memory usage
+```
+
+### Creating an HPA
+```yaml
+# hpa.yml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-deployment      # Scale THIS deployment!
+  minReplicas: 2              # Never go below 2 (for HA)
+  maxReplicas: 20             # Never exceed 20
+  metrics:
+    # Scale based on CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70  # Target: 70% CPU across all Pods
+    # Scale based on Memory too!
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80  # Scale out if memory > 80%
+```
+
+```bash
+# Apply HPA
+kubectl apply -f hpa.yml
+
+# Monitor HPA in action
+kubectl get hpa
+# NAME      REFERENCE         TARGETS          MINPODS   MAXPODS   REPLICAS
+# api-hpa   Deployment/api   45%/70%           2         20        3
+
+# Watch real-time
+kubectl get hpa -w
+
+# Describe for detailed events
+kubectl describe hpa api-hpa
+# Events:
+# SuccessfulRescale: New size: 5 → 8; Scaling up
+# SuccessfulRescale: New size: 8 → 3; Scaling down after traffic drop
+```
+
+### CLI Alternative
+```bash
+# Create HPA from kubectl (simple CPU-based)
+kubectl autoscale deployment api-deployment \
+  --min=2 \
+  --max=20 \
+  --cpu-percent=70
+```
+
+### Load Test to Observe Scaling
+```bash
+# Generate load with a simple pod
+kubectl run -i --tty load-generator \
+  --rm \
+  --image=busybox:1.28 \
+  --restart=Never \
+  -- /bin/sh -c "while sleep 0.01; do wget -q -O- http://api-service; done"
+
+# In another terminal, watch HPA respond:
+kubectl get hpa -w
+# api-hpa   3/20   45%/70%   3
+# api-hpa   3/20   85%/70%   3   ← Usage exceeded target!
+# api-hpa   5/20   85%/70%   5   ← Scaled out to 5!
+# api-hpa   5/20   60%/70%   5   ← Stable
+```
+
+## REAL_WORLD
+**Scaling on Custom Metrics (Beyond CPU/Memory)**
+CPU and memory aren't always the right signals to scale on. What if your API is slow because the message queue depth is 100,000? Scaling on CPU won't help — you need to scale on queue depth!
+
+You can use **Kubernetes Event-Driven Autoscaling (KEDA)** — an open-source project that scales on custom metrics from 50+ sources:
+- Kafka consumer lag
+- Redis queue length
+- AWS SQS queue depth
+- Prometheus custom metrics
+- HTTP requests per second
+
+```yaml
+# KEDA ScaledObject
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: kafka-consumer-scaler
+spec:
+  scaleTargetRef:
+    name: consumer-deployment
+  minReplicaCount: 1
+  maxReplicaCount: 50
+  triggers:
+    - type: kafka
+      metadata:
+        topic: payment-events
+        lagThreshold: "100"      # Scale if consumer lag > 100 messages
+        bootstrapServers: kafka-service:9092
+```
+
+## INTERVIEW
+**Q: Your HPA is configured to scale between 2-20 replicas at 70% CPU target. After a traffic spike, it scaled up to 15 replicas. Traffic dropped 30 minutes ago, but the HPA still shows 15 replicas. Why isn't it scaling down? And when will it scale down?**
+A: Kubernetes HPA has **scale-down stabilization** — a built-in delay before scaling down to prevent "flapping" (rapidly scaling up and down during brief traffic fluctuations).
+
+By default:
+- **Scale-up** happens quickly (within 30 seconds of detecting high load)
+- **Scale-down** has a **5-minute stabilization window** — the HPA looks at the maximum replica recommendation from the last 5 minutes, not the current one
+
+This is intentional! If traffic temporarily dropped for 2 minutes but might spike again, immediately scaling down 13 Pods would cause a poor user experience when traffic returns.
+
+You can configure the stabilization window:
+```yaml
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300   # Wait 5 minutes (default)
+    policies:
+      - type: Pods
+        value: 4
+        periodSeconds: 60    # Remove at most 4 pods per minute
+```
+
+After 5 minutes of consistently low load, the HPA will gradually scale down, removing at most 4 Pods per minute (per the policy) until it reaches the minimum replica count.

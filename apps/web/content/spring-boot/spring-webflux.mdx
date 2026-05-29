@@ -1,0 +1,153 @@
+---
+slug: "spring-webflux"
+title: "Spring WebFlux & Reactive Programming"
+level: 5
+---
+
+## WHY
+Traditional Spring MVC uses a Blocking I/O model. When your server makes a database query, the current Thread sits completely idle, blocked, waiting for the database to respond. If your API gets 10,000 concurrent requests, you need 10,000 Threads. Each Thread consumes 1MB of RAM. That's 10GB of RAM just for idle threads!
+
+In contrast, **Spring WebFlux** uses Non-Blocking I/O (Reactive Programming). When a Thread makes a database query, it registers a callback and immediately returns to the pool to handle other requests. When the database responds, a Thread from the pool picks up the result. 
+
+With WebFlux, you can handle 10,000 concurrent connections using only 8 Threads (one per CPU core). This is the same paradigm that powers Node.js, Nginx, and Netty.
+
+## THEORY
+### The Reactive Stack (Project Reactor)
+WebFlux is built on top of **Project Reactor**, which provides two core reactive types:
+- **`Mono<T>`:** A stream that emits 0 or 1 value. Think of it as a reactive `Optional<T>` or a reactive Future.
+- **`Flux<T>`:** A stream that emits 0 to N values over time. Think of it as a reactive `List<T>` or a stream of events.
+
+These types are lazy! Creating a `Mono` or `Flux` doesn't execute any code. The pipeline only executes when someone **subscribes** to it.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "spring-webflux" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Mono and Flux Basics)
+```java
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+public class ReactorDemo {
+    public static void main(String[] args) {
+
+        // Mono: emits exactly one value
+        Mono<String> greeting = Mono.just("Hello, WebFlux!");
+        greeting.subscribe(System.out::println); // "Hello, WebFlux!"
+
+        // Flux: emits multiple values
+        Flux<Integer> numbers = Flux.range(1, 5);
+        numbers
+            .map(n -> n * 2)
+            .filter(n -> n > 4)
+            .subscribe(System.out::println); // 6, 8, 10
+        
+        // Empty Mono (like returning null, but safely)
+        Mono<String> empty = Mono.empty();
+        empty.subscribe(
+            value -> System.out.println("Got: " + value),
+            error -> System.err.println("Error: " + error),
+            () -> System.out.println("Stream completed with no value!")
+        );
+    }
+}
+```
+
+### Level 2 — Building Blocks (A Reactive Controller)
+```java
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@RestController
+@RequestMapping("/api/reactive/users")
+public class UserReactiveController {
+
+    private final UserReactiveRepository userRepository;
+
+    // Returns 0 or 1 user — uses Mono
+    @GetMapping("/{id}")
+    public Mono<User> getUserById(@PathVariable Long id) {
+        return userRepository.findById(id);
+    }
+
+    // Returns 0 to N users — uses Flux
+    @GetMapping
+    public Flux<User> getAllUsers() {
+        return userRepository.findAll();
+    }
+
+    // Saves and returns the created user
+    @PostMapping
+    public Mono<User> createUser(@RequestBody User user) {
+        return userRepository.save(user);
+    }
+}
+```
+
+### Level 3 — Intermediate (Chaining Reactive Operators)
+The power of Reactor comes from chaining operators to build complex pipelines without blocking threads.
+
+```java
+@Service
+public class OrderService {
+
+    public Mono<OrderSummary> processOrder(Long userId, Long productId) {
+        
+        return userRepository.findById(userId)                    // Mono<User>
+                .switchIfEmpty(Mono.error(new UserNotFoundException(userId)))
+                .flatMap(user ->
+                    productRepository.findById(productId)         // Mono<Product>
+                        .flatMap(product ->
+                            // Both user and product loaded non-blockingly!
+                            orderRepository.save(new Order(user, product)) // Mono<Order>
+                        )
+                )
+                .map(order -> new OrderSummary(order.getId(), "CREATED"))
+                .onErrorMap(ex -> new OrderProcessingException("Failed!", ex))
+                .doOnSuccess(summary -> log.info("Order created: {}", summary));
+    }
+}
+```
+
+### Level 4 — Advanced (Server-Sent Events — Real-Time Streaming)
+WebFlux can stream data to the browser in real-time using Server-Sent Events (SSE) — no WebSocket needed for one-directional data.
+
+```java
+@GetMapping(value = "/live-feed", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<ServerSentEvent<String>> getLiveFeed() {
+    // Emit a new event every second!
+    return Flux.interval(Duration.ofSeconds(1))
+            .map(seq -> ServerSentEvent.<String>builder()
+                    .id(String.valueOf(seq))
+                    .event("stock-update")
+                    .data("AAPL: $" + (150 + Math.random() * 10))
+                    .build());
+}
+
+// JavaScript in the browser:
+// const evtSource = new EventSource('/api/live-feed');
+// evtSource.onmessage = (event) => { console.log(event.data); };
+```
+
+## REAL_WORLD
+**When should you use WebFlux vs Spring MVC?**
+
+- **Use Spring MVC** for standard CRUD applications with a SQL database (JDBC). JDBC is inherently blocking, and even WebFlux can't make it truly non-blocking.
+- **Use WebFlux** when your backend makes many downstream HTTP calls to other services (API Gateways, Microservice Aggregators). WebFlux will pipeline these calls concurrently instead of waiting for each one.
+- **Use WebFlux** for real-time data streaming (live dashboards, chat apps, notification systems).
+
+Most Enterprise applications still use Spring MVC + Virtual Threads (Java 21+) rather than WebFlux, because blocking code is much easier to reason about and debug.
+
+## INTERVIEW
+**Q: What is "Backpressure" in Reactive Programming?**
+A: Backpressure is a mechanism where the **Subscriber** tells the **Publisher** to slow down. If the Publisher emits 1,000 events per second but the Subscriber can only process 10 per second, the buffer will overflow and crash. Reactor's `Flux` supports backpressure natively, allowing subscribers to request only as many items as they can handle at one time.
+
+**Q: Can you use `@Transactional` in WebFlux?**
+A: Standard `@Transactional` is synchronous and blocking — it does NOT work with WebFlux. You must use reactive transaction management instead, often provided by R2DBC (Reactive Relational Database Connectivity) — the reactive alternative to JDBC.
+
+**Q: What is the difference between `map` and `flatMap` in Reactor?**
+A: `map` transforms a value synchronously (returns a regular object). `flatMap` transforms a value into a NEW `Mono` or `Flux` (for when the transformation itself is an async operation). You must use `flatMap` whenever you call a method that returns a `Mono` or `Flux` inside a pipeline.

@@ -1,0 +1,148 @@
+---
+slug: "service-mesh-k8s"
+title: "Service Mesh in Kubernetes"
+level: 5
+---
+
+## WHY
+As your microservices architecture grows to 50+ services, you face recurring cross-cutting concerns: How do you get distributed tracing across all services? How do you implement mutual TLS between every service pair? How do you do canary deployments at the network level?
+Implementing these in each microservice is duplicative, error-prone, and requires every team to reinvent the wheel.
+A **Service Mesh** (Istio, Linkerd) solves this by deploying a sidecar proxy (Envoy) alongside every Pod. All network traffic passes through these proxies, giving you observability, security, and traffic control without changing your application code.
+
+## THEORY
+### The Sidecar Proxy Pattern
+Every Pod gets an additional container automatically injected: the Envoy proxy. All inbound AND outbound traffic for the application container passes through Envoy. The application thinks it's talking directly to other services; Envoy intercepts everything and adds:
+- mTLS encryption
+- Distributed tracing headers
+- Circuit breaking
+- Canary routing
+- Retry logic
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "service-mesh" }
+```
+
+## CODE
+
+### Istio Installation
+```bash
+# Install Istio
+curl -L https://istio.io/downloadIstio | sh -
+istioctl install --set profile=default
+
+# Enable auto-injection for your namespace
+kubectl label namespace production istio-injection=enabled
+
+# Now every new Pod in 'production' gets an Envoy sidecar automatically!
+kubectl get pods -n production
+# NAME                   READY   STATUS
+# api-deployment-abc     2/2     Running   ← 2 containers! (api + envoy sidecar)
+```
+
+### Traffic Management: Canary Deployment
+```yaml
+# VirtualService: Route 90% to v1, 10% to v2
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: api-virtual-service
+spec:
+  hosts:
+    - api-service
+  http:
+    - match:
+        - headers:
+            x-canary-user:
+              exact: "true"   # Route canary users to v2
+      route:
+        - destination:
+            host: api-service
+            subset: v2
+    - route:
+        - destination:
+            host: api-service
+            subset: v1
+          weight: 90          # 90% → v1
+        - destination:
+            host: api-service
+            subset: v2
+          weight: 10          # 10% → v2
+---
+# DestinationRule: Define v1 and v2 subsets
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: api-destination
+spec:
+  host: api-service
+  subsets:
+    - name: v1
+      labels:
+        version: "1.0"
+    - name: v2
+      labels:
+        version: "2.0"
+```
+
+### Mutual TLS (mTLS) — Zero Trust Networking
+```yaml
+# PeerAuthentication: Enforce mTLS for all communication in namespace
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT    # All services must use mTLS — plaintext rejected!
+```
+
+### Circuit Breaker
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: payment-circuit-breaker
+spec:
+  host: payment-service
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5        # Open circuit after 5 errors
+      interval: 30s                  # Within 30 seconds
+      baseEjectionTime: 30s          # Keep circuit open for 30s
+      maxEjectionPercent: 50         # Eject at most 50% of hosts
+```
+
+## REAL_WORLD
+**Kiali: Service Mesh Observability Dashboard**
+Kiali is Istio's observability UI — it shows:
+- Real-time traffic flow between services (animated graph!)
+- Request success/error rates per service
+- Latency distribution (p50, p95, p99)
+- Which services have mTLS enabled
+- Traffic routing rules visualized
+
+```bash
+# Install Kiali
+kubectl apply -f samples/addons/kiali.yaml -n istio-system
+istioctl dashboard kiali  # Opens browser!
+```
+
+## INTERVIEW
+**Q: What is the performance overhead of a service mesh, and how do you evaluate whether the benefits justify the cost?**
+
+A: **Real overhead:** Istio with Envoy adds 5-15ms of latency per request (each hop goes through 2 Envoy proxies — one on the sender, one on the receiver) and 10-30% higher CPU usage across the cluster.
+
+**Benefits analysis:**
+1. **mTLS everywhere:** If you're in a regulated industry (healthcare, finance) requiring encryption in transit, implementing mTLS in each service pair is weeks of work. Istio does it in an afternoon.
+2. **Observability:** Distributed traces, golden signals (latency, error rate, throughput) per service — without adding any code.
+3. **Traffic management:** Canary deployments, A/B testing, fault injection for chaos engineering — all at the network layer.
+4. **Service-to-service auth:** Zero Trust network where a compromised service can't call privileged services.
+
+**When to NOT use a service mesh:**
+- Small number of services (< 10): overhead outweighs benefit
+- Simple traffic patterns: straightforward call graphs don't need mesh features
+- Team doesn't have the expertise: service mesh adds significant operational complexity
+
+**Alternatives:** Linkerd is significantly lighter than Istio (Rust-based proxy, 5ms vs 15ms overhead) for teams that want the key features without the full complexity.

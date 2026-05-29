@@ -1,0 +1,92 @@
+---
+slug: "pg-statistics"
+title: "PostgreSQL Statistics"
+level: 3
+---
+
+## WHY
+The PostgreSQL Query Planner is like a GPS navigation system. To find the fastest route, it needs an accurate map. PostgreSQL Statistics *are* that map. If the statistics are outdated or inaccurate, the planner might choose a terrible query plan (e.g., doing a sequential scan on a 100GB table instead of using an index), bringing your database to a halt.
+
+## THEORY
+### What are Statistics?
+PostgreSQL maintains a system catalog (`pg_statistic`) that stores statistical data about the contents of tables and indexes. This includes:
+- **Most Common Values (MCV):** A list of the most frequent values in a column.
+- **Histograms:** The distribution of data across bounds.
+- **Correlation:** How strongly the physical order of rows on disk matches the logical order of a column.
+- **Distinct Count:** How many unique values exist in a column.
+
+The `ANALYZE` command is responsible for sampling a random subset of rows from a table and updating these statistics. `AUTOVACUUM` runs `ANALYZE` automatically in the background.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "pg-statistics" }
+```
+
+## CODE
+
+### Manually Updating Statistics
+If you just inserted 5 million rows into a table, the auto-analyzer might not have run yet. It is a good practice to manually run ANALYZE.
+
+```sql
+-- Analyze a specific table
+ANALYZE users;
+
+-- Analyze the entire database
+ANALYZE;
+
+-- Run VACUUM and ANALYZE together (very common)
+VACUUM ANALYZE orders;
+```
+
+### Viewing Statistics
+The `pg_statistic` table is hard to read. PostgreSQL provides a human-readable view called `pg_stats`.
+
+```sql
+-- View statistics for the 'status' column in the 'orders' table
+SELECT 
+  null_frac, 
+  n_distinct, 
+  most_common_vals, 
+  most_common_freqs 
+FROM pg_stats 
+WHERE tablename = 'orders' AND attname = 'status';
+```
+
+### Tuning Statistics Targets
+By default, PostgreSQL samples 30,000 rows (based on `default_statistics_target = 100`) to generate the histogram and MCV list. For extremely large or highly skewed tables, this sample size might be too small, leading to bad query plans.
+
+```sql
+-- Increase the statistics target for a specific column (Max is 10000)
+ALTER TABLE large_events ALTER COLUMN event_type SET STATISTICS 1000;
+
+-- You MUST run ANALYZE after changing the target
+ANALYZE large_events;
+```
+
+## REAL_WORLD
+**The "Out of Bounds" Date Problem**
+A classic statistics problem occurs with time-series data. Imagine an `orders` table. Statistics show the maximum `created_at` date is '2023-10-01' (because ANALYZE last ran yesterday).
+
+Today is '2023-10-02'. A query asks for:
+`SELECT * FROM orders WHERE created_at = '2023-10-02'`
+
+The Query Planner looks at the statistics, sees the max date is yesterday, and estimates that exactly **0 rows** will match. Because it thinks 0 rows will match, it might choose a Nested Loop Join or ignore an index. In reality, there are 10,000 orders from today, and the query takes 5 minutes instead of 5 milliseconds!
+
+**Solution:** Increase the auto-analyze frequency for that specific table so statistics are updated more often.
+
+## INTERVIEW
+**Q: You have a query `SELECT * FROM users WHERE city = 'London' AND status = 'ACTIVE'`. Both columns have indexes, but the query is incredibly slow. PostgreSQL is heavily underestimating the number of rows returned. How do you fix this?**
+
+A: You are experiencing a **Cross-Column Correlation** problem.
+
+PostgreSQL statistics assume that columns are completely independent. It multiplies the probability of `city = 'London'` by the probability of `status = 'ACTIVE'`. But in reality, certain statuses might be highly correlated with certain cities.
+
+**The Fix:** Create **Extended Statistics**. This tells PostgreSQL to analyze the relationship *between* the two columns.
+
+```sql
+CREATE STATISTICS st_users_city_status (dependencies) 
+ON city, status FROM users;
+
+ANALYZE users;
+```
+Now the planner knows how often 'London' and 'ACTIVE' appear *together*, resulting in an accurate row estimate and a much faster query plan.

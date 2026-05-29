@@ -1,0 +1,216 @@
+---
+title: closures
+slug: closures
+---
+
+# Closures — Lexical Scope and Variable Capture
+
+A closure is the combination of a function bundled together with references to its surrounding state (the lexical environment). Closures allow an inner function to access variables from an outer scope even after the outer function has finished executing.
+
+---
+
+## 1. Lexical Scope vs. Dynamic Scope
+
+JavaScript uses **Lexical Scope** (also known as Static Scope). This means that the scope of an identifier is determined entirely at **write time** (during the compilation phase) based on its physical location within the source code, rather than at **call time** (runtime invocation).
+
+```javascript
+const x = 10;
+
+function foo() {
+  console.log(x); // Lexical scope look-up resolves to the outer x (10)
+}
+
+function bar() {
+  const x = 20;
+  foo(); // Invocation site does not change foo's lexical scope
+}
+
+bar(); // Prints 10, not 20
+```
+
+---
+
+## 2. V8 Internals: Contexts and Heap Allocation
+
+To understand closures at a low level, we must look at how V8 manages scope allocation.
+
+### The Stack vs. Heap Allocation Problem
+Normally, local variables in a function are allocated on the **Call Stack** within the function's stack frame. When the function returns, its stack frame is popped, and that memory is reclaimed.
+
+However, if an inner function references a variable from an outer function, and the inner function escapes (is returned or passed elsewhere), the outer function's stack frame is popped, but its variables must survive.
+
+```
+STRICT STACK ALLOCATION (No Closure):
+[Call Stack] -> [outer() Frame (allocates x)] -> [Returns] -> [Frame Popped (x is deleted)]
+
+V8 CLOSURE ALLOCATION:
+[Heap Memory]
+  |
+  +--> [Context Object (Scope of outer)]
+         |-- x: 10  <-- Retained because inner() has a [[Scope]] pointer here
+```
+
+### V8 Context Allocation
+To solve this, the V8 parser performs **Scope Analysis** (located in `src/ast/scopes.cc` in the V8 codebase) before compiling the code. 
+* If the parser detects that a variable in an outer function is captured by an inner function, that variable is **not** allocated on the stack.
+* Instead, V8 allocates a **`Context` object** (specifically, a `FunctionContext`) on the **Heap**.
+* The outer function’s local variables that are captured are stored as properties of this Heap-allocated `Context`.
+* When the inner function is instantiated, V8 creates a `JSFunction` object representing it. This object contains an internal field called `context` (accessible via the `[[Scope]]` internal slot), which points directly to the Heap-allocated `Context` of its parent.
+
+Because the inner function holds a reference to this heap `Context`, the garbage collector (V8’s Orinoco GC engine) cannot reclaim the memory containing the captured variables, even after the outer function's execution frame is removed from the stack.
+
+---
+
+## 3. The Classic Loop Bug and Scoping Solutions
+
+### The Bug
+```javascript
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => {
+    console.log(i);
+  }, 100);
+}
+// Outputs: 3, 3, 3
+```
+
+#### Why this happens:
+1. `var` is function-scoped (or globally scoped). It is not block-scoped.
+2. In this loop, only **one** binding is created for `i` in the parent execution context.
+3. The three arrow functions capture the *same* `i` variable by reference from the parent context.
+4. By the time the `setTimeout` callbacks execute (after at least 100ms, when the synchronous loop has long finished), the value of `i` has been incremented to `3`. All three closures read this shared mutable variable.
+
+---
+
+### Fix 1: Block Scope (`let`)
+```javascript
+for (let i = 0; i < 3; i++) {
+  setTimeout(() => {
+    console.log(i);
+  }, 100);
+}
+// Outputs: 0, 1, 2
+```
+* **Under the hood**: The `let` keyword is block-scoped. For every iteration of the loop, V8 creates a new lexical scope block. 
+* Each iteration gets its own unique binding of `i` initialized with the value from the previous iteration. 
+* Consequently, three separate `Context` objects are created on the heap, each storing a different, immutable value of `i` ($0$, $1$, and $2$).
+
+---
+
+### Fix 2: Immediately Invoked Function Expressions (IIFE)
+```javascript
+for (var i = 0; i < 3; i++) {
+  (function(capturedI) {
+    setTimeout(() => {
+      console.log(capturedI);
+    }, 100);
+  })(i);
+}
+// Outputs: 0, 1, 2
+```
+* **Under the hood**: An IIFE is executed immediately on each iteration. 
+* By passing `i` as an argument to the IIFE, it is mapped to a new parameter `capturedI`. 
+* Since function parameters are local variables scoped to that function invocation, a new execution context (and a corresponding Heap `Context` for the closure) is created for each iteration, capturing the value of `i` at that exact moment in time.
+
+---
+
+### Fix 3: Function Factory
+```javascript
+function createLogCallback(value) {
+  return () => {
+    console.log(value);
+  };
+}
+
+for (var i = 0; i < 3; i++) {
+  setTimeout(createLogCallback(i), 100);
+}
+// Outputs: 0, 1, 2
+```
+* **Under the hood**: The factory function `createLogCallback` returns a new closure. 
+* The argument `i` is bound to the parameter `value` inside the unique execution context of that specific call. This decouples the execution from the mutable loop variable `i`.
+
+---
+
+## 4. Memory Implications and Closures
+
+Because closures retain references to their outer environments, they can lead to memory retention issues if not managed carefully.
+
+### Shared Context Memory Leak (The Meteor Leak Pattern)
+When multiple inner functions are defined within the same outer function, they **share the same Context object**. This can cause unexpected memory retention.
+
+```javascript
+let globalHolder = null;
+
+function replaceThing() {
+  const priorThing = globalHolder;
+  
+  // Unused closure that references 'priorThing'
+  const unusedClosure = function() {
+    if (priorThing) {
+      console.log("hi");
+    }
+  };
+  
+  // Active closure that is assigned globally
+  globalHolder = {
+    longStr: new Array(1000000).join('*'),
+    someMethod: function() {
+      // This closure DOES NOT reference priorThing
+    }
+  };
+}
+
+setInterval(replaceThing, 1000);
+```
+
+#### Why this leaks memory:
+1. `unusedClosure` captures `priorThing`.
+2. `someMethod` is a closure created in the same execution of `replaceThing`.
+3. Because they are created in the same scope, `unusedClosure` and `someMethod` **share the same Heap Context object**.
+4. The shared `Context` object contains a reference to `priorThing`.
+5. Even though `someMethod` does not reference `priorThing` directly, it holds a reference to the shared `Context` object.
+6. Since `globalHolder` persists on the global scope, the `someMethod` closure remains alive, keeping the shared `Context` alive, which keeps `priorThing` alive.
+7. Each interval execution creates a chain of retained objects, causing a severe memory leak.
+
+---
+
+## 5. The Module Pattern
+
+Closures enable encapsulation by mimicking private class members. This is the foundation of the classic Module Pattern.
+
+```javascript
+const BankAccount = (function() {
+  // Private variable stored in the IIFE's closure context
+  let balance = 0;
+
+  function validateAmount(amount) {
+    return typeof amount === 'number' && amount > 0;
+  }
+
+  return {
+    deposit(amount) {
+      if (validateAmount(amount)) {
+        balance += amount;
+        return true;
+      }
+      return false;
+    },
+    withdraw(amount) {
+      if (validateAmount(amount) && amount <= balance) {
+        balance -= amount;
+        return true;
+      }
+      return false;
+    },
+    getBalance() {
+      return balance;
+    }
+  };
+})();
+
+BankAccount.deposit(100);
+console.log(BankAccount.getBalance()); // 100
+console.log(BankAccount.balance); // undefined (completely private)
+```
+
+---

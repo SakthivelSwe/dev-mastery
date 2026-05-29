@@ -1,0 +1,175 @@
+---
+slug: "docker-ci-cd"
+title: "Docker in CI/CD"
+level: 4
+---
+
+## WHY
+Docker is the backbone of modern CI/CD pipelines. By packaging your application and its environment together, Docker ensures that the artifact tested in CI is exactly what gets deployed to production — no "it worked in CI but fails in production" surprises.
+Every major CI/CD platform (GitHub Actions, GitLab CI, Jenkins, CircleCI) has first-class Docker support. Understanding how to integrate Docker into your pipeline is essential for modern software delivery.
+
+## THEORY
+### The Docker CI/CD Flow
+1. **Developer pushes code to Git**
+2. **CI triggers:** Build Docker image from Dockerfile
+3. **Run tests:** Inside a Docker container (consistent environment)
+4. **Security scan:** Check image for vulnerabilities (Trivy, Snyk)
+5. **Push image:** To a registry (GHCR, ECR, Docker Hub) with a unique tag (git SHA)
+6. **Deploy:** Update production to use the new image tag
+
+### Benefits
+- **Reproducible:** Same Docker image runs in CI and production
+- **Isolated:** Tests run in a clean, consistent environment every time
+- **Artifact-based:** The image is the deployable artifact — no "build on the server"
+- **Rollback:** Any previous image tag can be redeployed instantly
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "docker-cicd-pipeline" }
+```
+
+## CODE
+
+### GitHub Actions Full Pipeline
+```yaml
+# .github/workflows/ci-cd.yml
+name: Build, Test, and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build with Docker BuildKit (faster, better caching)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login (only on push to main, not PRs)
+      - name: Login to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build image (and push only on main branch)
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Cache from GitHub Actions cache for faster builds!
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Run tests INSIDE the built container
+      - name: Run tests
+        run: |
+          docker run --rm \
+            -e NODE_ENV=test \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            npm test
+
+      # Security scan
+      - name: Vulnerability Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'           # Fail the pipeline on CRITICAL vulnerabilities!
+          severity: 'CRITICAL,HIGH'
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy to Production
+        run: |
+          # SSH to production server and pull new image
+          ssh -i ${{ secrets.SSH_KEY }} user@production-server \
+            "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} && \
+             docker stop api && docker rm api && \
+             docker run -d --name api \
+               --restart=unless-stopped \
+               -p 8080:8080 \
+               ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+```
+
+### GitLab CI with Docker
+```yaml
+# .gitlab-ci.yml
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:dind   # Docker-in-Docker
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $IMAGE_TAG .
+    - docker push $IMAGE_TAG
+
+test:
+  stage: test
+  script:
+    - docker run --rm $IMAGE_TAG npm test
+
+deploy:
+  stage: deploy
+  only:
+    - main
+  script:
+    - docker pull $IMAGE_TAG
+    - docker service update --image $IMAGE_TAG my-app  # Docker Swarm
+```
+
+## REAL_WORLD
+**Caching in CI for Speed**
+Docker build caches are lost between CI runs by default (each run starts fresh). Use registry-based caching:
+
+```yaml
+- name: Build with registry cache
+  uses: docker/build-push-action@v5
+  with:
+    cache-from: type=registry,ref=ghcr.io/myorg/myapp:cache
+    cache-to: type=registry,ref=ghcr.io/myorg/myapp:cache,mode=max
+```
+
+This stores the build cache in the registry and restores it on the next run. Result: `npm install` steps are cached across pipeline runs — builds that took 8 minutes now take 90 seconds.
+
+## INTERVIEW
+**Q: Your CI/CD pipeline builds a Docker image and runs tests. The pipeline takes 12 minutes — 8 of which are just `npm install`. How do you optimize this?**
+A: The root cause is that `npm install` is not being cached between pipeline runs. Three solutions:
+
+1. **Layer cache ordering:** Ensure `package*.json` is copied and `npm install` runs BEFORE `COPY . .`. This way, npm install is only re-executed when `package.json` changes, not when any source file changes.
+
+2. **Registry-based layer caching:** Use `cache-from: type=registry` in GitHub Actions build-push-action to persist the Docker layer cache in the container registry between pipeline runs.
+
+3. **BuildKit inline cache:** Use `--build-arg BUILDKIT_INLINE_CACHE=1` to embed cache metadata in the pushed image, allowing `cache-from: image-name:latest` to restore layers.
+
+With proper caching, `npm install` only runs when `package.json` actually changes. Most builds will skip it entirely, reducing the pipeline from 12 minutes to 3-4 minutes.

@@ -1,0 +1,127 @@
+---
+slug: "transactions-mongodb"
+title: "MongoDB Transactions"
+level: 3
+---
+
+## WHY
+In the early days of MongoDB, critics aggressively pointed out its biggest flaw: It didn't support Multi-Document ACID Transactions. If you needed to move $100 from Alice's account to Bob's account, and the server crashed after deducting the money from Alice but before giving it to Bob, the $100 simply vanished forever.
+
+To fix this, developers had to build incredibly complex "Two-Phase Commit" logic into their application code. Today, modern MongoDB provides fully native, robust, multi-document ACID transactions, allowing it to compete directly with enterprise relational databases like PostgreSQL.
+
+## THEORY
+### ACID Guarantees
+- **Atomicity:** All operations in the transaction succeed, or they all fail. There is no partial success.
+- **Consistency:** The database rules (like unique constraints) are never violated.
+- **Isolation:** If two users execute transactions simultaneously, they do not interfere with each other.
+- **Durability:** Once committed, the data survives a server crash.
+
+### The Single-Document Rule
+It is a massive misconception that early MongoDB didn't have transactions. MongoDB has *always* had strict ACID transactions at the **Single Document Level**. If you update an array inside a massive single document, it is 100% atomic.
+
+Modern MongoDB transactions are specifically referring to **Multi-Document** transactions (updating Alice's document and Bob's document atomically).
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "mongo-transactions" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Starting a Session)
+Transactions in MongoDB require a **Session**. All database operations that are part of the transaction must be explicitly linked to this specific session.
+
+```javascript
+// Example using Node.js / Mongoose
+const session = await mongoose.startSession();
+
+// 1. Start the transaction
+session.startTransaction();
+
+try {
+    // 2. Perform operations (YOU MUST PASS THE SESSION OBJECT!)
+    await Account.updateOne(
+        { user: "Alice" }, 
+        { $inc: { balance: -100 } },
+        { session: session } // CRITICAL!
+    );
+    
+    await Account.updateOne(
+        { user: "Bob" }, 
+        { $inc: { balance: 100 } },
+        { session: session } // CRITICAL!
+    );
+    
+    // 3. If no errors occurred, commit the changes to the database!
+    await session.commitTransaction();
+    console.log("Money transferred successfully.");
+    
+} catch (error) {
+    // 4. If anything failed, abort! The database instantly undoes the partial changes.
+    await session.abortTransaction();
+    console.error("Transfer failed. Money returned to Alice.", error);
+} finally {
+    // 5. Always end the session to release database resources
+    session.endSession();
+}
+```
+
+### Level 2 — Building Blocks (The `withTransaction` Helper)
+Writing `try/catch/finally` blocks and manually calling `commit` and `abort` is tedious and error-prone. The official MongoDB Node.js driver provides a much cleaner wrapper called `withTransaction`. It automatically handles the `try/catch`, automatically commits on success, automatically aborts on error, and will even automatically retry the transaction if a transient network error occurs!
+
+```javascript
+const session = await client.startSession();
+
+try {
+    await session.withTransaction(async () => {
+        // You are inside the transaction!
+        await db.collection("accounts").updateOne(
+            { user: "Alice" }, { $inc: { balance: -100 } }, { session }
+        );
+        
+        await db.collection("accounts").updateOne(
+            { user: "Bob" }, { $inc: { balance: 100 } }, { session }
+        );
+    });
+} finally {
+    await session.endSession();
+}
+```
+
+### Level 3 — Intermediate (Read Preference and Read Concern)
+When running a transaction in a distributed cluster (with Primary and Secondary nodes), you must define the strictness of the transaction.
+
+By default, transactions use **"Local" Read Concern** and **"Primary" Read Preference**.
+This means the transaction only reads data from the Primary node, and it commits when the Primary node acknowledges the write.
+
+If you are a bank, this isn't safe enough. If the Primary node crashes instantly after committing, the transaction might not have replicated to the Secondary nodes yet, meaning the data is lost!
+
+You can configure **Write Concern ("majority")**:
+```javascript
+const transactionOptions = {
+    readPreference: 'primary',
+    readConcern: { level: 'local' },
+    writeConcern: { w: 'majority' } // WAIT for replicas to confirm the write!
+};
+
+await session.withTransaction(async () => { ... }, transactionOptions);
+```
+With `w: 'majority'`, the `commitTransaction()` call will literally block and wait until the majority of nodes in your cluster have physically saved the data to their hard drives.
+
+### Level 4 — Advanced (Transaction Limits)
+MongoDB is optimized for speed. Transactions force the database to hold massive amounts of state in RAM and lock documents, which kills performance.
+
+To protect the cluster, MongoDB enforces strict limits:
+1. **Execution Time Limit:** A transaction cannot run for more than **60 seconds** (by default). If you try to run a massive data migration script inside a single transaction, it will aggressively time out and abort.
+2. **Resource Limits:** You should never modify more than 1,000 documents inside a single transaction.
+
+## REAL_WORLD
+**When NOT to use Transactions**
+Just because MongoDB has multi-document transactions does NOT mean you should use them everywhere (like you would in SQL). In MongoDB, the vast majority of operations should be handled by embedding data inside a single document.
+
+If you are inserting an `Order` and its 5 `OrderItems`, you do NOT need a transaction. You simply embed the items into an array inside the `Order` document and insert it. Because it is a single document, the insert is 100% atomic by default, and it is 100x faster than a multi-document transaction! Only reach for transactions when dealing with completely isolated entities (like two different User accounts).
+
+## INTERVIEW
+**Q: I tried to run a transaction on my local MongoDB database, but I got an error saying `Transaction numbers are only allowed on a replica set member or mongos`. Why?**
+A: **Multi-document transactions DO NOT WORK on standalone MongoDB instances.** 
+MongoDB relies on the Replication Oplog (Operations Log) to coordinate and rollback transactions. A standard, default local installation of MongoDB is a "Standalone" instance and does not have an Oplog. To use transactions locally during development, you must configure your local MongoDB instance to run as a single-node "Replica Set".

@@ -1,0 +1,191 @@
+---
+slug: "testing-angular"
+title: "Testing Angular Applications"
+level: 4
+---
+
+## WHY
+Angular applications are complex. A single Component might inject three Services, listen to an RxJS stream, interact with the Router, and render a complicated HTML template based on NgRx state.
+If you only test pure functions (Unit Testing), you will miss the critical bugs (e.g., "The component logic works, but I forgot to bind the click event in the HTML template!").
+Angular provides a massive, deeply integrated Testing Toolkit (`TestBed`) that allows you to easily mock dependencies, compile HTML templates in memory, and simulate user clicks to guarantee your application works exactly as intended.
+
+## THEORY
+### Jasmine and Karma (Legacy) vs. Jest (Modern)
+Historically, Angular used **Jasmine** (the syntax: `describe`, `it`, `expect`) and **Karma** (a test runner that physically opens a Chrome browser to run tests). Karma is notoriously slow.
+In modern Angular (v16+), the ecosystem is rapidly migrating to **Jest** or **Vitest** (which use Node.js and JSDOM to simulate the browser in memory, running tests 10x faster).
+Regardless of the runner, the core Angular testing utility remains the **`TestBed`**.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "CodeVisualizer", "state": "angular-testing" }
+```
+
+## CODE
+
+### Level 1 — The TestBed (Component Testing)
+To test an Angular Component, you cannot just use `new MyComponent()`, because the constructor relies on Angular's Dependency Injection system.
+You use `TestBed.configureTestingModule` to create an isolated, fake Angular Module specifically for the test.
+
+```typescript
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { LoginComponent } from './login.component';
+
+describe('LoginComponent', () => {
+  let component: LoginComponent;
+  let fixture: ComponentFixture<LoginComponent>; // A wrapper around the component and its DOM!
+
+  // Runs BEFORE each test!
+  beforeEach(async () => {
+    // 1. Configure the fake testing environment
+    await TestBed.configureTestingModule({
+      imports: [LoginComponent] // Import the standalone component!
+    }).compileComponents(); // Compile the HTML and CSS
+
+    // 2. Instantiate the Component!
+    fixture = TestBed.createComponent(LoginComponent);
+    component = fixture.componentInstance;
+    
+    // 3. Force Angular to run Change Detection (evaluate the HTML!)
+    fixture.detectChanges();
+  });
+
+  it('should create the app', () => {
+    // Verify the class instantiated successfully
+    expect(component).toBeTruthy();
+  });
+});
+```
+
+### Level 2 — Testing the DOM and User Interaction
+Because `TestBed` compiles the HTML, we can simulate user clicks and verify the UI updates!
+
+```typescript
+it('should display an error when clicking login without a password', () => {
+  // 1. Find the button in the DOM using standard CSS selectors
+  const button = fixture.nativeElement.querySelector('button');
+  
+  // 2. Simulate a user click!
+  button.click();
+  
+  // 3. CRITICAL: We modified state via the click. 
+  // We MUST tell Angular to run Change Detection to update the HTML!
+  fixture.detectChanges();
+
+  // 4. Find the error message element and assert its text!
+  const errorMessage = fixture.nativeElement.querySelector('.error-text');
+  expect(errorMessage.textContent).toContain('Password is required');
+});
+```
+
+### Level 3 — Mocking Services
+If `LoginComponent` injects `AuthService` to make an HTTP request, running the test will actually hit the real backend database! This makes tests slow, flaky, and corrupts production data.
+You MUST replace the real service with a "Mock" (a fake object that returns predefined data).
+
+```typescript
+// 1. Create a fake object with Jest/Jasmine Spies!
+const mockAuthService = {
+  // A spy allows us to track if the function was called!
+  login: jasmine.createSpy('login').and.returnValue(of({ success: true }))
+};
+
+beforeEach(async () => {
+  await TestBed.configureTestingModule({
+    imports: [LoginComponent],
+    providers: [
+      // 2. Override the real service with the fake one!
+      // When the component asks for AuthService, Angular gives it the Mock!
+      { provide: AuthService, useValue: mockAuthService }
+    ]
+  }).compileComponents();
+  // ...
+});
+
+it('should call the auth service when the form is valid', () => {
+  component.email = "admin@test.com";
+  component.password = "secret";
+  
+  component.submitForm();
+
+  // 3. Verify the Spy was executed with the correct arguments!
+  expect(mockAuthService.login).toHaveBeenCalledWith("admin@test.com", "secret");
+});
+```
+
+### Level 4 — Testing HTTP Requests (HttpTestingController)
+When testing a Service that makes HTTP calls, you don't use `TestBed` to mock the Service itself. You mock the *network layer* using `HttpTestingController`.
+This allows you to verify that the Service constructed the correct URL, used the correct HTTP Method, and handled the server's response correctly.
+
+```typescript
+import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
+import { DataService } from './data.service';
+
+describe('DataService', () => {
+  let service: DataService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      imports: [HttpClientTestingModule], // Replaces the real HttpClient!
+      providers: [DataService]
+    });
+    service = TestBed.inject(DataService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => {
+    // Ensure there are no pending HTTP requests left over!
+    httpMock.verify();
+  });
+
+  it('should fetch users', () => {
+    const fakeUsers = [{ id: 1, name: 'Alice' }];
+
+    // 1. Execute the service method (It returns an Observable)
+    service.getUsers().subscribe(users => {
+      expect(users.length).toBe(1);
+      expect(users[0].name).toBe('Alice');
+    });
+
+    // 2. The code pauses above. We intercept the outgoing request!
+    const req = httpMock.expectOne('/api/users');
+    expect(req.request.method).toBe('GET'); // Verify it was a GET request!
+
+    // 3. Flush (resolve) the request with our fake data!
+    // This instantly triggers the .subscribe() block above!
+    req.flush(fakeUsers); 
+  });
+});
+```
+
+## REAL_WORLD
+**Harnesses (Angular CDK)**
+Testing UI components (like a DatePicker or a Select Dropdown) is incredibly fragile. If you write `fixture.nativeElement.querySelector('.mat-select-arrow').click()`, your test will break the moment the Angular Material team changes the internal CSS class name of their component.
+The Angular Component Dev Kit (CDK) provides **Test Harnesses**. 
+A Harness is a programmatic API for interacting with a component in a test, completely isolating you from the component's internal HTML structure!
+```typescript
+import { MatSelectHarness } from '@angular/material/select/testing';
+
+// Instead of querying CSS classes, you ask the Harness!
+const select = await loader.getHarness(MatSelectHarness);
+await select.open(); // The Harness knows exactly how to open the dropdown!
+await select.clickOptions({ text: 'New York' }); // It finds and clicks the option!
+```
+
+## INTERVIEW
+**Q: You write a test that clicks a button, which triggers an RxJS `delay(1000)` operator, and then updates a variable: `this.isReady = true`. You write `expect(component.isReady).toBeTrue()`, but the test fails because `isReady` is still false. You don't want to use `setTimeout` in your test because it makes the test suite incredibly slow. How do you test delayed asynchronous code instantly?**
+A: **The `fakeAsync` and `tick()` utilities!**
+Angular provides a magical wrapper called `fakeAsync`. When you wrap your test in `fakeAsync`, Angular intercepts all `setTimeout`, `setInterval`, and RxJS time-based operators and places them in a virtual time machine.
+You can then use the `tick(1000)` function to instantly fast-forward virtual time by 1000 milliseconds!
+```typescript
+import { fakeAsync, tick } from '@angular/core/testing';
+
+it('should update after a delay', fakeAsync(() => {
+  component.startProcess(); // Triggers the 1000ms delay
+  
+  expect(component.isReady).toBeFalse(); // Still false initially
+  
+  tick(1000); // INSTANTLY fast-forward virtual time by 1 second!
+  
+  expect(component.isReady).toBeTrue(); // Now it passes! The test took 0.01s to run.
+}));
+```

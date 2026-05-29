@@ -1,0 +1,187 @@
+---
+slug: "k8s-ci-cd"
+title: "CI/CD with Kubernetes"
+level: 5
+---
+
+## WHY
+Deploying to Kubernetes manually with `kubectl apply` is error-prone and doesn't scale. A proper CI/CD pipeline automates: building Docker images, scanning for vulnerabilities, running tests, and deploying to Kubernetes with zero-downtime rolling updates.
+This topic ties together Docker, Kubernetes, and GitHub Actions into a complete production deployment pipeline.
+
+## THEORY
+### The CI/CD Pipeline Flow
+```
+Git Push → CI Pipeline → Tests Pass → Build Docker Image → 
+Push to Registry → Update K8s Manifests → Deploy to Staging → 
+Verify → Deploy to Production
+```
+
+### Push-Based vs Pull-Based (GitOps)
+- **Push:** CI pipeline authenticates and directly runs `kubectl apply` against the cluster
+- **Pull (GitOps):** CI pipeline updates manifests in Git; ArgoCD/Flux pulls and applies
+
+GitOps is recommended for production — the cluster credentials never leave the cluster.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "k8s-ci-cd" }
+```
+
+## CODE
+
+### Complete CI/CD Pipeline: GitHub Actions → Kubernetes
+```yaml
+# .github/workflows/deploy.yml
+name: Build and Deploy to Kubernetes
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Run tests first!
+      - name: Run Tests
+        run: mvn test
+      
+      # Scan for vulnerabilities (block on CRITICAL)
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          exit-code: '1'
+          severity: 'CRITICAL'
+      
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and Push Docker Image
+        id: meta
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+  
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubeconfig
+        run: echo "${{ secrets.KUBE_CONFIG_STAGING }}" > ~/.kube/config
+      
+      - name: Deploy to Staging
+        run: |
+          # Update image in deployment
+          kubectl set image deployment/api \
+            api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n staging
+          
+          # Wait for rollout to complete
+          kubectl rollout status deployment/api -n staging --timeout=5m
+      
+      - name: Run Smoke Tests
+        run: ./scripts/smoke-test.sh https://staging.api.example.com
+  
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production  # Requires manual approval in GitHub!
+    
+    steps:
+      - name: Configure kubeconfig
+        run: echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" > ~/.kube/config
+      
+      - name: Deploy to Production
+        run: |
+          kubectl set image deployment/api \
+            api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n production
+          kubectl rollout status deployment/api -n production --timeout=10m
+```
+
+### GitOps Approach (Recommended)
+```yaml
+# CI pipeline updates the image tag in Git; ArgoCD deploys
+deploy-staging:
+  steps:
+    - name: Update Image Tag in Git
+      run: |
+        # Checkout the k8s-manifests repository
+        git clone https://github.com/myorg/k8s-manifests.git
+        cd k8s-manifests
+        
+        # Update the image tag
+        sed -i "s|image: my-api:.*|image: my-api:${{ github.sha }}|g" \
+          apps/staging/api/deployment.yaml
+        
+        # Commit and push
+        git config user.email "ci@mycompany.com"
+        git add .
+        git commit -m "deploy: update api to ${{ github.sha }}"
+        git push
+      # ArgoCD detects the change and deploys automatically!
+```
+
+## REAL_WORLD
+**Rollback Strategy**
+```bash
+# Kubernetes deployment rollback (instant!)
+kubectl rollout undo deployment/api -n production
+
+# Rollback to a specific version
+kubectl rollout history deployment/api -n production
+kubectl rollout undo deployment/api --to-revision=3 -n production
+```
+
+## INTERVIEW
+**Q: Your deployment to production fails midway through a rolling update. 3 of 5 pods are running the new broken version. How does Kubernetes limit the damage? What's your response?**
+
+A: Kubernetes has built-in safeguards:
+
+**Rolling update progress halted:** If the new Pods fail their readiness probe, Kubernetes stops the rolling update. The remaining 2 old Pods continue serving traffic. The maxUnavailable setting ensures at most N% of Pods are unavailable at any time.
+
+**Immediate response:**
+```bash
+# 1. Check what's happening
+kubectl rollout status deployment/api -n production
+# Waiting for rollout to finish: 3 out of 5 new replicas have been updated...
+
+# 2. Check Pod status/logs
+kubectl get pods -n production
+kubectl logs -n production api-NEW-POD --previous   # Logs from crashed pod!
+
+# 3. Rollback immediately!
+kubectl rollout undo deployment/api -n production
+# This scales up the old ReplicaSet and scales down the new one!
+# Kubernetes uses the saved old ReplicaSet for instant rollback.
+
+# 4. Verify rollback completed
+kubectl rollout status deployment/api -n production
+# All 5 pods are now running the old version again!
+```
+
+**Prevention:** Robust readiness probes (detect application-level failures, not just process running), canary deployments (test 1% of traffic before full rollout), and smoke tests in CI before production deployment gate.

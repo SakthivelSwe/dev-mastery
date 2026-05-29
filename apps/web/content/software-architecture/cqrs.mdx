@@ -1,0 +1,160 @@
+---
+slug: "cqrs"
+title: "CQRS & Event Sourcing"
+level: 4
+---
+
+## WHY
+Traditional applications use a single data model for both reading (queries) and writing (commands). This works fine for simple CRUD apps, but breaks down when:
+1. The query shape is radically different from the write shape (e.g., write normalized data, read denormalized dashboards).
+2. You need a complete audit trail of every state change for compliance/debugging.
+3. You need to rebuild historical application state at any point in time.
+
+**CQRS** separates the Write Model from the Read Model. **Event Sourcing** stores every state change as an immutable event instead of current state.
+
+## THEORY
+### CQRS (Command Query Responsibility Segregation)
+- **Commands:** Change state (`CreateOrder`, `UpdateProfile`, `DeleteUser`). Go to the Write DB.
+- **Queries:** Return data without changing state (`GetUserById`, `SearchProducts`). Go to the Read DB.
+
+These can use completely different databases, optimized for their specific access patterns.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "cqrs-pattern" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Simple CQRS)
+```java
+// COMMAND SIDE: Optimized for consistency and validation
+@Service
+public class OrderCommandService {
+    
+    public void createOrder(CreateOrderCommand command) {
+        // Validate the command
+        if (command.amount() <= 0) throw new InvalidOrderException("Amount must be positive");
+        
+        // Write to the write-optimized database (normalized PostgreSQL)
+        Order order = new Order(command.userId(), command.productId(), command.amount());
+        orderRepository.save(order);
+        
+        // Publish domain event for async propagation to read models!
+        eventBus.publish(new OrderCreatedEvent(order.getId(), order.getUserId()));
+    }
+}
+
+// QUERY SIDE: Optimized for fast reads
+@Service
+public class OrderQueryService {
+    
+    // DIFFERENT repository — reads from a denormalized read-model!
+    private final OrderSummaryReadRepository readRepository;
+    
+    // The Read Model might be a materialized view, Redis cache, or Elasticsearch index
+    public List<OrderSummaryDto> getUserOrderHistory(Long userId) {
+        return readRepository.findByUserId(userId); // Single optimized query!
+    }
+}
+```
+
+### Level 2 — Building Blocks (Event-Driven Read Model Updates)
+```java
+// When an Order is created (Command Side), an event propagates to update all Read Models!
+
+@EventListener
+public class OrderProjectionUpdater {
+    
+    // Read model 1: PostgreSQL denormalized view for user order history
+    @Async
+    public void updateUserOrderHistoryProjection(OrderCreatedEvent event) {
+        OrderSummary summary = new OrderSummary(
+            event.orderId(), event.userId(), event.productName(), event.amount()
+        );
+        orderSummaryRepository.save(summary);
+    }
+    
+    // Read model 2: Elasticsearch for product search analytics
+    @Async
+    public void updateSearchAnalytics(OrderCreatedEvent event) {
+        elasticsearchClient.incrementProductPurchaseCount(event.productId());
+    }
+    
+    // Read model 3: Redis cache for fast order count queries
+    @Async
+    public void updateOrderCountCache(OrderCreatedEvent event) {
+        redisTemplate.opsForValue().increment("order_count:" + event.userId());
+    }
+}
+```
+
+### Level 3 — Intermediate (Event Sourcing)
+Instead of storing the CURRENT STATE of an entity, Event Sourcing stores the HISTORY of all events that produced that state.
+
+```java
+// TRADITIONAL (State-based):
+// orders table: { id: 1, status: "SHIPPED", amount: 99.99, updatedAt: ... }
+// You only know the current state. The history is GONE!
+
+// EVENT SOURCING (Event-based):
+// order_events table:
+// { id: 1, orderId: 1, type: "OrderCreated",   data: {amount: 99.99}, at: T1 }
+// { id: 2, orderId: 1, type: "PaymentReceived", data: {txId: "xyz"},   at: T2 }
+// { id: 3, orderId: 1, type: "OrderShipped",    data: {tracking: "123"}, at: T3 }
+// COMPLETE history is preserved forever!
+
+// RECONSTITUTING CURRENT STATE:
+// Apply all events in sequence:
+public Order reconstituteOrder(Long orderId) {
+    List<DomainEvent> events = eventStore.loadEvents(orderId);
+    Order order = new Order();
+    for (DomainEvent event : events) {
+        order.apply(event); // Each event transitions the state!
+    }
+    return order; // Current state!
+}
+```
+
+### Level 4 — Advanced (Time Travel & Event Replay)
+```java
+// TEMPORAL QUERIES: Reconstruct state at ANY point in time!
+public Order getOrderStateAt(Long orderId, Instant pointInTime) {
+    List<DomainEvent> events = eventStore.loadEventsBefore(orderId, pointInTime);
+    Order order = new Order();
+    events.forEach(order::apply);
+    return order;
+}
+
+// EVENT REPLAY: Rebuild a read model from scratch after a bug!
+// Bug in the analytics service corrupted the order count. Fix:
+// 1. Deploy fixed analytics code
+// 2. Replay ALL historical events through the fixed projection:
+public void rebuildAnalyticsProjection() {
+    List<DomainEvent> allEvents = eventStore.loadAllEvents();
+    // The projection rebuilds itself from scratch!
+    allEvents.forEach(analyticsProjection::handle);
+}
+
+// This is IMPOSSIBLE with traditional state-based storage!
+// Event Sourcing gives you a superpower: the ability to build NEW read models
+// from historical data that you didn't even know you'd need when you started!
+```
+
+## REAL_WORLD
+**Where Event Sourcing Shines:**
+- **Banking:** Every transaction is an immutable event (deposit, withdrawal, transfer). Regulators require a complete audit trail — Event Sourcing is perfect.
+- **E-commerce:** Order lifecycle events (Created, Paid, Shipped, Delivered, Refunded) are naturally events.
+- **Git:** Git IS an event sourcing system. Each commit is an immutable event. `git checkout` is reconstructing state at a point in time.
+
+**Where Event Sourcing Overcomplicated Things:**
+- Simple CRUD applications where full audit trails aren't needed.
+- Applications with simple, stable query patterns that don't justify a separate read model.
+- Teams without experience managing an event store infrastructure.
+
+## INTERVIEW
+**Q: What is the difference between CQRS and Event Sourcing?**
+A: They are completely independent patterns! **CQRS** separates read and write models but says nothing about HOW state is stored. You can use CQRS with traditional state-based storage. **Event Sourcing** is a state storage strategy (storing events instead of state). They are often used TOGETHER, because Event Sourcing naturally produces events that can update CQRS read models, but you don't HAVE to use both.
+
+**Q: What are the drawbacks of Event Sourcing?**
+A: (1) **Eventual Consistency:** Read models are updated asynchronously — there's a lag. (2) **Event Schema Evolution:** If your event structure changes (a field is renamed), all historical events use the old schema. You need versioning and upcasting. (3) **Complexity:** It's much harder to understand and debug than simple state-based systems. (4) **Storage Growth:** Every state change is stored forever — for frequently updated entities, storage can grow rapidly.

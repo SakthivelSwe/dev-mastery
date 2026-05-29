@@ -1,0 +1,147 @@
+---
+slug: "io-and-nio"
+title: "I/O and NIO"
+level: 4
+---
+
+## WHY
+If you want to read a 500MB text file, how does it actually happen? 
+In traditional Java I/O (`java.io`), reading a file is a **Blocking** operation. When a Thread asks the Hard Drive for data, the Thread is physically frozen by the OS. It sits completely idle, doing zero work, until the mechanical hard drive slowly spins up and returns the bytes. If you have 200 HTTP connections downloading files, you need 200 frozen threads consuming massive amounts of RAM.
+
+In Java 1.4, Java introduced **NIO (Non-Blocking I/O)** (`java.nio`). NIO allows a single Thread to manage thousands of active network or file connections simultaneously. Instead of freezing, the Thread asks the OS for data and immediately moves on to serve another connection. When the OS finishes loading the data, it alerts the Thread via an Event Selector. This paradigm completely revolutionized high-performance Java servers (like Netty and Node.js).
+
+## THEORY
+### Classic `java.io` (Streams)
+Traditional I/O is based on Streams (`InputStream` / `OutputStream`). Data is read sequentially, one byte (or one character) at a time. It acts like a water pipe—you must read the bytes in the exact order they arrive, and the thread blocks until the water flows.
+
+### New `java.nio` (Channels and Buffers)
+NIO is based on Channels and Buffers. 
+- **Buffer**: A block of pre-allocated memory. Instead of reading 1 byte at a time, you read huge chunks of data into a Buffer. You can freely move forward and backward within the Buffer to inspect the data.
+- **Channel**: A bidirectional highway between the OS and your Buffer. You can both read and write to the same Channel simultaneously.
+- **Selector**: The event-loop engine. A single Selector can monitor thousands of Channels and instantly wake up the Thread when any one of them has data ready to read.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureDiagram", "type": "java-nio-selectors" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Classic I/O)
+```java
+import java.io.FileReader;
+import java.io.BufferedReader;
+
+public class ClassicIO {
+    public static void main(String[] args) {
+        // Decorator Pattern: 
+        // 1. FileReader connects to the OS.
+        // 2. BufferedReader wraps it, fetching large chunks of text into a memory buffer
+        //    to minimize expensive OS system calls.
+        try (BufferedReader br = new BufferedReader(new FileReader("data.txt"))) {
+            String line;
+            // The thread BLOCKS here until the hard drive returns the data
+            while ((line = br.readLine()) != null) {
+                System.out.println(line);
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+    }
+}
+```
+
+### Level 2 — Building Blocks (NIO.2 Path API)
+```java
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
+
+public class ModernFileIO {
+    public static void main(String[] args) throws Exception {
+        // Java 7 introduced NIO.2 (java.nio.file), which replaced the awful java.io.File class.
+        Path filePath = Paths.get("C:", "app", "config.txt");
+        
+        // Is it a directory? Does it exist?
+        if (Files.exists(filePath) && !Files.isDirectory(filePath)) {
+            
+            // Read ALL lines into memory instantly! 
+            // (Only do this for small files < 100MB)
+            List<String> lines = Files.readAllLines(filePath);
+            
+            // Write a new string to the file, overwriting the old content
+            Files.writeString(filePath, "New Configuration Data");
+        }
+    }
+}
+```
+
+### Level 3 — Intermediate (NIO Buffers & Channels)
+```java
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+
+public class NioChannels {
+    public static void main(String[] args) throws Exception {
+        RandomAccessFile file = new RandomAccessFile("data.txt", "rw");
+        FileChannel channel = file.getChannel();
+        
+        // Allocate a memory block of 48 bytes
+        ByteBuffer buffer = ByteBuffer.allocate(48);
+        
+        // Read data from the Channel INTO the Buffer
+        int bytesRead = channel.read(buffer);
+        
+        // CRITICAL: Flip the buffer from "Writing Mode" to "Reading Mode"
+        buffer.flip();
+        
+        while (buffer.hasRemaining()) {
+            System.out.print((char) buffer.get()); // Read 1 byte at a time
+        }
+        
+        channel.close();
+    }
+}
+```
+
+### Level 4 — Advanced (Memory-Mapped Files)
+```java
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+
+public class MappedFiles {
+    public static void main(String[] args) throws Exception {
+        // Ultra-high performance I/O used by databases like Apache Kafka and Cassandra!
+        FileChannel channel = FileChannel.open(Paths.get("massive_10GB_file.dat"), 
+                                               StandardOpenOption.READ, 
+                                               StandardOpenOption.WRITE);
+                                               
+        // We instruct the OS to map a 1GB chunk of the file directly into Virtual Memory!
+        // This completely bypasses the JVM Heap. The JVM interacts with it as if it were an array,
+        // but the OS seamlessly synchronizes the memory directly to the hard drive hardware.
+        MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_WRITE, 0, 1024 * 1024 * 1024);
+        
+        buffer.put(0, (byte) 97); // Extremely fast direct memory write!
+        channel.close();
+    }
+}
+```
+
+## REAL_WORLD
+When building high-concurrency microservices, Spring Boot uses **Tomcat** by default. Tomcat historically used classic Thread-per-Request Blocking I/O. If 10,000 users connect, Tomcat needed 10,000 threads.
+
+However, modern Spring WebFlux uses **Netty**. Netty is a massive architectural wrapper around Java NIO Selectors and Channels. It uses an Event Loop architecture (exactly like Node.js). 
+In Netty, a single thread runs an infinite loop monitoring a `Selector`. When 10,000 HTTP connections arrive, the Selector registers them all. The single thread sleeps until the OS interrupts it saying: "Connection 4,201 just received a data packet". The thread wakes up, processes the packet, and immediately goes back to monitoring. 
+This allows a single Java thread to effortlessly manage 100,000 simultaneous websocket connections using less than 50MB of RAM, achieving insane levels of scalability.
+
+## INTERVIEW
+**Q: What is the difference between `java.io.File` and `java.nio.file.Path`?**
+A: `java.io.File` is the legacy API from Java 1.0. It is heavily flawed—many methods silently return `false` instead of throwing exceptions when they fail, and it struggles with metadata and symlinks. `java.nio.file.Path` (NIO.2) introduced in Java 7 is the modern replacement. It properly throws exceptions, supports complex file attributes, and scales infinitely better. You should always use `Path` and `Files` in modern Java.
+
+**Q: Why do you have to call `flip()` on an NIO ByteBuffer?**
+A: A ByteBuffer is backed by a simple byte array and uses internal pointers (position and limit). When you are writing data *into* the buffer from a Channel, the `position` pointer moves forward. If you want to read that data back out, you must call `flip()`. This resets the `position` back to 0, and sets the `limit` to the amount of data written, switching the buffer from "write mode" into "read mode".
+
+**Q: What is a Memory-Mapped File?**
+A: It is a feature where the Operating System maps a portion of a physical file on the hard drive directly into the application's Virtual Memory space. This allows the Java application to read and write to the file by manipulating memory directly, completely bypassing expensive OS system calls (like `read()` and `write()`). It is the absolute fastest way to process massive files in Java.

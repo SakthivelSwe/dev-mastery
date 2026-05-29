@@ -1,0 +1,113 @@
+---
+title: ddl-basics
+slug: ddl-basics
+---
+
+# DDL — CREATE TABLE, Data Types, Constraints
+
+### 1. Architectural & Theoretical Foundations
+
+#### PostgreSQL Data Types Internals
+*   `INTEGER` vs `BIGINT` vs `NUMERIC`: 
+    *   `INTEGER` (4 bytes, $-2^{31}$ to $2^{31}-1$) and `BIGINT` (8 bytes, $-2^{63}$ to $2^{63}-1$) are stored as native binary integers. Computations on these types are executed directly on the CPU registers, making them extremely fast.
+    *   `NUMERIC(precision, scale)` is an arbitrary-precision type. It stores numbers as a series of decimal digits in a variable-length format (typically 2 bytes per group of 4 decimal digits, plus overhead). Computations are performed in software, which is significantly slower than native CPU math. Use `NUMERIC` strictly for financial calculations where rounding errors are unacceptable.
+*   `VARCHAR` vs `TEXT`:
+    *   In PostgreSQL, `VARCHAR(n)` and `TEXT` use the same underlying storage representation (varlena). There is no performance difference between them. 
+    *   If a string exceeds the page size threshold (typically 2KB), PostgreSQL employs **TOAST** (The Oversized-Attribute Storage Technique), compressing the data and moving it out of the main table row into a separate TOAST table.
+*   `TIMESTAMPTZ` vs `TIMESTAMP`:
+    *   `TIMESTAMP` stores date and time without any timezone context.
+    *   `TIMESTAMPTZ` stores values in UTC. When input, PostgreSQL converts the value from the client’s timezone to UTC. When queried, it converts the UTC value back to the client's current session timezone. Always use `TIMESTAMPTZ` for global applications.
+
+#### Constraints Mechanics
+Constraints are validated at the transaction boundary or immediately upon row modification, depending on deferrability.
+*   `NOT NULL`: Enforced via a null bitmap in the tuple header. Checking this is extremely cheap.
+*   `UNIQUE`: Implemented by creating a unique B-Tree index. When a row is inserted, the engine traverses the B-Tree to check for existence.
+*   `CHECK`: Evaluates an expression for every insert or update. If the expression evaluates to `FALSE` (but not `NULL`), the transaction fails.
+*   `PRIMARY KEY`: Syntactically combines `NOT NULL` and `UNIQUE`.
+
+#### Primary Key Strategies: Serial vs. BIGSERIAL vs. UUIDv4
+*   `serial` (4 bytes) / `BIGSERIAL` (8 bytes): Uses an underlying database sequence. It is highly efficient for indexing (sequential inserts minimize B-Tree page splits). However, they expose business volume and are susceptible to ID exhaustion if `serial` is chosen over `BIGSERIAL`.
+*   `gen_random_uuid()` (UUID v4, 16 bytes): Provides globally unique identifiers without central coordination. The primary downside is B-Tree fragmentation. Random UUIDs cause inserts to target random physical pages, leading to high disk I/O (page splits and cache misses) as the index grows beyond RAM capacity.
+
+---
+
+### 2. DDL & DML Code Implementation
+
+```sql
+-- Create database schema demonstrating advanced constraints and UUIDs
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE tenant_profiles (
+    tenant_id UUID DEFAULT gen_random_uuid(),
+    subdomain VARCHAR(63) NOT NULL,
+    account_tier VARCHAR(20) DEFAULT 'FREE',
+    billing_email VARCHAR(255) NOT NULL,
+    max_users INTEGER NOT NULL DEFAULT 5,
+    monthly_budget NUMERIC(15, 4) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT pk_tenant_profiles PRIMARY KEY (tenant_id),
+    CONSTRAINT uq_tenant_subdomain UNIQUE (subdomain),
+    CONSTRAINT chk_valid_tier CHECK (account_tier IN ('FREE', 'PRO', 'ENTERPRISE')),
+    CONSTRAINT chk_max_users CHECK (max_users > 0),
+    CONSTRAINT chk_positive_budget CHECK (monthly_budget >= 0.0000),
+    CONSTRAINT chk_valid_email CHECK (billing_email LIKE '%@%.%')
+);
+
+-- Seed Data
+INSERT INTO tenant_profiles (subdomain, account_tier, billing_email, max_users, monthly_budget)
+VALUES 
+('alpha', 'PRO', 'finance@alpha.com', 50, 2500.0000),
+('beta', 'FREE', 'admin@beta.org', 3, 0.0000);
+```
+
+---
+
+### 3. Real-World Object-Relational Mapping (ORM)
+
+```java
+package com.devmastery.sql.domain;
+
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import org.hibernate.annotations.ColumnDefault;
+
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.util.UUID;
+
+@Entity
+@Table(name = "tenant_profiles", uniqueConstraints = {
+    @UniqueConstraint(name = "uq_tenant_subdomain", columnNames = "subdomain")
+})
+@Getter
+@Setter
+public class TenantProfile {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "tenant_id", updatable = false, nullable = false)
+    private UUID tenantId;
+
+    @Column(name = "subdomain", nullable = false, length = 63)
+    private String subdomain;
+
+    @Column(name = "account_tier", nullable = false, length = 20)
+    private String accountTier = "FREE";
+
+    @Column(name = "billing_email", nullable = false, length = 255)
+    private String billingEmail;
+
+    @Column(name = "max_users", nullable = false)
+    private Integer maxUsers = 5;
+
+    @Column(name = "monthly_budget", nullable = false, precision = 15, scale = 4)
+    private BigDecimal monthlyBudget;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private OffsetDateTime createdAt = OffsetDateTime.now();
+}
+```
+
+---
