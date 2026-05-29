@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -18,6 +19,8 @@ export const metadata: Metadata = {
   },
   robots: { index: true, follow: true },
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'),
+  manifest: '/manifest.json',
+  themeColor: '#0d1117',
 };
 
 // Flash-free dark mode: runs synchronously BEFORE the first paint
@@ -55,6 +58,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         className="min-h-screen antialiased"
         style={{ backgroundColor: 'var(--bg-primary)', color: 'var(--text-primary)' }}
       >
+        <OfflineBanner />
         {children}
       </body>
     </html>
