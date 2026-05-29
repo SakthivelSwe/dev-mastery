@@ -11,6 +11,7 @@ import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
 import MockInterviewShell from '../interview/MockInterviewShell';
+import SystemDesignCanvas from '../system-design/SystemDesignCanvas';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { markLayerComplete } from '@/lib/api';
@@ -81,6 +82,8 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
             <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
           </div>
         );
+      case 'system-design':
+        return <SystemDesignCanvas topicSlug={topicSlug} />;
       case 'real-world':
         return <MdxRenderer source={topic.layers.realWorld} />;
       case 'interview':

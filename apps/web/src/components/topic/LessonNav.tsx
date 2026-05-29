@@ -9,6 +9,7 @@ const tabs: { id: TabState; label: string; icon: any; est: string }[] = [
   { id: 'theory', label: 'Theory & Concepts', icon: BookOpen, est: '10m' },
   { id: 'visualizer', label: 'Visualizer', icon: Play, est: '15m' },
   { id: 'code', label: 'Code Lab', icon: Code, est: '20m' },
+  { id: 'system-design', label: 'System Design', icon: Briefcase, est: '30m' },
   { id: 'real-world', label: 'Real World', icon: Briefcase, est: '5m' },
   { id: 'interview', label: 'Interview Prep', icon: MessageSquare, est: '10m' },
   { id: 'feynman', label: 'Feynman Check', icon: Mic, est: '5m' },
