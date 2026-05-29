@@ -80,6 +80,11 @@ public class ProgressController {
         return ResponseEntity.ok(progressService.getUserSummary(userId));
     }
 
+    @GetMapping("/stats")
+    public ResponseEntity<Object> getStats(@RequestHeader("X-User-Id") UUID userId) {
+        return ResponseEntity.ok(progressService.getStats(userId));
+    }
+
     @GetMapping
     public ResponseEntity<Object> getProgress(@RequestHeader("X-User-Id") UUID userId) {
         return ResponseEntity.ok(progressService.getUserProgress(userId));

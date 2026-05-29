@@ -5,6 +5,9 @@ import com.devmastery.progress.entity.LessonCompletion;
 import com.devmastery.progress.entity.UserProgress;
 import com.devmastery.progress.entity.TopicInfo;
 import com.devmastery.progress.entity.PathInfo;
+import com.devmastery.progress.entity.UserStreak;
+import com.devmastery.progress.entity.UserBadge;
+import com.devmastery.progress.dto.StatsResponse;
 import com.devmastery.progress.repository.LessonCompletionRepository;
 import com.devmastery.progress.repository.UserProgressRepository;
 import lombok.RequiredArgsConstructor;
@@ -12,7 +15,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.time.OffsetDateTime;
 import java.util.UUID;
+import java.util.UUID;
 import java.util.Map;
+import java.util.List;
 import java.util.stream.Collectors;
 
 @Service
@@ -117,6 +122,23 @@ public class ProgressService {
     
     public Object getUserSummary(UUID userId) {
         return gamificationService.getUserSummary(userId);
+    }
+    
+    @SuppressWarnings("unchecked")
+    public StatsResponse getStats(UUID userId) {
+        Map<String, Object> summary = (Map<String, Object>) gamificationService.getUserSummary(userId);
+        UserStreak streak = (UserStreak) summary.get("streak");
+        List<UserBadge> badges = (List<UserBadge>) summary.get("badges");
+        
+        long topicsCompleted = userProgressRepository.countByUserIdAndStatus(userId, "completed");
+        long totalLearningTimeSecs = lessonCompletionRepository.getTotalTimeSpentByUserId(userId);
+        
+        return StatsResponse.builder()
+                .streak(streak)
+                .badges(badges)
+                .topicsCompleted(topicsCompleted)
+                .totalLearningTimeSecs(totalLearningTimeSecs)
+                .build();
     }
     
     public Map<String, Boolean> getPathProgress(UUID userId, String pathSlug) {

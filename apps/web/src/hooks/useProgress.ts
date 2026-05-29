@@ -86,13 +86,29 @@ export function useDashboard() {
   const userId = user?.id;
 
   const { data, error, isLoading } = useSWR(
-    userId ? [`${PROGRESS_API}/v1/progress/summary`, userId] : null,
+    userId ? [`${PROGRESS_API}/v1/progress/stats`, userId] : null,
     ([url, uid]) => fetcher(url, uid),
-    { refreshInterval: 60_000, fallbackData: MOCK_DASHBOARD }
+    { refreshInterval: 60_000 }
   );
 
+  let dashboardData = MOCK_DASHBOARD;
+  if (data) {
+    // Map StatsResponse to DashboardSummary
+    const streakInfo = data.streak || {};
+    
+    dashboardData = {
+      ...MOCK_DASHBOARD,
+      totalXp: streakInfo.totalXp || 0,
+      streak: streakInfo.currentStreak || 0,
+      rank: streakInfo.badgeLevel ? streakInfo.badgeLevel.replace('-', ' ').toUpperCase() : 'NOVICE',
+      totalCompleted: data.topicsCompleted || 0,
+      // badges: data.badges
+      // totalLearningTimeSecs: data.totalLearningTimeSecs
+    };
+  }
+
   return {
-    dashboard: (data as DashboardSummary) ?? MOCK_DASHBOARD,
+    dashboard: dashboardData,
     isLoading: isLoading && !data,
     error,
   };
