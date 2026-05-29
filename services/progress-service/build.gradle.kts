@@ -71,6 +71,11 @@ dependencies {
     // ─── Testing ──────────────────────────────────────────────
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.springframework.security:spring-security-test")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+
+    // iText for PDF Certificate Generation
+    implementation("com.itextpdf:itext-core:8.0.3")
+
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:postgresql")
     testImplementation("com.redis:testcontainers-redis")
