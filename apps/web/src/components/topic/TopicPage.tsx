@@ -10,6 +10,7 @@ import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
+import MockInterviewShell from '../interview/MockInterviewShell';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { markLayerComplete } from '@/lib/api';
@@ -83,7 +84,7 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
       case 'real-world':
         return <MdxRenderer source={topic.layers.realWorld} />;
       case 'interview':
-        return <MdxRenderer source={topic.layers.interview} />;
+        return <MockInterviewShell topicSlug={topicSlug} />;
       case 'feynman':
         return <FeynmanCheckPanel topicSlug={topicSlug} topicTitle={topic.title} />;
       case 'build':
