@@ -1,15 +1,25 @@
 'use client';
 
 import React from 'react';
-import { Hammer, Github, Terminal, CheckCircle2 } from 'lucide-react';
+import { Hammer, Terminal, CheckCircle2 } from 'lucide-react';
+import { CodeEditorShell } from '../code/CodeEditorShell';
 
 interface BuildChallengePanelProps {
   buildContent: string;
 }
 
 export default function BuildChallengePanel({ buildContent }: BuildChallengePanelProps) {
+  // Use default boilerplate for Java for now
+  const initialCode = `public class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello from DevMastery!");
+        
+        // Write your solution here...
+    }
+}`;
+
   return (
-    <div className="h-full flex flex-col max-w-4xl mx-auto pb-20">
+    <div className="h-full flex flex-col w-full pb-20">
       <div className="mb-6">
         <h2 className="text-3xl font-bold font-display mb-3 flex items-center gap-3">
           <Hammer className="text-[--accent-java]" size={28} />
@@ -20,11 +30,11 @@ export default function BuildChallengePanel({ buildContent }: BuildChallengePane
         </p>
       </div>
 
-      <div className="flex-1 flex gap-8">
-        <div className="flex-1 bg-card/30 border border-border rounded-xl p-8">
+      <div className="flex-1 flex flex-col xl:flex-row gap-8">
+        <div className="w-full xl:w-1/3 bg-card/30 border border-border rounded-xl p-8 shrink-0">
           <h3 className="text-xl font-semibold mb-6 flex items-center gap-2">
             <Terminal size={20} className="text-emerald-400" />
-            Project Requirements
+            Requirements
           </h3>
           
           <div className="space-y-6 text-muted-foreground">
@@ -53,24 +63,9 @@ export default function BuildChallengePanel({ buildContent }: BuildChallengePane
           </div>
         </div>
 
-        <div className="w-80 flex flex-col gap-4">
-          <div className="bg-card/50 border border-border rounded-xl p-6">
-            <h3 className="font-medium mb-4">Submission</h3>
-            <p className="text-sm text-muted-foreground mb-6">
-              When you're done, push your code to a public GitHub repository and submit the link below for automated analysis.
-            </p>
-            <div className="space-y-4">
-              <input 
-                type="url" 
-                placeholder="https://github.com/username/repo"
-                className="w-full bg-background border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-java"
-              />
-              <button className="w-full bg-accent-java hover:bg-[#d8841a] text-white px-4 py-2 rounded-md font-medium flex justify-center items-center gap-2 transition-colors">
-                <Github size={18} />
-                Submit Repository
-              </button>
-            </div>
-          </div>
+        {/* Code Editor Section */}
+        <div className="flex-1 min-w-0">
+          <CodeEditorShell initialCode={initialCode} languageString="java" />
         </div>
       </div>
     </div>

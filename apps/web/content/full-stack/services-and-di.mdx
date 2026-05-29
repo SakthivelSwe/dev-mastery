@@ -3,84 +3,116 @@ title: services-and-di
 slug: services-and-di
 ---
 
-# Angular Services & Dependency Injection: Hierarchies and Resolution Mechanics
+# Architectural Deep Dive: Angular Dependency Injection (DI)
 
-Angular features a hierarchical Dependency Injection (DI) system. It is a powerful design pattern that decouples class creation from consumer usage, enabling clean, testable architectures.
+## 1. Architectural Foundations & Core Mechanics
+
+Angular relies on a hierarchical Dependency Injection (DI) framework. This framework is not a simple map of instances, but rather a tree of injectors that mirrors the DOM and component tree.
+
+### The Hierarchical Injector Tree
+
+Angular resolves dependencies by climbing up two parallel injector trees:
+
+```
+                  [ModuleInjector Tree]
+                  (AppConfig / Root Injector)
+                               │
+                               ▼
+                  [ElementInjector Tree]
+                  (Dynamic Component Tree)
+                               │
+         ┌─────────────────────┴─────────────────────┐
+         ▼                                           ▼
+[ParentComponent ElementInjector]       [ChildComponent ElementInjector]
+(Declares local providers)              (Resolves via NodeInjector lookup)
+```
+
+1.  **`ElementInjector` Tree**: Built dynamically alongside the component/directive tree. Each DOM node can host an `ElementInjector`. Components declare local providers here via the `providers` or `viewProviders` arrays.
+2.  **`ModuleInjector` Tree**: Configured globally. In modern standalone applications, this is registered via `provideStore`, `provideRouter`, or within the application configuration inside `bootstrapApplication()`.
+
+### The Resolution Algorithm & NodeInjector Lookup
+
+When a class requests a dependency:
+1.  Angular starts at the local `ElementInjector` (the `NodeInjector` associated with the current component's view).
+2.  If the token is not found, it traverses upward through the parent elements in the template.
+3.  If the root of the `ElementInjector` tree is reached without locating the token, Angular switches to the `ModuleInjector` tree, starting at the current environment's injector up to the root injector.
+4.  If still not found, it falls back to the `NullInjector`. Unless the dependency is marked optional, the `NullInjector` throws a `StaticInjectorError`.
 
 ---
 
-## 1. Injector Hierarchy
+## 2. Deep-Dive API & Declarative Synthesis
 
-Angular resolves dependencies by traversing an injector tree. This tree contains two main branches: the **Module/Environment Injector Tree** and the **Element/Node Injector Tree**.
+### Injection Token Types
 
-```
-             NullInjector (Throws error if not @Optional)
-                   │
-            PlatformInjector (Contains platform-wide services)
-                   │
-          EnvironmentInjector (Root injector, configured via provideStore, bootstrap)
-                   │
-            ElementInjector (Component-level, NodeInjector)
-```
-
-1.  **`NullInjector`**: The absolute top of the tree. If a dependency lookup reaches this point, Angular throws an error unless the dependency is marked with `@Optional()`.
-2.  **`PlatformInjector`**: Configured when bootstrapping the platform (e.g., platform-browser, platform-server).
-3.  **`EnvironmentInjector`**: Replaces the old root `ModuleInjector` in standalone applications. Configured in `bootstrapApplication` or within route configurations using `providers: [...]`.
-4.  **`ElementInjector` / `NodeInjector`**: Created on every DOM element that hosts a component or directive. Configured via the `providers` or `viewProviders` arrays inside the `@Component` decorator.
-
----
-
-## 2. Resolution Modifiers
-
-By default, Angular starts searching for a dependency at the current component's `ElementInjector`. If not found, it traverses upward through parent element injectors, then moves to the `EnvironmentInjector`, and finally up to the `NullInjector`. This path can be customized using resolution modifiers:
-
-*   **`@Self()`**: Instructs Angular to look for the dependency *only* in the local component/directive's `ElementInjector`.
-*   **`@SkipSelf()`**: Instructs Angular to bypass the local `ElementInjector` and begin the search at the parent injector.
-*   **`@Optional()`**: Prevents Angular from throwing an error if the dependency is not found, returning `null` instead.
-*   **`@Host()`**: Restricts the search to the current template host. The search will not ascend beyond the component's host element.
+Dependencies are identified by lookup tokens. While classes can act as their own tokens, interfaces cannot exist at runtime in JavaScript. For interfaces, configuration configurations, or primitives, we use `InjectionToken`.
 
 ```typescript
-import { Component, Injectable, Optional, Self, SkipSelf, Host } from '@angular/core';
+import { InjectionToken } from '@angular/core';
+
+export interface AppConfig {
+  apiUrl: string;
+  timeoutMs: number;
+}
+
+export const APP_CONFIG = new InjectionToken<AppConfig>('app.config');
+```
+
+### Provider Configuration Strategies
+
+```typescript
+import { bootstrapApplication } from '@angular/platform-browser';
+import { AppComponent } from './app.component';
+import { APP_CONFIG } from './config.token';
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    // 1. Value Provider
+    {
+      provide: APP_CONFIG,
+      useValue: { apiUrl: 'https://api.enterprise.com', timeoutMs: 5000 }
+    },
+    // 2. Class Provider (useful for swapping implementations)
+    {
+      provide: LoggerService,
+      useClass: EnterpriseLoggerService
+    },
+    // 3. Factory Provider (dynamic resolution)
+    {
+      provide: API_SERVICE,
+      useFactory: (config: AppConfig) => new ApiService(config),
+      deps: [APP_CONFIG]
+    }
+  ]
+});
+```
+
+### Resolution Modifiers
+
+Angular provides parameter decorators to control how the DI engine searches for dependencies:
+
+```typescript
+import { Injectable, Inject, Optional, Self, SkipSelf, Host } from '@angular/core';
+import { APP_CONFIG, AppConfig } from './config.token';
 
 @Injectable()
-export class LoggerService {
-  log(msg: string): void { console.log(`[Logger]: ${msg}`); }
-}
-
-@Component({
-  selector: 'app-di-resolution',
-  standalone: true,
-  providers: [LoggerService], // Configured on ElementInjector
-  template: `<div>Check console for DI resolution outputs.</div>`
-})
-export class DiResolutionComponent {
+export class ConsumerService {
   constructor(
-    // Looks only at this component's ElementInjector
-    @Self() private selfLogger: LoggerService,
-
-    // Skips this component's ElementInjector and looks in parent elements/root
-    @SkipSelf() @Optional() private parentLogger: LoggerService | null,
-
-    // Looks up to the host element boundary
-    @Host() private hostLogger: LoggerService
-  ) {
-    this.selfLogger.log('Resolved from local ElementInjector.');
-    if (this.parentLogger) {
-      this.parentLogger.log('Resolved from parent.');
-    } else {
-      console.log('Parent logger not found (expected behavior).');
-    }
-  }
+    @Inject(APP_CONFIG) private config: AppConfig,
+    @Optional() private logger?: LoggerService, // Returns null instead of throwing error if missing
+    @Self() private localService?: LocalService, // Searches ONLY in this element's injector
+    @SkipSelf() private parentService?: ParentService, // Skips current element, starts lookup at parent
+    @Host() private hostService?: HostService // Restricts lookup to the host component of the template
+  ) {}
 }
 ```
 
 ---
 
-## 3. Injection Tokens & Advanced Providers
+## 3. Advanced Implementation & Production Patterns
 
-While class-based injection is common, Angular also supports custom configuration tokens using `InjectionToken` and advanced provider configurations.
+Let's build a dynamic, configurable HTTP interceptor framework using custom `InjectionToken`s, factory providers, and clean architectural decoupling.
+
+### `api-token.ts`
 
 ```typescript
-import { InjectionToken, inject, Injectable } from '@angular/core';
-
-export interface AppConfig
+import { InjectionToken } from '@angular/core';

@@ -6,7 +6,7 @@ import { useAuthStore } from '@/store/useAuthStore';
 import LessonNav from './LessonNav';
 import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap } from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
-import CodeEditorShell from '@/components/code/CodeEditorShell';
+import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
@@ -77,7 +77,7 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
       case 'code':
         return (
           <div className="h-full -m-6">
-            <CodeEditorShell />
+            <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
           </div>
         );
       case 'real-world':
