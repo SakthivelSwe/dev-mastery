@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 
-const v11Path = 'c:/Projects/dev-mastery/services/content-service/src/main/resources/db/migration/V11__seed_topics_all_paths.sql';
-const contentDir = 'c:/Projects/dev-mastery/apps/web/content';
+const v11Path = 'c:/AI projects/dev-mastery/services/content-service/src/main/resources/db/migration/V11__seed_topics_all_paths.sql';
+const v15Path = 'c:/AI projects/dev-mastery/services/content-service/src/main/resources/db/migration/V15__seed_new_paths.sql';
+const contentDir = 'c:/AI projects/dev-mastery/apps/web/content';
 
-const sqlContent = fs.readFileSync(v11Path, 'utf8');
+const sqlContent = fs.readFileSync(v11Path, 'utf8') + '\n' + fs.readFileSync(v15Path, 'utf8');
 
 const pathRegex = /SELECT id INTO path_id FROM learning_paths WHERE slug = '([^']+)';([\s\S]*?)(?=SELECT id INTO path_id|$)/g;
 

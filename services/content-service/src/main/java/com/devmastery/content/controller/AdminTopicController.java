@@ -2,7 +2,6 @@ package com.devmastery.content.controller;
 
 import com.devmastery.content.dto.admin.*;
 import com.devmastery.content.service.AdminTopicService;
-import com.devmastery.content.search.OpenSearchIndexer;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -26,7 +25,6 @@ import java.util.List;
 public class AdminTopicController {
 
     private final AdminTopicService adminTopicService;
-    private final OpenSearchIndexer openSearchIndexer;
 
     @GetMapping("/stats")
     @Operation(summary = "Get topic stats for dashboard")
@@ -102,13 +100,6 @@ public class AdminTopicController {
     @Operation(summary = "Create a new topic")
     public ResponseEntity<Void> createTopic(@Valid @RequestBody AdminTopicCreateRequest request) {
         adminTopicService.createTopic(request);
-        return ResponseEntity.ok().build();
-    }
-
-    @PostMapping("/reindex")
-    @Operation(summary = "Reindex all topics into OpenSearch")
-    public ResponseEntity<Void> reindexAllTopics() {
-        openSearchIndexer.reindexAllTopics();
         return ResponseEntity.ok().build();
     }
 }

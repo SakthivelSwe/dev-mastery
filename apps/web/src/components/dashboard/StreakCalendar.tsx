@@ -36,7 +36,7 @@ export function StreakCalendar({ activity, streak }: StreakCalendarProps) {
     const activityMap = new Map<string, ActivityItem>();
     activity.forEach(a => activityMap.set(a.date, a));
 
-    const today = new Date('2026-05-29');
+    const today = new Date();
     const weeks: { date: string; xp: number; topics: number }[][] = [];
     let currentWeek: { date: string; xp: number; topics: number }[] = [];
 
@@ -66,7 +66,6 @@ export function StreakCalendar({ activity, streak }: StreakCalendarProps) {
     return weeks;
   }, [activity]);
 
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   return (
     <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-5">

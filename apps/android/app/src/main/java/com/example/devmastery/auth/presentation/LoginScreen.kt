@@ -12,6 +12,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 fun LoginScreen(
     onLoginSuccess: () -> Unit,
+    onNavigateToRegister: () -> Unit = {},
     viewModel: AuthViewModel = viewModel(factory = AuthViewModel.Factory)
 ) {
     val authState by viewModel.authState.collectAsState()
@@ -72,6 +73,14 @@ fun LoginScreen(
                 text = (authState as AuthState.Error).message,
                 color = MaterialTheme.colorScheme.error
             )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+        TextButton(onClick = {
+            viewModel.resetState()
+            onNavigateToRegister()
+        }) {
+            Text("Don't have an account? Sign Up")
         }
     }
 }

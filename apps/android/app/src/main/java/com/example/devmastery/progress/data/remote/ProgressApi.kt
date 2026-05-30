@@ -24,7 +24,27 @@ data class SpacedReviewDto(
     val nextReviewDate: String
 )
 
+data class StreakDto(
+    val currentStreak: Int,
+    val longestStreak: Int,
+    val lastActivityDate: String?
+)
+
+data class ProgressSummaryDto(
+    val totalXp: Int,
+    val level: Int,
+    val completedTopics: Int,
+    val streak: Int,
+    val dueReviewsCount: Int
+)
+
 interface ProgressApi {
+    @GET("progress/summary")
+    suspend fun getSummary(): ProgressSummaryDto
+
+    @GET("progress/streak")
+    suspend fun getStreak(): StreakDto
+
     @POST("progress/layers/complete")
     suspend fun completeLayer(@Body request: LayerCompletionRequest)
 

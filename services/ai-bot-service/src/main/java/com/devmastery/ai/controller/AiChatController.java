@@ -1,6 +1,7 @@
 package com.devmastery.ai.controller;
 
 import com.devmastery.ai.dto.ChatRequest;
+import com.devmastery.ai.dto.ChatResponse;
 import com.devmastery.ai.dto.FeynmanRequest;
 import com.devmastery.ai.dto.FeynmanScoreResponse;
 import com.devmastery.ai.service.AiChatService;
@@ -37,6 +38,16 @@ public class AiChatController {
     public Flux<String> chat(@Valid @RequestBody ChatRequest request) {
         log.debug("Chat request for topic: {}, section: {}", request.topicSlug(), request.sectionType());
         return aiChatService.streamChat(request);
+    }
+
+    /**
+     * Non-streaming JSON endpoint for mobile clients (Android) that don't support SSE.
+     * Collects the full AI response and returns it as a single JSON object.
+     */
+    @PostMapping(value = "/chat/sync", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ChatResponse> chatSync(@Valid @RequestBody ChatRequest request) {
+        log.debug("Sync chat request for topic: {}, section: {}", request.topicSlug(), request.sectionType());
+        return aiChatService.chatSync(request);
     }
 
     /**

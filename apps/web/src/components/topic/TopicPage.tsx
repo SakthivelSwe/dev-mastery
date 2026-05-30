@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { useTopicStore, TabState } from '@/store/useTopicStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import LessonNav from './LessonNav';
@@ -10,32 +11,46 @@ import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
-import MockInterviewShell from '../interview/MockInterviewShell';
-import SystemDesignCanvas from '../system-design/SystemDesignCanvas';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { markLayerComplete } from '@/lib/api';
 
 interface TopicPageProps {
   topicSlug:  string;
+  pathSlug:   string;
   topic:       Topic | null;
+  prevSlug:   string | null;
+  nextSlug:   string | null;
   MdxRenderer: React.ComponentType<{ source: string; className?: string }>;
 }
 
-export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPageProps) {
-  const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
+export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSlug, MdxRenderer }: TopicPageProps) {
+  const { activeTab, setActiveTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user } = useAuthStore();
-  const { messages, sendMessage, isLoading: aiLoading } = useAiChat();
+  const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
+    topicSlug,
+    sectionType: activeTab,
+    initialMessage: topic
+      ? `Hi! I'm your AI tutor for **${topic.title}**. Ask me anything about this topic!`
+      : undefined,
+  });
   const [chatInput, setChatInput]   = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
   const [xpFlash, setXpFlash]       = useState(false);
   const startTime = useRef(Date.now());
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const router = useRouter();
 
   // Scroll AI chat to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Reset to first tab whenever the user navigates to a different topic
+  useEffect(() => {
+    setActiveTab('why');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topicSlug]);
 
   // Reset start timer when changing tabs
   useEffect(() => {
@@ -46,8 +61,8 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
     setIsCompleting(true);
     try {
       const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
-      if (user) {
-        await markLayerComplete(user.id, topicSlug, activeTab, timeSpent);
+      if (user && topic?.id) {
+        await markLayerComplete(user.id, topic.id, activeTab, timeSpent);
       }
       markTabCompleted(activeTab);
       setXpFlash(true);
@@ -57,6 +72,10 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
     } finally {
       setIsCompleting(false);
     }
+  };
+
+  const navigateTo = (slug: string) => {
+    router.push(`/learn/${pathSlug}/${slug}`);
   };
 
   const renderContent = () => {
@@ -82,12 +101,10 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
             <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
           </div>
         );
-      case 'system-design':
-        return <SystemDesignCanvas topicSlug={topicSlug} />;
       case 'real-world':
         return <MdxRenderer source={topic.layers.realWorld} />;
       case 'interview':
-        return <MockInterviewShell topicSlug={topicSlug} />;
+        return <MdxRenderer source={topic.layers.interview} />;
       case 'feynman':
         return <FeynmanCheckPanel topicSlug={topicSlug} topicTitle={topic.title} />;
       case 'build':
@@ -143,7 +160,11 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
 
         {/* Footer Navigation Bar */}
         <div className="h-16 border-t border-[--border-default] flex items-center justify-between px-6 bg-[--bg-surface]/50 backdrop-blur-sm shrink-0">
-          <button className="flex items-center gap-2 text-sm text-[--text-muted] hover:text-[--text-primary] px-4 py-2 rounded-lg hover:bg-[--bg-elevated] transition-all">
+          <button
+            onClick={() => prevSlug && navigateTo(prevSlug)}
+            disabled={!prevSlug}
+            className="flex items-center gap-2 text-sm text-[--text-muted] hover:text-[--text-primary] px-4 py-2 rounded-lg hover:bg-[--bg-elevated] transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+          >
             <ChevronLeft size={16} />
             Previous
           </button>
@@ -162,6 +183,15 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
           >
             {isCompleting ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
             {isCompleting ? 'Saving...' : 'Mark Complete'}
+          </button>
+
+          <button
+            onClick={() => nextSlug && navigateTo(nextSlug)}
+            disabled={!nextSlug}
+            className="flex items-center gap-2 text-sm text-[--text-muted] hover:text-[--text-primary] px-4 py-2 rounded-lg hover:bg-[--bg-elevated] transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            Next
+            <ChevronRight size={16} />
           </button>
         </div>
       </div>
@@ -236,3 +266,18 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
     </div>
   );
 }
+
+// ── Helper: Empty layer placeholder ─────────────────────────────
+function EmptyLayer({ label }: { label: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center h-64 gap-3 text-[--text-muted]">
+      <div className="w-12 h-12 rounded-xl bg-[--bg-elevated] flex items-center justify-center text-2xl">📝</div>
+      <p className="font-medium text-[--text-secondary]">{label}</p>
+      <p className="text-sm text-center max-w-sm">
+        Content for this layer is being prepared. Check back soon or try another tab.
+      </p>
+    </div>
+  );
+}
+
+

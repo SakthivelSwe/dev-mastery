@@ -1,12 +1,12 @@
 package com.example.devmastery.auth.presentation
 
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.example.devmastery.auth.data.remote.AuthRepository
-import com.example.devmastery.auth.data.local.TokenManager
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import com.example.devmastery.DevMasteryApp
+import com.example.devmastery.auth.data.local.TokenManager
+import com.example.devmastery.auth.data.remote.AuthRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,28 +30,42 @@ class AuthViewModel(
     fun login(email: String, password: String) {
         _authState.value = AuthState.Loading
         viewModelScope.launch {
-            val result = authRepository.login(email, password)
-            result.onSuccess { response ->
-                tokenManager.saveToken(response.token)
-                _authState.value = AuthState.Success(response.token, response.user.name)
-            }.onFailure { error ->
-                _authState.value = AuthState.Error(error.message ?: "An error occurred")
-            }
+            authRepository.login(email, password)
+                .onSuccess { response ->
+                    // Backend AuthResponse is flat: { token, id, email, fullName, role }
+                    tokenManager.saveToken(response.token)
+                    tokenManager.saveUserId(response.id)
+                    tokenManager.saveUserName(response.fullName)
+                    tokenManager.saveUserEmail(response.email)
+                    _authState.value = AuthState.Success(response.token, response.fullName)
+                }
+                .onFailure { _authState.value = AuthState.Error(it.message ?: "Login failed") }
         }
     }
+
+    fun register(email: String, password: String, name: String) {
+        _authState.value = AuthState.Loading
+        viewModelScope.launch {
+            authRepository.register(email, password, name)
+                .onSuccess { response ->
+                    tokenManager.saveToken(response.token)
+                    tokenManager.saveUserId(response.id)
+                    tokenManager.saveUserName(response.fullName)
+                    tokenManager.saveUserEmail(response.email)
+                    _authState.value = AuthState.Success(response.token, response.fullName)
+                }
+                .onFailure { _authState.value = AuthState.Error(it.message ?: "Registration failed") }
+        }
+    }
+
+    fun resetState() { _authState.value = AuthState.Idle }
 
     companion object {
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(
-                modelClass: Class<T>,
-                extras: CreationExtras
-            ): T {
-                val application = checkNotNull(extras[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY]) as DevMasteryApp
-                return AuthViewModel(
-                    application.container.authRepository,
-                    application.container.tokenManager
-                ) as T
+            override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
+                val app = checkNotNull(extras[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY]) as DevMasteryApp
+                return AuthViewModel(app.container.authRepository, app.container.tokenManager) as T
             }
         }
     }

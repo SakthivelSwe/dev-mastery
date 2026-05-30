@@ -33,6 +33,10 @@ export const PATH_META: Record<string, PathMeta> = {
   'postgresql-dba':      { slug: 'postgresql-dba',       label: 'PostgreSQL DBA',     emoji: '🐘', color: '#336791', bgGradient: 'from-blue-700/20 to-indigo-600/10',    description: 'VACUUM, replication, partitioning',        group: 'Databases' },
   'mongodb':             { slug: 'mongodb',              label: 'MongoDB',            emoji: '🍃', color: '#4DB33D', bgGradient: 'from-green-600/20 to-emerald-600/10',  description: 'Documents, aggregation, sharding',         group: 'Databases' },
   'full-stack':          { slug: 'full-stack',           label: 'Full Stack',         emoji: '🚀', color: '#4285F4', bgGradient: 'from-blue-500/20 to-violet-500/10',    description: 'End-to-end application development',       group: 'Fullstack' },
+  'nextjs':              { slug: 'nextjs',               label: 'Next.js',            emoji: '▲',  color: '#000000', bgGradient: 'from-gray-500/20 to-slate-500/10',     description: 'App Router, SSR, ISR, Server Actions',     group: 'Frontend' },
+  'docker':              { slug: 'docker',               label: 'Docker',             emoji: '🐳', color: '#2496ED', bgGradient: 'from-blue-500/20 to-sky-500/10',       description: 'Containers, Compose, multi-stage builds',  group: 'DevOps' },
+  'kubernetes':          { slug: 'kubernetes',           label: 'Kubernetes',         emoji: '☸️', color: '#326CE5', bgGradient: 'from-blue-600/20 to-indigo-500/10',    description: 'Pods, Services, Deployments, Helm',        group: 'DevOps' },
+  'git-github':          { slug: 'git-github',           label: 'Git & GitHub',       emoji: '🔀', color: '#F05032', bgGradient: 'from-orange-500/20 to-red-500/10',     description: 'Version control, branching, CI/CD',        group: 'DevOps' },
 };
 
 export const ALL_PATH_SLUGS = Object.keys(PATH_META);

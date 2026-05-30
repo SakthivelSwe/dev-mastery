@@ -40,6 +40,15 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
+  // Rewrite API calls through Next.js to avoid CORS in production
+  // In development the backend services run directly on their ports
+  async rewrites() {
+    return [
+      { source: '/api/auth/:path*',    destination: `${process.env.NEXT_PUBLIC_AUTH_API_URL || 'http://localhost:8081'}/:path*` },
+      { source: '/api/content/:path*', destination: `${process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082'}/:path*` },
+      { source: '/api/progress/:path*',destination: `${process.env.NEXT_PUBLIC_PROGRESS_API_URL || 'http://localhost:8083'}/:path*` },
+    ];
+  },
 };
 
 export default withPWA(nextConfig);

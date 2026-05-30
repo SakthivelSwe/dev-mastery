@@ -2,15 +2,13 @@ package com.devmastery.progress.controller;
 
 import com.devmastery.progress.dto.LayerCompletionRequest;
 import com.devmastery.progress.dto.MarkCompleteRequest;
+import com.devmastery.progress.dto.ProgressSummaryResponse;
 import com.devmastery.progress.dto.ReviewRatingRequest;
 import com.devmastery.progress.service.GamificationService;
 import com.devmastery.progress.service.ProgressService;
 import com.devmastery.progress.service.SpacedReviewService;
-import com.devmastery.progress.service.CertificateService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.UUID;
@@ -24,7 +22,6 @@ public class ProgressController {
     private final ProgressService progressService;
     private final GamificationService gamificationService;
     private final SpacedReviewService spacedReviewService;
-    private final CertificateService certificateService;
 
     // Ideally userId comes from the JWT via Spring Security Context.
     // For local testing in Phase 1B, we can accept it as a header or just use a mock if auth isn't fully propagated yet.
@@ -80,13 +77,8 @@ public class ProgressController {
     }
     
     @GetMapping("/summary")
-    public ResponseEntity<Object> getSummary(@RequestHeader("X-User-Id") UUID userId) {
+    public ResponseEntity<ProgressSummaryResponse> getSummary(@RequestHeader("X-User-Id") UUID userId) {
         return ResponseEntity.ok(progressService.getUserSummary(userId));
-    }
-
-    @GetMapping("/stats")
-    public ResponseEntity<Object> getStats(@RequestHeader("X-User-Id") UUID userId) {
-        return ResponseEntity.ok(progressService.getStats(userId));
     }
 
     @GetMapping
@@ -99,21 +91,5 @@ public class ProgressController {
             @PathVariable UUID userId,
             @PathVariable String pathSlug) {
         return ResponseEntity.ok(progressService.getPathProgress(userId, pathSlug));
-    }
-
-    @GetMapping(value = "/certificates/{pathSlug}", produces = MediaType.APPLICATION_PDF_VALUE)
-    public ResponseEntity<byte[]> getCertificate(
-            @RequestHeader("X-User-Id") UUID userId,
-            @PathVariable String pathSlug,
-            @RequestParam(defaultValue = "Student Developer") String userName) {
-        // In a real app, verify the user has 100% completed the path before generating
-        byte[] pdf = certificateService.generateCertificate(userId, userName, pathSlug);
-        
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentDispositionFormData("attachment", pathSlug + "-certificate.pdf");
-        
-        return ResponseEntity.ok()
-                .headers(headers)
-                .body(pdf);
     }
 }

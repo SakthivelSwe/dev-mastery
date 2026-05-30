@@ -1,5 +1,6 @@
 import { Metadata } from 'next';
 import DashboardClient from './DashboardClient';
+import AuthGuard from '@/components/shared/AuthGuard';
 
 export const metadata: Metadata = {
   title: 'Dashboard | DevMastery',
@@ -7,5 +8,9 @@ export const metadata: Metadata = {
 };
 
 export default function DashboardPage() {
-  return <DashboardClient />;
+  return (
+    <AuthGuard>
+      <DashboardClient />
+    </AuthGuard>
+  );
 }

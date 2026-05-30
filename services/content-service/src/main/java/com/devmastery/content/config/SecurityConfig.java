@@ -19,6 +19,9 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.SecurityFilterChain;
@@ -30,7 +33,6 @@ import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * Security configuration for content-service.
@@ -47,9 +49,25 @@ public class SecurityConfig {
     private String jwtSecret;
 
     @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOriginPatterns(java.util.List.of(
+            "http://localhost:3000", "http://localhost:3001", "https://*.devmastery.app"
+        ));
+        config.setAllowedMethods(java.util.List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(java.util.List.of("*"));
+        config.setAllowCredentials(true);
+        config.setMaxAge(3600L);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+
+    @Bean
     public SecurityFilterChain filterChain(HttpSecurity http, JwtAuthFilter jwtAuthFilter) throws Exception {
         return http
                 .csrf(AbstractHttpConfigurer::disable)
+                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         // Public read access to content
@@ -100,13 +118,11 @@ public class SecurityConfig {
                         .getPayload();
 
                 String userId = claims.getSubject();
-                @SuppressWarnings("unchecked")
-                List<String> roles = (List<String>) claims.get("roles", List.class);
+                // auth-service stores a single "role" String claim, not a list
+                String roleClaim = claims.get("role", String.class);
 
-                List<SimpleGrantedAuthority> authorities = roles == null ? List.of() :
-                        roles.stream()
-                             .map(r -> new SimpleGrantedAuthority("ROLE_" + r.toUpperCase()))
-                             .collect(Collectors.toList());
+                List<SimpleGrantedAuthority> authorities = roleClaim == null ? List.of() :
+                        List.of(new SimpleGrantedAuthority("ROLE_" + roleClaim.toUpperCase()));
 
                 UsernamePasswordAuthenticationToken auth =
                         new UsernamePasswordAuthenticationToken(userId, null, authorities);

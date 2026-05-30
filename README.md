@@ -1,112 +1,83 @@
-# DevMastery 🚀
-> *From Zero to 10-Year Senior Engineer. Depth-first, concept-complete, AI-assisted learning.*
+# DevMastery — Setup & Integration Guide
 
-**100% Free Stack — Zero licensing cost at any scale.**
+> Master Every Technology. Miss Nothing. — Full-stack depth-first learning platform.
 
----
+## 🏗️ Architecture
 
-## Quick Start
+| Service | Port | Tech |
+|---------|------|------|
+| **Web Frontend** | 3000 | Next.js 14, TypeScript, Tailwind, Zustand |
+| **auth-service** | 8081 | Spring Boot 3.2, JWT |
+| **content-service** | 8082 | Spring Boot 3.2, Flyway, Valkey cache |
+| **progress-service** | 8083 | Spring Boot 3.2, XP/streak/badges |
+| **execution-service** | 8084 | Spring Boot + WebSocket + Judge0 CE |
+| **ai-bot-service** | 8085 | Spring WebFlux + Gemini SSE streaming |
 
-### Prerequisites
-| Tool | Version | Install |
-|---|---|---|
-| Node.js | ≥ 20 | https://nodejs.org |
-| JDK 21 | LTS (Temurin) | https://adoptium.net |
-| Docker Desktop | Latest | https://docker.com |
-| Git | Latest | https://git-scm.com |
+## 🚀 Quick Start
 
-### 1. Clone & Install
+### 1. Start Infrastructure
 ```bash
-git clone https://github.com/YOUR_ORG/devmastery.git
-cd devmastery
-npm install
+docker-compose -f docker-compose.dev.yml up -d
 ```
+Starts: PostgreSQL (5433), Valkey (6379), OpenSearch (9200), MinIO (9000), Judge0 CE (2358)
 
-### 2. Configure Environment
+### 2. Frontend
 ```bash
-cp .env.dev.example .env.dev
-# Edit .env.dev — fill in your GEMINI_API_KEY and change all CHANGE_ME_ placeholders
+cd apps/web && npm install
+cp .env.example .env.local
+npm run dev   # http://localhost:3000
 ```
 
-### 3. Start Infrastructure
+### 3. Backend (each in separate terminal)
 ```bash
-npm run infra:up
-# Waits for all services to be healthy (PostgreSQL, Valkey, OpenSearch, Kafka, Judge0, MinIO)
+cd services/auth-service     && ./gradlew bootRun
+cd services/content-service  && ./gradlew bootRun
+cd services/progress-service && ./gradlew bootRun
+cd services/execution-service && ./gradlew bootRun
+cd services/ai-bot-service   && GEMINI_API_KEY=your_key ./gradlew bootRun
 ```
 
-### 4. Start Backend Services
-```bash
-cd services/content-service
-./gradlew bootRun
-# API running at http://localhost:8082
-# Swagger UI: http://localhost:8082/swagger-ui.html
+## 🔑 Key API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/auth/register` | POST | Create account |
+| `/v1/auth/login` | POST | Login → JWT |
+| `/v1/paths` | GET | List 18 learning paths |
+| `/v1/paths/{slug}/roadmap` | GET | Path roadmap by levels |
+| `/v1/topics/{slug}` | GET | Full topic + 9 lesson layers |
+| `/v1/progress/layers/complete` | POST | Mark layer complete |
+| `/v1/progress/summary` | GET | Dashboard XP/streak/progress |
+| `ws://localhost:8084/ws/execute` | WS | Code execution (STOMP) |
+| `/v1/ai/chat` | POST | Gemini SSE streaming chat |
+| `/v1/ai/feynman/score` | POST | AI-score understanding |
+
+## 🎨 Design System: "Terminal Precision"
+- **bg-primary**: `#0D1117` · **bg-surface**: `#161B22` · **bg-elevated**: `#21262D`
+- **accent-java**: `#F89820` · **accent-spring**: `#6DB33F` · **accent-ai**: `#4285F4`
+- Fonts: **Syne** (display) · **DM Sans** (body) · **JetBrains Mono** (code)
+
+## 🧩 9-Layer Teaching Model
+`Why → Theory → Visualizer → Code Lab → Real World → Interview → Feynman → Build → Spaced Review`
+
+## 📁 Frontend Structure
 ```
-
-### 5. Start Web App
-```bash
-cd apps/web
-npm run dev
-# Web app running at http://localhost:3000
+apps/web/src/
+├── app/
+│   ├── page.tsx              # Landing page
+│   ├── login/, register/     # Auth pages
+│   ├── dashboard/            # Protected dashboard (Sidebar + Topbar)
+│   ├── learn/
+│   │   ├── [pathSlug]/roadmap/    # Path roadmap (list/map view)
+│   │   └── [pathSlug]/[topicSlug]/ # Topic with 9 tabs
+│   └── profile/              # User profile
+├── components/
+│   ├── shell/                # Sidebar, Topbar, CommandPalette
+│   ├── topic/                # TopicPage, LessonNav, panels
+│   ├── dashboard/            # Charts, PathCard, StatsBar
+│   ├── roadmap/              # RoadmapCanvas (D3), RoadmapListView
+│   └── visualizer/           # DSA algorithm visualizers
+├── hooks/                    # useAiChat, useProgress, useCodeExecution
+├── lib/                      # api.ts (all backend calls), pathMeta.ts
+└── store/                    # useAuthStore (persist), useTopicStore
 ```
-
----
-
-## Architecture
-
-```
-devmastery/
-├── apps/
-│   ├── web/          ← Next.js 14 (TypeScript, Tailwind, shadcn/ui)
-│   └── android/      ← Kotlin + Jetpack Compose (Phase 3)
-├── services/
-│   ├── api-gateway/          ← Port 8080
-│   ├── auth-service/         ← Port 8081
-│   ├── content-service/      ← Port 8082  ✅ Phase 0
-│   ├── progress-service/     ← Port 8083
-│   ├── code-execution-service/ ← Port 8084
-│   ├── ai-bot-service/       ← Port 8085
-│   ├── quiz-service/         ← Port 8086
-│   ├── notification-service/ ← Port 8087
-│   ├── user-service/         ← Port 8088
-│   └── search-service/       ← Port 8089
-├── docker-compose.dev.yml    ← Full dev environment
-├── turbo.json
-└── package.json
-```
-
-## Technology Stack (100% Free)
-
-| Layer | Technology |
-|---|---|
-| Web Frontend | Next.js 14, TypeScript, Tailwind CSS, shadcn/ui, D3.js, Framer Motion |
-| Backend | Spring Boot 3.2, Java 21, Gradle, Flyway, MapStruct, Lombok |
-| Database | PostgreSQL 16, Valkey 7.x, OpenSearch 2.x, MinIO |
-| Messaging | Apache Kafka 3.x |
-| AI | Google Gemini API (gemini-1.5-flash) — free tier 1M tokens/day |
-| Android | Kotlin 2, Jetpack Compose, Hilt, Room, Coroutines |
-| DevOps | Docker Compose, GitHub Actions, Oracle Cloud Always Free |
-
-## Cost
-```
-Development:  ₹0 (Docker Compose local)
-Production:   ₹0/month (Oracle Cloud Always Free — 4 OCPU, 24GB ARM)
-Annual cost:  ~₹800 (domain name only)
-```
-
----
-
-## Project Phases
-
-| Phase | Weeks | Status |
-|---|---|---|
-| **Phase 0** — Foundation, Monorepo, DB Schema, Content Service, Web Scaffold | 1–3 | 🔨 In Progress |
-| **Phase 1** — Auth, Progress, DSA Visualizer, AI Bot | 4–8 | ⏳ Planned |
-| **Phase 2** — Code Lab, Quiz Engine, Gamification | 9–12 | ⏳ Planned |
-| **Phase 3** — Android App | 13–18 | ⏳ Planned |
-| **Phase 4** — System Design, Mock Interview, Admin CMS | 19–24 | ⏳ Planned |
-| **Phase 5** — Monitoring, Play Store, Beta Launch | 25–28 | ⏳ Planned |
-
----
-
-## License
-All components use 100% free and open-source licenses (MIT, Apache 2.0, LGPL).

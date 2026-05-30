@@ -8,8 +8,9 @@ const CONTENT_API  = process.env.NEXT_PUBLIC_CONTENT_API_URL  || 'http://localho
 
 // ─── Fetcher ─────────────────────────────────────────────────
 
-const fetcher = async (url: string, userId?: string) => {
+const fetcher = async (url: string, token?: string, userId?: string) => {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
   if (userId) headers['X-User-Id'] = userId;
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -67,9 +68,13 @@ const MOCK_DASHBOARD: DashboardSummary = {
     { pathSlug: 'software-architecture', completedTopics: 0, totalTopics: 35, xpEarned: 0, lastStudied: null },
     { pathSlug: 'design-system',     completedTopics: 0,  totalTopics: 30, xpEarned: 0,    lastStudied: null },
     { pathSlug: 'full-stack',        completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
+    { pathSlug: 'docker',            completedTopics: 0,  totalTopics: 22, xpEarned: 0,    lastStudied: null },
+    { pathSlug: 'kubernetes',        completedTopics: 0,  totalTopics: 26, xpEarned: 0,    lastStudied: null },
+    { pathSlug: 'git-github',        completedTopics: 0,  totalTopics: 26, xpEarned: 0,    lastStudied: null },
+    { pathSlug: 'nextjs',            completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
   ],
   recentActivity: Array.from({ length: 90 }, (_, i) => {
-    const d = new Date('2026-05-29');
+    const d = new Date();
     d.setDate(d.getDate() - i);
     return {
       date: d.toISOString().split('T')[0],
@@ -82,45 +87,35 @@ const MOCK_DASHBOARD: DashboardSummary = {
 // ─── Hooks ────────────────────────────────────────────────────
 
 export function useDashboard() {
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const userId = user?.id;
 
   const { data, error, isLoading } = useSWR(
-    userId ? [`${PROGRESS_API}/v1/progress/stats`, userId] : null,
-    ([url, uid]) => fetcher(url, uid),
-    { refreshInterval: 60_000 }
+    userId ? [`${PROGRESS_API}/v1/progress/summary`, token, userId] : null,
+    ([url, tok, uid]) => fetcher(url, tok ?? undefined, uid),
+    { refreshInterval: 60_000, fallbackData: MOCK_DASHBOARD }
   );
 
-  let dashboardData = MOCK_DASHBOARD;
-  if (data) {
-    // Map StatsResponse to DashboardSummary
-    const streakInfo = data.streak || {};
-    
-    dashboardData = {
-      ...MOCK_DASHBOARD,
-      totalXp: streakInfo.totalXp || 0,
-      streak: streakInfo.currentStreak || 0,
-      rank: streakInfo.badgeLevel ? streakInfo.badgeLevel.replace('-', ' ').toUpperCase() : 'NOVICE',
-      totalCompleted: data.topicsCompleted || 0,
-      // badges: data.badges
-      // totalLearningTimeSecs: data.totalLearningTimeSecs
-    };
-  }
+  // Merge API response with mock defaults so partial backend responses
+  // (e.g. ProgressSummaryResponse) don't leave fields undefined in the UI.
+  const merged: DashboardSummary = data
+    ? { ...MOCK_DASHBOARD, ...(data as Partial<DashboardSummary>) }
+    : MOCK_DASHBOARD;
 
   return {
-    dashboard: dashboardData,
+    dashboard: merged,
     isLoading: isLoading && !data,
     error,
   };
 }
 
 export function usePathProgress(pathSlug: string) {
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const userId = user?.id;
 
   return useSWR(
-    userId ? [`${PROGRESS_API}/v1/progress/path/${pathSlug}`, userId] : null,
-    ([url, uid]) => fetcher(url, uid),
+    userId ? [`${PROGRESS_API}/v1/progress/path/${pathSlug}`, token, userId] : null,
+    ([url, tok, uid]) => fetcher(url, tok ?? undefined, uid),
     { fallbackData: null }
   );
 }

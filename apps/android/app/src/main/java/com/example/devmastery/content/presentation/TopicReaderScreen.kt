@@ -11,11 +11,16 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.jeziellago.compose.markdowntext.MarkdownText
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.SmartToy
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TopicReaderScreen(
     topicSlug: String,
     onBack: () -> Unit,
+    onAiChat: () -> Unit = {},
     viewModel: TopicViewModel = viewModel(factory = TopicViewModel.Factory)
 ) {
     val topicState by viewModel.topicState.collectAsState()
@@ -28,9 +33,20 @@ fun TopicReaderScreen(
         topBar = {
             TopAppBar(
                 title = { Text(if (topicState is TopicState.Success) (topicState as TopicState.Success).topic.title else "Loading...") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onAiChat) {
+                        Icon(Icons.Default.SmartToy, contentDescription = "AI Chat",
+                            tint = MaterialTheme.colorScheme.primary)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    titleContentColor = MaterialTheme.colorScheme.onSurface,
                 )
             )
         }

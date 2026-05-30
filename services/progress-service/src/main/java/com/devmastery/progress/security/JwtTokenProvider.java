@@ -1,4 +1,4 @@
-package com.devmastery.auth.security;
+package com.devmastery.progress.security;
 
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.io.Decoders;

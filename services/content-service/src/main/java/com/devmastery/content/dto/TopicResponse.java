@@ -20,6 +20,7 @@ public record TopicResponse(
         String pathTitle,
         Integer level,
         Integer estimatedMins,
+        Integer xpReward,
         Integer orderIndex,
         Boolean hasVisualizer,
         Boolean hasCodeLab,

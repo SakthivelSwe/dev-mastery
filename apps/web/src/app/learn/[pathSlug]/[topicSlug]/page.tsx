@@ -26,12 +26,17 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 }
 
 export default async function TopicPageRoute({ params }: PageProps) {
-  // Fetch topic data server-side (SSR)
-  const topic = await fetchTopic(params.topicSlug);
+  // Fetch topic data and path concurrently
+  const [topic, path] = await Promise.all([
+    fetchTopic(params.topicSlug),
+    fetchPath(params.pathSlug),
+  ]);
 
-  // If topic genuinely doesn't exist in DB, show 404
-  // (comment out for dev if backend is off)
-  // if (!topic) notFound();
+  // Build prev/next navigation from the ordered topic list
+  const topics = path?.topics ?? [];
+  const currentIndex = topics.findIndex(t => t.slug === params.topicSlug);
+  const prevTopic = currentIndex > 0 ? topics[currentIndex - 1] : null;
+  const nextTopic = currentIndex >= 0 && currentIndex < topics.length - 1 ? topics[currentIndex + 1] : null;
 
   return (
     <div className="flex flex-col h-screen overflow-hidden">
@@ -59,7 +64,10 @@ export default async function TopicPageRoute({ params }: PageProps) {
       <main className="flex-1 overflow-hidden">
         <TopicPage
           topicSlug={params.topicSlug}
+          pathSlug={params.pathSlug}
           topic={topic}
+          prevSlug={prevTopic?.slug ?? null}
+          nextSlug={nextTopic?.slug ?? null}
           MdxRenderer={MdxRenderer}
         />
       </main>

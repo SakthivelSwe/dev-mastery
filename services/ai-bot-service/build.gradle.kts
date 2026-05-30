@@ -37,9 +37,7 @@ dependencies {
     implementation("io.lettuce:lettuce-core")  // reactive Valkey client
 
     // ─── Database ─────────────────────────────────────────────
-    implementation("org.springframework.boot:spring-boot-starter-data-r2dbc")
-    runtimeOnly("org.postgresql:r2dbc-postgresql")
-    runtimeOnly("org.postgresql:postgresql")
+    // Removed DB dependencies since we use REST to talk to content-service
 
     // ─── Caffeine L1 In-Process Cache ─────────────────────────
     implementation("com.github.ben-manes.caffeine:caffeine")

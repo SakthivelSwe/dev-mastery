@@ -2,8 +2,8 @@
 
 import React, { useEffect, useState } from 'react';
 import PatternVisualizer from '@/components/patterns/PatternVisualizer';
-import { fetchAllPaths } from '@/lib/api';
 
+const CONTENT_API = process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082';
 
 export default function PatternsPage() {
   const [patterns, setPatterns] = useState<any[]>([]);
@@ -14,7 +14,7 @@ export default function PatternsPage() {
   useEffect(() => {
     async function loadPatterns() {
       try {
-        const res = await fetch('http://localhost:8082/v1/patterns');
+        const res = await fetch(`${CONTENT_API}/v1/patterns`);
         if (!res.ok) throw new Error('Failed');
         const data = await res.json();
         setPatterns(data);
@@ -32,7 +32,7 @@ export default function PatternsPage() {
     if (!activePatternSlug) return;
     async function loadPatternDetails() {
       try {
-        const res = await fetch(`http://localhost:8082/v1/patterns/${activePatternSlug}`);
+        const res = await fetch(`${CONTENT_API}/v1/patterns/${activePatternSlug}`);
         if (!res.ok) throw new Error('Failed');
         const data = await res.json();
         setActivePattern(data);

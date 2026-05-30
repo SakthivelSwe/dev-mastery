@@ -4,6 +4,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Bot, X, Send, User, Sparkles, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
+const AI_API = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8084';
+
 interface AiChatDrawerProps {
   topicSlug: string;
   topicTitle: string;
@@ -44,7 +46,7 @@ export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClo
       setMessages(prev => [...prev, { role: 'ai', content: '', isStreaming: true }]);
 
       // NOTE: We connect to the backend ai-bot-service directly (port 8084)
-      const response = await fetch('http://localhost:8084/v1/ai/chat', {
+      const response = await fetch(`${AI_API}/v1/ai/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

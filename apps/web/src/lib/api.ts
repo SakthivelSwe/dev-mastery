@@ -3,8 +3,28 @@
 // Handles all communication with Spring Boot microservices
 // ============================================================
 
-const CONTENT_API = process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082';
+const CONTENT_API  = process.env.NEXT_PUBLIC_CONTENT_API_URL  || 'http://localhost:8082';
 const PROGRESS_API = process.env.NEXT_PUBLIC_PROGRESS_API_URL || 'http://localhost:8083';
+export const AUTH_API = process.env.NEXT_PUBLIC_AUTH_API_URL || 'http://localhost:8081';
+
+// ─── Auth Headers Helper ─────────────────────────────────────
+// Reads from Zustand persist store (localStorage) safely at call time
+
+function getAuthHeaders(): Record<string, string> {
+  try {
+    const stored = localStorage.getItem('devmastery-auth');
+    if (!stored) return {};
+    const parsed = JSON.parse(stored);
+    const token: string | undefined = parsed?.state?.token;
+    const userId: string | undefined = parsed?.state?.user?.id;
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (userId) headers['X-User-Id'] = userId;
+    return headers;
+  } catch {
+    return {};
+  }
+}
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -21,16 +41,83 @@ export interface TopicLayers {
 }
 
 export interface Topic {
-  id:          string;
-  slug:        string;
-  title:       string;
-  level:       number;
-  pathSlug:    string;
-  pathTitle:   string;
-  layers:      TopicLayers;
-  xpReward:    number;
+  id:            string;
+  slug:          string;
+  title:         string;
+  level:         number;
+  pathSlug:      string;
+  pathTitle:     string;
+  layers:        TopicLayers;
+  xpReward:      number;
   estimatedMins: number;
-  tags:        string[];
+  tags:          string[];
+}
+
+// Raw backend response (before transformation)
+interface BackendLesson {
+  sectionType: string;
+  contentMdx:  string;
+}
+
+interface BackendTopicResponse {
+  id:            string;
+  slug:          string;
+  title:         string;
+  description:   string;
+  pathSlug:      string;
+  pathTitle:     string;
+  level:         number;
+  estimatedMins: number;
+  xpReward?:     number;
+  tags?:         string[];
+  lessons:       BackendLesson[];
+  codeExamples?: unknown[];
+}
+
+/** Map sectionType → layers key */
+function mapSectionToLayerKey(sectionType: string): keyof TopicLayers | null {
+  const m: Record<string, keyof TopicLayers> = {
+    'why':         'why',
+    'theory':      'theory',
+    'visual':      'visual',
+    'code':        'code',
+    'realworld':   'realWorld',
+    'real-world':  'realWorld',
+    'realWorld':   'realWorld',
+    'interview':   'interview',
+    'feynman':     'feynman',
+    'build':       'build',
+    'spacedreview':'spacedReview',
+    'spaced-review':'spacedReview',
+    'spacedReview': 'spacedReview',
+  };
+  return m[sectionType] ?? null;
+}
+
+/** Transform raw backend TopicResponse → frontend Topic */
+function transformTopic(raw: BackendTopicResponse): Topic {
+  const layers: TopicLayers = {
+    why: '', theory: '', visual: '', code: '',
+    realWorld: '', interview: '', feynman: '', build: '', spacedReview: '',
+  };
+
+  (raw.lessons ?? []).forEach((lesson) => {
+    const key = mapSectionToLayerKey(lesson.sectionType);
+    if (key) layers[key] = lesson.contentMdx ?? '';
+  });
+
+  return {
+    id:            raw.id,
+    slug:          raw.slug,
+    title:         raw.title,
+    level:         raw.level,
+    pathSlug:      raw.pathSlug,
+    pathTitle:     raw.pathTitle,
+    layers,
+    xpReward:      raw.xpReward ?? 50,
+    estimatedMins: raw.estimatedMins ?? 20,
+    tags:          raw.tags ?? [],
+  };
 }
 
 export interface LearningPath {
@@ -82,7 +169,8 @@ export async function fetchTopic(slug: string): Promise<Topic | null> {
       next: { revalidate: 3600 }, // Cache for 1 hour
     });
     if (!res.ok) return null;
-    return res.json();
+    const raw: BackendTopicResponse = await res.json();
+    return transformTopic(raw);
   } catch {
     return null;
   }
@@ -92,6 +180,66 @@ export async function fetchPath(slug: string): Promise<LearningPath | null> {
   try {
     const res = await fetch(`${CONTENT_API}/v1/paths/${slug}`, {
       next: { revalidate: 3600 },
+    });
+    if (!res.ok) return null;
+    const raw = await res.json();
+    // Backend PathResponse uses orderIndex, frontend uses order
+    const topics: TopicSummary[] = (raw.topics ?? []).map((t: any) => ({
+      id:    t.id    ?? '',
+      slug:  t.slug  ?? '',
+      title: t.title ?? '',
+      level: t.level ?? 1,
+      order: t.orderIndex ?? t.order ?? 0,
+    }));
+    return {
+      id:          raw.id          ?? '',
+      slug:        raw.slug        ?? slug,
+      title:       raw.title       ?? '',
+      description: raw.description ?? '',
+      icon:        raw.icon        ?? '',
+      accentColor: raw.accentColor ?? '',
+      totalTopics: raw.totalTopics ?? topics.length,
+      topics,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Path Roadmap (levels view) ──────────────────────────────
+
+export interface TopicRoadmapItem {
+  slug:          string;
+  title:         string;
+  estimatedMins: number;
+  completed:     boolean;
+  hasVisualizer: boolean;
+  hasCodeLab:    boolean;
+}
+
+export interface LevelRoadmap {
+  level:          number;
+  label:          string;
+  topicCount:     number;
+  completedCount: number;
+  topics:         TopicRoadmapItem[];
+}
+
+export interface PathRoadmapData {
+  path: {
+    slug:        string;
+    title:       string;
+    totalTopics: number;
+  };
+  levels: LevelRoadmap[];
+}
+
+export async function fetchPathRoadmap(slug: string): Promise<PathRoadmapData | null> {
+  try {
+    const headers = getAuthHeaders();
+    const res = await fetch(`${CONTENT_API}/v1/paths/${slug}/roadmap`, {
+      headers,
+      next: { revalidate: 300 },
     });
     if (!res.ok) return null;
     return res.json();
@@ -106,7 +254,17 @@ export async function fetchAllPaths(): Promise<LearningPath[]> {
       next: { revalidate: 3600 },
     });
     if (!res.ok) return [];
-    return res.json();
+    const rawPaths = await res.json();
+    return (rawPaths as any[]).map(raw => ({
+      id:          raw.id          ?? '',
+      slug:        raw.slug        ?? '',
+      title:       raw.title       ?? '',
+      description: raw.description ?? '',
+      icon:        raw.icon        ?? '',
+      accentColor: raw.accentColor ?? '',
+      totalTopics: raw.totalTopics ?? 0,
+      topics:      [],  // not populated in list view
+    }));
   } catch {
     return [];
   }
@@ -114,7 +272,7 @@ export async function fetchAllPaths(): Promise<LearningPath[]> {
 
 export async function searchTopics(query: string): Promise<TopicSummary[]> {
   try {
-    const res = await fetch(`${CONTENT_API}/v1/topics/search?q=${encodeURIComponent(query)}`);
+    const res = await fetch(`${CONTENT_API}/v1/search/topics?q=${encodeURIComponent(query)}`);
     if (!res.ok) return [];
     return res.json();
   } catch {
@@ -127,7 +285,7 @@ export async function searchTopics(query: string): Promise<TopicSummary[]> {
 export async function fetchUserProgress(userId: string): Promise<UserProgress | null> {
   try {
     const res = await fetch(`${PROGRESS_API}/v1/progress/summary`, {
-      headers: { 'X-User-Id': userId },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       next: { revalidate: 60 }, // Refresh every minute
     });
     if (!res.ok) return null;
@@ -139,18 +297,19 @@ export async function fetchUserProgress(userId: string): Promise<UserProgress | 
 
 export async function markLayerComplete(
   userId: string,
-  topicSlug: string,
+  topicId: string,
   layer: string,
   timeSpentSecs: number
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${PROGRESS_API}/v1/progress/layer-complete`, {
+    const res = await fetch(`${PROGRESS_API}/v1/progress/layers/complete`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-User-Id': userId,
+        ...getAuthHeaders(),
       },
-      body: JSON.stringify({ topicSlug, layer, timeSpentSecs }),
+      body: JSON.stringify({ topicId, layerName: layer }),
     });
     return res.ok;
   } catch {

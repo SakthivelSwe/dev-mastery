@@ -1,6 +1,7 @@
 package com.devmastery.ai.service;
 
 import com.devmastery.ai.dto.ChatRequest;
+import com.devmastery.ai.dto.ChatResponse;
 import com.devmastery.ai.dto.TopicResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -11,6 +12,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.util.List;
 import java.util.Map;
@@ -98,6 +100,25 @@ public class AiChatService {
                     log.error("Gemini streaming error: {}", e.getMessage());
                     return Flux.just("data: I'm having trouble connecting right now. Please try again.\n\n");
                 });
+    }
+
+    /**
+     * Non-streaming (sync) version — collects the full response into one string.
+     * Used by mobile clients (Android) that don't support SSE.
+     */
+    public Mono<ChatResponse> chatSync(ChatRequest request) {
+        return streamChat(request)
+                .map(chunk -> {
+                    // SSE chunks are "data: text\n\n" — strip the prefix
+                    if (chunk.startsWith("data: ")) {
+                        String text = chunk.substring(6).trim();
+                        return text.equals("[DONE]") ? "" : text.replace("\\n", "\n");
+                    }
+                    return "";
+                })
+                .filter(s -> !s.isBlank())
+                .collectList()
+                .map(tokens -> new ChatResponse(String.join("", tokens)));
     }
 
     /**

@@ -38,9 +38,12 @@ async function importAllContent() {
       // Split content into 9 sections by ## headings
       const sections = parseSections(parsed.content);
       
+      // Check if the file uses standard DevMastery headings
+      const hasStandardFormat = !!(sections['WHY'] || sections['THEORY'] || sections['CODE']);
+
       const topicImport = {
         slug: parsed.frontmatter.slug,
-        layers: {
+        layers: hasStandardFormat ? {
             why:          sections['WHY'] || sections['WHY IT MATTERS'] || '',
             theory:       sections['THEORY'] || sections['HOW IT WORKS'] || '',
             visual:       sections['VISUALIZATION_CONFIG'] || sections['VISUALIZATION'] || '',
@@ -50,6 +53,17 @@ async function importAllContent() {
             feynman:      sections['FEYNMAN CHECK'] || sections['FEYNMAN'] || '',
             build:        sections['BUILD'] || sections['BUILD CHALLENGE'] || '',
             spacedReview: sections['SPACED REVIEW'] || sections['REVIEW'] || ''
+        } : {
+            // Legacy format: put entire content into theory layer as fallback
+            why:          '',
+            theory:       parsed.content,
+            visual:       '',
+            code:         '',
+            realWorld:    '',
+            interview:    '',
+            feynman:      '',
+            build:        '',
+            spacedReview: ''
         }
       };
 

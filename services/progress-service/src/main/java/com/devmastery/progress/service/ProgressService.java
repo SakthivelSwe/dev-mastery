@@ -1,23 +1,23 @@
 package com.devmastery.progress.service;
 
 import com.devmastery.progress.dto.MarkCompleteRequest;
+import com.devmastery.progress.dto.ProgressSummaryResponse;
 import com.devmastery.progress.entity.LessonCompletion;
 import com.devmastery.progress.entity.UserProgress;
+import com.devmastery.progress.entity.UserStreak;
 import com.devmastery.progress.entity.TopicInfo;
 import com.devmastery.progress.entity.PathInfo;
-import com.devmastery.progress.entity.UserStreak;
-import com.devmastery.progress.entity.UserBadge;
-import com.devmastery.progress.dto.StatsResponse;
 import com.devmastery.progress.repository.LessonCompletionRepository;
+import com.devmastery.progress.repository.SpacedReviewRepository;
 import com.devmastery.progress.repository.UserProgressRepository;
+import com.devmastery.progress.repository.UserStreakRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.UUID;
-import java.util.UUID;
 import java.util.Map;
-import java.util.List;
 import java.util.stream.Collectors;
 
 @Service
@@ -28,6 +28,8 @@ public class ProgressService {
     private final UserProgressRepository userProgressRepository;
     private final com.devmastery.progress.repository.TopicInfoRepository topicInfoRepository;
     private final com.devmastery.progress.repository.PathInfoRepository pathInfoRepository;
+    private final UserStreakRepository userStreakRepository;
+    private final SpacedReviewRepository spacedReviewRepository;
     private final GamificationService gamificationService;
 
     @Transactional
@@ -119,26 +121,38 @@ public class ProgressService {
     public Object getUserStreak(UUID userId) {
         return gamificationService.getStreakInfo(userId);
     }
-    
-    public Object getUserSummary(UUID userId) {
-        return gamificationService.getUserSummary(userId);
+
+    /**
+     * Returns a flat ProgressSummaryResponse consumed by web and Android clients.
+     * Fields: totalXp, level (1-5), completedTopics, streak (current days), dueReviewsCount.
+     */
+    public ProgressSummaryResponse getUserSummary(UUID userId) {
+        UserStreak streak = userStreakRepository.findByUserId(userId)
+                .orElseGet(() -> UserStreak.builder()
+                        .userId(userId)
+                        .currentStreak(0)
+                        .longestStreak(0)
+                        .freezeCount(1)
+                        .totalXp(0)
+                        .badgeLevel("apprentice")
+                        .build());
+
+        int totalXp = streak.getTotalXp();
+        int level = xpToLevel(totalXp);
+        long completedTopics = userProgressRepository.countByUserIdAndStatus(userId, "completed");
+        int currentStreak = streak.getCurrentStreak();
+        int dueReviews = spacedReviewRepository.findDueReviews(userId, Instant.now()).size();
+
+        return new ProgressSummaryResponse(totalXp, level, (int) completedTopics, currentStreak, dueReviews);
     }
-    
-    @SuppressWarnings("unchecked")
-    public StatsResponse getStats(UUID userId) {
-        Map<String, Object> summary = (Map<String, Object>) gamificationService.getUserSummary(userId);
-        UserStreak streak = (UserStreak) summary.get("streak");
-        List<UserBadge> badges = (List<UserBadge>) summary.get("badges");
-        
-        long topicsCompleted = userProgressRepository.countByUserIdAndStatus(userId, "completed");
-        long totalLearningTimeSecs = lessonCompletionRepository.getTotalTimeSpentByUserId(userId);
-        
-        return StatsResponse.builder()
-                .streak(streak)
-                .badges(badges)
-                .topicsCompleted(topicsCompleted)
-                .totalLearningTimeSecs(totalLearningTimeSecs)
-                .build();
+
+    /** Converts total XP to a 1-5 numeric level matching the badge thresholds. */
+    private int xpToLevel(int xp) {
+        if (xp >= 10000) return 5; // master
+        if (xp >= 5000)  return 4; // architect
+        if (xp >= 2000)  return 3; // craftsman
+        if (xp >= 500)   return 2; // journeyman
+        return 1;                   // apprentice
     }
     
     public Map<String, Boolean> getPathProgress(UUID userId, String pathSlug) {

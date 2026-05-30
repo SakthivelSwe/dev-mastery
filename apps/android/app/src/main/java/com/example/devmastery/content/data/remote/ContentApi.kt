@@ -52,7 +52,20 @@ data class PathRoadmapResponse(
     val levels: List<LevelRoadmapDto>
 )
 
+data class PathDto(
+    val slug: String,
+    val title: String,
+    val description: String?,
+    val totalTopics: Int,
+    val estimatedHours: Int,
+    val techStack: String?,
+    val difficulty: String?
+)
+
 interface ContentApi {
+    @GET("paths")
+    suspend fun getAllPaths(): List<PathDto>
+
     @GET("paths/{slug}/roadmap")
     suspend fun getPathRoadmap(@Path("slug") slug: String): PathRoadmapResponse
 

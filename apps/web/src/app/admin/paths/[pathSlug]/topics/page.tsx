@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { Check, X, ArrowLeft, Settings, PenTool } from 'lucide-react';
 
+const CONTENT_API = process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082';
+
 interface TopicSummary {
   id: string;
   slug: string;
@@ -24,7 +26,7 @@ export default function AdminTopicList({ params }: { params: { pathSlug: string 
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch(`http://localhost:8082/admin/topics/paths/${pathSlug}`)
+    fetch(`${CONTENT_API}/admin/topics/paths/${pathSlug}`)
       .then((res) => res.json())
       .then((data) => {
         setTopics(data);

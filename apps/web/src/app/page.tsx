@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
+import { useAuthStore } from '@/store/useAuthStore';
 
 /* ─── Learning Path data (matches V6 seed migration) ─────────── */
 const LEARNING_PATHS = [
@@ -120,6 +121,8 @@ const FEATURES = [
 
 /* ─── Navbar ─────────────────────────────────────────────────── */
 function Navbar() {
+  const { isAuthenticated, _hasHydrated, logout } = useAuthStore();
+
   return (
     <nav
       className="fixed top-0 left-0 right-0 z-50 border-b"
@@ -157,22 +160,46 @@ function Navbar() {
           ))}
         </div>
 
-        {/* CTA */}
-        <div className="flex items-center gap-3">
-          <button
-            id="nav-signin"
-            className="btn-ghost text-sm px-4 py-2"
-            style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-default)' }}
-          >
-            Sign In
-          </button>
-          <button
-            id="nav-getstarted"
-            className="btn-primary text-sm px-4 py-2"
-          >
-            Get Started Free
-          </button>
-        </div>
+        {/* CTA — changes based on auth state */}
+        {_hasHydrated && (
+          <div className="flex items-center gap-3">
+            {isAuthenticated ? (
+              <>
+                <Link
+                  href="/dashboard"
+                  className="btn-primary text-sm px-4 py-2"
+                >
+                  Go to Dashboard →
+                </Link>
+                <button
+                  onClick={logout}
+                  className="btn-ghost text-sm px-4 py-2"
+                  style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-default)' }}
+                >
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <>
+                <Link
+                  href="/login"
+                  id="nav-signin"
+                  className="btn-ghost text-sm px-4 py-2"
+                  style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-default)' }}
+                >
+                  Sign In
+                </Link>
+                <Link
+                  href="/register"
+                  id="nav-getstarted"
+                  className="btn-primary text-sm px-4 py-2"
+                >
+                  Get Started Free
+                </Link>
+              </>
+            )}
+          </div>
+        )}
       </div>
     </nav>
   );
@@ -242,18 +269,20 @@ function Hero() {
 
         {/* CTA buttons */}
         <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-          <button
+          <Link
+            href="/register"
             id="hero-start"
-            className="btn-primary text-base px-8 py-3.5 w-full sm:w-auto"
+            className="btn-primary text-base px-8 py-3.5 w-full sm:w-auto text-center"
           >
             Start Learning Free →
-          </button>
-          <button
+          </Link>
+          <a
+            href="#paths"
             id="hero-paths"
-            className="btn-ghost text-base px-8 py-3.5 w-full sm:w-auto"
+            className="btn-ghost text-base px-8 py-3.5 w-full sm:w-auto text-center"
           >
             Browse Learning Paths
-          </button>
+          </a>
         </div>
 
         {/* Stats */}
@@ -290,9 +319,10 @@ function PathCard({ path }: { path: typeof LEARNING_PATHS[0] }) {
   const [hovered, setHovered] = useState(false);
 
   return (
-    <div
+    <Link
+      href={`/learn/${path.slug}/roadmap`}
       id={`path-card-${path.slug}`}
-      className="relative rounded-xl border cursor-pointer overflow-hidden transition-all duration-300"
+      className="relative rounded-xl border cursor-pointer overflow-hidden transition-all duration-300 block"
       style={{
         background: hovered
           ? `linear-gradient(135deg, rgba(${path.accent.includes('java') ? '248,152,32' : path.accent.includes('spring') ? '109,179,63' : '66,133,244'}, 0.06) 0%, var(--bg-surface) 60%)`
@@ -359,7 +389,7 @@ function PathCard({ path }: { path: typeof LEARNING_PATHS[0] }) {
           Start path →
         </span>
       </div>
-    </div>
+    </Link>
   );
 }
 
@@ -557,18 +587,22 @@ function CtaSection() {
           Join developers who chose depth over shortcuts.
         </p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <button
+          <Link
+            href="/register"
             id="cta-start"
             className="btn-primary text-base px-10 py-4"
           >
             Start Learning Free →
-          </button>
-          <button
+          </Link>
+          <a
+            href="https://github.com"
+            target="_blank"
+            rel="noopener noreferrer"
             id="cta-github"
             className="btn-ghost text-base px-10 py-4"
           >
             ⭐ Star on GitHub
-          </button>
+          </a>
         </div>
 
         <div className="mt-12 text-xs" style={{ color: 'var(--text-muted)' }}>

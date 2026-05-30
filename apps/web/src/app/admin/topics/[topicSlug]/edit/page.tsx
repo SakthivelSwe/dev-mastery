@@ -6,6 +6,8 @@ import { ArrowLeft, Save, Sparkles, Send, Check } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { MDXRemote } from 'next-mdx-remote';
 
+const CONTENT_API = process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082';
+
 const SECTIONS = ['why', 'theory', 'visual', 'code', 'realworld', 'interview'];
 
 interface TopicData {
@@ -38,7 +40,7 @@ export default function AdminTopicEditor({ params }: { params: { topicSlug: stri
 
   // Fetch topic data
   useEffect(() => {
-    fetch(`http://localhost:8082/v1/topics/${topicSlug}`)
+    fetch(`${CONTENT_API}/v1/topics/${topicSlug}`)
       .then((res) => res.json())
       .then((data: TopicData) => {
         setTopic(data);
@@ -87,7 +89,7 @@ export default function AdminTopicEditor({ params }: { params: { topicSlug: stri
     if (!topic) return;
     setIsSaving(true);
     try {
-      await fetch(`http://localhost:8082/admin/topics/${topic.slug}/draft`, {
+      await fetch(`${CONTENT_API}/admin/topics/${topic.slug}/draft`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

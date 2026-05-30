@@ -15,26 +15,26 @@ export default function CustomInputPanel({
   value,
   onChange,
   onApply,
-  buttonText = "Apply"
+  buttonText = 'Apply',
 }: CustomInputPanelProps) {
-  
   return (
     <div className="flex gap-2 items-center">
-      <input 
-        type="text" 
+      <input
+        type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && onApply()}
         placeholder={
-          inputType === 'array' ? 'e.g., 50,30,70' :
-          inputType === 'string' ? 'e.g., apple' :
-          inputType === 'graph' ? 'Adjacency list format' :
+          inputType === 'array' ? 'e.g., 50,30,70,20,40' :
+          inputType === 'string' ? 'e.g., apple'           :
+          inputType === 'graph' ? 'Adjacency list JSON'   :
           'Enter a value'
         }
-        className="bg-background border rounded px-3 py-1 text-sm w-64"
+        className="bg-[--bg-primary] border border-[--border-default] rounded-lg px-3 py-1.5 text-sm w-64 text-[--text-primary] placeholder:text-[--text-muted] focus:outline-none focus:ring-1 focus:ring-[--accent-ai] focus:border-[--accent-ai]"
       />
-      <button 
-        onClick={onApply} 
-        className="bg-primary text-primary-foreground px-4 py-1 rounded text-sm hover:opacity-90"
+      <button
+        onClick={onApply}
+        className="bg-[--accent-ai] text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:brightness-110 transition-all active:scale-95"
       >
         {buttonText}
       </button>

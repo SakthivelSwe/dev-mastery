@@ -1,11 +1,15 @@
 'use client';
 
 import Link from 'next/link';
-import { Search, Bell, Sun, Moon, UserCircle2 } from 'lucide-react';
+import { Search, Bell, Sun, Moon, UserCircle2, LogOut } from 'lucide-react';
 import { useState } from 'react';
+import { useAuthStore } from '@/store/useAuthStore';
+import { useRouter } from 'next/navigation';
 
 export function Topbar() {
   const [isDark, setIsDark] = useState(true);
+  const { user, logout } = useAuthStore();
+  const router = useRouter();
 
   const toggleTheme = () => {
     setIsDark(prev => {
@@ -14,6 +18,11 @@ export function Topbar() {
       localStorage.setItem('theme', next ? 'dark' : 'light');
       return next;
     });
+  };
+
+  const handleLogout = () => {
+    logout();
+    router.push('/');
   };
 
   return (
@@ -57,6 +66,13 @@ export function Topbar() {
           {isDark ? <Sun size={18} /> : <Moon size={18} />}
         </button>
 
+        {/* User name display */}
+        {user && (
+          <span className="text-sm text-[--text-secondary] ml-2 hidden lg:block">
+            {user.fullName.split(' ')[0]}
+          </span>
+        )}
+
         {/* Avatar / Profile */}
         <Link
           href="/profile"
@@ -65,6 +81,16 @@ export function Topbar() {
         >
           <UserCircle2 size={22} />
         </Link>
+
+        {/* Logout */}
+        <button
+          onClick={handleLogout}
+          className="p-2 rounded-lg text-[--text-muted] hover:text-[--error] hover:bg-[--bg-elevated] transition-all"
+          aria-label="Sign out"
+          title="Sign out"
+        >
+          <LogOut size={18} />
+        </button>
       </div>
     </header>
   );
