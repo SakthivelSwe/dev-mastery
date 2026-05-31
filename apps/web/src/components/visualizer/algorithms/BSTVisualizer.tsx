@@ -63,6 +63,12 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
     treeLayout(rootHierarchy);
 
     // ─── LINKS ────────────────────────────────────────────────────────────
+    // linkGen: .x/.y accessors receive the point (hierarchy node), not the link datum.
+    // So we use d.x / d.y directly, then call linkGen({ source, target }) per link.
+    const linkGen = d3.linkVertical<any, any>()
+      .x((d: any) => d.x + 40)
+      .y((d: any) => d.y);
+
     const linkData = rootHierarchy.links();
     const links = g.selectAll<SVGPathElement, any>('path.link')
       .data(linkData, (d: any) => `${d.source.data.id}->${d.target.data.id}`);
@@ -74,19 +80,14 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
       .attr('stroke', '#30363d')
       .attr('stroke-width', 2)
       .style("opacity", 0)
-      .attr('d', d3.linkVertical<any, any>()
-        .x(d => d.source.x + 40) // center adjust
-        .y(d => d.source.y)
-      );
+      // Collapsed at source position (enter animation start)
+      .attr('d', (d: any) => linkGen({ source: d.source, target: d.source }));
 
     const mergedLinks = enterLinks.merge(links);
     mergedLinks.transition()
       .duration(transitionDuration)
       .style("opacity", 1)
-      .attr('d', d3.linkVertical<any, any>()
-        .x(d => d.x + 40)
-        .y(d => d.y)
-      );
+      .attr('d', (d: any) => linkGen(d));
 
     links.exit()
       .transition()

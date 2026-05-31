@@ -5,31 +5,37 @@ import { Play, Pause, RotateCcw, StepForward } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { visualizerRegistry } from './VisualizerRegistry';
 import CustomInputPanel from './CustomInputPanel';
+import VisualizerRouter from '@/components/visualizers/VisualizerRouter';
 
-export default function VisualizerShell({ topicSlug = 'binary-search-tree' }: { topicSlug?: string }) {
-  const visualizerConfig = visualizerRegistry[topicSlug] || visualizerRegistry['binary-search-tree'];
-  const VisualizerComponent = visualizerConfig.component;
+const API_BASE = process.env.NEXT_PUBLIC_CONTENT_API_URL ?? 'http://localhost:8082';
 
-  const [data, setData]       = useState<any>(visualizerConfig.defaultData);
+export default function VisualizerShell({ topicSlug = 'array-basics' }: { topicSlug?: string }) {
+  // Use the registry for known complex visualizers; VisualizerRouter handles the
+  // slug → component mapping with ArrayVisualizer as the default fallback (NEVER BST).
+  const visualizerConfig = visualizerRegistry[topicSlug] ?? null;
+
+  const [data, setData]       = useState<any>(visualizerConfig?.defaultData ?? [12, 45, 7, 23, 67, 34, 89]);
   const [speed, setSpeed]     = useState(1);
   const [stepMode, setStepMode] = useState(false);
 
-  const defaultInputStr = typeof visualizerConfig.defaultData === 'string'
-    ? visualizerConfig.defaultData
-    : Array.isArray(visualizerConfig.defaultData)
-      ? visualizerConfig.defaultData.join(',')
-      : JSON.stringify(visualizerConfig.defaultData);
+  const defaultInputStr = !visualizerConfig ? '12,45,7,23,67,34,89'
+    : typeof visualizerConfig.defaultData === 'string'
+      ? visualizerConfig.defaultData
+      : Array.isArray(visualizerConfig.defaultData)
+        ? visualizerConfig.defaultData.join(',')
+        : JSON.stringify(visualizerConfig.defaultData);
   const [inputVal, setInputVal] = useState(defaultInputStr);
 
   const handleUpdate = () => {
     try {
-      if (visualizerConfig.inputType === 'array') {
+      const inputType = visualizerConfig?.inputType ?? 'array';
+      if (inputType === 'array') {
         const parsed = inputVal.split(',').map(s => {
           const num = parseInt(s.trim());
           return isNaN(num) ? s.trim() : num;
         });
         setData(parsed);
-      } else if (visualizerConfig.inputType === 'graph') {
+      } else if (inputType === 'graph') {
         setData(JSON.parse(inputVal));
       } else {
         setData(inputVal);
@@ -39,7 +45,29 @@ export default function VisualizerShell({ topicSlug = 'binary-search-tree' }: { 
     }
   };
 
-  const sampleCode = `// Visualizer: ${topicSlug}`;
+  const [sampleCode, setSampleCode] = useState(`// Loading visualizer data...`);
+
+  React.useEffect(() => {
+    async function fetchCode() {
+      try {
+        const res = await fetch(`${API_BASE}/v1/topics/${topicSlug}/code?tier=easy&lang=java`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.code) {
+            setSampleCode(data.code);
+          } else {
+            setSampleCode(`// No visualization code available for ${topicSlug}.`);
+          }
+        } else {
+          setSampleCode(`// No visualization code available for ${topicSlug}.`);
+        }
+      } catch (err) {
+        console.error('Failed to fetch code for visualizer', err);
+        setSampleCode(`// Failed to load visualization code.`);
+      }
+    }
+    fetchCode();
+  }, [topicSlug]);
 
   return (
     <div className="flex h-[calc(100vh-8rem)] w-full">
@@ -47,7 +75,7 @@ export default function VisualizerShell({ topicSlug = 'binary-search-tree' }: { 
       <div className="w-[60%] flex flex-col border-r border-[--border-default] p-4 gap-4">
         <div className="flex flex-wrap justify-between items-center bg-[--bg-elevated] p-3 rounded-lg border border-[--border-default] gap-3">
           <CustomInputPanel
-            inputType={visualizerConfig.inputType}
+            inputType={visualizerConfig?.inputType ?? 'array'}
             value={inputVal}
             onChange={setInputVal}
             onApply={handleUpdate}
@@ -82,16 +110,14 @@ export default function VisualizerShell({ topicSlug = 'binary-search-tree' }: { 
         </div>
 
         <div className="flex-1 rounded-lg overflow-hidden relative bg-[--bg-elevated] border border-[--border-default]">
-          {/* Complexity Badges */}
-          <div className="absolute top-4 left-4 flex flex-col gap-2 z-10">
-            <span className="bg-[--bg-surface]/80 backdrop-blur text-xs px-2 py-1 border border-[--border-default] rounded text-emerald-400">
-              Time: O(log n)
-            </span>
-            <span className="bg-[--bg-surface]/80 backdrop-blur text-xs px-2 py-1 border border-[--border-default] rounded text-blue-400">
-              Space: O(n)
-            </span>
-          </div>
-          <VisualizerComponent data={data} speed={speed} stepMode={stepMode} />
+          {/* Render via VisualizerRouter — correctly routes ALL slugs.
+              Default fallback = ArrayVisualizer. NEVER falls back to BSTVisualizer. */}
+          <VisualizerRouter
+            topicSlug={topicSlug}
+            data={Array.isArray(data) ? (data as number[]) : [12, 45, 7, 23]}
+            speed={Math.round(speed)}
+            isPlaying={stepMode}
+          />
         </div>
 
         <div className="bg-[--bg-elevated] border border-[--border-default] p-4 rounded-lg text-sm text-[--text-secondary] min-h-[80px]">

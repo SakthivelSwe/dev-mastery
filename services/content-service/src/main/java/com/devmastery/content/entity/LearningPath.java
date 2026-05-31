@@ -10,6 +10,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
 /**
  * Learning Path entity.
  * Top-level grouping: Java Mastery, DSA Mastery, Spring Boot Mastery, etc.
@@ -72,5 +74,6 @@ public class LearningPath {
 
     @OneToMany(mappedBy = "learningPath", fetch = FetchType.LAZY, cascade = CascadeType.ALL)
     @OrderBy("orderIndex ASC")
+    @JsonDeserialize(as = ArrayList.class)
     private List<Topic> topics = new ArrayList<>();
 }

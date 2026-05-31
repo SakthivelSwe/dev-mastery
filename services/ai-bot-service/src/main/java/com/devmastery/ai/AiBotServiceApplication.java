@@ -12,8 +12,4 @@ public class AiBotServiceApplication {
         SpringApplication.run(AiBotServiceApplication.class, args);
     }
 
-    @Bean
-    public WebClient.Builder webClientBuilder() {
-        return WebClient.builder();
-    }
 }

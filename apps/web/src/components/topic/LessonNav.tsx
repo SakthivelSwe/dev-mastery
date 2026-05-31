@@ -16,8 +16,9 @@ const tabs: { id: TabState; label: string; icon: any; est: string }[] = [
   { id: 'spaced-review',label: 'Spaced Review',      icon: Repeat,         est: '3m' },
 ];
 
-export default function LessonNav() {
-  const { activeTab, setActiveTab, completedTabs } = useTopicStore();
+export default function LessonNav({ topicSlug }: { topicSlug: string }) {
+  const { activeTab, setActiveTab, completedTabsByTopic } = useTopicStore();
+  const completedTabs = completedTabsByTopic[topicSlug] || {};
 
   return (
     <div className="w-64 border-r border-[--border-default] bg-[--bg-surface] h-full p-3 flex flex-col gap-1 overflow-y-auto shrink-0">

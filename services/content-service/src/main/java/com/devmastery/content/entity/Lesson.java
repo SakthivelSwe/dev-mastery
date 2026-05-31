@@ -8,6 +8,8 @@ import org.hibernate.annotations.UpdateTimestamp;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 /**
  * Lesson entity — one of 6 teaching sections within a Topic.
  * section_type: why | theory | visual | code | realworld | interview
@@ -33,6 +35,7 @@ public class Lesson {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "topic_id", nullable = false)
+    @JsonIgnore
     private Topic topic;
 
     @Column(name = "section_type", nullable = false, length = 50)

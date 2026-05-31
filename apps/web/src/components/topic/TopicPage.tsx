@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useTopicStore, TabState } from '@/store/useTopicStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import LessonNav from './LessonNav';
+import { MdxRenderer } from './MdxRenderer';
 import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap } from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
 import { CodeEditorShell } from '@/components/code/CodeEditorShell';
@@ -21,10 +22,9 @@ interface TopicPageProps {
   topic:       Topic | null;
   prevSlug:   string | null;
   nextSlug:   string | null;
-  MdxRenderer: React.ComponentType<{ source: string; className?: string }>;
 }
 
-export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSlug, MdxRenderer }: TopicPageProps) {
+export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSlug }: TopicPageProps) {
   const { activeTab, setActiveTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
@@ -64,7 +64,7 @@ export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSl
       if (user && topic?.id) {
         await markLayerComplete(user.id, topic.id, activeTab, timeSpent);
       }
-      markTabCompleted(activeTab);
+      markTabCompleted(topicSlug, activeTab);
       setXpFlash(true);
       setTimeout(() => setXpFlash(false), 2000);
     } catch (e) {
@@ -124,9 +124,9 @@ export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSl
   const topicTitle = topic?.title || topicSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] w-full overflow-hidden">
+    <div className="flex h-full w-full overflow-hidden">
       {/* ── Left Sidebar: Topic Navigation ─────────────────── */}
-      <LessonNav />
+      <LessonNav topicSlug={topicSlug} />
 
       {/* ── Main Content Area ──────────────────────────────── */}
       <div className="flex-1 flex flex-col relative overflow-hidden bg-[--bg-primary]">
@@ -154,7 +154,7 @@ export default function TopicPage({ topicSlug, pathSlug, topic, prevSlug, nextSl
         </div>
 
         {/* Dynamic Content Pane */}
-        <div className="flex-1 overflow-y-auto px-8 py-6">
+        <div className="flex-1 min-h-0 overflow-y-auto px-8 py-6">
           {renderContent()}
         </div>
 

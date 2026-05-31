@@ -32,6 +32,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-cache")
     implementation("org.springframework.cloud:spring-cloud-starter-openfeign")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-hibernate6")
 
     // ─── Valkey / Redis Cache (spring-data-redis works with Valkey) ──
     implementation("org.springframework.boot:spring-boot-starter-data-redis")

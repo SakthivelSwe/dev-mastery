@@ -4,13 +4,16 @@ import Link from 'next/link';
 import { BookOpen, ChevronRight } from 'lucide-react';
 import type { PathProgressSummary } from '@/hooks/useProgress';
 import { PATH_META } from '@/lib/pathMeta';
+import { normalizeSlug } from '@/lib/api';
 
 interface PathCardProps {
   progress: PathProgressSummary;
 }
 
 export function PathCard({ progress }: PathCardProps) {
-  const meta = PATH_META[progress.pathSlug];
+  // Normalize slug: guard against underscore slugs (e.g. "spring_boot" → "spring-boot")
+  const slug = normalizeSlug(progress.pathSlug);
+  const meta = PATH_META[slug];
   if (!meta) return null;
 
   const pct = progress.totalTopics > 0
@@ -21,7 +24,7 @@ export function PathCard({ progress }: PathCardProps) {
 
   return (
     <Link
-      href={`/learn/${progress.pathSlug}/roadmap`}
+      href={`/learn/${slug}/roadmap`}
       className="group relative bg-[--bg-surface] border border-[--border-default] rounded-2xl p-5 flex flex-col gap-3 hover:border-[--text-muted]/30 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden"
     >
       {/* Gradient top accent */}

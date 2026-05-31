@@ -7,6 +7,15 @@ const CONTENT_API  = process.env.NEXT_PUBLIC_CONTENT_API_URL  || 'http://localho
 const PROGRESS_API = process.env.NEXT_PUBLIC_PROGRESS_API_URL || 'http://localhost:8083';
 export const AUTH_API = process.env.NEXT_PUBLIC_AUTH_API_URL || 'http://localhost:8081';
 
+/**
+ * Normalize a path slug so it always uses hyphens, never underscores.
+ * Guards against slugs coming from the URL or the progress service
+ * with underscores (e.g. "spring_boot" → "spring-boot").
+ */
+export function normalizeSlug(slug: string): string {
+  return slug.replace(/_/g, '-');
+}
+
 // ─── Auth Headers Helper ─────────────────────────────────────
 // Reads from Zustand persist store (localStorage) safely at call time
 
@@ -235,11 +244,16 @@ export interface PathRoadmapData {
 }
 
 export async function fetchPathRoadmap(slug: string): Promise<PathRoadmapData | null> {
+  // Normalize slug: always use hyphens (guards against underscore slugs in URLs)
+  const normalizedSlug = normalizeSlug(slug);
   try {
     const headers = getAuthHeaders();
-    const res = await fetch(`${CONTENT_API}/v1/paths/${slug}/roadmap`, {
+    // NOTE: `next: { revalidate }` is a Server Component hint — omit it here
+    // because this function is called from a 'use client' component.
+    const res = await fetch(`${CONTENT_API}/v1/paths/${normalizedSlug}/roadmap`, {
       headers,
-      next: { revalidate: 300 },
+      // Disable browser cache so a fresh request is always made on retry
+      cache: 'no-store',
     });
     if (!res.ok) return null;
     return res.json();

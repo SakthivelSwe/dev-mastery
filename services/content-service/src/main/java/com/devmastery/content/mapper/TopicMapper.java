@@ -41,11 +41,15 @@ public interface TopicMapper {
     List<LessonResponse> toLessonResponseList(List<Lesson> lessons);
 
     // ─── CodeExample → CodeExampleResponse ──────────────────
-    @Mapping(target = "topicId", source = "topic.id")
-    @Mapping(target = "lessonId", source = "lesson.id")
-    CodeExampleResponse toCodeExampleResponse(CodeExample example);
+    default CodeExampleResponse toCodeExampleResponse(CodeExample example) {
+        if (example == null) return null;
+        return CodeExampleResponse.fromEntity(example);
+    }
 
-    List<CodeExampleResponse> toCodeExampleResponseList(List<CodeExample> examples);
+    default List<CodeExampleResponse> toCodeExampleResponseList(List<CodeExample> examples) {
+        if (examples == null) return null;
+        return examples.stream().map(this::toCodeExampleResponse).toList();
+    }
 
     // ─── Named qualifier: enum → string ─────────────────────
     @Named("sectionTypeToString")

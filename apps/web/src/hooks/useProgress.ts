@@ -39,49 +39,18 @@ export interface DashboardSummary {
   recentActivity: { date: string; xp: number; topics: number }[];
 }
 
-// ─── Mock Data (used when backend is not available) ───────────
+// ─── Default Data (used when starting or empty) ───────────
 
-const MOCK_DASHBOARD: DashboardSummary = {
-  totalXp: 4850,
-  streak: 12,
-  rank: 'Senior Engineer',
+const EMPTY_DASHBOARD: DashboardSummary = {
+  totalXp: 0,
+  streak: 0,
+  rank: 'Novice',
   dailyGoal: 200,
-  dailyXp: 130,
-  completedTopicsToday: 3,
-  totalCompleted: 48,
-  pathProgress: [
-    { pathSlug: 'java-mastery',      completedTopics: 12, totalTopics: 52, xpEarned: 1200, lastStudied: '2026-05-29' },
-    { pathSlug: 'spring-boot',       completedTopics: 8,  totalTopics: 40, xpEarned: 800,  lastStudied: '2026-05-28' },
-    { pathSlug: 'dsa',               completedTopics: 15, totalTopics: 55, xpEarned: 1500, lastStudied: '2026-05-29' },
-    { pathSlug: 'leetcode-patterns', completedTopics: 5,  totalTopics: 35, xpEarned: 500,  lastStudied: '2026-05-27' },
-    { pathSlug: 'javascript',        completedTopics: 4,  totalTopics: 42, xpEarned: 400,  lastStudied: '2026-05-26' },
-    { pathSlug: 'typescript',        completedTopics: 2,  totalTopics: 48, xpEarned: 200,  lastStudied: '2026-05-25' },
-    { pathSlug: 'react',             completedTopics: 2,  totalTopics: 38, xpEarned: 200,  lastStudied: '2026-05-24' },
-    { pathSlug: 'system-design',     completedTopics: 0,  totalTopics: 45, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'sql',               completedTopics: 0,  totalTopics: 36, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'angular',           completedTopics: 0,  totalTopics: 38, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'html',              completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'css',               completedTopics: 0,  totalTopics: 38, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'mongodb',           completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'postgresql-dba',    completedTopics: 0,  totalTopics: 32, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'api-design',        completedTopics: 0,  totalTopics: 30, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'software-architecture', completedTopics: 0, totalTopics: 35, xpEarned: 0, lastStudied: null },
-    { pathSlug: 'design-system',     completedTopics: 0,  totalTopics: 30, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'full-stack',        completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'docker',            completedTopics: 0,  totalTopics: 22, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'kubernetes',        completedTopics: 0,  totalTopics: 26, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'git-github',        completedTopics: 0,  totalTopics: 26, xpEarned: 0,    lastStudied: null },
-    { pathSlug: 'nextjs',            completedTopics: 0,  totalTopics: 28, xpEarned: 0,    lastStudied: null },
-  ],
-  recentActivity: Array.from({ length: 90 }, (_, i) => {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    return {
-      date: d.toISOString().split('T')[0],
-      xp: i < 12 ? Math.floor(Math.random() * 250) + 50 : Math.random() > 0.6 ? Math.floor(Math.random() * 150) : 0,
-      topics: i < 12 ? Math.floor(Math.random() * 5) + 1 : 0,
-    };
-  }),
+  dailyXp: 0,
+  completedTopicsToday: 0,
+  totalCompleted: 0,
+  pathProgress: [],
+  recentActivity: [],
 };
 
 // ─── Hooks ────────────────────────────────────────────────────
@@ -93,14 +62,14 @@ export function useDashboard() {
   const { data, error, isLoading } = useSWR(
     userId ? [`${PROGRESS_API}/v1/progress/summary`, token, userId] : null,
     ([url, tok, uid]) => fetcher(url, tok ?? undefined, uid),
-    { refreshInterval: 60_000, fallbackData: MOCK_DASHBOARD }
+    { refreshInterval: 60_000, fallbackData: EMPTY_DASHBOARD }
   );
 
-  // Merge API response with mock defaults so partial backend responses
+  // Merge API response with defaults so partial backend responses
   // (e.g. ProgressSummaryResponse) don't leave fields undefined in the UI.
   const merged: DashboardSummary = data
-    ? { ...MOCK_DASHBOARD, ...(data as Partial<DashboardSummary>) }
-    : MOCK_DASHBOARD;
+    ? { ...EMPTY_DASHBOARD, ...(data as Partial<DashboardSummary>) }
+    : EMPTY_DASHBOARD;
 
   return {
     dashboard: merged,

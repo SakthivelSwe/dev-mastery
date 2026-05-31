@@ -62,6 +62,11 @@ export default function HeapVisualizer({ data, speed, stepMode }: HeapVisualizer
     const links = treeGroup.selectAll<SVGPathElement, any>("path.link")
       .data(linkData, (d: any) => `${d.source.data.id}-${d.target.data.id}`);
 
+    // linkGen: .x/.y accessors receive the hierarchy node point, not the link datum.
+    const linkGen = d3.linkVertical<any, any>()
+      .x((d: any) => d.x)
+      .y((d: any) => d.y);
+
     const enterLinks = links.enter()
       .append("path")
       .attr("class", "link")
@@ -69,17 +74,14 @@ export default function HeapVisualizer({ data, speed, stepMode }: HeapVisualizer
       .attr("stroke", "#30363d")
       .attr("stroke-width", 2)
       .style("opacity", 0)
-      .attr("d", d3.linkVertical()
-        .x((d: any) => d.source.x) // Start at parent
-        .y((d: any) => d.source.y) as any);
+      // Collapsed at source position (enter animation start)
+      .attr("d", (d: any) => linkGen({ source: d.source, target: d.source }));
 
     const mergedLinks = enterLinks.merge(links);
     mergedLinks.transition()
       .duration(transitionDuration)
       .style("opacity", 1)
-      .attr("d", d3.linkVertical()
-        .x((d: any) => d.x)
-        .y((d: any) => d.y) as any);
+      .attr("d", (d: any) => linkGen(d));
 
     links.exit()
       .transition()

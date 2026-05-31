@@ -1,0 +1,1 @@
+-- Dummy migration to satisfy Flyway validate since V18 is already applied remotely but missing locally.

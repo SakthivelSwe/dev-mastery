@@ -4,6 +4,8 @@ import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -29,6 +31,7 @@ public class Topic {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "path_id", nullable = false)
+    @JsonIgnore
     private LearningPath learningPath;
 
     @Column(nullable = false, unique = true, length = 255)
@@ -75,9 +78,11 @@ public class Topic {
 
     @OneToMany(mappedBy = "topic", fetch = FetchType.LAZY, cascade = CascadeType.ALL, orphanRemoval = true)
     @OrderBy("orderIndex ASC")
+    @JsonDeserialize(as = ArrayList.class)
     private List<Lesson> lessons = new ArrayList<>();
 
     @OneToMany(mappedBy = "topic", fetch = FetchType.LAZY, cascade = CascadeType.ALL, orphanRemoval = true)
     @OrderBy("orderIndex ASC")
+    @JsonDeserialize(as = ArrayList.class)
     private List<CodeExample> codeExamples = new ArrayList<>();
 }

@@ -13,6 +13,9 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 
+import org.springframework.transaction.annotation.Transactional;
+import org.hibernate.Hibernate;
+
 /**
  * Dedicated cache loader component — CRITICAL PATTERN from spec.
  *
@@ -30,6 +33,7 @@ import java.util.List;
  */
 @Component
 @RequiredArgsConstructor
+@Transactional(readOnly = true)
 public class ContentCacheLoader {
 
     private final LearningPathRepository pathRepository;
@@ -42,10 +46,14 @@ public class ContentCacheLoader {
         return pathRepository.findAllActive();
     }
 
-    @Cacheable(value = "devmastery:content:topics", key = "'path:' + #slug")
+    // NOT cached — caching raw Hibernate entities causes LazyInitializationException
+    // on Redis deserialize because PersistentBag proxies are serialized but can't
+    // be re-attached to a session. Cache the DTO in PathRoadmapService instead.
     public LearningPath loadPath(String slug) {
-        return pathRepository.findBySlug(slug)
+        LearningPath path = pathRepository.findBySlug(slug)
                 .orElseThrow(() -> new PathNotFoundException(slug));
+        Hibernate.initialize(path.getTopics());
+        return path;
     }
 
     @CacheEvict(value = "devmastery:content:topics", allEntries = true)
@@ -61,8 +69,11 @@ public class ContentCacheLoader {
      */
     @Cacheable(value = "devmastery:content:lesson", key = "#slug")
     public Topic loadTopic(String slug) {
-        return topicRepository.findBySlug(slug)
+        Topic topic = topicRepository.findBySlug(slug)
                 .orElseThrow(() -> new TopicNotFoundException(slug));
+        Hibernate.initialize(topic.getLessons());
+        Hibernate.initialize(topic.getCodeExamples());
+        return topic;
     }
 
     @CacheEvict(value = "devmastery:content:lesson", key = "#slug")

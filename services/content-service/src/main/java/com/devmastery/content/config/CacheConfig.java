@@ -60,16 +60,18 @@ public class CacheConfig {
                         RedisSerializationContext.SerializationPair.fromSerializer(serializer));
 
         // Per-cache TTL overrides
-        Map<String, RedisCacheConfiguration> cacheConfigurations = Map.of(
-                "devmastery:content:topics",
-                defaultConfig.entryTtl(Duration.ofHours(topicsTtlHours)),
-
-                "devmastery:content:lesson",
-                defaultConfig.entryTtl(Duration.ofHours(lessonTtlHours)),
-
-                "devmastery:search:popular",
-                defaultConfig.entryTtl(Duration.ofHours(searchPopularTtlHours))
-        );
+        Map<String, RedisCacheConfiguration> cacheConfigurations = new java.util.HashMap<>();
+        cacheConfigurations.put("devmastery:content:topics",
+                defaultConfig.entryTtl(Duration.ofHours(topicsTtlHours)));
+        cacheConfigurations.put("devmastery:content:lesson",
+                defaultConfig.entryTtl(Duration.ofHours(lessonTtlHours)));
+        cacheConfigurations.put("devmastery:content:roadmap",
+                defaultConfig.entryTtl(Duration.ofHours(1)));
+        cacheConfigurations.put("devmastery:search:popular",
+                defaultConfig.entryTtl(Duration.ofHours(searchPopularTtlHours)));
+        // Code Lab tier/language switcher — 6 hours TTL (compilable code rarely changes)
+        cacheConfigurations.put("code-examples",
+                defaultConfig.entryTtl(Duration.ofHours(6)));
 
         return RedisCacheManager.builder(connectionFactory)
                 .cacheDefaults(defaultConfig.entryTtl(Duration.ofHours(1)))

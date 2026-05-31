@@ -1,7 +1,6 @@
 import { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import TopicPage from '@/components/topic/TopicPage';
-import { MdxRenderer } from '@/components/topic/MdxRenderer';
 import { fetchTopic, fetchPath } from '@/lib/api';
 
 interface PageProps {
@@ -68,7 +67,6 @@ export default async function TopicPageRoute({ params }: PageProps) {
           topic={topic}
           prevSlug={prevTopic?.slug ?? null}
           nextSlug={nextTopic?.slug ?? null}
-          MdxRenderer={MdxRenderer}
         />
       </main>
     </div>

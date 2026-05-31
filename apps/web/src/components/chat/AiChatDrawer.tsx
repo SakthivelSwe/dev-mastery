@@ -10,6 +10,8 @@ interface AiChatDrawerProps {
   topicSlug: string;
   topicTitle: string;
   sectionType?: string;
+  codeContext?: string;
+  errorContext?: string;
   isOpen: boolean;
   onClose: () => void;
 }
@@ -20,7 +22,7 @@ interface Message {
   isStreaming?: boolean;
 }
 
-export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClose }: AiChatDrawerProps) {
+export function AiChatDrawer({ topicSlug, topicTitle, sectionType, codeContext, errorContext, isOpen, onClose }: AiChatDrawerProps) {
   const [messages, setMessages] = useState<Message[]>([
     { role: 'ai', content: `Hello! I'm your DevMastery AI assistant. Ask me anything about **${topicTitle}**!` }
   ]);
@@ -28,34 +30,34 @@ export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClo
   const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  const suggestedQuestions = [
+    "Can you explain this concept again?",
+    "What's the time complexity of the optimal solution?",
+    "How does this relate to real-world applications?"
+  ];
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isTyping) return;
+  const sendToAI = async (userMessage: string) => {
+    if (!userMessage.trim() || isTyping) return;
 
-    const userMessage = input.trim();
     setInput('');
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
     setIsTyping(true);
 
     try {
-      // Add empty AI message that will be streamed into
       setMessages(prev => [...prev, { role: 'ai', content: '', isStreaming: true }]);
 
-      // NOTE: We connect to the backend ai-bot-service directly (port 8084)
       const response = await fetch(`${AI_API}/v1/ai/chat`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Assuming the user has a JWT, it should be passed here in a real scenario
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: userMessage,
+          userMessage: userMessage,
           topicSlug,
-          sectionType
+          currentCode: codeContext,
+          currentError: errorContext,
         })
       });
 
@@ -172,9 +174,24 @@ export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClo
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Suggested Questions */}
+      {messages.length === 1 && !isTyping && (
+        <div className="p-4 flex flex-col gap-2">
+          {suggestedQuestions.map((q, i) => (
+            <button
+              key={i}
+              onClick={() => sendToAI(q)}
+              className="text-left p-2 rounded-lg bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 text-sm border border-blue-500/20 transition-colors"
+            >
+              {q}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Input */}
       <div className="p-4 border-t border-border bg-card">
-        <form onSubmit={handleSubmit} className="flex gap-2">
+        <form onSubmit={(e) => { e.preventDefault(); sendToAI(input); }} className="flex gap-2">
           <input
             type="text"
             value={input}
