@@ -6,14 +6,15 @@ import { fetchTopic, fetchPath } from '@/lib/api';
 import Link from 'next/link';
 
 interface PageProps {
-  params: { pathSlug: string; topicSlug: string };
+  params: Promise<{ pathSlug: string; topicSlug: string }>;
 }
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
-  const topic = await fetchTopic(params.topicSlug);
-  const title = topic?.title ?? params.topicSlug
+  const { pathSlug, topicSlug } = await params;
+  const topic = await fetchTopic(topicSlug);
+  const title = topic?.title ?? topicSlug
     .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-  const pathTitle = topic?.pathTitle ?? params.pathSlug
+  const pathTitle = topic?.pathTitle ?? pathSlug
     .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 
   return {
@@ -27,8 +28,9 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 }
 
 export default async function TopicPageRoute({ params }: PageProps) {
+  const { pathSlug, topicSlug } = await params;
   // Fetch topic data server-side (SSR)
-  const topic = await fetchTopic(params.topicSlug);
+  const topic = await fetchTopic(topicSlug);
 
   // If topic genuinely doesn't exist in DB, show 404
   // (comment out for dev if backend is off)
@@ -48,10 +50,10 @@ export default async function TopicPageRoute({ params }: PageProps) {
           <Link href="/dashboard" className="hover:text-[--text-primary] transition-colors">Dashboard</Link>
           <span>/</span>
           <Link
-            href={`/learn/${params.pathSlug}/roadmap`}
+            href={`/learn/${pathSlug}/roadmap`}
             className="hover:text-[--text-primary] transition-colors capitalize"
           >
-            {params.pathSlug.replace(/-/g, ' ')}
+            {pathSlug.replace(/-/g, ' ')}
           </Link>
         </div>
       </header>
@@ -59,7 +61,7 @@ export default async function TopicPageRoute({ params }: PageProps) {
       {/* Topic Page — takes up remaining height */}
       <main className="flex-1 overflow-hidden">
         <TopicPage
-          topicSlug={params.topicSlug}
+          topicSlug={topicSlug}
           topic={topic}
           MdxRenderer={MdxRenderer}
         />

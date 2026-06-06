@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, use } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, Save, Sparkles, Send, Check } from 'lucide-react';
 import Editor from '@monaco-editor/react';
@@ -25,8 +25,8 @@ interface TopicData {
   }[];
 }
 
-export default function AdminTopicEditor({ params }: { params: { topicSlug: string } }) {
-  const { topicSlug } = params;
+export default function AdminTopicEditor({ params }: { params: Promise<{ topicSlug: string }> }) {
+  const { topicSlug } = use(params);
   
   const [topic, setTopic] = useState<TopicData | null>(null);
   const [activeSection, setActiveSection] = useState<string>('why');
