@@ -1,63 +1,84 @@
+# =============================================================
+# DevMastery — Android Release Build
+#
+# FIXES:
+# 1. Keystore "Tag number over 30" error — uses PKCS12 format
+# 2. Proper signing config via GitHub Secrets
+# 3. Uploads APK as artifact on every push, release on tag
+#
+# Required GitHub Secrets:
+#   SIGNING_KEY_STORE_BASE64   — base64 of your .p12 keystore
+#   SIGNING_STORE_PASSWORD     — keystore password
+#   SIGNING_KEY_ALIAS          — key alias inside keystore
+#   SIGNING_KEY_PASSWORD       — key password
+# =============================================================
 name: Android Release
 
 on:
   push:
     tags:
-      - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
-  workflow_dispatch: # Allow manual trigger
+      - 'v*'        # Tag push: full release (e.g. v1.0, v1.2.3)
+  workflow_dispatch: # Manual trigger from GitHub UI
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 30
+
     defaults:
       run:
         working-directory: ./apps/android
 
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Java JDK
+      # Use Java 17 — matches compile/target SDK in build.gradle.kts
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: 'temurin'   # Eclipse Temurin (OpenJDK) — supports PKCS12 keystores
           java-version: '17'
           cache: 'gradle'
-
-      - name: Decode Keystore
-        id: decode_keystore
-        env:
-          KEYSTORE_B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
-        run: |
-          echo "$KEYSTORE_B64" | base64 -d -i > devmastery.jks
-          echo "store_file=$(pwd)/devmastery.jks" >> $GITHUB_ENV
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
+      # Decode the PKCS12 keystore from base64 secret
+      # To generate: keytool -genkey -v -keystore devmastery.p12 -storetype PKCS12
+      #              then: base64 devmastery.p12 | tr -d '\n'  → save to SIGNING_KEY_STORE_BASE64
+      - name: Decode keystore (PKCS12)
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 --decode > devmastery.p12
+          echo "SIGNING_STORE_FILE=$(pwd)/devmastery.p12" >> $GITHUB_ENV
+          echo "Keystore decoded successfully"
+          file devmastery.p12   # Print file type for debugging
+
       - name: Build Release APK
         env:
-          SIGNING_STORE_FILE: ${{ env.store_file }}
+          SIGNING_STORE_FILE: ${{ env.SIGNING_STORE_FILE }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Upload APK to GitHub Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devmastery-release-${{ github.sha }}
+          path: apps/android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+
+      # Only publish a GitHub Release when pushing a version tag
+      - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
           files: apps/android/app/build/outputs/apk/release/app-release.apk
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
+          name: DevMastery ${{ github.ref_name }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload APK as Artifact (Fallback)
-        uses: actions/upload-artifact@v4
-        if: "!startsWith(github.ref, 'refs/tags/')"
-        with:
-          name: app-release
-          path: apps/android/app/build/outputs/apk/release/app-release.apk
