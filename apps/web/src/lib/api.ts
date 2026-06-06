@@ -1,10 +1,12 @@
 // ============================================================
 // DevMastery — API Client
-// Handles all communication with Spring Boot microservices
+// Single base URL — talks to the devmastery-core modular monolith.
 // ============================================================
 
-const CONTENT_API = process.env.NEXT_PUBLIC_CONTENT_API_URL || 'http://localhost:8082';
-const PROGRESS_API = process.env.NEXT_PUBLIC_PROGRESS_API_URL || 'http://localhost:8083';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+// Back-compat aliases so existing call sites keep working.
+const CONTENT_API = API_BASE;
+const PROGRESS_API = API_BASE;
 
 // ─── Types ──────────────────────────────────────────────────
 
