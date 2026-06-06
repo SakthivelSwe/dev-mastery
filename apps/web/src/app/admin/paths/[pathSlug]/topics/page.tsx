@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
 import { Check, X, ArrowLeft, Settings, PenTool } from 'lucide-react';
 
@@ -18,8 +18,8 @@ interface TopicSummary {
   updatedAt: string;
 }
 
-export default function AdminTopicList({ params }: { params: { pathSlug: string } }) {
-  const { pathSlug } = params;
+export default function AdminTopicList({ params }: { params: Promise<{ pathSlug: string }> }) {
+  const { pathSlug } = use(params);
   const [topics, setTopics] = useState<TopicSummary[]>([]);
   const [loading, setLoading] = useState(true);
 
