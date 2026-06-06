@@ -17,7 +17,9 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(System.getenv("SIGNING_STORE_FILE") ?: rootProject.file("devmastery.jks"))
+            // PKCS12 keystore (.p12) — decoded from SIGNING_KEY_STORE_BASE64 secret in CI.
+            // JKS format (.jks) is NOT used: causes "Tag number over 30" error on JDK 17+.
+            storeFile = file(System.getenv("SIGNING_STORE_FILE") ?: rootProject.file("devmastery.p12"))
             storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: "devmastery123"
             keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: "devmastery"
             keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: "devmastery123"
