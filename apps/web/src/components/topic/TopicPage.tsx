@@ -7,6 +7,7 @@ import LessonNav from './LessonNav';
 import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap, RefreshCw, AlertCircle } from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
 import { CodeEditorShell } from '@/components/code/CodeEditorShell';
+import { CodeLayerView } from '@/components/code/CodeLayerView';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
@@ -135,8 +136,15 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
         return <VisualizerShell topicSlug={topicSlug} />;
       case 'code':
         return (
-          <div className="h-full -m-6">
-            <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
+          <div className="h-full">
+            {topic.layers.code
+              ? <CodeLayerView codeContent={topic.layers.code} language="java" />
+              : (
+                <div className="h-full -m-6">
+                  <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
+                </div>
+              )
+            }
           </div>
         );
       case 'real-world':
