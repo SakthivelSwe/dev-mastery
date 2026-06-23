@@ -1,6 +1,8 @@
+
 'use client';
 
 import useSWR from 'swr';
+import { useEffect } from 'react';
 import { useAuthStore } from '@/store/useAuthStore';
 
 const API_BASE     = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
@@ -139,11 +141,18 @@ export function useDashboard() {
   const { user, token } = useAuthStore();
   const userId = user?.id;
 
-  const { data, error, isLoading } = useSWR(
+  const { data, error, isLoading, mutate } = useSWR(
     userId ? ['dashboard', userId, token] : null,
     () => buildDashboard(token),
     { refreshInterval: 60_000, fallbackData: EMPTY_DASHBOARD, revalidateOnFocus: false }
   );
+
+  // Listen for topic completions and immediately revalidate
+  useEffect(() => {
+    function handler() { mutate(); }
+    window.addEventListener('devmastery:progress-update', handler);
+    return () => window.removeEventListener('devmastery:progress-update', handler);
+  }, [mutate]);
 
   return {
     dashboard: (data as DashboardSummary) ?? EMPTY_DASHBOARD,

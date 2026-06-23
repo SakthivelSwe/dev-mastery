@@ -4,11 +4,7 @@ import { Loader2 } from 'lucide-react';
 import { useDashboard } from '@/hooks/useProgress';
 import { StatsBar } from '@/components/dashboard/StatsBar';
 import { PathGrid } from '@/components/dashboard/PathCard';
-import { StreakCalendar } from '@/components/dashboard/StreakCalendar';
 import { ContinueLearning } from '@/components/dashboard/ContinueLearning';
-import { SkillRadarChart } from '@/components/dashboard/SkillRadarChart';
-import { XpHistoryChart } from '@/components/dashboard/XpHistoryChart';
-import { BadgeGallery } from '@/components/dashboard/BadgeGallery';
 import { useAuthStore } from '@/store/useAuthStore';
 
 export default function DashboardClient() {
@@ -61,32 +57,9 @@ export default function DashboardClient() {
 
         {/* ── Main Grid ─────────────────────────────────────── */}
         <div className="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-6 mb-8">
-          {/* Left: Path Cards & Charts */}
-          <div className="flex flex-col gap-6">
-            <PathGrid pathProgress={dashboard.pathProgress} />
-            
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="h-[320px]">
-                <XpHistoryChart activity={dashboard.recentActivity} />
-              </div>
-              <div className="h-[320px]">
-                <SkillRadarChart pathProgress={dashboard.pathProgress} />
-              </div>
-            </div>
-          </div>
-
-          {/* Right: Sidebar Widgets */}
-          <div className="flex flex-col gap-6">
-            <ContinueLearning pathProgress={dashboard.pathProgress} />
-            <BadgeGallery totalCompleted={dashboard.totalCompleted} streak={dashboard.streak} />
-          </div>
+          <PathGrid pathProgress={dashboard.pathProgress} />
+          <ContinueLearning pathProgress={dashboard.pathProgress} />
         </div>
-
-        {/* ── Activity Calendar ─────────────────────────────── */}
-        <StreakCalendar
-          activity={dashboard.recentActivity}
-          streak={dashboard.streak}
-        />
 
         {/* ── Footer Padding ────────────────────────────────── */}
         <div className="h-8" />

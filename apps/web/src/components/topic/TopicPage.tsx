@@ -24,7 +24,7 @@ interface TopicPageProps {
 
 export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageProps) {
   const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat();
   const [chatInput, setChatInput]   = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
@@ -77,11 +77,15 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
     try {
       const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
       if (user) {
-        await markLayerComplete(user.id, topicSlug, activeTab, timeSpent);
+        await markLayerComplete(user.id, topicSlug, activeTab, timeSpent, token);
       }
       markTabCompleted(activeTab);
       setXpFlash(true);
       setTimeout(() => setXpFlash(false), 2000);
+      // Invalidate dashboard SWR cache so stats refresh automatically
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('devmastery:progress-update'));
+      }
     } catch (e) {
       console.error(e);
     } finally {

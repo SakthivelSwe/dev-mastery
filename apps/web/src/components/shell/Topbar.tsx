@@ -69,10 +69,9 @@ export function Topbar() {
 
       {/* Right Actions */}
       <div className="ml-auto flex items-center gap-1">
-        {/* Notifications */}
-        <button className="p-2 rounded-lg text-[--text-muted] hover:text-[--text-primary] hover:bg-[--bg-elevated] transition-all relative" aria-label="Notifications">
+        {/* Notifications — placeholder until backend supports it */}
+        <button className="p-2 rounded-lg text-[--text-muted] hover:text-[--text-primary] hover:bg-[--bg-elevated] transition-all" aria-label="Notifications">
           <Bell size={18} />
-          <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 bg-[--accent-java] rounded-full" />
         </button>
 
         {/* Theme toggle */}
