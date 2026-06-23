@@ -3,10 +3,15 @@
 import { useState, useEffect } from 'react';
 import { WifiOff, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
+import { useBackendWarmup } from '@/hooks/useBackendWarmup';
 
 export function OfflineBanner() {
   const [isOffline, setIsOffline] = useState(false);
   const [isDismissed, setIsDismissed] = useState(false);
+
+  // Silently ping the Render backend to keep it warm. Runs once here
+  // (global component) so every page load wakes the backend if needed.
+  useBackendWarmup();
 
   useEffect(() => {
     // Check initial state
