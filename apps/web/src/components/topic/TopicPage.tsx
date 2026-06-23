@@ -25,7 +25,10 @@ interface TopicPageProps {
 export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageProps) {
   const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user, token } = useAuthStore();
-  const { messages, sendMessage, isLoading: aiLoading } = useAiChat();
+  const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
+    topicSlug: topicSlug,
+    sectionType: activeTab,
+  });
   const [chatInput, setChatInput]   = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
   const [xpFlash, setXpFlash]       = useState(false);

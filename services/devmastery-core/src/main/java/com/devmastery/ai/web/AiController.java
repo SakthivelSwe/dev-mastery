@@ -18,14 +18,14 @@ public class AiController {
     public AiController(AiService ai) { this.ai = ai; }
 
     @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> chat(@AuthenticationPrincipal UUID userId,
+    public Flux<String> chat(@AuthenticationPrincipal(errorOnInvalidType = false) UUID userId,
                              @RequestBody ChatRequest req) {
         return ai.chat(userId, req.topicSlug(), req.sectionType(),
                 req.userQuery(), req.history() == null ? List.of() : req.history());
     }
 
     @PostMapping("/feynman/score")
-    public Mono<AiService.FeynmanScore> feynman(@AuthenticationPrincipal UUID userId,
+    public Mono<AiService.FeynmanScore> feynman(@AuthenticationPrincipal(errorOnInvalidType = false) UUID userId,
                                                 @RequestBody FeynmanRequest req) {
         return ai.scoreFeynman(userId, req.topicSlug(), req.explanation());
     }
