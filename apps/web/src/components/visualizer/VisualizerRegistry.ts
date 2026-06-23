@@ -7,6 +7,7 @@ const HeapVisualizer = dynamic(() => import('./algorithms/HeapVisualizer'), { ss
 const TrieVisualizer = dynamic(() => import('./algorithms/TrieVisualizer'), { ssr: false });
 const DPVisualizer = dynamic(() => import('./algorithms/DPVisualizer'), { ssr: false });
 const GraphVisualizer = dynamic(() => import('./algorithms/GraphVisualizer'), { ssr: false });
+const WrapperClassVisualizer = dynamic(() => import('./algorithms/WrapperClassVisualizer'), { ssr: false });
 
 export const visualizerRegistry: Record<string, { component: React.ComponentType<any>; inputType: 'array' | 'string' | 'number' | 'graph'; defaultData: any }> = {
   'binary-search-tree': {
@@ -50,5 +51,15 @@ export const visualizerRegistry: Record<string, { component: React.ComponentType
       nodes: [{ id: 'A' }, { id: 'B' }, { id: 'C' }],
       edges: [{ source: 'A', target: 'B' }, { source: 'B', target: 'C' }]
     },
-  }
+  },
+  'wrapper-classes': {
+    component: WrapperClassVisualizer,
+    inputType: 'number',
+    defaultData: 42,
+  },
+  'data-types-and-variables': {
+    component: WrapperClassVisualizer,
+    inputType: 'number',
+    defaultData: 42,
+  },
 };

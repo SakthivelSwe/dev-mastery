@@ -1,0 +1,698 @@
+---
+title: "Wrapper Classes — Autoboxing, Unboxing & the Integer Cache"
+slug: "wrapper-classes"
+level: 1
+---
+
+## WHY
+
+Java was designed as a purely object-oriented language — everything should be an object. But its designers also recognised that creating a full object on the Heap just to store a single `42` would be catastrophically slow and wasteful. So Java made a pragmatic compromise: **eight primitive types** (`byte`, `short`, `int`, `long`, `float`, `double`, `char`, `boolean`) that live directly on the Thread Stack and carry zero object overhead.
+
+This compromise created a split world, and that split causes real problems:
+
+1. **Collections can't hold primitives.** `List<int>` is illegal. The Java Generics system requires objects. Without a way to wrap an `int` into an object, you couldn't put numbers into an `ArrayList`.
+2. **Methods requiring `Object` can't accept primitives.** If a method signature is `void process(Object o)`, you can't pass a raw `int`.
+3. **Primitives can't be `null`.** A database column, an HTTP query parameter, or a JSON field might be absent. An `int` can't express "this value was not provided" — it defaults to `0`. An `Integer` can express `null`.
+4. **Primitives have no methods.** You can't call `42.toString()` or `42.compareTo(100)`.
+
+Wrapper classes bridge this gap. But they come with **traps** that trip up even experienced developers every single day: the `==` identity trap with the Integer Cache, the autoboxing performance disaster inside loops, and the `NullPointerException` from unboxing a `null` wrapper. Understanding wrapper classes is not optional knowledge — it is Java survival skill.
+
+## THEORY
+
+### The Eight Wrapper Classes
+
+Every primitive type has a corresponding wrapper class in the `java.lang` package (automatically imported):
+
+| Primitive | Wrapper Class | Size | Range |
+|-----------|---------------|------|-------|
+| `byte`    | `Byte`        | 8-bit | -128 to 127 |
+| `short`   | `Short`       | 16-bit | -32,768 to 32,767 |
+| `int`     | `Integer`     | 32-bit | -2,147,483,648 to 2,147,483,647 |
+| `long`    | `Long`        | 64-bit | -9.2×10¹⁸ to 9.2×10¹⁸ |
+| `float`   | `Float`       | 32-bit | ~1.4×10⁻⁴⁵ to ~3.4×10³⁸ |
+| `double`  | `Double`      | 64-bit | ~4.9×10⁻³²⁴ to ~1.8×10³⁰⁸ |
+| `char`    | `Character`   | 16-bit | '\u0000' to '\uffff' (0 to 65,535) |
+| `boolean` | `Boolean`     | 1-bit* | `true` or `false` |
+
+*Boolean's actual JVM memory size is implementation-dependent, often 1 byte or 4 bytes.
+
+### Autoboxing — Primitive → Object
+
+**Autoboxing** is the compiler automatically converting a primitive into its wrapper object. It was introduced in Java 5. Before Java 5, you had to manually write `Integer obj = Integer.valueOf(42);`. Now the compiler inserts that call for you invisibly.
+
+Autoboxing happens in three situations:
+1. Assigning a primitive to a wrapper variable: `Integer x = 42;`
+2. Passing a primitive to a method expecting a wrapper: `list.add(42);`
+3. Assigning a primitive to an `Object` or parent type variable: `Object o = 3.14;`
+
+What the compiler *actually* generates under the hood:
+```java
+// What you write:
+Integer x = 42;
+
+// What javac compiles it to (you can verify with javap -c):
+Integer x = Integer.valueOf(42);
+```
+
+### Unboxing — Object → Primitive
+
+**Unboxing** is the reverse: the compiler automatically extracting the primitive value from a wrapper object. It calls the appropriate `.xxxValue()` method.
+
+Unboxing happens when:
+1. Assigning a wrapper to a primitive variable: `int n = myInteger;`
+2. Using a wrapper in arithmetic: `int result = myInteger + 10;`
+3. Returning a wrapper from a method declared to return a primitive.
+
+What the compiler generates:
+```java
+// What you write:
+Integer obj = Integer.valueOf(42);
+int n = obj;
+
+// What javac compiles it to:
+int n = obj.intValue();
+```
+
+### ⚠️ The Unboxing NPE Trap
+
+If a wrapper object is `null` and you try to unbox it, the JVM calls `.intValue()` on `null`, causing a `NullPointerException`. This is one of the most common runtime bugs in Java codebases.
+
+```java
+Integer total = null; // from a DB query that returned no rows
+int result = total + 1; // BOOM! NullPointerException at runtime, not compile time!
+```
+
+### The Integer Cache — The Most Dangerous Java Trap
+
+To save memory and improve performance, the JVM maintains a **static cache** of `Integer` objects for values in the range **-128 to +127**. When you autobox (or call `Integer.valueOf()`) for a value in this range, the JVM does *not* create a new object. It returns a reference to a pre-existing, shared, cached object.
+
+This has a shocking consequence for the `==` operator:
+
+```
+Integer a = 100;  →  points to cached Integer@pool[228]
+Integer b = 100;  →  points to same cached Integer@pool[228]
+a == b            →  TRUE  (they are the SAME object in memory)
+
+Integer x = 200;  →  new Integer object at @0x001 is created on the Heap
+Integer y = 200;  →  new Integer object at @0x002 is created on the Heap
+x == y            →  FALSE (they are DIFFERENT objects in memory)
+x.equals(y)       →  TRUE  (they hold the SAME value)
+```
+
+The **golden rule**: always use `.equals()` to compare wrapper objects. Never use `==` unless you intentionally want to test object identity (rare).
+
+The same caching applies to `Byte`, `Short`, `Long` (-128 to 127), `Character` (0 to 127), and `Boolean` (two cached constants: `Boolean.TRUE` and `Boolean.FALSE`). `Float` and `Double` do **not** have caches.
+
+The cache upper bound for `Integer` is configurable with the JVM flag `-XX:AutoBoxCacheMax=<size>`.
+
+### The Number Class Hierarchy
+
+All numeric wrapper classes extend the abstract class `java.lang.Number`:
+
+```
+Object
+  └─ Number  (abstract)
+       ├─ Byte
+       ├─ Short
+       ├─ Integer
+       ├─ Long
+       ├─ Float
+       ├─ Double
+       └─ BigInteger / BigDecimal  (not primitives, but part of the hierarchy)
+
+Object
+  └─ Character  (does NOT extend Number)
+  └─ Boolean    (does NOT extend Number)
+```
+
+Because of this hierarchy, `Number` provides `intValue()`, `longValue()`, `floatValue()`, and `doubleValue()` methods on all numeric wrappers.
+
+### Common Utility Methods
+
+| Method | Description | Example |
+|--------|-------------|---------|
+| `Integer.parseInt("42")` | String → primitive `int` | `int n = Integer.parseInt("42");` |
+| `Integer.valueOf("42")` | String → `Integer` object | `Integer obj = Integer.valueOf("42");` |
+| `Integer.valueOf(42)` | primitive `int` → `Integer` object | `Integer obj = Integer.valueOf(42);` |
+| `obj.intValue()` | `Integer` object → primitive `int` | `int n = obj.intValue();` |
+| `Integer.toString(42)` | primitive `int` → `String` | `String s = Integer.toString(42);` |
+| `obj.compareTo(other)` | Compare two wrappers (-1, 0, or 1) | `a.compareTo(b)` |
+| `Integer.compare(a, b)` | Static compare of two `int` values | `Integer.compare(5, 10)` → -1 |
+| `Integer.min(a, b)` | Minimum of two values | `Integer.min(3, 7)` → 3 |
+| `Integer.max(a, b)` | Maximum of two values | `Integer.max(3, 7)` → 7 |
+| `Integer.sum(a, b)` | Sum of two values (use in streams) | `Integer.sum(3, 7)` → 10 |
+| `Integer.toBinaryString(n)` | Convert to binary string | `Integer.toBinaryString(10)` → `"1010"` |
+| `Integer.toHexString(n)` | Convert to hex string | `Integer.toHexString(255)` → `"ff"` |
+| `Integer.toOctalString(n)` | Convert to octal string | `Integer.toOctalString(8)` → `"10"` |
+| `Integer.bitCount(n)` | Count set bits (1s) in binary | `Integer.bitCount(10)` → 2 |
+| `Integer.MAX_VALUE` | Largest `int` constant (2,147,483,647) | `int max = Integer.MAX_VALUE;` |
+| `Integer.MIN_VALUE` | Smallest `int` constant (-2,147,483,648) | `int min = Integer.MIN_VALUE;` |
+| `Double.isNaN(v)` | Check if value is Not-a-Number | `Double.isNaN(0.0 / 0.0)` → true |
+| `Double.isInfinite(v)` | Check if value is ±Infinity | `Double.isInfinite(1.0 / 0.0)` → true |
+| `Character.isDigit(c)` | Check if char is a digit | `Character.isDigit('5')` → true |
+| `Character.isLetter(c)` | Check if char is a letter | `Character.isLetter('A')` → true |
+| `Character.toUpperCase(c)` | Convert char to uppercase | `Character.toUpperCase('a')` → 'A' |
+| `Boolean.parseBoolean("true")` | String → primitive `boolean` | `boolean b = Boolean.parseBoolean("true");` |
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "WrapperClassVisualizer" }
+```
+
+## CODE
+
+### Level 1 — Beginner: All Eight Wrapper Types
+```java
+public class AllWrapperTypes {
+    public static void main(String[] args) {
+        // Primitive declarations
+        byte   b  = 127;
+        short  s  = 32000;
+        int    i  = 1_000_000;   // Underscores allowed for readability (Java 7+)
+        long   l  = 9_000_000_000L; // 'L' suffix mandatory for long literals
+        float  f  = 3.14f;          // 'f' suffix mandatory for float literals
+        double d  = 3.141592653589793;
+        char   c  = 'J';
+        boolean bo = true;
+
+        // Autoboxing: compiler calls valueOf() automatically
+        Byte      byteObj    = b;
+        Short     shortObj   = s;
+        Integer   intObj     = i;
+        Long      longObj    = l;
+        Float     floatObj   = f;
+        Double    doubleObj  = d;
+        Character charObj    = c;
+        Boolean   boolObj    = bo;
+
+        System.out.println("=== Wrapper Objects ===");
+        System.out.println("Byte:      " + byteObj);
+        System.out.println("Short:     " + shortObj);
+        System.out.println("Integer:   " + intObj);
+        System.out.println("Long:      " + longObj);
+        System.out.println("Float:     " + floatObj);
+        System.out.println("Double:    " + doubleObj);
+        System.out.println("Character: " + charObj);
+        System.out.println("Boolean:   " + boolObj);
+
+        // Unboxing: compiler calls intValue(), doubleValue() etc. automatically
+        int   unboxedInt  = intObj;   // compiler → intObj.intValue()
+        double unboxedDbl = doubleObj; // compiler → doubleObj.doubleValue()
+
+        System.out.println("\n=== Unboxed Values ===");
+        System.out.println("int:    " + unboxedInt);
+        System.out.println("double: " + unboxedDbl);
+    }
+}
+// Expected Output:
+// === Wrapper Objects ===
+// Byte:      127
+// Short:     32000
+// Integer:   1000000
+// Long:      9000000000
+// Float:     3.14
+// Double:    3.141592653589793
+// Character: J
+// Boolean:   true
+//
+// === Unboxed Values ===
+// int:    1000000
+// double: 3.141592653589793
+```
+
+### Level 2 — Building Blocks: Collections, Parsing & Conversion
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+
+public class WrappersWithCollections {
+    public static void main(String[] args) {
+        // --- 1. Collections require wrapper types, NOT primitives ---
+        // List<int> scores = new ArrayList<>(); // ← COMPILE ERROR!
+        ArrayList<Integer> scores = new ArrayList<>();
+
+        // Autoboxing happens silently when you call .add(primitive)
+        scores.add(95);
+        scores.add(87);
+        scores.add(72);
+        scores.add(100);
+        System.out.println("Scores: " + scores); // [95, 87, 72, 100]
+
+        // Collections.sort uses Integer.compareTo() internally
+        Collections.sort(scores);
+        System.out.println("Sorted: " + scores); // [72, 87, 95, 100]
+
+        // --- 2. Parsing Strings to primitives (extremely common in real code) ---
+        String userInput = "42";
+        int parsedInt = Integer.parseInt(userInput);   // "42" → 42 (primitive)
+        double parsedDbl = Double.parseDouble("3.14");  // "3.14" → 3.14 (primitive)
+        boolean parsedBool = Boolean.parseBoolean("true"); // "true" → true
+        long parsedLong = Long.parseLong("9876543210"); // String → long
+
+        System.out.println("\n=== Parsed Values ===");
+        System.out.println("int:     " + parsedInt);
+        System.out.println("double:  " + parsedDbl);
+        System.out.println("boolean: " + parsedBool);
+        System.out.println("long:    " + parsedLong);
+
+        // --- 3. Number to String conversions ---
+        String intToStr  = Integer.toString(255);         // "255"
+        String hexStr    = Integer.toHexString(255);      // "ff"
+        String binStr    = Integer.toBinaryString(255);   // "11111111"
+        String octStr    = Integer.toOctalString(255);    // "377"
+
+        System.out.println("\n=== 255 in Different Bases ===");
+        System.out.println("Decimal: " + intToStr);
+        System.out.println("Hex:     " + hexStr);
+        System.out.println("Binary:  " + binStr);
+        System.out.println("Octal:   " + octStr);
+
+        // --- 4. Useful constants ---
+        System.out.println("\n=== Integer Constants ===");
+        System.out.println("MAX_VALUE: " + Integer.MAX_VALUE);  // 2,147,483,647
+        System.out.println("MIN_VALUE: " + Integer.MIN_VALUE);  // -2,147,483,648
+        System.out.println("SIZE (bits): " + Integer.SIZE);     // 32
+        System.out.println("BYTES: " + Integer.BYTES);         // 4
+    }
+}
+// Key Output:
+// Scores: [95, 87, 72, 100]
+// Sorted: [72, 87, 95, 100]
+// 255 in Different Bases:
+// Decimal: 255  Hex: ff  Binary: 11111111  Octal: 377
+// MAX_VALUE: 2147483647
+```
+
+### Level 3 — Intermediate: The Integer Cache Trap
+```java
+public class IntegerCacheTrap {
+    public static void main(String[] args) {
+        System.out.println("=== The Integer Cache (-128 to 127) ===");
+
+        // Values WITHIN the cache range: valueOf() returns SAME cached object
+        Integer a = Integer.valueOf(100);
+        Integer b = Integer.valueOf(100);
+        System.out.println("valueOf(100) == valueOf(100): " + (a == b));   // true  ← SAME cached object
+        System.out.println("valueOf(100).equals(valueOf(100)): " + a.equals(b)); // true
+
+        // Values OUTSIDE the cache range: valueOf() creates NEW objects each time
+        Integer x = Integer.valueOf(200);
+        Integer y = Integer.valueOf(200);
+        System.out.println("\nvalueOf(200) == valueOf(200): " + (x == y));   // false ← DIFFERENT objects!
+        System.out.println("valueOf(200).equals(valueOf(200)): " + x.equals(y)); // true  ← same VALUE
+
+        System.out.println("\n=== What Autoboxing Does Behind the Scenes ===");
+        Integer p = 127; // compiler → Integer.valueOf(127) → cache hit ✓
+        Integer q = 127; // compiler → Integer.valueOf(127) → same cache hit ✓
+        System.out.println("127 == 127 (autoboxed): " + (p == q));   // true
+
+        Integer r = 128; // compiler → Integer.valueOf(128) → new object
+        Integer s = 128; // compiler → Integer.valueOf(128) → another new object
+        System.out.println("128 == 128 (autoboxed): " + (r == s));   // false ← THE TRAP!
+        System.out.println("128.equals(128): " + r.equals(s));       // true
+
+        System.out.println("\n=== The == Operator Tests Object Identity, NOT Value ===");
+        System.out.println("RULE: ALWAYS use .equals() or Integer.compare() for wrapper comparison!");
+
+        System.out.println("\n=== Boolean and Character Caches ===");
+        Boolean bt1 = Boolean.valueOf(true);
+        Boolean bt2 = Boolean.valueOf(true);
+        System.out.println("Boolean(true) == Boolean(true): " + (bt1 == bt2)); // true (cached)
+
+        Character ch1 = Character.valueOf('A'); // 'A' is 65 — within cache (0-127)
+        Character ch2 = Character.valueOf('A');
+        System.out.println("Character('A') == Character('A'): " + (ch1 == ch2)); // true (cached)
+
+        System.out.println("\n=== Null Safety with Wrappers ===");
+        Integer nullable = null; // primitives CANNOT be null, wrappers CAN
+        if (nullable != null) {
+            System.out.println("Value: " + nullable);
+        } else {
+            System.out.println("Value was not provided (null)");
+        }
+        // nullable + 1 would throw NullPointerException here!
+    }
+}
+// Expected Output:
+// valueOf(100) == valueOf(100): true
+// valueOf(100).equals(valueOf(100)): true
+// valueOf(200) == valueOf(200): false
+// valueOf(200).equals(valueOf(200)): true
+// 127 == 127 (autoboxed): true
+// 128 == 128 (autoboxed): false  ← THE TRAP!
+// 128.equals(128): true
+// Boolean(true) == Boolean(true): true
+// Character('A') == Character('A'): true
+// Value was not provided (null)
+```
+
+### Level 4 — Advanced: Performance, Character Utilities & Streams
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class WrappersAdvanced {
+    // ─── Performance Demonstration ─────────────────────────────────────
+    static void demoAutoboxingPerformanceTrap() {
+        final int ITERATIONS = 10_000_000;
+
+        // ❌ BAD: Using Integer accumulator in a loop
+        long start1 = System.nanoTime();
+        Integer sumWrapper = 0; // Object on the Heap
+        for (int i = 0; i < ITERATIONS; i++) {
+            sumWrapper += i;
+            // Each iteration: unbox sumWrapper, add i, rebox result → new Integer on Heap!
+            // 10 million garbage objects created and immediately discarded → GC pressure!
+        }
+        long duration1 = System.nanoTime() - start1;
+
+        // ✅ GOOD: Using int primitive accumulator in a loop
+        long start2 = System.nanoTime();
+        int sumPrimitive = 0; // Value directly on the Stack
+        for (int i = 0; i < ITERATIONS; i++) {
+            sumPrimitive += i; // Pure arithmetic, zero object creation!
+        }
+        long duration2 = System.nanoTime() - start2;
+
+        System.out.printf("Integer loop:   %,d ms%n", duration1 / 1_000_000);
+        System.out.printf("int loop:       %,d ms%n", duration2 / 1_000_000);
+        System.out.printf("Speedup factor: %.1fx%n", (double) duration1 / duration2);
+    }
+
+    // ─── Character Utilities (very useful in algorithm problems) ─────────
+    static void demoCharacterUtilities() {
+        char[] testChars = {'A', 'z', '5', ' ', '@', 'ñ'};
+        System.out.println("\n=== Character Analysis ===");
+        System.out.printf("%-8s %-10s %-10s %-10s %-10s %-10s%n",
+            "Char", "isLetter", "isDigit", "isUpperCase", "isWhitespace", "isAlphabetic");
+        for (char ch : testChars) {
+            System.out.printf("'%c'    %-10b %-10b %-10b %-10b %-10b%n",
+                ch,
+                Character.isLetter(ch),
+                Character.isDigit(ch),
+                Character.isUpperCase(ch),
+                Character.isWhitespace(ch),
+                Character.isAlphabetic(ch)
+            );
+        }
+    }
+
+    // ─── Streams with Wrapper Type Method References ──────────────────
+    static void demoStreams() {
+        System.out.println("\n=== Streams + Method References ===");
+
+        List<String> stringNumbers = List.of("3", "1", "4", "1", "5", "9", "2", "6");
+
+        // Integer::parseInt as a method reference (very common in real code)
+        List<Integer> parsed = stringNumbers.stream()
+            .map(Integer::parseInt)           // String → int (autoboxed to Integer)
+            .filter(n -> n > 3)               // keep only values > 3
+            .sorted()                          // Integer implements Comparable
+            .collect(Collectors.toList());
+
+        System.out.println("Parsed & filtered: " + parsed); // [4, 5, 6, 9]
+
+        // IntStream uses primitives internally (no autoboxing!) — more efficient
+        int sum = IntStream.rangeClosed(1, 100)
+            .filter(n -> n % 2 == 0)
+            .sum();
+        System.out.println("Sum of even numbers 1-100: " + sum); // 2550
+    }
+
+    public static void main(String[] args) {
+        demoAutoboxingPerformanceTrap();
+        demoCharacterUtilities();
+        demoStreams();
+    }
+}
+// Example Output (timing varies by machine):
+// Integer loop:   120 ms
+// int loop:         8 ms
+// Speedup factor: 15.0x
+//
+// === Character Analysis ===
+// Char   isLetter   isDigit    isUpperCase isWhitespace isAlphabetic
+// 'A'    true       false      true        false        true
+// 'z'    true       false      false       false        true
+// '5'    false      true       false       false        false
+// ' '    false      false      false       true         false
+// '@'    false      false      false       false        false
+// 'ñ'    true       false      false       false        true    ← Handles Unicode!
+//
+// Parsed & filtered: [4, 5, 6, 9]
+// Sum of even numbers 1-100: 2550
+```
+
+### Level 5 — Expert: Number Hierarchy, Bit Manipulation & Custom Autoboxing Internals
+```java
+import java.lang.reflect.Field;
+
+public class WrappersExpert {
+    // ─── The Number Abstract Class ──────────────────────────────────────
+    // Number provides crossType conversion methods for ALL numeric wrappers
+    static void demoNumberHierarchy() {
+        Number num = Integer.valueOf(42); // polymorphic reference — any numeric wrapper works here
+
+        // Cross-type extraction (all defined in abstract class Number):
+        System.out.println("intValue():    " + num.intValue());    // 42
+        System.out.println("longValue():   " + num.longValue());   // 42L
+        System.out.println("floatValue():  " + num.floatValue());  // 42.0f
+        System.out.println("doubleValue(): " + num.doubleValue()); // 42.0
+
+        // This polymorphism is how generics libraries process any numeric type generically:
+        Number[] numbers = {42, 3.14, 100L, (short) 7, (byte) 255};
+        double total = 0;
+        for (Number n : numbers) {
+            total += n.doubleValue(); // Works for Integer, Double, Long, Short, Byte!
+        }
+        System.out.println("Sum of mixed types: " + total); // 214.14...
+    }
+
+    // ─── Bit Manipulation Utilities ─────────────────────────────────────
+    static void demoBitUtils() {
+        int n = 60; // binary: 00111100
+
+        System.out.println("\n=== Bit Manipulation for " + n + " (binary: " + Integer.toBinaryString(n) + ") ===");
+        System.out.println("bitCount (set bits):   " + Integer.bitCount(n));          // 4
+        System.out.println("highestOneBit:         " + Integer.highestOneBit(n));     // 32
+        System.out.println("lowestOneBit:          " + Integer.lowestOneBit(n));      // 4
+        System.out.println("numberOfLeadingZeros:  " + Integer.numberOfLeadingZeros(n));  // 26
+        System.out.println("numberOfTrailingZeros: " + Integer.numberOfTrailingZeros(n)); // 2
+        System.out.println("reverse bits:          " + Integer.toBinaryString(Integer.reverse(n)));
+        System.out.println("reverseBytes:          " + Integer.reverseBytes(n));
+    }
+
+    // ─── Inspecting the Integer Cache via Reflection ─────────────────────
+    // This reveals exactly how the JVM caches Integer objects internally.
+    static void inspectIntegerCache() throws Exception {
+        System.out.println("\n=== Inspecting the Integer Cache with Reflection ===");
+
+        // The cache is stored in a private static field of an inner class
+        Class<?> cacheClass = Class.forName("java.lang.Integer$IntegerCache");
+        Field cacheField = cacheClass.getDeclaredField("cache");
+        cacheField.setAccessible(true);
+        Integer[] cache = (Integer[]) cacheField.get(null);
+
+        System.out.println("Cache size: " + cache.length + " entries");      // 256
+        System.out.println("First entry (index 0 = -128): " + cache[0]);     // -128
+        System.out.println("Last entry (index 255 = 127): " + cache[255]);   // 127
+
+        // Verify that autoboxed 100 and cache[228] (128 offset) are IDENTICAL objects:
+        Integer autoboxed = 100;
+        Integer fromCache = cache[100 + 128]; // -128 is at index 0, so 100 is at 100+128
+        System.out.println("\nAutoboxed 100 == cache[228]: " + (autoboxed == fromCache)); // true
+        System.out.println("They are the EXACT same object in memory (same identity hash)");
+        System.out.println("Autoboxed identityHashCode: " + System.identityHashCode(autoboxed));
+        System.out.println("Cache     identityHashCode: " + System.identityHashCode(fromCache));
+    }
+
+    public static void main(String[] args) throws Exception {
+        demoNumberHierarchy();
+        demoBitUtils();
+        inspectIntegerCache();
+    }
+}
+// Expected Output:
+// intValue():    42
+// longValue():   42
+// floatValue():  42.0
+// doubleValue(): 42.0
+// Sum of mixed types: 214.14000244140625
+//
+// === Bit Manipulation for 60 ===
+// bitCount (set bits):   4
+// highestOneBit:         32
+// lowestOneBit:          4
+// numberOfLeadingZeros:  26
+// numberOfTrailingZeros: 2
+//
+// === Inspecting the Integer Cache ===
+// Cache size: 256 entries
+// First entry: -128
+// Last entry:   127
+// Autoboxed 100 == cache[228]: true  ← PROVEN: same memory address!
+// identityHashCodes are IDENTICAL
+```
+
+## REAL_WORLD
+
+Wrapper classes appear constantly in professional Java codebases. Two areas where misusing them causes real production bugs:
+
+### 1. Spring Boot / JPA Entity Design (null semantics)
+
+```java
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;   // ← Must be Long (wrapper), NOT long (primitive)
+                        // Because a new entity that hasn't been saved yet has id = null.
+                        // A primitive 'long id' would default to 0, hiding the "unsaved" state.
+
+    @Column(name = "quantity", nullable = false)
+    private int quantity;   // ← Use primitive: this is REQUIRED, can never be null
+
+    @Column(name = "discount_percent")
+    private Double discountPercent;  // ← Use wrapper: this is OPTIONAL, null = "no discount"
+                                      // If you used 'double', Jackson would deserialize missing
+                                      // JSON field as 0.0, wrongly implying "0% discount"
+
+    @Column(name = "is_priority")
+    private Boolean isPriority;     // ← Use wrapper: null = "user didn't specify preference"
+                                     // A primitive 'boolean' would force a default of 'false'
+
+    // getters/setters...
+}
+```
+
+### 2. Jackson Deserialization (API development)
+
+```java
+// API receives this JSON:
+// { "productId": "101", "count": "5", "price": "29.99" }
+// Everything arrives as Strings from HTTP. Wrapper methods convert them.
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/cart")
+public class CartController {
+
+    @PostMapping("/add")
+    public ResponseEntity<String> addToCart(
+            @RequestParam String productId,
+            @RequestParam String count,
+            @RequestParam String price) {
+
+        // Safe parsing with validation
+        int productIdInt;
+        try {
+            productIdInt = Integer.parseInt(productId);
+        } catch (NumberFormatException e) {
+            return ResponseEntity.badRequest().body("productId must be a number");
+        }
+
+        int quantity = Integer.parseInt(count);        // "5" → 5
+        double itemPrice = Double.parseDouble(price);  // "29.99" → 29.99
+
+        // Character utility: validate that the productId doesn't contain letters
+        for (char ch : productId.toCharArray()) {
+            if (!Character.isDigit(ch)) {
+                return ResponseEntity.badRequest().body("productId must be digits only");
+            }
+        }
+
+        // Integer constants for boundary checks
+        if (quantity < 1 || quantity > Integer.MAX_VALUE) {
+            return ResponseEntity.badRequest().body("quantity out of range");
+        }
+
+        return ResponseEntity.ok("Added " + quantity + " x item#" + productIdInt
+                + " @ $" + itemPrice + " to cart");
+    }
+}
+```
+
+### 3. The Autoboxing-in-Loop Performance Anti-Pattern (Real code review finding)
+
+```java
+// ❌ REAL BUG FOUND IN PRODUCTION: Calculating order totals using Integer instead of int
+@Service
+public class OrderService {
+
+    // This method processes 500,000 orders per day. With Integer, it creates 500,000
+    // temporary objects per invocation, triggering dozens of GC pauses.
+    public Integer calculateTotalRevenueBuggy(List<Order> orders) {
+        Integer total = 0; // ← The bug: Integer wrapper, not int primitive
+        for (Order order : orders) {
+            total += order.getAmount(); // ← unbox total, add amount, rebox result → new object!
+        }
+        return total;
+    }
+
+    // ✅ FIXED: Use primitive accumulator, box only at the boundary
+    public Integer calculateTotalRevenueFixed(List<Order> orders) {
+        int total = 0; // ← primitive: zero object allocation in the loop
+        for (Order order : orders) {
+            total += order.getAmount(); // ← pure arithmetic, nothing on the heap
+        }
+        return total; // ← single autoboxing happens here, at the return boundary
+    }
+}
+```
+
+## INTERVIEW
+
+### Q1: What is the difference between `int` and `Integer` in Java?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak answer:** "int is a basic type and Integer is a class that wraps it."
+
+✅ **Strong answer:**
+"`int` is a primitive type. Its 4-byte value is stored directly on the Thread Stack, has no object overhead, and cannot be `null`. `Integer` is a reference type — a full Java object allocated on the Heap, carrying 16 bytes of object header overhead in addition to its value. You must use `Integer` (not `int`) when working with Java Collections (`List<Integer>`), when a value needs to represent a `null` state (e.g., an optional database column), or when you need utility methods like `Integer.parseInt()` or `Integer.toBinaryString()`. The critical gotcha is that comparing `Integer` objects with `==` checks object identity, not value equality — always use `.equals()` for wrappers."
+
+---
+
+### Q2: Explain the Integer Cache and the famous `== trap`.
+**Difficulty:** Medium | **Companies:** Amazon, Google, Morgan Stanley
+
+❌ **Weak answer:** "Java caches some Integer values to make comparisons faster."
+
+✅ **Strong answer:**
+"To optimize performance, the JVM pre-creates and caches a pool of `Integer` objects for the range **-128 to +127** at JVM startup (in `Integer$IntegerCache`). When you autobox or call `Integer.valueOf()` for a value in this range, Java returns a reference to the existing cached object instead of creating a new one. The consequence is that `Integer a = 100; Integer b = 100;` results in `a == b` being `true`, because both variables point to the *same* cached object. However, `Integer x = 200; Integer y = 200;` results in `x == y` being `false`, because 200 is outside the cache — two distinct new objects are created on the Heap. The `==` operator on reference types compares memory addresses (identity), not values. Therefore, always use `.equals()` to compare wrapper objects. The cache upper bound can be extended via the JVM flag `-XX:AutoBoxCacheMax`."
+
+---
+
+### Q3: What is a NullPointerException caused by unboxing and how do you prevent it?
+**Difficulty:** Medium | **Companies:** JP Morgan, Netflix
+
+❌ **Weak answer:** "If the Integer is null and you try to use it, you get a NPE."
+
+✅ **Strong answer:**
+"When the compiler unboxes a wrapper object, it inserts a call to `.intValue()`. If the wrapper object is `null`, calling `.intValue()` on `null` throws a `NullPointerException`. This is insidious because the bug appears as an NPE at the *arithmetic line*, not at the assignment, making it hard to diagnose. Example: `Integer total = null; int result = total + 1;` — this compiles without error but throws NPE at runtime because the compiler translates it to `total.intValue() + 1`. Prevention strategies: (1) Always null-check before unboxing: `if (total != null)`. (2) Use `Objects.requireNonNullElse(total, 0)` for a fallback value. (3) Prefer primitive types for fields that are guaranteed to always have a value. (4) Return `OptionalInt` from methods that might not have a value."
+
+---
+
+### Q4: Why is using `Integer` as a loop accumulator a performance anti-pattern?
+**Difficulty:** Medium | **Companies:** Atlassian, Bloomberg, Netflix
+
+❌ **Weak answer:** "Because Integer objects are slower than int primitives."
+
+✅ **Strong answer:**
+"Wrapper objects are **immutable** in Java. When you write `Integer sum = 0; sum += i;`, the `+=` operator cannot modify the existing `Integer` object in-place. Instead, the compiler generates: `sum = Integer.valueOf(sum.intValue() + i)`. Every single iteration of the loop: (1) unboxes `sum` by calling `sum.intValue()`, (2) adds `i`, and (3) **allocates a brand new `Integer` object on the Heap** via `Integer.valueOf()`. In a loop of 10 million iterations, this creates 10 million short-lived `Integer` objects, causing enormous Garbage Collector pressure and can increase loop execution time by 10-20x. The fix is trivial: use a primitive `int` accumulator inside the loop and only box it at the return boundary: `int sum = 0; ... return sum;`."
+
+---
+
+### Q5: What does `Integer.valueOf()` do differently from `new Integer()`? Why is `new Integer()` deprecated?
+**Difficulty:** Hard | **Companies:** Oracle, Thoughtworks
+
+❌ **Weak answer:** "They both create an Integer object, valueOf() is just newer."
+
+✅ **Strong answer:**
+"`new Integer(42)` always creates a brand new object on the Heap, bypassing the Integer Cache entirely — even for values in the -128 to 127 range. This is wasteful and inconsistent. `Integer.valueOf(42)` is the *factory method* pattern: it checks the cache first and returns the cached object if available, only creating a new object for values outside the cache range. `new Integer(int)` was **deprecated in Java 9** and **removed in Java 16** because it violated the principle of least surprise — developers expected that two `Integer` variables holding `100` might be the same object (from the cache), but `new Integer(100)` always produced a distinct object. Using `new Integer()` could also accidentally cause `==` comparisons to return `false` for values within the cache range. Always use `Integer.valueOf()` or autoboxing instead."
+
