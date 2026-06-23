@@ -9,14 +9,24 @@ import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 class ContentServiceImpl implements ContentService, ContentCommandService {
+
+    private static final Map<Integer, String> LEVEL_LABELS = Map.of(
+            1, "Foundation",
+            2, "Working Knowledge",
+            3, "Practitioner",
+            4, "Advanced",
+            5, "Expert"
+    );
 
     private final TopicRepository topics;
     private final LessonRepository lessons;
@@ -25,15 +35,17 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     private final LessonCompletionRepository completions;
     private final ExternalRunnerLinkBuilder runners;
     private final ApplicationEventPublisher events;
+    private final JdbcTemplate jdbc;
 
     ContentServiceImpl(TopicRepository topics, LessonRepository lessons,
                        LearningPathRepository paths, CodeExampleRepository codeExamples,
                        LessonCompletionRepository completions,
                        ExternalRunnerLinkBuilder runners,
-                       ApplicationEventPublisher events) {
+                       ApplicationEventPublisher events,
+                       JdbcTemplate jdbc) {
         this.topics = topics; this.lessons = lessons; this.paths = paths;
         this.codeExamples = codeExamples; this.completions = completions;
-        this.runners = runners; this.events = events;
+        this.runners = runners; this.events = events; this.jdbc = jdbc;
     }
 
     @Override
@@ -72,6 +84,64 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     }
 
     @Override
+    public PathRoadmap getPathRoadmap(String slug, UUID userId) {
+        LearningPathEntity p = paths.findBySlug(slug)
+                .orElseThrow(() -> new ResourceNotFoundException("Path not found: " + slug));
+
+        List<TopicEntity> all =
+                topics.findByPathIdAndPublishedTrueOrderByDisplayOrder(p.getId());
+
+        Set<UUID> completedIds = userId == null ? Set.of() : completedTopicIds(userId, p.getId());
+
+        // group by level (1..5), preserving display order inside each group
+        Map<Integer, List<TopicEntity>> byLevel = all.stream()
+                .collect(Collectors.groupingBy(TopicEntity::getLevel,
+                        LinkedHashMap::new, Collectors.toList()));
+
+        List<LevelGroup> levels = new ArrayList<>();
+        for (int lvl = 1; lvl <= 5; lvl++) {
+            List<TopicEntity> bucket = byLevel.getOrDefault(lvl, List.of());
+            if (bucket.isEmpty()) continue;
+            int completedCount = 0;
+            List<TopicRoadmap> mapped = new ArrayList<>(bucket.size());
+            for (TopicEntity t : bucket) {
+                boolean done = completedIds.contains(t.getId());
+                if (done) completedCount++;
+                mapped.add(new TopicRoadmap(t.getSlug(), t.getTitle(),
+                        t.getEstimatedMins(), done,
+                        t.isHasVisualizer(), t.isHasCodeLab()));
+            }
+            levels.add(new LevelGroup(lvl, LEVEL_LABELS.getOrDefault(lvl, "Level " + lvl),
+                    bucket.size(), completedCount, mapped));
+        }
+
+        return new PathRoadmap(
+                new PathHeader(p.getSlug(), p.getTitle(), all.size()),
+                levels);
+    }
+
+    /** Returns the set of topic ids that the given user has completed (status='completed'). */
+    private Set<UUID> completedTopicIds(UUID userId, UUID pathId) {
+        try {
+            List<UUID> ids = jdbc.query(
+                    """
+                    select up.topic_id
+                      from user_progress up
+                      join topics t on t.id = up.topic_id
+                     where up.user_id = ?
+                       and up.status  = 'completed'
+                       and t.path_id  = ?
+                    """,
+                    (rs, i) -> (UUID) rs.getObject("topic_id"),
+                    userId, pathId);
+            return new HashSet<>(ids);
+        } catch (Exception ignored) {
+            // user_progress missing or query failure → treat as no completions
+            return Set.of();
+        }
+    }
+
+    @Override
     @Cacheable(value = CacheNames.LESSONS_BY_TOPIC, key = "#topicId")
     public List<LessonView> getLessonsByTopic(UUID topicId) {
         return lessons.findByTopicIdOrderBySection(topicId).stream()
@@ -102,16 +172,26 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     }
 
     private TopicDetail toDetail(TopicEntity t) {
+        // Populate per-layer MDX content from the `lessons` table (column section_type → content_mdx).
         Map<String, String> sections = new LinkedHashMap<>();
-        sections.put("why", t.getWhy());
-        sections.put("theory", t.getTheory());
-        sections.put("visual", t.getVisual());
-        sections.put("code", t.getCode());
-        sections.put("real_world", t.getRealWorld());
-        sections.put("interview", t.getInterview());
-        sections.put("feynman", t.getFeynman());
-        sections.put("build", t.getBuild());
-        sections.put("spaced_review", t.getSpacedReview());
+        sections.put("why", null);
+        sections.put("theory", null);
+        sections.put("visual", null);
+        sections.put("code", null);
+        sections.put("real_world", null);
+        sections.put("interview", null);
+        sections.put("feynman", null);
+        sections.put("build", null);
+        sections.put("spaced_review", null);
+        for (LessonEntity l : lessons.findByTopicIdOrderBySection(t.getId())) {
+            // Normalise legacy section names (e.g. "realworld" → "real_world", "spacedreview" → "spaced_review")
+            String key = switch (l.getSection() == null ? "" : l.getSection().toLowerCase()) {
+                case "realworld", "real-world" -> "real_world";
+                case "spacedreview", "spaced-review" -> "spaced_review";
+                default -> l.getSection() == null ? "" : l.getSection().toLowerCase();
+            };
+            if (sections.containsKey(key)) sections.put(key, l.getContent());
+        }
 
         var examples = codeExamples.findByTopicId(t.getId()).stream()
                 .map(c -> new CodeExampleView(c.getId(), c.getLanguage(), c.getCode(),

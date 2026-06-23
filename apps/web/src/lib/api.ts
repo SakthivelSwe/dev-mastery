@@ -81,10 +81,36 @@ export interface ActivityItem {
 export async function fetchTopic(slug: string): Promise<Topic | null> {
   try {
     const res = await fetch(`${CONTENT_API}/v1/topics/${slug}`, {
-      next: { revalidate: 3600 }, // Cache for 1 hour
+      // Always pull fresh content in dev so DB updates show up immediately.
+      cache: 'no-store',
     });
     if (!res.ok) return null;
-    return res.json();
+    const raw = await res.json();
+    // Backend returns `sections` with snake_case keys; frontend expects `layers` (camelCase).
+    const s = raw.sections ?? raw.layers ?? {};
+    const layers: TopicLayers = {
+      why:          s.why          ?? '',
+      theory:       s.theory       ?? '',
+      visual:       s.visual       ?? '',
+      code:         s.code         ?? '',
+      realWorld:    s.real_world   ?? s.realWorld   ?? '',
+      interview:    s.interview    ?? '',
+      feynman:      s.feynman      ?? '',
+      build:        s.build        ?? '',
+      spacedReview: s.spaced_review ?? s.spacedReview ?? '',
+    };
+    return {
+      id:           raw.id,
+      slug:         raw.slug,
+      title:        raw.title,
+      level:        raw.level,
+      pathSlug:     raw.pathSlug  ?? '',
+      pathTitle:    raw.pathTitle ?? '',
+      layers,
+      xpReward:     raw.xpReward      ?? 10,
+      estimatedMins: raw.estimatedMins ?? 25,
+      tags:         raw.tags ?? [],
+    };
   } catch {
     return null;
   }
@@ -111,6 +137,52 @@ export async function fetchAllPaths(): Promise<LearningPath[]> {
     return res.json();
   } catch {
     return [];
+  }
+}
+
+// ─── Roadmap ────────────────────────────────────────────────
+
+export interface RoadmapTopic {
+  slug: string;
+  title: string;
+  estimatedMins: number;
+  completed: boolean;
+  hasVisualizer: boolean;
+  hasCodeLab: boolean;
+}
+
+export interface RoadmapLevel {
+  level: number;
+  label: string;
+  topicCount: number;
+  completedCount: number;
+  topics: RoadmapTopic[];
+}
+
+export interface RoadmapResponse {
+  path: { slug: string; title: string; totalTopics: number };
+  levels: RoadmapLevel[];
+}
+
+/**
+ * Fetch the roadmap for a learning path. Forwards the bearer token (if any) so
+ * the backend can populate per-user "completed" flags.
+ */
+export async function fetchRoadmap(slug: string): Promise<RoadmapResponse | null> {
+  try {
+    const headers: Record<string, string> = {};
+    if (typeof window !== 'undefined') {
+      const token = localStorage.getItem('auth_token');
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+    }
+    const res = await fetch(`${CONTENT_API}/v1/paths/${slug}/roadmap`, {
+      headers,
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
   }
 }
 

@@ -4,41 +4,52 @@ import React, { useState } from 'react';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useRouter } from 'next/navigation';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+
 export default function RegisterPage() {
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const { login } = useAuthStore();
   const router = useRouter();
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setSubmitting(true);
 
     try {
-      const res = await fetch('http://localhost:8081/v1/auth/register', {
+      const res = await fetch(`${API_BASE}/v1/auth/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fullName, email, password }),
       });
 
       if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.message || 'Registration failed');
+        let msg = `Registration failed (${res.status})`;
+        try {
+          const errorData = await res.json();
+          msg = errorData.message || errorData.error || msg;
+        } catch { /* non-JSON response */ }
+        throw new Error(msg);
       }
 
       const data = await res.json();
+      // Backend shape: { token, user: { id, email, fullName, roles } }
       login(data.token, {
-        id: data.id,
-        email: data.email,
-        fullName: data.fullName,
-        role: data.role,
+        id: data.user.id,
+        email: data.user.email,
+        fullName: data.user.fullName,
+        roles: data.user.roles ?? [],
       });
 
-      router.push('/');
+      router.push('/dashboard');
     } catch (err: any) {
-      setError(err.message);
+      setError(err?.message || 'Network error — is the backend running?');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -86,18 +97,19 @@ export default function RegisterPage() {
             <input 
               type="password" 
               required
-              minLength={6}
+              minLength={8}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="mt-1 w-full bg-background border border-border rounded-md px-4 py-2 text-sm focus:outline-none focus:border-primary"
-              placeholder="••••••••"
+              placeholder="At least 8 characters"
             />
           </div>
           <button 
             type="submit" 
-            className="w-full bg-primary text-primary-foreground font-semibold py-2.5 rounded-md hover:opacity-90 transition-opacity mt-2"
+            disabled={submitting}
+            className="w-full bg-primary text-primary-foreground font-semibold py-2.5 rounded-md hover:opacity-90 transition-opacity mt-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Create Account
+            {submitting ? 'Creating…' : 'Create Account'}
           </button>
         </form>
         

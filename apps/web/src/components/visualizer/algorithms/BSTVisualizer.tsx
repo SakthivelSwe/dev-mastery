@@ -34,8 +34,17 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
     const height = svgRef.current.clientHeight;
     const transitionDuration = 700 / speed;
 
+    // Bail out cleanly if the container hasn't been laid out yet or the data
+    // isn't a usable array of numbers — prevents `d.source.x` undefined errors
+    // when this visualizer is mounted for a topic that doesn't actually use it.
+    if (width < 80 || height < 100) return;
+
+    const cleanData = Array.isArray(data)
+      ? data.map(v => (typeof v === 'number' ? v : parseFloat(String(v)))).filter(v => !Number.isNaN(v))
+      : [];
+
     let root: TreeNode | null = null;
-    data.forEach((val) => {
+    cleanData.forEach((val) => {
       root = insertNode(root, val);
     });
 
@@ -59,13 +68,18 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
       return children.length > 0 ? children : null;
     });
 
-    const treeLayout = d3.tree<TreeNode>().size([width - 80, height - 100]);
+    const treeLayout = d3.tree<TreeNode>().size([Math.max(40, width - 80), Math.max(40, height - 100)]);
     treeLayout(rootHierarchy);
 
     // ─── LINKS ────────────────────────────────────────────────────────────
-    const linkData = rootHierarchy.links();
+    const linkData = rootHierarchy.links().filter(
+      (l: any) => l?.source && l?.target && l.source.x != null && l.target.x != null
+    );
     const links = g.selectAll<SVGPathElement, any>('path.link')
       .data(linkData, (d: any) => `${d.source.data.id}->${d.target.data.id}`);
+
+    const safeX = (d: any) => (d && typeof d.x === 'number' ? d.x : 0);
+    const safeY = (d: any) => (d && typeof d.y === 'number' ? d.y : 0);
 
     const enterLinks = links.enter()
       .append('path')
@@ -75,8 +89,8 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
       .attr('stroke-width', 2)
       .style("opacity", 0)
       .attr('d', d3.linkVertical<any, any>()
-        .x(d => d.source.x + 40) // center adjust
-        .y(d => d.source.y)
+        .x((d: any) => safeX(d?.source) + 40)
+        .y((d: any) => safeY(d?.source))
       );
 
     const mergedLinks = enterLinks.merge(links);
@@ -84,8 +98,8 @@ export default function BSTVisualizer({ data, speed, stepMode }: BSTVisualizerPr
       .duration(transitionDuration)
       .style("opacity", 1)
       .attr('d', d3.linkVertical<any, any>()
-        .x(d => d.x + 40)
-        .y(d => d.y)
+        .x((d: any) => safeX(d) + 40)
+        .y((d: any) => safeY(d))
       );
 
     links.exit()

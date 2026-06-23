@@ -10,6 +10,7 @@ import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
 import BuildChallengePanel from './BuildChallengePanel';
 import SpacedReviewWidget from './SpacedReviewWidget';
+import { MarkdownView } from './MarkdownView';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { markLayerComplete } from '@/lib/api';
@@ -17,10 +18,9 @@ import { markLayerComplete } from '@/lib/api';
 interface TopicPageProps {
   topicSlug:  string;
   topic:       Topic | null;
-  MdxRenderer: React.ComponentType<{ source: string; className?: string }>;
 }
 
-export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPageProps) {
+export default function TopicPage({ topicSlug, topic }: TopicPageProps) {
   const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat();
@@ -69,9 +69,9 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
 
     switch (activeTab as TabState) {
       case 'why':
-        return <MdxRenderer source={topic.layers.why} />;
+        return <MarkdownView source={topic.layers.why} />;
       case 'theory':
-        return <MdxRenderer source={topic.layers.theory} />;
+        return <MarkdownView source={topic.layers.theory} />;
       case 'visualizer':
         return <VisualizerShell topicSlug={topicSlug} />;
       case 'code':
@@ -81,9 +81,9 @@ export default function TopicPage({ topicSlug, topic, MdxRenderer }: TopicPagePr
           </div>
         );
       case 'real-world':
-        return <MdxRenderer source={topic.layers.realWorld} />;
+        return <MarkdownView source={topic.layers.realWorld} />;
       case 'interview':
-        return <MdxRenderer source={topic.layers.interview} />;
+        return <MarkdownView source={topic.layers.interview} />;
       case 'feynman':
         return <FeynmanCheckPanel topicSlug={topicSlug} topicTitle={topic.title} />;
       case 'build':

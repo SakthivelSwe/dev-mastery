@@ -3,7 +3,7 @@ import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client';
 import { v4 as uuidv4 } from 'uuid';
 
-const EXECUTION_API = process.env.NEXT_PUBLIC_EXECUTION_API_URL || 'http://localhost:8085';
+const EXECUTION_API = process.env.NEXT_PUBLIC_EXECUTION_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 export interface CodeExecutionResult {
   stdout: string | null;

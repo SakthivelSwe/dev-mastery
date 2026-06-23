@@ -17,15 +17,19 @@ interface PathConfig {
   icon:   React.ReactNode;
   color:  string;
   group:  string;
+  /** Optional href override — by default a path opens its roadmap. */
+  href?:  string;
 }
 
 const PATHS: PathConfig[] = [
   // Backend
   { slug: 'java-mastery',       label: 'Java Mastery',         icon: <Coffee size={16} />,   color: 'var(--accent-java)',    group: 'Backend' },
   { slug: 'spring-boot',        label: 'Spring Boot',          icon: <Server size={16} />,   color: 'var(--accent-spring)',  group: 'Backend' },
+  { slug: 'microservices',      label: 'Microservices',        icon: <Network size={16} />,  color: 'var(--accent-spring)',  group: 'Backend' },
   // Algorithms
   { slug: 'dsa',                label: 'DSA & Algorithms',     icon: <GitBranch size={16} />, color: 'var(--accent-dsa)',    group: 'Algorithms' },
-  { slug: 'leetcode-patterns',  label: 'LeetCode Patterns',    icon: <Cpu size={16} />,      color: 'var(--accent-dsa)',     group: 'Algorithms' },
+  // LeetCode Patterns is a dedicated page (not a learning-path roadmap)
+  { slug: 'leetcode-patterns',  label: 'LeetCode Patterns',    icon: <Cpu size={16} />,      color: 'var(--accent-dsa)',     group: 'Algorithms', href: '/patterns' },
   // Frontend
   { slug: 'javascript',         label: 'JavaScript',           icon: <FileCode size={16} />, color: '#F7DF1E',               group: 'Frontend' },
   { slug: 'typescript',         label: 'TypeScript',           icon: <Code2 size={16} />,    color: '#3178C6',               group: 'Frontend' },
@@ -118,11 +122,14 @@ export function Sidebar({ className = '' }: SidebarProps) {
               {(isOpen || collapsed) && (
                 <div className="mt-0.5 space-y-0.5">
                   {groupPaths.map(path => {
-                    const isActive = pathname.includes(`/learn/${path.slug}`);
+                    const targetHref = path.href ?? `/learn/${path.slug}/roadmap`;
+                    const isActive = path.href
+                      ? pathname.startsWith(path.href)
+                      : pathname.includes(`/learn/${path.slug}`);
                     return (
                       <Link
                         key={path.slug}
-                        href={`/learn/${path.slug}/roadmap`}
+                        href={targetHref}
                         title={path.label}
                         className={`
                           flex items-center gap-2.5 px-2 py-2 rounded-lg text-sm transition-all duration-150 group

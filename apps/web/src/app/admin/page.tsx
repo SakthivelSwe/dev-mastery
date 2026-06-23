@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { Layers, CheckCircle, FileEdit, AlertCircle } from 'lucide-react';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+
 interface PathStats {
   pathSlug: string;
   pathTitle: string;
@@ -26,7 +28,7 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('http://localhost:8082/admin/topics/stats')
+    fetch(`${API_BASE}/admin/topics/stats`)
       .then((res) => res.json())
       .then((data) => {
         setStats(data);

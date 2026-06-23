@@ -2,12 +2,18 @@ package com.devmastery.content.internal;
 
 import jakarta.persistence.*;
 import lombok.*;
-import org.hibernate.annotations.JdbcTypeCode;
-import org.hibernate.type.SqlTypes;
 
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Topic entity — mapped against the Supabase {@code topics} schema (V≥5).
+ *
+ * The original design stored the six "learning layers" (why/theory/visual/...)
+ * directly on the topic. The current schema moves them into the {@code lessons}
+ * table, so those Java fields are kept as {@link Transient} for backwards
+ * compatibility with existing service code (they remain {@code null}).
+ */
 @Entity
 @Table(name = "topics")
 @Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
@@ -30,30 +36,35 @@ class TopicEntity {
     @Column(nullable = false)
     private int level;
 
-    @Column(name = "display_order")
+    /** Supabase column is {@code order_index}. */
+    @Column(name = "order_index")
     private int displayOrder;
 
-    @Column(nullable = false)
-    private String status; // draft | published
-
-    @Column(name = "xp_reward")
-    private int xpReward;
+    /** Supabase uses a boolean {@code is_published}; we expose it as a string. */
+    @Column(name = "is_published", nullable = false)
+    private boolean published;
 
     @Column(name = "estimated_mins")
     private int estimatedMins;
 
-    @JdbcTypeCode(SqlTypes.JSON)
-    @Column(columnDefinition = "jsonb")
-    private List<String> tags;
+    @Column(name = "has_visualizer")
+    private boolean hasVisualizer;
 
-    // Six learning layers — stored inline for simplicity.
-    @Column(columnDefinition = "text") private String why;
-    @Column(columnDefinition = "text") private String theory;
-    @Column(columnDefinition = "text") private String visual;
-    @Column(columnDefinition = "text") private String code;
-    @Column(name = "real_world", columnDefinition = "text") private String realWorld;
-    @Column(columnDefinition = "text") private String interview;
-    @Column(columnDefinition = "text") private String feynman;
-    @Column(columnDefinition = "text") private String build;
-    @Column(name = "spaced_review", columnDefinition = "text") private String spacedReview;
+    @Column(name = "has_code_lab")
+    private boolean hasCodeLab;
+
+    // ── Fields not present in the V≥5 schema — kept transient so existing code
+    //    that touches them still compiles and returns sensible defaults. ─────
+    @Transient private int xpReward;
+    @Transient private List<String> tags;
+    @Transient private String status;
+    @Transient private String why;
+    @Transient private String theory;
+    @Transient private String visual;
+    @Transient private String code;
+    @Transient private String realWorld;
+    @Transient private String interview;
+    @Transient private String feynman;
+    @Transient private String build;
+    @Transient private String spacedReview;
 }

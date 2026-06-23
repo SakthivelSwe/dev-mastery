@@ -27,6 +27,8 @@ class CodeExampleEntity {
     @Column(columnDefinition = "text")
     private String explanation;
 
-    @Column(name = "expected_output", columnDefinition = "text")
+    /** Legacy column — does not exist in the Supabase {@code code_examples} table.
+     *  Kept on the entity for back-compat with {@code ContentService} mappers. */
+    @Transient
     private String expectedOutput;
 }

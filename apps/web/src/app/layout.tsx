@@ -44,8 +44,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
-        {/* Blocking script — must run before paint to avoid theme flash */}
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        {/* Blocking script — must run before paint to avoid theme flash.
+            suppressHydrationWarning tolerates third-party (e.g. browser
+            extension) mutations of this <script> node. */}
+        <script
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: themeScript }}
+        />
         {/* Fonts — preconnect for performance */}
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
