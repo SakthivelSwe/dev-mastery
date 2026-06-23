@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useTopicStore, TabState } from '@/store/useTopicStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import LessonNav from './LessonNav';
-import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap } from 'lucide-react';
+import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap, RefreshCw, AlertCircle } from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
 import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import FeynmanCheckPanel from './FeynmanCheckPanel';
@@ -13,14 +13,16 @@ import SpacedReviewWidget from './SpacedReviewWidget';
 import { MarkdownView } from './MarkdownView';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
-import { markLayerComplete } from '@/lib/api';
+import { fetchTopic, markLayerComplete } from '@/lib/api';
+
+const COLD_START_TIMEOUT_MS = 15_000; // after 15s show "backend waking up" message
 
 interface TopicPageProps {
   topicSlug:  string;
   topic:       Topic | null;
 }
 
-export default function TopicPage({ topicSlug, topic }: TopicPageProps) {
+export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageProps) {
   const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat();
@@ -29,6 +31,36 @@ export default function TopicPage({ topicSlug, topic }: TopicPageProps) {
   const [xpFlash, setXpFlash]       = useState(false);
   const startTime = useRef(Date.now());
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Client-side fallback: if SSR returned null (cold backend), retry here
+  const [topic, setTopic] = useState<Topic | null>(initialTopic);
+  const [fetchError, setFetchError] = useState(false);
+  const [waitingTooLong, setWaitingTooLong] = useState(false);
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const loadTopic = useCallback(async () => {
+    setFetchError(false);
+    setWaitingTooLong(false);
+    try {
+      const data = await fetchTopic(topicSlug);
+      if (data) {
+        setTopic(data);
+      } else {
+        setFetchError(true);
+      }
+    } catch {
+      setFetchError(true);
+    }
+  }, [topicSlug]);
+
+  useEffect(() => {
+    if (initialTopic) { setTopic(initialTopic); return; }
+    // SSR returned null — start client-side fetch
+    loadTopic();
+    // After COLD_START_TIMEOUT_MS show a "waking up" hint
+    retryRef.current = setTimeout(() => setWaitingTooLong(true), COLD_START_TIMEOUT_MS);
+    return () => { if (retryRef.current) clearTimeout(retryRef.current); };
+  }, [topicSlug, initialTopic, loadTopic]);
 
   // Scroll AI chat to bottom on new messages
   useEffect(() => {
@@ -59,10 +91,30 @@ export default function TopicPage({ topicSlug, topic }: TopicPageProps) {
 
   const renderContent = () => {
     if (!topic) {
+      if (fetchError) {
+        return (
+          <div className="flex flex-col items-center justify-center h-full gap-4 text-[--text-muted]">
+            <AlertCircle size={32} className="text-red-400" />
+            <span className="text-sm text-[--text-secondary] font-medium">Could not load topic content.</span>
+            <button
+              onClick={loadTopic}
+              className="flex items-center gap-2 text-xs px-4 py-2 rounded-lg bg-[--bg-elevated] border border-[--border-default] hover:border-indigo-500/50 transition-all"
+            >
+              <RefreshCw size={13} /> Retry
+            </button>
+          </div>
+        );
+      }
       return (
-        <div className="flex flex-col items-center justify-center h-full gap-4 text-[--text-muted]">
-          <Loader2 className="animate-spin" size={32} />
-          <span className="text-sm">Loading topic content...</span>
+        <div className="flex flex-col items-center justify-center h-full gap-3 text-[--text-muted]">
+          <Loader2 className="animate-spin text-indigo-400" size={32} />
+          <span className="text-sm font-medium text-[--text-secondary]">Loading topic content…</span>
+          {waitingTooLong && (
+            <div className="flex flex-col items-center gap-2 mt-1 max-w-xs text-center">
+              <span className="text-xs text-amber-400">⚡ The backend is waking up from sleep (Render free tier).</span>
+              <span className="text-xs text-[--text-muted]">This can take up to 60 s on first visit. Subsequent loads will be instant.</span>
+            </div>
+          )}
         </div>
       );
     }
