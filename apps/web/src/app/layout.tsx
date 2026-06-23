@@ -1,6 +1,10 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import './globals.css';
+
+// Required by @cloudflare/next-on-pages: every route segment must run on the
+// Edge runtime. Setting this on the root layout propagates to all child routes.
+export const runtime = 'edge';
 
 export const metadata: Metadata = {
   title: {
@@ -20,6 +24,10 @@ export const metadata: Metadata = {
   robots: { index: true, follow: true },
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'),
   manifest: '/manifest.json',
+};
+
+// Next.js 15 moved themeColor / viewport out of metadata into its own export.
+export const viewport: Viewport = {
   themeColor: '#0d1117',
 };
 
