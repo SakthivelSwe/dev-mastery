@@ -215,15 +215,15 @@ export async function markLayerComplete(
   userId: string,
   topicSlug: string,
   layer: string,
-  timeSpentSecs: number
+  timeSpentSecs: number,
+  token?: string | null
 ): Promise<boolean> {
   try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
     const res = await fetch(`${PROGRESS_API}/v1/progress/layer-complete`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Id': userId,
-      },
+      headers,
       body: JSON.stringify({ topicSlug, layer, timeSpentSecs }),
     });
     return res.ok;
