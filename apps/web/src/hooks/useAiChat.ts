@@ -1,6 +1,14 @@
 import { useState, useCallback, useRef } from 'react';
+import { useAuthStore } from '@/store/useAuthStore';
 
 const AI_API = process.env.NEXT_PUBLIC_AI_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+
+/** Build headers with optional Authorization. */
+function authHeaders(token: string | null | undefined): HeadersInit {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) h['Authorization'] = `Bearer ${token}`;
+  return h;
+}
 
 export interface ChatMessage {
   role:    'user' | 'ai';
@@ -22,6 +30,7 @@ interface UseAiChatOptions {
  */
 export function useAiChat(options: UseAiChatOptions = {}) {
   const { topicSlug = 'general', sectionType, initialMessage } = options;
+  const token = useAuthStore(s => s.token);
 
   const [messages, setMessages] = useState<ChatMessage[]>(
     initialMessage
@@ -49,15 +58,19 @@ export function useAiChat(options: UseAiChatOptions = {}) {
     try {
       const response = await fetch(`${AI_API}/v1/ai/chat`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(token),
         body:    JSON.stringify({
-          message:     userText,
+          userQuery:   userText,   // matches ChatRequest.userQuery() on the backend
           topicSlug,
           sectionType: sectionType ?? null,
+          history:     [],
         }),
         signal: abortRef.current.signal,
       });
 
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Please sign in to use the AI assistant.');
+      }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       if (!response.body) throw new Error('No response body');
 
@@ -98,18 +111,22 @@ export function useAiChat(options: UseAiChatOptions = {}) {
       if (err.name === 'AbortError') return; // User cancelled — silent
 
       console.error('[useAiChat] Error:', err);
+      const msg =
+        err?.message?.startsWith('Please sign in')
+          ? err.message
+          : "I'm having trouble connecting right now. Please check that the AI service is running and try again.";
       setMessages(prev => {
         const updated = [...prev];
         updated[updated.length - 1] = {
           ...updated[updated.length - 1],
-          content: "I'm having trouble connecting right now. Please check that the AI service is running and try again.",
+          content: msg,
         };
         return updated;
       });
     } finally {
       setIsLoading(false);
     }
-  }, [topicSlug, sectionType, isLoading]);
+  }, [topicSlug, sectionType, isLoading, token]);
 
   const clearMessages = useCallback(() => {
     abortRef.current?.abort();
@@ -129,6 +146,7 @@ export interface FeynmanScore {
 }
 
 export function useFeynmanScore() {
+  const token = useAuthStore(s => s.token);
   const [result, setResult]   = useState<FeynmanScore | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError]     = useState<string | null>(null);
@@ -141,7 +159,7 @@ export function useFeynmanScore() {
     try {
       const res = await fetch(`${AI_API}/v1/ai/feynman/score`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(token),
         body:    JSON.stringify({ topicSlug, topicTitle, explanation }),
       });
 
