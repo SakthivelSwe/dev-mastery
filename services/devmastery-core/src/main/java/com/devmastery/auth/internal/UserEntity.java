@@ -22,17 +22,22 @@ class UserEntity {
     @Column(name = "password_hash", nullable = false)
     private String passwordHash;
 
-    @Column(name = "full_name")
+    /**
+     * The Supabase schema column is {@code name} (not {@code full_name}).
+     * We keep the Java field {@code fullName} so the API response shape
+     * ({@code AuthService.UserView.fullName}) stays stable.
+     */
+    @Column(name = "name", nullable = false)
     private String fullName;
 
-    @Column(name = "auth_provider")
-    private String authProvider; // "local", "google" etc.
+    @Column(name = "auth_provider", nullable = false)
+    private String authProvider; // CHECK: 'google' | 'github' | 'email'
 
     @Column(nullable = false)
-    private String role; // USER | ADMIN
+    private String role; // CHECK: 'user' | 'admin'
 
     @Column(nullable = false)
-    private String subscription; // free | premium
+    private String subscription; // CHECK: 'free' | 'pro'
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
@@ -40,8 +45,8 @@ class UserEntity {
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = Instant.now();
-        if (role == null) role = "USER";
+        if (role == null) role = "user";
         if (subscription == null) subscription = "free";
-        if (authProvider == null) authProvider = "local";
+        if (authProvider == null) authProvider = "email";
     }
 }

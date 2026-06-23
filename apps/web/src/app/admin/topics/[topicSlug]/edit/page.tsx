@@ -7,6 +7,7 @@ import Editor from '@monaco-editor/react';
 import { MDXRemote } from 'next-mdx-remote';
 
 const SECTIONS = ['why', 'theory', 'visual', 'code', 'realworld', 'interview'];
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 interface TopicData {
   id: string;
@@ -38,7 +39,7 @@ export default function AdminTopicEditor({ params }: { params: Promise<{ topicSl
 
   // Fetch topic data
   useEffect(() => {
-    fetch(`http://localhost:8082/v1/topics/${topicSlug}`)
+    fetch(`${API_BASE}/v1/topics/${topicSlug}`)
       .then((res) => res.json())
       .then((data: TopicData) => {
         setTopic(data);
@@ -87,7 +88,7 @@ export default function AdminTopicEditor({ params }: { params: Promise<{ topicSl
     if (!topic) return;
     setIsSaving(true);
     try {
-      await fetch(`http://localhost:8082/admin/topics/${topic.slug}/draft`, {
+      await fetch(`${API_BASE}/admin/topics/${topic.slug}/draft`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

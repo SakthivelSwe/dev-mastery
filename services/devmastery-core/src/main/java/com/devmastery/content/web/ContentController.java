@@ -46,6 +46,13 @@ public class ContentController {
         return content.getPathBySlug(slug);
     }
 
+    @GetMapping("/paths/{slug}/roadmap")
+    public ContentService.PathRoadmap roadmap(
+            @PathVariable String slug,
+            @AuthenticationPrincipal UUID userId) {
+        return content.getPathRoadmap(slug, userId);
+    }
+
     @PostMapping("/lessons/{lessonId}/complete")
     public void completeLesson(
             @AuthenticationPrincipal UUID userId,

@@ -1,35 +1,34 @@
-package com.devmastery.content.internal;
+package com.devmastery.patterns.internal;
 
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.time.Instant;
 import java.util.UUID;
 
 @Entity
-@Table(name = "learning_paths")
+@Table(name = "problem_patterns")
 @Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
-class LearningPathEntity {
+class ProblemPatternEntity {
 
     @Id
     @GeneratedValue
     @Column(columnDefinition = "uuid")
     private UUID id;
 
+    @Column(nullable = false)
+    private String name;
+
     @Column(nullable = false, unique = true)
     private String slug;
-
-    @Column(nullable = false)
-    private String title;
 
     @Column(columnDefinition = "text")
     private String description;
 
-    private String icon;
+    @Column(name = "difficulty_level")
+    private String difficultyLevel;
 
-    @Column(name = "accent_color")
-    private String accentColor;
-
-    /** Supabase column is {@code order_index}. */
-    @Column(name = "order_index")
-    private int displayOrder;
+    @Column(name = "created_at")
+    private Instant createdAt;
 }
+

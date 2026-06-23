@@ -7,7 +7,24 @@ import { visualizerRegistry } from './VisualizerRegistry';
 import CustomInputPanel from './CustomInputPanel';
 
 export default function VisualizerShell({ topicSlug = 'binary-search-tree' }: { topicSlug?: string }) {
-  const visualizerConfig = visualizerRegistry[topicSlug] || visualizerRegistry['binary-search-tree'];
+  // Only render a visualizer if this topic actually has one registered.
+  // Otherwise show a friendly placeholder instead of crashing inside a default viz.
+  const visualizerConfig = visualizerRegistry[topicSlug];
+  if (!visualizerConfig) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-center px-6">
+        <div className="w-14 h-14 rounded-2xl bg-[--bg-elevated] border border-[--border-default] flex items-center justify-center mb-4">
+          <Play size={22} className="text-[--text-muted]" />
+        </div>
+        <h3 className="text-lg font-semibold text-[--text-primary] mb-1">No visualizer for this topic</h3>
+        <p className="text-sm text-[--text-secondary] max-w-md">
+          Interactive visualisers are available on selected algorithm and data-structure topics
+          (Binary Search Tree, Linked List, Heap, Trie, Graph, DP…). Continue with the other layers
+          to learn this topic.
+        </p>
+      </div>
+    );
+  }
   const VisualizerComponent = visualizerConfig.component;
   
   const [data, setData] = useState<any>(visualizerConfig.defaultData);

@@ -18,9 +18,11 @@ class LessonEntity {
     @Column(name = "topic_id", nullable = false, columnDefinition = "uuid")
     private UUID topicId;
 
-    @Column(nullable = false)
+    /** Supabase column is {@code section_type} (CHECK why|theory|...|spacedreview). */
+    @Column(name = "section_type", nullable = false)
     private String section;
 
-    @Column(columnDefinition = "text")
+    /** Supabase column is {@code content_mdx}. */
+    @Column(name = "content_mdx", columnDefinition = "text")
     private String content;
 }

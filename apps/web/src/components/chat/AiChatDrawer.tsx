@@ -44,7 +44,8 @@ export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClo
       setMessages(prev => [...prev, { role: 'ai', content: '', isStreaming: true }]);
 
       // NOTE: We connect to the backend ai-bot-service directly (port 8084)
-      const response = await fetch('http://localhost:8084/v1/ai/chat', {
+      const API_BASE = process.env.NEXT_PUBLIC_AI_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+      const response = await fetch(`${API_BASE}/v1/ai/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

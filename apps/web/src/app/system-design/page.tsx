@@ -4,6 +4,8 @@ import React, { useEffect, useState } from 'react';
 import SystemDesignViewer from '@/components/system-design/SystemDesignViewer';
 // Uses direct fetch since system-design uses a different path than standard content API
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+
 export default function SystemDesignPage() {
   const [architectures, setArchitectures] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -13,7 +15,7 @@ export default function SystemDesignPage() {
   useEffect(() => {
     async function loadArchitectures() {
       try {
-        const res = await fetch('http://localhost:8082/v1/system-design');
+        const res = await fetch(`${API_BASE}/v1/system-design`);
         if (!res.ok) throw new Error('Failed');
         const data = await res.json();
         setArchitectures(data);
@@ -31,7 +33,7 @@ export default function SystemDesignPage() {
     if (!activeSlug) return;
     async function loadDetails() {
       try {
-        const res = await fetch(`http://localhost:8082/v1/system-design/${activeSlug}`);
+        const res = await fetch(`${API_BASE}/v1/system-design/${activeSlug}`);
         if (!res.ok) throw new Error('Failed');
         const data = await res.json();
         setActiveArchitecture(data);

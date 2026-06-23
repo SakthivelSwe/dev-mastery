@@ -17,6 +17,6 @@ class SpacedReviewEntity {
     @Column(name = "topic_id", nullable = false, columnDefinition = "uuid") private UUID topicId;
     @Column(name = "next_review_date", nullable = false) private LocalDate nextReviewDate;
     @Column(name = "interval_days", nullable = false) private int intervalDays;
-    @Column(name = "ease_factor", nullable = false) private double easeFactor;
+    @Column(name = "easiness_factor", nullable = false) private double easeFactor;
     @Column(nullable = false) private int repetitions;
 }

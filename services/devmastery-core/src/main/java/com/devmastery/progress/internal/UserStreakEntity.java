@@ -16,5 +16,5 @@ class UserStreakEntity {
     private UUID userId;
     @Column(name = "current_streak", nullable = false) private int currentStreak;
     @Column(name = "longest_streak", nullable = false) private int longestStreak;
-    @Column(name = "last_activity_date") private LocalDate lastActivityDate;
+    @Column(name = "last_activity") private LocalDate lastActivityDate;
 }

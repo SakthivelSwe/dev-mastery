@@ -17,6 +17,13 @@ public interface ContentService {
 
     List<LessonView> getLessonsByTopic(UUID topicId);
 
+    /**
+     * Roadmap view of a learning path — topics grouped by skill level (1–5)
+     * with per-user completion flags. {@code userId} may be {@code null} for
+     * unauthenticated visitors (everything will be marked not-completed).
+     */
+    PathRoadmap getPathRoadmap(String slug, UUID userId);
+
     record PathSummary(UUID id, String slug, String title, String description, String icon) { }
 
     record PathDetail(UUID id, String slug, String title, String description,
@@ -34,4 +41,15 @@ public interface ContentService {
 
     record CodeExampleView(UUID id, String language, String code, String explanation,
                            String expectedOutput, String tryOnlineUrl) { }
+
+    // ── Roadmap DTOs (match frontend RoadmapCanvas types) ───────────────────
+    record PathRoadmap(PathHeader path, List<LevelGroup> levels) { }
+
+    record PathHeader(String slug, String title, int totalTopics) { }
+
+    record LevelGroup(int level, String label, int topicCount, int completedCount,
+                      List<TopicRoadmap> topics) { }
+
+    record TopicRoadmap(String slug, String title, int estimatedMins,
+                        boolean completed, boolean hasVisualizer, boolean hasCodeLab) { }
 }

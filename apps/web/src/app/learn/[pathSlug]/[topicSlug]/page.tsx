@@ -1,8 +1,6 @@
 import { Metadata } from 'next';
-import { notFound } from 'next/navigation';
 import TopicPage from '@/components/topic/TopicPage';
-import { MdxRenderer } from '@/components/topic/MdxRenderer';
-import { fetchTopic, fetchPath } from '@/lib/api';
+import { fetchTopic } from '@/lib/api';
 import Link from 'next/link';
 
 interface PageProps {
@@ -29,12 +27,11 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
 export default async function TopicPageRoute({ params }: PageProps) {
   const { pathSlug, topicSlug } = await params;
-  // Fetch topic data server-side (SSR)
+  // Fetch topic data server-side (SSR). MDX rendering happens client-side
+  // via <MarkdownView/> inside <TopicPage/> — we cannot pass React elements
+  // from server components across the RSC boundary into a client component
+  // without React version mismatches, so we just pass the raw strings.
   const topic = await fetchTopic(topicSlug);
-
-  // If topic genuinely doesn't exist in DB, show 404
-  // (comment out for dev if backend is off)
-  // if (!topic) notFound();
 
   return (
     <div className="flex flex-col h-screen overflow-hidden">
@@ -60,11 +57,7 @@ export default async function TopicPageRoute({ params }: PageProps) {
 
       {/* Topic Page — takes up remaining height */}
       <main className="flex-1 overflow-hidden">
-        <TopicPage
-          topicSlug={topicSlug}
-          topic={topic}
-          MdxRenderer={MdxRenderer}
-        />
+        <TopicPage topicSlug={topicSlug} topic={topic} />
       </main>
     </div>
   );

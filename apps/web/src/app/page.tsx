@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 
-/* ─── Learning Path data (matches V6 seed migration) ─────────── */
+/* ─── Learning Path data — slugs MUST match learning_paths.slug in the DB ─── */
 const LEARNING_PATHS = [
   {
     slug: 'java-mastery',
@@ -17,7 +17,7 @@ const LEARNING_PATHS = [
     gradient: 'gradient-java',
   },
   {
-    slug: 'dsa-mastery',
+    slug: 'dsa',
     title: 'DSA Mastery',
     description: 'Arrays → Trees → Graphs → DP → Greedy → Backtracking. Crack any coding interview.',
     icon: '🧩',
@@ -28,7 +28,7 @@ const LEARNING_PATHS = [
     gradient: 'gradient-kotlin',
   },
   {
-    slug: 'spring-boot-mastery',
+    slug: 'spring-boot',
     title: 'Spring Boot Mastery',
     description: 'Spring Core → REST → JPA → Security → Microservices → Kafka → Valkey',
     icon: '🌱',
@@ -39,9 +39,9 @@ const LEARNING_PATHS = [
     gradient: 'gradient-spring',
   },
   {
-    slug: 'frontend-mastery',
-    title: 'Frontend Mastery',
-    description: 'HTML/CSS → JavaScript → TypeScript → React → Angular → Next.js → RxJS',
+    slug: 'react',
+    title: 'React',
+    description: 'Hooks → State Management → Performance → Patterns → Next.js → RxJS',
     icon: '⚛️',
     accent: 'var(--accent-react)',
     level: '1–5',
@@ -50,7 +50,7 @@ const LEARNING_PATHS = [
     gradient: 'gradient-react',
   },
   {
-    slug: 'system-design-mastery',
+    slug: 'system-design',
     title: 'System Design',
     description: 'Scalability → CAP Theorem → Caching → Sharding → Message Queues → Case Studies',
     icon: '🏗️',
@@ -61,9 +61,9 @@ const LEARNING_PATHS = [
     gradient: 'gradient-java',
   },
   {
-    slug: 'design-patterns',
-    title: 'Design Patterns',
-    description: 'All 23 GoF patterns + Architectural patterns. Creational → Structural → Behavioral',
+    slug: 'software-architecture',
+    title: 'Software Architecture',
+    description: 'Layered, Hexagonal, Event-driven, Microservices, DDD, CQRS, Saga patterns.',
     icon: '🔷',
     accent: 'var(--accent-ai)',
     level: '2–5',
@@ -72,14 +72,25 @@ const LEARNING_PATHS = [
     gradient: 'gradient-ai',
   },
   {
-    slug: 'interview-preparation',
-    title: 'Interview Prep',
-    description: '450 problems · 2000+ MCQs · LLD · HLD · Mock Interviews with AI',
+    slug: 'leetcode-patterns',
+    title: 'LeetCode Patterns',
+    description: '20 universal coding patterns · Two pointers, sliding window, BFS/DFS, DP, and more.',
     icon: '🎯',
     accent: 'var(--accent-interview)',
     level: '2–5',
     topics: 40,
     hours: 40,
+    gradient: 'gradient-spring',
+  },
+  {
+    slug: 'microservices',
+    title: 'Microservices with Spring',
+    description: 'Design and ship production-grade microservices · Spring Cloud, Resilience4j, Kafka, Kubernetes.',
+    icon: '🧬',
+    accent: 'var(--accent-spring)',
+    level: '1–5',
+    topics: 28,
+    hours: 120,
     gradient: 'gradient-spring',
   },
 ];
@@ -159,19 +170,21 @@ function Navbar() {
 
         {/* CTA */}
         <div className="flex items-center gap-3">
-          <button
+          <Link
+            href="/login"
             id="nav-signin"
             className="btn-ghost text-sm px-4 py-2"
             style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-default)' }}
           >
             Sign In
-          </button>
-          <button
+          </Link>
+          <Link
+            href="/register"
             id="nav-getstarted"
             className="btn-primary text-sm px-4 py-2"
           >
             Get Started Free
-          </button>
+          </Link>
         </div>
       </div>
     </nav>
@@ -242,18 +255,20 @@ function Hero() {
 
         {/* CTA buttons */}
         <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-          <button
+          <Link
+            href="/register"
             id="hero-start"
             className="btn-primary text-base px-8 py-3.5 w-full sm:w-auto"
           >
             Start Learning Free →
-          </button>
-          <button
+          </Link>
+          <a
+            href="#paths"
             id="hero-paths"
             className="btn-ghost text-base px-8 py-3.5 w-full sm:w-auto"
           >
             Browse Learning Paths
-          </button>
+          </a>
         </div>
 
         {/* Stats */}
@@ -290,9 +305,10 @@ function PathCard({ path }: { path: typeof LEARNING_PATHS[0] }) {
   const [hovered, setHovered] = useState(false);
 
   return (
-    <div
+    <Link
+      href={`/learn/${path.slug}/roadmap`}
       id={`path-card-${path.slug}`}
-      className="relative rounded-xl border cursor-pointer overflow-hidden transition-all duration-300"
+      className="relative block rounded-xl border cursor-pointer overflow-hidden transition-all duration-300 no-underline"
       style={{
         background: hovered
           ? `linear-gradient(135deg, rgba(${path.accent.includes('java') ? '248,152,32' : path.accent.includes('spring') ? '109,179,63' : '66,133,244'}, 0.06) 0%, var(--bg-surface) 60%)`
@@ -359,7 +375,7 @@ function PathCard({ path }: { path: typeof LEARNING_PATHS[0] }) {
           Start path →
         </span>
       </div>
-    </div>
+    </Link>
   );
 }
 
@@ -557,18 +573,22 @@ function CtaSection() {
           Join developers who chose depth over shortcuts.
         </p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <button
+          <Link
+            href="/register"
             id="cta-start"
             className="btn-primary text-base px-10 py-4"
           >
             Start Learning Free →
-          </button>
-          <button
+          </Link>
+          <a
+            href="https://github.com/devmastery/dev-mastery"
+            target="_blank"
+            rel="noopener noreferrer"
             id="cta-github"
             className="btn-ghost text-base px-10 py-4"
           >
             ⭐ Star on GitHub
-          </button>
+          </a>
         </div>
 
         <div className="mt-12 text-xs" style={{ color: 'var(--text-muted)' }}>

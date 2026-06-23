@@ -54,11 +54,14 @@ class AuthServiceImpl implements AuthService {
     }
 
     private AuthResult issue(UserEntity u) {
-        String token = jwt.generate(u.getId(), u.getEmail(), List.of(u.getRole()));
+        // DB stores role as lowercase ('user'|'admin'); Spring Security uses ROLE_<UPPER>.
+        String roleUpper = u.getRole() == null ? "USER" : u.getRole().toUpperCase();
+        String token = jwt.generate(u.getId(), u.getEmail(), List.of(roleUpper));
         return new AuthResult(token, toView(u));
     }
 
     private UserView toView(UserEntity u) {
-        return new UserView(u.getId(), u.getEmail(), u.getFullName(), List.of(u.getRole()));
+        String roleUpper = u.getRole() == null ? "USER" : u.getRole().toUpperCase();
+        return new UserView(u.getId(), u.getEmail(), u.getFullName(), List.of(roleUpper));
     }
 }

@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 
-const AI_API = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8084';
+const AI_API = process.env.NEXT_PUBLIC_AI_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 export interface ChatMessage {
   role:    'user' | 'ai';
