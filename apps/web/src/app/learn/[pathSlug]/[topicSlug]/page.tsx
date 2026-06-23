@@ -3,16 +3,18 @@ import { notFound } from 'next/navigation';
 import TopicPage from '@/components/topic/TopicPage';
 import { MdxRenderer } from '@/components/topic/MdxRenderer';
 import { fetchTopic, fetchPath } from '@/lib/api';
+import Link from 'next/link';
 
 interface PageProps {
-  params: { pathSlug: string; topicSlug: string };
+  params: Promise<{ pathSlug: string; topicSlug: string }>;
 }
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
-  const topic = await fetchTopic(params.topicSlug);
-  const title = topic?.title ?? params.topicSlug
+  const { pathSlug, topicSlug } = await params;
+  const topic = await fetchTopic(topicSlug);
+  const title = topic?.title ?? topicSlug
     .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-  const pathTitle = topic?.pathTitle ?? params.pathSlug
+  const pathTitle = topic?.pathTitle ?? pathSlug
     .split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 
   return {
@@ -26,8 +28,9 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 }
 
 export default async function TopicPageRoute({ params }: PageProps) {
+  const { pathSlug, topicSlug } = await params;
   // Fetch topic data server-side (SSR)
-  const topic = await fetchTopic(params.topicSlug);
+  const topic = await fetchTopic(topicSlug);
 
   // If topic genuinely doesn't exist in DB, show 404
   // (comment out for dev if backend is off)
@@ -37,28 +40,28 @@ export default async function TopicPageRoute({ params }: PageProps) {
     <div className="flex flex-col h-screen overflow-hidden">
       {/* App Shell Header */}
       <header className="h-16 border-b border-[--border-default] flex items-center px-6 bg-[--bg-surface]/80 backdrop-blur-md shrink-0 z-10">
-        <a href="/" className="flex items-center gap-1">
+        <Link href="/" className="flex items-center gap-1">
           <span className="text-xl font-bold font-display tracking-tight text-[--text-primary]">
             Dev<span className="text-[--accent-ai]">Mastery</span>
           </span>
-        </a>
+        </Link>
         <div className="ml-6 flex items-center gap-2 text-sm text-[--text-muted]">
           <span>/</span>
-          <a href="/dashboard" className="hover:text-[--text-primary] transition-colors">Dashboard</a>
+          <Link href="/dashboard" className="hover:text-[--text-primary] transition-colors">Dashboard</Link>
           <span>/</span>
-          <a
-            href={`/learn/${params.pathSlug}/roadmap`}
+          <Link
+            href={`/learn/${pathSlug}/roadmap`}
             className="hover:text-[--text-primary] transition-colors capitalize"
           >
-            {params.pathSlug.replace(/-/g, ' ')}
-          </a>
+            {pathSlug.replace(/-/g, ' ')}
+          </Link>
         </div>
       </header>
 
       {/* Topic Page — takes up remaining height */}
       <main className="flex-1 overflow-hidden">
         <TopicPage
-          topicSlug={params.topicSlug}
+          topicSlug={topicSlug}
           topic={topic}
           MdxRenderer={MdxRenderer}
         />
