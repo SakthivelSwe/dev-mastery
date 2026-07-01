@@ -162,3 +162,246 @@ return NextResponse.redirect(new URL('/login', request.url));
 const tenant = request.headers.get('host').split('.')[0];
 return NextResponse.rewrite(new URL(`/tenants/${tenant}`, request.url));
 ```
+
+## FEYNMAN CHECK
+
+### Explain Next.js Middleware Like I'm 10 Years Old
+> Middleware runs BEFORE every request reaches your Next.js page or API route — it's the GATEKEEPER. Use it for auth (redirect unauthenticated users to /login), A/B testing (route 50% of users to a new version), localization (detect language and rewrite URLs), bot protection (block suspicious user agents), or geo-routing (serve different content per country). Create middleware.ts at the project root, export a default function that receives the request and returns NextResponse.next() (continue), NextResponse.redirect(url), or NextResponse.rewrite(url). The non-obvious depth: middleware runs on the EDGE RUNTIME by default — closer to users globally, faster cold start, but limited to a subset of Node.js APIs (no fs, no native modules, no Node.js crypto — must use Web Crypto API).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between redirect, rewrite, and next() in middleware?**
+> **A:** NextResponse.next() lets the request continue to its original destination (the page/API route). NextResponse.redirect(url) sends a 307 redirect to the browser — the URL bar changes, browser makes a new request. NextResponse.rewrite(url) RENDERS a different page while KEEPING the original URL — the browser sees /old-url but Next.js serves /new-url's content. Use rewrite for A/B testing, localization (URL stays /products, content comes from /en/products), and feature flags. Use redirect for canonical URL changes, auth redirects, and external links.
+
+**Q2: Mental model for middleware matchers?**
+> **A:** export const config = { matcher: ['/admin/:path*', '/api/:path*'] } limits middleware to specific routes — middleware runs ONLY on /admin/* and /api/* paths, not on every request. Matchers are crucial for performance: without matchers, middleware runs on EVERY request including static assets (images, fonts, _next/static) — adding latency to every single request. With matchers, middleware runs only where needed. Negative matchers (regex with negative lookahead) exclude specific patterns: '/((?!api|_next/static|favicon.ico).*)' runs on everything EXCEPT those paths.
+
+**Q3: Most dangerous misconception about middleware?**
+> **A:** Middleware can access the response body:
+> ```typescript
+> // WRONG: middleware runs BEFORE the response is generated
+> export function middleware(request: NextRequest) {
+>   const response = NextResponse.next();
+>   const body = await response.text();  // body is empty -- response hasn't been generated yet
+>   if (body.includes('sensitive')) return new Response('Blocked');
+> }
+>
+> // CORRECT: middleware can only modify the REQUEST going in
+> //          and RESPONSE HEADERS coming out (set/delete headers, cookies)
+> //          NOT the response body content
+> export function middleware(request: NextRequest) {
+>   const response = NextResponse.next();
+>   response.headers.set('X-Custom-Header', 'value');  // OK
+>   response.cookies.set('analytics', 'tracking-id');  // OK
+>   return response;
+> }
+> ```
+
+**Q4: How do you implement authentication in middleware?**
+> **A:** Read the session cookie or Authorization header, verify it (JWT signature, session store lookup), and decide: continue (NextResponse.next()), redirect to login (NextResponse.redirect('/login')), or pass user info to the page (set headers or cookies). Pattern: const token = request.cookies.get('session')?.value; if (!token) return NextResponse.redirect(new URL('/login', request.url)); const payload = await verifyJWT(token); response.headers.set('x-user-id', payload.sub); return response;. The server component can then read the header from headers().
+
+**Q5: FAANG-grade definition of Next.js middleware.**
+> **A:** "Next.js middleware is request-level code executed before page rendering or API handler invocation — running on the Edge Runtime (V8 isolates, ~1ms cold start, globally distributed) with restricted Web Standards-only APIs — defined in a single middleware.ts at the project root with a default export receiving NextRequest — capable of NextResponse.next() (continue), NextResponse.redirect() (browser redirect), NextResponse.rewrite() (URL-preserving content swap), and response header/cookie modification — scoped via config.matcher patterns to prevent execution on static assets — and used for auth, i18n, A/B testing, geolocation routing, and bot protection — but cannot modify response body content (runs before response generation)."
+
+## BUILD
+
+### 🏗️ Mini Project: Production Middleware — Auth + I18n + A/B Test + Bot Block
+
+**What you will build:** A single middleware.ts handling four concerns in order: bot blocking, locale detection and URL rewrite, A/B test assignment via cookie, and JWT auth check with redirect — the standard production middleware composition.
+**Why this project:** Forces all middleware patterns in one realistic file.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest middleware-demo --typescript --tailwind --app
+npm install jose  # Edge-compatible JWT library
+mkdir -p src/app/en src/app/es src/app/dashboard
+```
+
+#### Step 2 — Middleware
+```typescript
+// src/middleware.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { jwtVerify } from 'jose';
+
+const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET ?? 'dev-secret');
+const SUPPORTED_LOCALES = ['en', 'es', 'fr'] as const;
+const DEFAULT_LOCALE = 'en';
+
+// Matcher: skip middleware on static assets and _next internals
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+};
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // ─────────── 1. BOT PROTECTION ───────────
+  const userAgent = request.headers.get('user-agent') ?? '';
+  const blockedBots = [/badbot/i, /scraper/i, /spam/i];
+  if (blockedBots.some(re => re.test(userAgent))) {
+    return new NextResponse('Forbidden', { status: 403 });
+  }
+
+  // ─────────── 2. I18N URL REWRITE ───────────
+  // /products -> /en/products (rewrite, URL stays as /products)
+  const hasLocale = SUPPORTED_LOCALES.some(
+    loc => pathname === `/${loc}` || pathname.startsWith(`/${loc}/`),
+  );
+
+  if (!hasLocale) {
+    // Detect locale from Accept-Language header
+    const acceptLang = request.headers.get('accept-language') ?? '';
+    const preferred = acceptLang.split(',')
+      .map(l => l.split(';')[0].split('-')[0])
+      .find(lang => SUPPORTED_LOCALES.includes(lang as any)) ?? DEFAULT_LOCALE;
+
+    const url = request.nextUrl.clone();
+    url.pathname = `/${preferred}${pathname}`;
+    return NextResponse.rewrite(url);
+  }
+
+  // ─────────── 3. A/B TEST ASSIGNMENT ───────────
+  const response = NextResponse.next();
+  let variant = request.cookies.get('ab-variant')?.value;
+  if (!variant) {
+    variant = Math.random() < 0.5 ? 'A' : 'B';
+    response.cookies.set('ab-variant', variant, {
+      maxAge: 60 * 60 * 24 * 30,  // 30 days
+      httpOnly: true,
+    });
+  }
+  response.headers.set('x-ab-variant', variant);
+
+  // ─────────── 4. AUTH CHECK ───────────
+  const protectedRoute = pathname.includes('/dashboard') || pathname.includes('/admin');
+  if (protectedRoute) {
+    const token = request.cookies.get('session')?.value;
+    if (!token) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('returnTo', pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+
+    try {
+      const { payload } = await jwtVerify(token, JWT_SECRET);
+      // Pass user info to Server Components via headers
+      response.headers.set('x-user-id', String(payload.sub));
+      response.headers.set('x-user-role', String(payload.role));
+
+      // Admin-only check
+      if (pathname.includes('/admin') && payload.role !== 'admin') {
+        return NextResponse.redirect(new URL('/403', request.url));
+      }
+    } catch {
+      // Invalid/expired token
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('reason', 'session-expired');
+      return NextResponse.redirect(loginUrl);
+    }
+  }
+
+  return response;
+}
+```
+
+#### Step 3 — Locale Pages
+```typescript
+// src/app/[locale]/page.tsx
+export default function Home({ params }: { params: { locale: string } }) {
+  const greetings: Record<string, string> = { en: 'Hello', es: 'Hola', fr: 'Bonjour' };
+  return <h1 className="p-8 text-3xl">{greetings[params.locale]} World!</h1>;
+}
+
+// src/app/[locale]/dashboard/page.tsx
+import { headers } from 'next/headers';
+
+export default function Dashboard() {
+  const userId = headers().get('x-user-id');
+  const role = headers().get('x-user-role');
+  return (
+    <div className="p-8">
+      <h1 className="text-2xl font-bold">Dashboard</h1>
+      <p>User: {userId} ({role})</p>
+    </div>
+  );
+}
+```
+
+#### Step 4 — A/B Variant Reader
+```typescript
+// src/components/ABTest.tsx
+import { headers, cookies } from 'next/headers';
+
+export function ABTest({ A, B }: { A: React.ReactNode; B: React.ReactNode }) {
+  const variant = headers().get('x-ab-variant') ?? cookies().get('ab-variant')?.value;
+  return <>{variant === 'B' ? B : A}</>;
+}
+
+// Usage: <ABTest A={<OldButton />} B={<NewButton />} />
+```
+
+#### Step 5 — Tests
+```typescript
+// Test the middleware logic
+import { middleware } from '@/middleware';
+import { NextRequest } from 'next/server';
+
+it('blocks known bot user agents', async () => {
+  const req = new NextRequest('http://localhost:3000/', {
+    headers: { 'user-agent': 'badbot/1.0' },
+  });
+  const res = await middleware(req);
+  expect(res?.status).toBe(403);
+});
+
+it('rewrites to default locale when none detected', async () => {
+  const req = new NextRequest('http://localhost:3000/products', {
+    headers: { 'accept-language': 'es' },
+  });
+  const res = await middleware(req);
+  expect(res?.headers.get('x-middleware-rewrite')).toContain('/es/products');
+});
+```
+
+**Expected Output:**
+```
+GET / -> rewritten to /en (based on Accept-Language)
+GET / with es header -> rewritten to /es
+GET / from badbot user-agent -> 403
+GET /dashboard without session -> redirect to /login?returnTo=/dashboard
+GET /admin with role=user -> redirect to /403
+Cookie ab-variant set to A or B (50/50 split)
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add rate limiting via @upstash/ratelimit (Edge-compatible)
+- [ ] Add a CSP header builder with nonces per request
+- [ ] Add geo-routing using request.geo (Vercel-specific)
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three middleware response types and their use cases?
+**Q2:** What is the difference between rewrite and redirect?
+**Q3:** Write a middleware matcher excluding /api and _next. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does middleware run on Edge Runtime by default?
+**Q5:** A PR uses Node.js crypto in middleware — explain the error.
+**Q6:** Can middleware modify the response body?
+
+### Day 7 — Application
+**Q7:** Build an auth middleware that supports both JWT cookies and Authorization headers.
+**Q8:** A PR doesn't set a matcher and middleware runs on every static asset — diagnose the perf issue.
+**Q9:** How do you pass middleware-derived data (like user ID) to Server Components?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Next.js middleware — runtime, capabilities, limitations, and a real-world auth implementation."
+**Q11:** Draw: middleware execution order in the request lifecycle — request → middleware chain → handler → response.
+**Q12:** ★ System design: "Design middleware for a multi-tenant SaaS — auth, tenant isolation, rate limiting, A/B testing, i18n."

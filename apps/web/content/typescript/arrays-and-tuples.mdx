@@ -103,3 +103,175 @@ However, at runtime, a Tuple is just a standard JavaScript array. Because JavaSc
 To completely prevent this and lock the Tuple, you must use the `readonly` modifier:
 `let person: readonly [string, number] = ["Alice", 30];`
 Now, `person.push()` will throw a TypeScript error because the `.push` method doesn't exist on readonly arrays.
+
+## FEYNMAN CHECK
+
+### Explain Arrays & Tuples Like I'm 10 Years Old
+> An ARRAY in TS is a list where every element has the SAME type and the length can change: `number[]` or `Array<number>`. A TUPLE is a list where each POSITION has a specific type and the length is fixed: `[string, number, boolean]`. Tuples are perfect for "named returns" — `useState` returns `[T, (next: T) => void]` — a fixed pair where position 0 is the value and position 1 is the setter. Variadic tuples (TS 4.0+) let you express things like "an array starting with a string followed by any numbers" `[string, ...number[]]`. The non-obvious power: `as const` on a tuple LITERAL turns `[1,2,3]` from `number[]` into `readonly [1, 2, 3]` — a fully literal, frozen tuple usable as a type.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When do you choose a tuple over an array?**
+> **A:** Use a tuple when POSITION CARRIES MEANING and the length is known. `[string, number]` for "name + age", or `[Promise<T>, AbortController]` for "result + canceler". Use an array when items are interchangeable. The bug they prevent: `const [val, set] = useState(0)` would silently swap if `useState` returned `(string|function)[]` — the tuple type enforces that position 0 is the value.
+
+**Q2: Mental model for variadic tuples?**
+> **A:** A variadic tuple lets you SPREAD types: `type WithName<T extends unknown[]> = [string, ...T]`. This is how TS types functions like `pipe(a, b, c, d, ...)` where the output of one function feeds the next. It's also how `Parameters<F>` becomes useful — it's a tuple type, so you can prepend, append, or slice it.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing arrays in TS prevent index-out-of-bounds:
+> ```ts
+> // ❌ No bounds check — TS infers arr[99] as string, but it's actually undefined
+> const arr: string[] = ['a', 'b'];
+> const x = arr[99];                  // type 'string', value undefined → 💥
+>
+> // ✅ Use noUncheckedIndexedAccess for safety
+> // "noUncheckedIndexedAccess": true in tsconfig
+> const x = arr[99];                  // now type 'string | undefined'
+> if (x) console.log(x.toUpperCase());
+> ```
+
+**Q4: How do readonly arrays and tuples differ at runtime?**
+> **A:** Identical — readonly is a COMPILE-TIME only modifier. `readonly number[]` and `ReadonlyArray<number>` and `readonly [1,2,3]` all compile to the same JS as their mutable versions; only the compiler refuses `.push`, index assignment, etc. Use `Object.freeze` for actual runtime immutability. The reason readonly matters: it prevents bugs from cross-module mutation and enables better type inference.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript arrays are homogeneous mutable lists typed as `T[]` or `Array<T>`; tuples are heterogeneous fixed-length (or variadic) lists where each position has its own type — both compile to identical JavaScript arrays at runtime, with readonly modifiers and `as const` assertions providing compile-time immutability and literal-type inference."
+
+## BUILD
+
+### 🏗️ Mini Project: Type-Safe Pipe Function Using Variadic Tuples
+
+**What you will build:** A `pipe` function where the TYPE of the result is inferred from the chain of functions — output of `f` flows into input of `g`, with TS validating compatibility at every step.
+**Why this project:** Forces variadic tuples, generic inference, and recursive types — the techniques behind RxJS, Redux Toolkit, and Lodash's typed fp.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-tuples && cd ts-tuples
+npm init -y && npm install -D typescript
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/pipe.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Variadic Pipe With Tuple Magic
+```ts
+// src/pipe.ts
+// Recursive helper: given a tuple of functions, validate input→output chain
+type Chain<Fns extends readonly unknown[], Last = unknown> =
+  Fns extends readonly [(arg: infer A) => infer B, ...infer Rest]
+    ? readonly [(arg: A) => B, ...Chain<Rest, B>]
+    : readonly [];
+
+// Get the final output type
+type ChainOutput<Fns> =
+  Fns extends readonly [...unknown[], (arg: unknown) => infer Out] ? Out : never;
+
+export function pipe<Fns extends readonly ((arg: any) => any)[]>(
+  ...fns: Chain<Fns> extends Fns ? Fns : Chain<Fns>
+): (input: Parameters<Fns[0]>[0]) => ChainOutput<Fns> {
+  return (input) => fns.reduce((acc: unknown, fn) => fn(acc), input) as ChainOutput<Fns>;
+}
+```
+
+#### Step 3 — Use It With Compile-Time Validation
+```ts
+// src/main.ts
+import { pipe } from './pipe.js';
+
+const double = (n: number) => n * 2;
+const toStr  = (n: number) => n.toString();
+const length = (s: string) => s.length;
+
+const run = pipe(double, toStr, length);   // (input: number) => number
+console.log(run(5));   // 1 — "10".length
+
+// ❌ TS rejects chains that don't type-check
+// const broken = pipe(double, length);   // length expects string, double returns number
+```
+
+#### Step 4 — Error Handling: useState-like Tuple Pair
+```ts
+type UseState<T> = readonly [T, (next: T | ((prev: T) => T)) => void];
+
+export function useState<T>(initial: T): UseState<T> {
+  let value = initial;
+  const setter = (next: T | ((prev: T) => T)) => {
+    value = typeof next === 'function' ? (next as (p: T) => T)(value) : next;
+  };
+  return [value, setter] as const;
+}
+
+// Caller — tuple destructuring with full type safety
+const [count, setCount] = useState(0);
+setCount(c => c + 1);
+// setCount('hi');   // ❌ TS error: string not assignable to number
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect } from 'vitest';
+import { pipe, useState } from './pipe.js';
+
+describe('pipe', () => {
+  it('chains functions left-to-right', () => {
+    const run = pipe((n: number) => n + 1, (n: number) => n * 2);
+    expect(run(3)).toBe(8);
+  });
+  it('preserves types end-to-end', () => {
+    const run = pipe((s: string) => s.length, (n: number) => n > 0);
+    const r: boolean = run('hi');
+    expect(r).toBe(true);
+  });
+});
+
+describe('useState', () => {
+  it('returns a tuple', () => {
+    const [v, set] = useState(10);
+    expect(v).toBe(10);
+    expect(typeof set).toBe('function');
+  });
+});
+```
+
+**Expected Output:**
+```
+2     # from pipe(double, toStr, length)(5) = '10'.length = 2
+1     # from useState counter
+
+# tsc rejects mismatched chains:
+src/main.ts:12:35 - error TS2345: Argument of type '(s: string) => number' is not assignable to '(arg: number) => any'.
+```
+
+**Stretch Challenges:**
+- [ ] Add an async `pipeP` variant that types Promise unwrapping at each step
+- [ ] Implement `flow` (same as pipe but accepts a single tuple argument)
+- [ ] Add overloads for 1-10 arguments and compare with the variadic version
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between `number[]` and `[number, number]`?
+**Q2:** What does `readonly` mean for an array at runtime vs compile time?
+**Q3:** Write a tuple type for `[name: string, age: number]` (labelled). From memory.
+
+### Day 3 — Comprehension
+**Q4:** When does `as const` change array inference? Show a 2-line example.
+**Q5:** Why is `useState` typed as a tuple, not an object `{ value, setValue }`?
+**Q6:** Refactor for safer indexing:
+```ts
+const arr: number[] = [1, 2, 3];
+const first = arr[10].toFixed(2);
+```
+
+### Day 7 — Application
+**Q7:** Build a typed `zip` function that takes 2-3 arrays and returns tuples preserving types.
+**Q8:** A PR types React's `useState` as `{value, set}` — explain why the tuple form matters.
+**Q9:** What does `noUncheckedIndexedAccess` cost in DX? When is it worth turning on?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how Redux Toolkit types its slice reducers using tuples + variadic generics."
+**Q11:** Draw: how does `...T` in tuple types interact with function-Parameters inference?
+**Q12:** ★ System design: "Type the public API of a typed RPC framework where each endpoint defines [input tuple, output type, errors]."

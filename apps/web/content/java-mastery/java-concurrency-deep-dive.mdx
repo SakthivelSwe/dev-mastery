@@ -1,210 +1,538 @@
 ---
-title: Java Concurrency Deep Dive
-slug: java-concurrency-deep-dive
+slug: "java-concurrency-deep-dive"
+title: "Java Concurrency Deep Dive"
+level: 5
 ---
 
 ## WHY
 
-Concurrency is the art of executing multiple computations simultaneously. In modern cloud-native architectures, applications must handle thousands of concurrent requests with sub-millisecond latency. A naive approach to concurrency—relying purely on `synchronized` blocks and global locks—leads to catastrophic bottlenecks, thread contention, and priority inversion.
+Basic concurrency gets you correctness. Advanced concurrency gets you **correctness at scale**.
 
-Java's concurrency model has evolved significantly from the basic `Thread` and `Runnable` constructs of JDK 1.0. To build high-performance, low-latency systems (like high-frequency trading platforms, real-time analytics engines, or massively multiplayer games), top-tier developers must move beyond basic synchronization. You must understand the internal mechanics of lock-free programming, Compare-And-Swap (CAS) instructions, the `java.util.concurrent` (J.U.C) framework, and how the JVM interacts directly with CPU-level memory barriers. 
+When throughput climbs and latency budgets shrink, naive locking becomes your bottleneck:
 
-Without this deep knowledge, systems suffer from hidden race conditions, deadlocks, and "liveness" issues that only appear under extreme production loads.
+1. **Lock convoying**: many threads serialized behind one hot lock
+2. **Context switch overhead**: blocked threads wake/sleep continuously
+3. **False sharing**: unrelated counters on same cache line invalidate each other
+4. **Priority inversion**: high-priority work waits for low-priority lock owner
+5. **Tail latency spikes**: p99 blows up due to contention and GC pressure
 
----
+High-performance Java systems (trading, ad-tech, stream processing, realtime games) rely on deeper primitives:
+
+- lock-free CAS loops
+- AQS-based synchronization
+- work-stealing pools
+- mechanical sympathy (cache lines, memory fences)
+- structured coordination patterns with minimal blocking
+
+This topic explains the internals and gives production-ready patterns.
 
 ## THEORY
 
-At the core of advanced Java concurrency is the abandonment of pessimistic locking (where a thread blocks waiting for a lock) in favor of optimistic, lock-free algorithms. 
+### CAS (Compare-And-Swap) as the Atomic Primitive
 
-### Compare-And-Swap (CAS) Mechanics
-CAS is a hardware-level atomic instruction provided by modern CPUs (like `CMPXCHG` on x86). It operates on three operands:
-1. A memory location ($V$).
-2. The expected old value ($A$).
-3. The new value to write ($B$).
+CAS operates on three values:
 
-The CPU atomically updates $V$ to $B$ *only if* the current value of $V$ matches $A$. If $V$ does not match $A$ (meaning another thread modified it), the instruction fails, and the thread typically retries the operation in a `while` loop (a spin-lock). 
+- memory location `V`
+- expected value `A`
+- new value `B`
 
-Java exposes CAS through the `Unsafe` class (historically) and now safely through `VarHandle` and the `java.util.concurrent.atomic` package. Because CAS does not put threads to sleep (avoiding costly context switches to the OS kernel), it is radically faster under low-to-moderate contention.
+Operation succeeds only if `V == A`, then atomically writes `B`.
 
-### The AQS (AbstractQueuedSynchronizer)
-The AQS is the heartbeat of the J.U.C package. It is the internal framework used to build `ReentrantLock`, `CountDownLatch`, `Semaphore`, and `ReadWriteLock`. 
+```
+if (V == A) {
+    V = B;   // atomic
+    return success;
+}
+return fail;
+```
 
-AQS relies on:
-- A `volatile int state` to represent the synchronization state (e.g., lock acquired = 1, unlocked = 0).
-- A FIFO wait queue (a variant of a CLH queue) to manage blocked threads.
-- CAS operations to atomically update the state.
+Java exposes CAS via `Atomic*` classes and `VarHandle.compareAndSet()`.
 
-When a thread attempts to acquire a lock via AQS, it uses CAS to set the state. If it succeeds, it proceeds. If it fails, AQS parks the thread using `LockSupport.park()` and enqueues it. When the lock is released, AQS uses `LockSupport.unpark()` to wake the next thread in the queue.
+### CAS Advantages and Costs
 
-### The Fork/Join Framework & Work-Stealing
-Introduced in Java 7, `ForkJoinPool` is optimized for divide-and-conquer workloads. Unlike a standard `ThreadPoolExecutor` where threads share a single task queue, every thread in a `ForkJoinPool` has its own local deque (double-ended queue).
-- **Forking:** When a thread divides a task, it pushes the subtasks onto the head of its *own* deque.
-- **Work-Stealing:** If Thread A finishes its tasks and its deque is empty, it acts as a "thief" and steals tasks from the *tail* of Thread B's deque. This minimizes contention (Thread B works on the head, Thread A steals from the tail) and keeps all CPU cores saturated.
+| Aspect | CAS |
+|--------|-----|
+| Blocking | Non-blocking (threads spin/retry) |
+| Context switch | Avoided under low contention |
+| Deadlock risk | None (no lock ownership) |
+| Starvation risk | Possible under extreme contention |
+| Best use | small critical updates (counters, references, queue pointers) |
 
----
+CAS is not universally faster. Under high contention, retries can burn CPU.
+
+### ABA Problem
+
+CAS checks value equality, not history.
+
+Thread T1 reads head `A`.
+T2 changes `A -> B -> A`.
+T1 CAS sees `A` and succeeds, unaware state changed.
+
+Mitigation:
+
+- `AtomicStampedReference<T>`: version stamp with value
+- `AtomicMarkableReference<T>`: mark bit + reference
+- immutable nodes and hazard-pointer style ownership patterns
+
+### AQS (AbstractQueuedSynchronizer)
+
+AQS powers most `java.util.concurrent.locks` utilities:
+
+- `ReentrantLock`
+- `Semaphore`
+- `CountDownLatch`
+- `ReentrantReadWriteLock`
+
+Core internals:
+
+- `volatile int state`
+- FIFO CLH-style wait queue nodes
+- CAS on `state`
+- parking via `LockSupport.park()`
+
+AQS flow:
+
+1. try acquire (`tryAcquire`) via CAS
+2. if fail, enqueue thread
+3. park thread
+4. releasing thread unparks successor
+
+### ForkJoinPool and Work-Stealing
+
+`ForkJoinPool` is optimized for divide-and-conquer tasks.
+
+- each worker has its own deque
+- worker pops from head of own deque
+- idle worker steals from tail of another worker
+
+Benefits:
+
+- lower contention than global queue
+- better CPU utilization
+- excellent for recursive decomposition
+
+### Mechanical Sympathy: Cache Lines and False Sharing
+
+CPU cache line typically 64 bytes.
+
+If two hot counters live in same line but are updated by different threads:
+
+- each write invalidates other core's cache line
+- coherence traffic explodes
+- throughput collapses
+
+Fixes:
+
+- pad hot fields
+- isolate counters by thread (`LongAdder` stripes)
+- layout-aware structures
+
+### Concurrency Model Comparison
+
+| Model | Strength | Weakness | Use Case |
+|------|----------|----------|----------|
+| `synchronized` | Simple, safe | coarse blocking | low-contention critical sections |
+| `ReentrantLock` | timeout, conditions | manual unlock required | advanced lock coordination |
+| Lock-free CAS | no blocking | retry storms | counters, stacks, queues |
+| Actor/message passing | isolation | serialization cost | high-level service concurrency |
+| Virtual threads | cheap blocking model | pinned blocking caveats | IO-heavy request-per-task |
 
 ## VISUALIZATION_CONFIG
-
-```mermaid
-graph TD
-    subgraph AQS Architecture
-        A[Thread 1] -- "CAS(state, 0, 1) -> Success" --> B((State: 1))
-        C[Thread 2] -- "CAS(state, 0, 1) -> Fail" --> D[CLH Wait Queue]
-        E[Thread 3] -- "CAS(state, 0, 1) -> Fail" --> D
-        D --> F[Node: Thread 2 parked]
-        D --> G[Node: Thread 3 parked]
-    end
-    
-    subgraph Fork/Join Work Stealing
-        H[Worker Thread A] -->|Pops from Head| I[Deque A]
-        J[Worker Thread B] -->|Pops from Head| K[Deque B]
-        J -.->|Steals from Tail| I
-    end
+```json
+{ "type": "none" }
 ```
 
----
+## CODE
 
-## IMPLEMENTATION
+### Level 1 - Beginner
 
-Let's implement a highly advanced, lock-free Stack structure using raw CAS mechanics via `AtomicReference`. This bypasses all synchronization bottlenecks, making it perfectly safe and wildly fast for concurrent environments.
-
-```java
-package com.devmastery.concurrency;
-
-import java.util.concurrent.atomic.AtomicReference;
-
-/**
- * A highly optimized, lock-free concurrent Stack using Treiber's algorithm.
- * It uses Compare-And-Swap (CAS) to achieve thread safety without any blocking locks.
- */
-public class LockFreeStack<T> {
-
-    // AtomicReference acts as the head pointer to the stack
-    private final AtomicReference<Node<T>> head = new AtomicReference<>();
-
-    // Internal Node class holding the data and pointer to the next element
-    private static class Node<E> {
-        final E item;
-        Node<E> next;
-
-        Node(E item) {
-            this.item = item;
-        }
-    }
-
-    /**
-     * Pushes an item onto the stack atomically.
-     */
-    public void push(T item) {
-        Node<T> newHead = new Node<>(item);
-        Node<T> oldHead;
-        
-        // Spin-lock: Loop until the CAS operation succeeds
-        do {
-            oldHead = head.get();
-            newHead.next = oldHead;
-            
-            // CAS: "If the head is STILL oldHead, atomically set it to newHead"
-        } while (!head.compareAndSet(oldHead, newHead));
-    }
-
-    /**
-     * Pops an item from the stack atomically.
-     * Returns null if the stack is empty.
-     */
-    public T pop() {
-        Node<T> oldHead;
-        Node<T> newHead;
-        
-        // Spin-lock: Loop until the CAS operation succeeds
-        do {
-            oldHead = head.get();
-            if (oldHead == null) {
-                return null; // Stack is empty
-            }
-            newHead = oldHead.next;
-            
-            // CAS: "If the head is STILL oldHead, atomically set it to the next node"
-        } while (!head.compareAndSet(oldHead, newHead));
-        
-        return oldHead.item;
-    }
-}
-```
-
-### Addressing the ABA Problem
-In the above code, if Thread 1 reads `oldHead` (A), gets paused, and Thread 2 pops A, pops B, and pushes a *new* A, Thread 1 will wake up, see `head == A`, and assume nothing changed. This is the **ABA Problem**. 
-In Java, garbage collection prevents memory address reuse (unlike C++), so the ABA problem is less destructive for simple object references. However, for complex CAS logic, Java provides `AtomicStampedReference`, which attaches an integer stamp (version number) to the reference to detect ABA modifications.
-
----
-
-## VERIFICATION
-
-To verify the lock-free stack under extreme contention, we use a `CountDownLatch` to synchronize the start of hundreds of threads simultaneously, flooding the stack with concurrent pushes and pops.
+From race condition to atomic correctness.
 
 ```java
-package com.devmastery.concurrency;
-
-import org.junit.jupiter.api.Test;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+public class CounterComparison {
+    static int unsafe = 0;
+    static AtomicInteger atomic = new AtomicInteger(0);
 
-public class LockFreeStackTest {
+    public static void main(String[] args) throws Exception {
+        int threads = 16;
+        int perThread = 100_000;
 
-    @Test
-    public void testHighContentionPushPop() throws InterruptedException {
-        LockFreeStack<Integer> stack = new LockFreeStack<>();
-        int threadCount = 100;
-        int operationsPerThread = 1000;
-        
-        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
-        CountDownLatch readyLatch = new CountDownLatch(threadCount);
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(threadCount);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch done = new CountDownLatch(threads);
 
-        AtomicInteger totalPushed = new AtomicInteger(0);
-
-        // Create 100 threads that will each push 1000 items
-        for (int i = 0; i < threadCount; i++) {
-            executor.submit(() -> {
-                readyLatch.countDown();
-                try {
-                    startLatch.await(); // Wait for the global start signal
-                    for (int j = 0; j < operationsPerThread; j++) {
-                        stack.push(j);
-                        totalPushed.incrementAndGet();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    doneLatch.countDown();
+        for (int t = 0; t < threads; t++) {
+            pool.submit(() -> {
+                for (int i = 0; i < perThread; i++) {
+                    unsafe++;                     // race condition
+                    atomic.incrementAndGet();     // CAS-based atomic update
                 }
+                done.countDown();
             });
         }
 
-        // Wait for all threads to initialize, then fire the starting gun
-        readyLatch.await();
-        startLatch.countDown();
-        doneLatch.await();
+        done.await();
+        pool.shutdown();
 
-        assertEquals(threadCount * operationsPerThread, totalPushed.get());
-
-        // Verify pop integrity
-        int popCount = 0;
-        while (stack.pop() != null) {
-            popCount++;
-        }
-        assertEquals(threadCount * operationsPerThread, popCount);
-        
-        executor.shutdown();
+        int expected = threads * perThread;
+        System.out.println("Expected = " + expected);
+        System.out.println("Unsafe   = " + unsafe);          // usually < expected
+        System.out.println("Atomic   = " + atomic.get());    // always expected
     }
 }
 ```
 
-### Expected Outcome
-The `LockFreeStack` will process hundreds of thousands of operations across 100 threads in milliseconds without throwing `ConcurrentModificationException` and without losing a single item. Because it never blocks at the OS level, it will drastically outperform `Collections.synchronizedList()` or `ReentrantLock` implementations under heavy load.
+### Level 2 - Building Blocks
+
+Custom lock using AQS.
+
+```java
+import java.util.concurrent.locks.*;
+
+public class AqsMutex implements Lock {
+
+    private static class Sync extends AbstractQueuedSynchronizer {
+        @Override
+        protected boolean tryAcquire(int acquires) {
+            // lock free path: state 0 -> 1
+            return compareAndSetState(0, 1);
+        }
+
+        @Override
+        protected boolean tryRelease(int releases) {
+            setState(0);
+            return true;
+        }
+
+        @Override
+        protected boolean isHeldExclusively() {
+            return getState() == 1;
+        }
+
+        Condition newCondition() {
+            return new ConditionObject();
+        }
+    }
+
+    private final Sync sync = new Sync();
+
+    @Override
+    public void lock() {
+        sync.acquire(1);
+    }
+
+    @Override
+    public void unlock() {
+        sync.release(1);
+    }
+
+    @Override
+    public boolean tryLock() {
+        return sync.tryAcquire(1);
+    }
+
+    @Override
+    public void lockInterruptibly() throws InterruptedException {
+        sync.acquireInterruptibly(1);
+    }
+
+    @Override
+    public boolean tryLock(long time, java.util.concurrent.TimeUnit unit) throws InterruptedException {
+        return sync.tryAcquireNanos(1, unit.toNanos(time));
+    }
+
+    @Override
+    public Condition newCondition() {
+        return sync.newCondition();
+    }
+
+    public static void main(String[] args) throws Exception {
+        AqsMutex lock = new AqsMutex();
+        final int[] counter = {0};
+
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) {
+                lock.lock();
+                try { counter[0]++; } finally { lock.unlock(); }
+            }
+        });
+
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) {
+                lock.lock();
+                try { counter[0]++; } finally { lock.unlock(); }
+            }
+        });
+
+        t1.start(); t2.start();
+        t1.join(); t2.join();
+        System.out.println(counter[0]); // 200000
+    }
+}
+```
+
+### Level 3 - Intermediate
+
+Lock-free stack with ABA protection using `AtomicStampedReference`.
+
+```java
+import java.util.concurrent.atomic.AtomicStampedReference;
+
+public class LockFreeStack<T> {
+    private static final class Node<E> {
+        final E item;
+        final Node<E> next;
+        Node(E item, Node<E> next) {
+            this.item = item;
+            this.next = next;
+        }
+    }
+
+    // stamp increments every successful head update
+    private final AtomicStampedReference<Node<T>> head =
+        new AtomicStampedReference<>(null, 0);
+
+    public void push(T item) {
+        int[] stampHolder = new int[1];
+        Node<T> current;
+        Node<T> next;
+
+        do {
+            current = head.get(stampHolder);
+            next = new Node<>(item, current);
+            // CAS with both ref and stamp
+        } while (!head.compareAndSet(current, next, stampHolder[0], stampHolder[0] + 1));
+    }
+
+    public T pop() {
+        int[] stampHolder = new int[1];
+        Node<T> current;
+        Node<T> next;
+
+        do {
+            current = head.get(stampHolder);
+            if (current == null) return null;
+            next = current.next;
+        } while (!head.compareAndSet(current, next, stampHolder[0], stampHolder[0] + 1));
+
+        return current.item;
+    }
+
+    public static void main(String[] args) {
+        LockFreeStack<Integer> s = new LockFreeStack<>();
+        s.push(1); s.push(2); s.push(3);
+        System.out.println(s.pop()); // 3
+        System.out.println(s.pop()); // 2
+        System.out.println(s.pop()); // 1
+        System.out.println(s.pop()); // null
+    }
+}
+```
+
+### Level 4 - Advanced
+
+ForkJoin work-stealing + parallel divide-and-conquer.
+
+```java
+import java.util.concurrent.*;
+
+public class ParallelSum extends RecursiveTask<Long> {
+    private static final int THRESHOLD = 10_000;
+    private final int[] arr;
+    private final int from;
+    private final int to;
+
+    public ParallelSum(int[] arr, int from, int to) {
+        this.arr = arr;
+        this.from = from;
+        this.to = to;
+    }
+
+    @Override
+    protected Long compute() {
+        int len = to - from;
+        if (len <= THRESHOLD) {
+            long sum = 0;
+            for (int i = from; i < to; i++) sum += arr[i];
+            return sum;
+        }
+
+        int mid = from + len / 2;
+        ParallelSum left = new ParallelSum(arr, from, mid);
+        ParallelSum right = new ParallelSum(arr, mid, to);
+
+        // Fork one, compute one to improve locality
+        left.fork();
+        long rightRes = right.compute();
+        long leftRes = left.join();
+        return leftRes + rightRes;
+    }
+
+    public static void main(String[] args) {
+        int n = 5_000_000;
+        int[] data = new int[n];
+        java.util.Arrays.fill(data, 1);
+
+        ForkJoinPool pool = new ForkJoinPool();
+        long start = System.nanoTime();
+        long result = pool.invoke(new ParallelSum(data, 0, data.length));
+        long ms = (System.nanoTime() - start) / 1_000_000;
+
+        System.out.println("sum=" + result + " time(ms)=" + ms);
+    }
+}
+```
+
+### Level 5 - Expert
+
+False sharing demo and mitigation.
+
+```java
+public class FalseSharingDemo {
+    // Two counters likely on same cache line
+    static class CountersBad {
+        volatile long a = 0;
+        volatile long b = 0;
+    }
+
+    // Padded counters to separate cache lines
+    static class PaddedLong {
+        volatile long value = 0;
+        // simple manual padding (demonstration only)
+        long p1, p2, p3, p4, p5, p6, p7;
+    }
+    static class CountersGood {
+        final PaddedLong a = new PaddedLong();
+        final PaddedLong b = new PaddedLong();
+    }
+
+    static long testBad() throws InterruptedException {
+        CountersBad c = new CountersBad();
+        Thread t1 = new Thread(() -> {
+            for (long i = 0; i < 200_000_000L; i++) c.a = i;
+        });
+        Thread t2 = new Thread(() -> {
+            for (long i = 0; i < 200_000_000L; i++) c.b = i;
+        });
+        long s = System.nanoTime();
+        t1.start(); t2.start();
+        t1.join(); t2.join();
+        return (System.nanoTime() - s) / 1_000_000;
+    }
+
+    static long testGood() throws InterruptedException {
+        CountersGood c = new CountersGood();
+        Thread t1 = new Thread(() -> {
+            for (long i = 0; i < 200_000_000L; i++) c.a.value = i;
+        });
+        Thread t2 = new Thread(() -> {
+            for (long i = 0; i < 200_000_000L; i++) c.b.value = i;
+        });
+        long s = System.nanoTime();
+        t1.start(); t2.start();
+        t1.join(); t2.join();
+        return (System.nanoTime() - s) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        long bad = testBad();
+        long good = testGood();
+        System.out.println("false-sharing(ms)=" + bad);
+        System.out.println("padded(ms)=" + good);
+        System.out.println("speedup=" + String.format("%.2fx", (double) bad / good));
+    }
+}
+```
+
+## REAL_WORLD
+
+### Case Study: API Gateway Under Burst Traffic
+
+Symptoms:
+
+- CPU 70 percent but p99 latency > 2s
+- thread dumps show many BLOCKED on a shared map lock
+- GC normal, no memory issue
+
+Fixes applied:
+
+1. replaced shared synchronized map with `ConcurrentHashMap`
+2. switched hot counters from `AtomicLong` to `LongAdder`
+3. isolated expensive auth checks behind semaphore bulkhead (max 100 concurrent)
+4. moved fan-out aggregation to `CompletableFuture` with bounded executor
+
+Result:
+
+- p99: 2100ms -> 180ms
+- throughput +3.4x
+- blocked thread count near zero
+
+### Practical Guidelines
+
+| Problem Pattern | Recommended Utility |
+|-----------------|---------------------|
+| startup waits for N dependencies | `CountDownLatch` |
+| per-request fan-out then join | `CompletableFuture.allOf` |
+| protect fragile downstream service | `Semaphore` bulkhead |
+| read-heavy in-memory cache | `StampedLock` optimistic reads |
+| recursive parallel computation | `ForkJoinPool` |
+
+## INTERVIEW
+
+### Q1: Explain CAS and why it can outperform locks.
+
+Weak: CAS is atomic compare and update.
+
+Strong: CAS atomically updates a memory location if its current value matches expected. It avoids kernel-level blocking and context switches, so under low-to-moderate contention it often beats lock-based synchronization. But under high contention, repeated CAS failures cause spin retries and wasted CPU, so lock-based approaches can become better.
+
+---
+
+### Q2: What is AQS and why is it important?
+
+Weak: AQS is used by ReentrantLock.
+
+Strong: AQS is the synchronization framework underpinning `ReentrantLock`, `Semaphore`, `CountDownLatch`, and others. It uses a volatile `state` field, CAS transitions, and a FIFO wait queue with `LockSupport.park/unpark`. Instead of each utility reinventing queueing and wake-up semantics, they implement `tryAcquire/tryRelease` on top of AQS.
+
+---
+
+### Q3: Describe ABA problem and mitigation strategies.
+
+Weak: value changes back and CAS misses it.
+
+Strong: ABA occurs when thread T1 reads value A, another thread changes A->B->A, and T1 CAS succeeds even though state changed. Mitigate with versioned references (`AtomicStampedReference`), mark bits, immutable node design, or algorithms that include sequence/version metadata in CAS conditions.
+
+---
+
+### Q4: When choose ForkJoinPool over ThreadPoolExecutor?
+
+Weak: for parallel tasks.
+
+Strong: Use ForkJoinPool for recursive divide-and-conquer workloads where tasks split into subtasks and join results. Work-stealing deques reduce contention and balance load naturally. Use ThreadPoolExecutor for independent request tasks, IO-heavy workloads, and explicit queue/backpressure policies.
+
+---
+
+### Q5: What is false sharing and how do you detect/fix it?
+
+Weak: cache issue between threads.
+
+Strong: False sharing happens when independent hot fields used by different threads occupy the same CPU cache line. Writes invalidate each other's lines via MESI protocol, causing severe throughput drops. Detect via perf counters/flame graphs showing coherence stalls and by synthetic benchmarks. Fix with field padding, striped counters (`LongAdder`), data layout changes, or thread-local accumulation with periodic merge.
+
+## FEYNMAN CHECK
+
+Imagine two cashiers with separate counters but sharing one tiny drawer. Even though they count different money, every time one opens the drawer the other gets interrupted. That is false sharing. Locks are like one key to the shop: everyone queues. CAS is like trying to replace an item only if shelf state did not change; if changed, retry quickly. AQS is the trained queue manager deciding who waits, who wakes, and in what order.
+
+## BUILD
+
+1. Implement lock-free queue with `AtomicReference` head/tail and benchmark against `LinkedBlockingQueue` for single-producer/single-consumer.
+2. Write custom AQS-based binary semaphore and verify fairness behavior with 20 threads.
+3. Build parallel merge sort with `ForkJoinPool`, then compare with single-thread merge sort on arrays of 10M integers.
+
+## SPACED REVIEW
+
+- Day 1: CAS semantics, success/failure path, and when retries happen.
+- Day 3: AQS internals: state, queue, park/unpark.
+- Day 7: ABA problem and stamped reference solution.
+- Day 14: ForkJoin work-stealing mechanics and best-fit workloads.
+- Day 30: Explain false sharing with cache-line diagram and mitigation choices.

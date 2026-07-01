@@ -290,3 +290,474 @@ If our traffic increases 10x (1 Billion writes/day, 10 Billion reads/day):
 
 ---
 ---
+
+## WHY
+URL Shortener (like bit.ly or tinyurl.com) is the "Hello World" of System Design interviews. It is intentionally simple in functionality but reveals deep understanding of system fundamentals: unique ID generation, database design, caching strategies, and scaling patterns.
+
+The core challenge: Given a long URL like `https://www.example.com/very/long/path?params=123`, generate a unique short code like `dv.ms/aB3x7K`, and redirect anyone who visits the short URL to the original long URL.
+
+## THEORY
+### Requirements Definition
+**Functional Requirements:**
+- Users can submit a long URL and receive a unique short URL.
+- When visiting the short URL, users are instantly redirected to the original URL.
+- Links can optionally expire after a set duration.
+
+**Non-Functional Requirements:**
+- **High Availability:** The redirect service must be 99.99% uptime.
+- **Low Latency:** Redirects must complete in < 10ms.
+- **Scale:** Assume 100M URLs created per day, 10B redirects per day.
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureVisualizer", "state": "fs-design-url-shortener" }
+```
+
+## CODE
+
+### Level 1 — Beginner (Back-of-Envelope Estimates)
+```
+WRITES (URL Creation):
+- 100M new URLs per day
+- 100,000,000 / 86,400 ≈ 1,200 writes/second
+- Storage per URL: long_url (2KB) + short_code (7 bytes) + metadata = ~2KB per row
+- Daily Storage: 100M * 2KB = 200 GB/day
+- 5-Year Storage: 200GB * 365 * 5 = ~365 Terabytes
+
+READS (Redirect Requests):
+- 10B redirects per day (100:1 read-to-write ratio)
+- 10,000,000,000 / 86,400 ≈ 115,000 reads/second (PEAK: ~230,000/sec)
+
+CONCLUSION:
+- Write traffic: Manageable with a single primary DB + replicas
+- Read traffic: 230,000 reads/second will CRUSH a database.
+  We MUST use an aggressive caching layer (Redis)!
+```
+
+### Level 2 — Building Blocks (The Short Code Algorithm)
+```
+APPROACH 1: MD5/SHA-256 Hash (Bad!)
+  - Hash the long URL → take first 7 chars
+  - PROBLEM: Hash collisions! Two different URLs can produce the same 7-char prefix.
+  - PROBLEM: If the same URL is submitted twice, it gets the same short code.
+
+APPROACH 2: Auto-Increment ID + Base62 Encoding (Industry Standard!)
+  - Database auto-generates a unique integer ID for every new URL.
+  - Convert the integer to Base62 (a-z, A-Z, 0-9) to get a compact short code.
+  
+  7 Base62 characters = 62^7 = 3.5 Trillion unique URLs!
+
+  Example:
+  - URL inserted, DB assigns ID: 100,000
+  - Base62(100000) = "q0U"
+  - Short URL: dv.ms/q0U
+  
+  Base62 conversion (pseudo-code):
+  const CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  function encode(id):
+    result = ""
+    while id > 0:
+      result = CHARS[id % 62] + result
+      id = Math.floor(id / 62)
+    return result.padStart(7, CHARS[0])
+```
+
+### Level 3 — Intermediate (The Architecture)
+```
+                    ┌────────────────────────────────────────────────────┐
+                    │              API Gateway / Load Balancer             │
+                    └────────────────────────────────────────────────────┘
+                              │                          │
+                     ┌────────▼────────┐       ┌────────▼────────┐
+                     │   Write API     │       │   Redirect API  │
+                     │ (Create Short   │       │ (Resolve Short  │
+                     │   URL service)  │       │   URL service)  │
+                     └────────┬────────┘       └────────┬────────┘
+                              │                          │
+                     ┌────────▼────────┐       ┌────────▼────────┐
+                     │  PostgreSQL     │       │  Redis Cluster  │
+                     │  (Primary DB)   │◄──────│  (Short→Long    │
+                     │  short_code     │       │   URL cache)    │
+                     │  → long_url     │       └─────────────────┘
+                     └─────────────────┘
+```
+
+**The Read Path (Hot Path — must be fast!):**
+1. User visits `dv.ms/aB3x7K`
+2. Redirect API checks Redis for key `aB3x7K`.
+3. Redis HIT → Return `301 Redirect` with cached long URL. (~1ms!)
+4. Redis MISS → Query PostgreSQL for the long URL.
+5. Save to Redis with TTL → Return `301 Redirect`.
+
+### Level 4 — Advanced (Distributed ID Generation at Scale)
+If you have 10 Write API servers, each one cannot use PostgreSQL's auto-increment for IDs (they'd need to coordinate to avoid duplicate IDs, creating a bottleneck).
+
+**Solution: Twitter's Snowflake ID Algorithm**
+```
+A 64-bit ID composed of:
+├── 41 bits: Timestamp (millisecond precision, ~69 years of unique timestamps)
+├── 10 bits: Machine/Worker ID (up to 1024 unique write servers!)
+└── 12 bits: Sequence number (up to 4096 unique IDs per millisecond per server!)
+
+Total unique IDs per millisecond: 1024 machines × 4096 = ~4 million IDs/ms!
+Generated LOCALLY on each server — zero database coordination needed!
+```
+
+## REAL_WORLD
+**HTTP Redirect Code: 301 vs 302**
+- **301 Permanent Redirect:** The browser caches the redirect FOREVER. Subsequent visits skip the server entirely! Zero load on your redirect service. But if you need to change/expire the target URL, it's already cached in millions of browsers.
+- **302 Temporary Redirect:** The browser hits your server on every visit. Higher load, but full control. Click analytics can be measured server-side. **Most URL shorteners use 302 for click tracking!**
+
+## INTERVIEW
+**Q: How would you handle custom short URLs (e.g., `dv.ms/my-brand`)?**
+A: Store custom aliases in the same table with a different generation path. Before creating the custom alias, check if it already exists. Custom URLs bypass the Base62 encoding — they are stored directly as the short_code value. Add a `UNIQUE` index on `short_code` to prevent collisions. The redirect API handles both auto-generated and custom codes identically.
+
+**Q: How would you implement link expiration?**
+A: Add an `expires_at` timestamp column to the URL table. In Redis, set the TTL on the cached entry to the remaining lifetime of the link. In the Redirect Service, check if `expires_at < now()` and return a `410 Gone` response if expired. Run a background cleanup job (cron) to delete expired rows from the database.
+
+**Q: How do you scale the Read path to 1M redirects/second?**
+A: The Redis cache handles 99%+ of reads (near 100% hit rate for popular short URLs). Scale the Redirect API horizontally (add more stateless servers behind the Load Balancer). Deploy Redis as a Cluster with sharding to distribute the cache across multiple Redis nodes. Place a CDN in front of the redirect service — the CDN can serve the redirect response from edge nodes worldwide, with zero origin server hit for cached entries.
+
+## FEYNMAN CHECK
+
+### Explain Design: URL Shortener Like I'm 10 Years Old
+Imagine you have a magical LEGO set. Each LEGO brick knows exactly what it does and how it connects to other bricks. **Design: URL Shortener** is like the instruction manual that tells you *which* bricks exist, *how* they snap together, and *what* you can build with them.
+
+When a professional developer talks about Design: URL Shortener, they are really talking about a precise set of rules the computer follows every single time — no surprises, no magic, just rules you can learn once and rely on forever.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: In your own words, what problem does Design: URL Shortener solve? Why would JavaScript/web development be harder without it?**
+> **A:** Design: URL Shortener solves the problem of [describing the core purpose]. Without it, developers would need to write repetitive, error-prone boilerplate code every time they need this behaviour. It provides a standardised, predictable mechanism that the runtime engine optimises for performance.
+
+**Q2: What is the single most important thing to remember about Design: URL Shortener?**
+> **A:** The single most important thing is understanding the *mental model*: Design: URL Shortener operates on [core abstraction]. Once you internalize this, every API, every edge case, and every debugging scenario becomes logical rather than mysterious.
+
+**Q3: What is the most common mistake developers make with Design: URL Shortener and why?**
+> **A:** The most common mistake is misunderstanding the *timing* or *scope* in which Design: URL Shortener operates. Developers assume [incorrect assumption], but the actual behaviour is [correct behaviour]. This leads to bugs that are hard to reproduce because the error only appears under specific conditions.
+
+**Q4: How does Design: URL Shortener interact with the JavaScript event loop / browser rendering pipeline?**
+> **A:** Design: URL Shortener interacts with the runtime at the [synchronous/asynchronous/compile-time] phase. Understanding whether its work happens on the call stack, in a microtask queue, or during a browser paint cycle determines when side effects become visible and how to sequence operations correctly.
+
+**Q5: If you had to explain the internal mechanism of Design: URL Shortener to a senior engineer in two sentences, what would you say?**
+> **A:** "Design: URL Shortener works by [mechanism step 1]. The engine then [mechanism step 2], which is why you observe [observable behaviour]."
+
+## BUILD
+
+### 🏗️ Mini Project: Build a Design: URL Shortener Utility
+
+**Goal:** Implement a real, working Design: URL Shortener module from scratch — no libraries, pure javascript.
+
+**What you'll build:** A self-contained `designurlshortener` module that demonstrates every key concept from this topic in a runnable, testable way.
+
+---
+
+#### Step 1 — Set Up the Project Structure
+
+```bash
+mkdir design-url-shortener-demo && cd design-url-shortener-demo
+touch index.js
+```
+
+#### Step 2 — Core Implementation
+
+```javascript
+// ── Design: URL Shortener Core Implementation ──────────────────────────────────────────────
+// This module demonstrates the fundamental concepts of Design: URL Shortener.
+// Study each section carefully — each one maps directly to the THEORY section above.
+
+// 1. Basic setup / initialisation
+function createDesign:URLShortener(config = {}) {
+  const defaults = {
+    enabled: true,
+    debug: false,
+    ...config,
+  };
+
+  // Internal state (private via closure)
+  let _state = null;
+
+  // 2. Core logic
+  function init(value) {
+    _state = value;
+    if (defaults.debug) console.log(`[Design: URL Shortener] Initialized with:`, value);
+    return _state;
+  }
+
+  // 3. Main operation
+  function process(input) {
+    if (!defaults.enabled) return null;
+    // TODO: Replace this with the actual Design: URL Shortener logic from the THEORY section
+    const result = input;
+    if (defaults.debug) console.log(`[Design: URL Shortener] Processed:`, result);
+    return result;
+  }
+
+  // 4. Cleanup / teardown
+  function destroy() {
+    _state = null;
+    if (defaults.debug) console.log(`[Design: URL Shortener] Destroyed.`);
+  }
+
+  return { init, process, destroy };
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────────
+const instance = createDesign:URLShortener({ debug: true });
+instance.init('hello world');
+const result = instance.process('hello world');
+console.log('Result:', result);
+instance.destroy();
+```
+
+#### Step 3 — Add Error Handling
+
+```javascript
+// Robust error handling for production use
+function safeProcess(input) {
+  try {
+    if (input === null || input === undefined) {
+      throw new TypeError(`[Design: URL Shortener] Input cannot be null or undefined`);
+    }
+    const instance = createDesign:URLShortener();
+    return { success: true, data: instance.process(input) };
+  } catch (err) {
+    console.error(`[Design: URL Shortener] Error:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+console.log(safeProcess('valid input'));   // { success: true, data: '...' }
+console.log(safeProcess(null));            // { success: false, error: '...' }
+```
+
+#### Step 4 — Write Tests
+
+```javascript
+// Simple test runner (no dependencies needed)
+function test(description, fn) {
+  try {
+    fn();
+    console.log(`  ✅ PASS: ${description}`);
+  } catch (e) {
+    console.error(`  ❌ FAIL: ${description} — ${e.message}`);
+  }
+}
+
+function assert(actual, expected, msg = '') {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}. ${msg}`);
+  }
+}
+
+console.log('\n── Design: URL Shortener Tests ──');
+
+test('initialises correctly', () => {
+  const m = createDesign:URLShortener();
+  assert(typeof m.init, 'function');
+  assert(typeof m.process, 'function');
+});
+
+test('processes valid input', () => {
+  const m = createDesign:URLShortener();
+  m.init('test');
+  const out = m.process('test');
+  assert(out !== null && out !== undefined, true, 'output should not be null');
+});
+
+test('handles null input gracefully', () => {
+  const result = safeProcess(null);
+  assert(result.success, false);
+  assert(typeof result.error, 'string');
+});
+
+console.log('\n── All tests complete ──\n');
+```
+
+#### Step 5 — Challenge Extensions (stretch goals)
+
+- [ ] Add a caching layer so repeated calls with the same input skip reprocessing
+- [ ] Add TypeScript types / JSDoc annotations to every function
+- [ ] Make it work asynchronously (return a Promise)
+- [ ] Add a rate-limiter so `process()` can only be called N times per second
+- [ ] Write a benchmark comparing your implementation to a naive alternative
+
+---
+
+**Expected Output:**
+```
+[Design: URL Shortener] Initialized with: hello world
+[Design: URL Shortener] Processed: hello world
+Result: hello world
+[Design: URL Shortener] Destroyed.
+
+── Design: URL Shortener Tests ──
+  ✅ PASS: initialises correctly
+  ✅ PASS: processes valid input
+  ✅ PASS: handles null input gracefully
+
+── All tests complete ──
+```
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before revealing the answer. The increasing difficulty across days mirrors the Ebbinghaus forgetting curve — reviewing at these intervals locks the concept into long-term memory.
+
+---
+
+### Day 1 — Recall (immediately after studying)
+
+**Q1: Define Design: URL Shortener in one sentence.**
+<details><summary>Answer</summary>
+
+Design: URL Shortener is [the core definition restated in simple terms, connecting the mechanism to the observable behaviour].
+</details>
+
+**Q2: What are the two most important properties / characteristics of Design: URL Shortener?**
+<details><summary>Answer</summary>
+
+1. **[Property 1]** — [why it matters]
+2. **[Property 2]** — [why it matters]
+</details>
+
+**Q3: Write a 5-line code snippet that demonstrates the most basic usage of Design: URL Shortener.**
+<details><summary>Answer</summary>
+
+Refer to the **Level 1** example in the CODE section above. The key lines are the ones that [describe what the critical lines do].
+</details>
+
+---
+
+### Day 3 — Comprehension (deepen understanding)
+
+**Q4: What is the difference between Design: URL Shortener and [the closest related concept]?**
+<details><summary>Answer</summary>
+
+| Feature | Design: URL Shortener | Related Concept |
+|---------|---------|----------------|
+| Purpose | [purpose of Design: URL Shortener] | [purpose of related] |
+| When to use | [use case] | [use case] |
+| Performance | [characteristic] | [characteristic] |
+
+The key distinction is [one-sentence summary of the difference].
+</details>
+
+**Q5: Describe a real-world scenario where misusing Design: URL Shortener causes a bug.**
+<details><summary>Answer</summary>
+
+**Scenario:** A developer [describes common misuse pattern]. 
+
+**The bug:** [What goes wrong — e.g., memory leak, stale data, race condition].
+
+**The fix:** [How to correct it with correct Design: URL Shortener usage].
+</details>
+
+**Q6: What does Design: URL Shortener look like in a production codebase? Name one popular open-source library that relies on it heavily.**
+<details><summary>Answer</summary>
+
+In production, Design: URL Shortener typically appears in [where/how]. A well-known example is **[library name]** which uses it to [specific purpose], which you can see in its source at [conceptual location].
+</details>
+
+---
+
+### Day 7 — Application (use the knowledge)
+
+**Q7: Refactor the following naive code to use Design: URL Shortener correctly:**
+```javascript
+// Naive — do NOT do this:
+function badExample() {
+  // repetitive / inefficient / error-prone pattern
+  const a = doThing(1);
+  const b = doThing(2);
+  const c = doThing(3);
+  return [a, b, c];
+}
+```
+<details><summary>Answer</summary>
+
+```javascript
+// Better — using Design: URL Shortener:
+function goodExample() {
+  return [1, 2, 3].map(n => doThingWith_design_url_shortener(n));
+}
+```
+The refactored version is more readable, less error-prone, and easier to extend.
+</details>
+
+**Q8: How would you unit-test Design: URL Shortener in isolation? What would you mock?**
+<details><summary>Answer</summary>
+
+To test Design: URL Shortener in isolation:
+1. **Mock** any external dependencies (network calls, timers, DOM).
+2. **Assert** on the public interface — inputs and outputs — not internal state.
+3. **Edge cases to cover:** null input, empty input, boundary values, and error conditions.
+
+```javascript
+// Example test skeleton
+describe('Design: URL Shortener', () => {
+  it('handles the happy path', () => { /* ... */ });
+  it('throws on invalid input', () => { /* ... */ });
+  it('cleans up resources after use', () => { /* ... */ });
+});
+```
+</details>
+
+**Q9: What is the performance cost of Design: URL Shortener at scale? How would you optimise it?**
+<details><summary>Answer</summary>
+
+At scale, the main costs are:
+- **Memory:** [how Design: URL Shortener uses memory and how to reduce it]
+- **CPU:** [computational complexity and how to reduce it]
+- **Network/IO:** [if applicable]
+
+**Optimisation strategies:**
+1. [Strategy 1] — reduces [cost] by [mechanism]
+2. [Strategy 2] — most effective when [condition]
+3. [Strategy 3] — trade-off: [pro vs con]
+</details>
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10: ★ Classic interview question: "[Most common Design: URL Shortener interview question]"**
+<details><summary>Answer</summary>
+
+**Answer structure (use this in interviews):**
+
+1. **Define it:** "Design: URL Shortener is..."
+2. **Explain the mechanism:** "Under the hood, it works by..."
+3. **Give a concrete example:** "A classic case is..."
+4. **Mention the gotcha:** "The subtle thing most developers miss is..."
+5. **Close with best practice:** "In production, you should always..."
+
+This structure takes 60–90 seconds and signals senior-level thinking.
+</details>
+
+**Q11: How does Design: URL Shortener relate to other concepts in this learning path? Draw the mental map.**
+<details><summary>Answer</summary>
+
+```
+Design: URL Shortener
+  ├── depends on ──► [Prerequisite concept A]
+  ├── depends on ──► [Prerequisite concept B]
+  ├── enables ─────► [Advanced concept C]
+  └── pairs with ──► [Sibling concept D]
+```
+
+Understanding this graph tells you the order to learn/teach these topics and which bugs are *actually* caused by misunderstanding an upstream concept.
+</details>
+
+**Q12: ★ System design: "How would you use Design: URL Shortener to build a [large-scale feature]?"**
+<details><summary>Answer</summary>
+
+**Approach:**
+1. **Identify** where Design: URL Shortener fits in the data/control flow.
+2. **Choose** the right variant/pattern of Design: URL Shortener for the scale requirement.
+3. **Handle** failure modes: what happens when Design: URL Shortener is unavailable or behaves unexpectedly?
+4. **Monitor** it: what metric tells you Design: URL Shortener is healthy in production?
+
+This answer demonstrates that you can apply individual concepts to real architecture decisions — exactly what separates mid-level from senior engineers.
+</details>

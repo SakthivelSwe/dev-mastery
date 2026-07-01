@@ -133,3 +133,211 @@ An `OnPush` component only checks for updates if an `@Input()` reference changes
 *The Fix:* 
 Option A (Best): Use the `| async` pipe in the HTML template (`{{ data$ | async }}`). The `async` pipe internally calls `markForCheck()`, specifically telling Angular to wake up the `OnPush` component!
 Option B: If you must subscribe in TypeScript, you must inject the `ChangeDetectorRef` service, and manually call `this.cdr.markForCheck()` inside the `.subscribe()` block to tell Angular the data changed!
+
+## FEYNMAN CHECK
+
+### Explain Angular Performance Like I'm 10 Years Old
+> Angular performance is about reducing: (1) bundle size (how much JS the browser downloads), (2) change detection overhead (how often Angular scans the component tree), and (3) render cost (how many DOM operations). The tools: OnPush CD strategy (skip unchanged subtrees), signals (surgical per-component updates), lazy loading (smaller initial bundle), pure pipes (memoised transforms), trackBy in ngFor (reuse DOM nodes), AOT compilation (no JIT compiler in bundle), and @defer (download components only when needed). The non-obvious truth: 80% of Angular performance issues come from 3 things — function calls in templates, *ngFor without trackBy, and using Default change detection on a large component tree. Fix those three and you're 80% of the way there.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the single highest-impact Angular performance optimisation?**
+> **A:** Switching from Default to OnPush change detection on complex subtrees. Default CD checks EVERY component in the tree on EVERY async event — 60+ times per second in active apps. OnPush only checks a component when its @Input references change or an internal event fires. For a 500-component tree where only 5 components change per user action, Default runs 500 checks; OnPush runs 5 checks. Combined with signals, you get surgical per-component updates with zero unnecessary checks — 100x improvement for large trees.
+
+**Q2: Mental model for virtual scrolling?**
+> **A:** Rendering 10,000 DOM nodes is catastrophically slow — initial render takes seconds, scroll jank is constant. Virtual scrolling renders only the ~20 nodes visible in the viewport, recycling DOM nodes as the user scrolls. Angular CDK's CdkVirtualScrollViewport calculates item sizes, tracks scroll position, and swaps content in and out of a fixed pool of rendered items. Result: 10,000 rows render as fast as 20 rows, scroll is smooth, memory footprint is minimal.
+
+**Q3: Most dangerous misconception about Angular performance?**
+> **A:** Angular's default settings are production-optimised:
+> ```typescript
+> // WRONG: Default CD + function calls in templates is the default
+> @Component({
+>   // No changeDetection: OnPush specified -- Default is used
+>   template: '<p>{{ formatDate(item.createdAt) }}</p>'  // called every CD cycle
+> })
+>
+> // CORRECT: Opt into OnPush everywhere + use pure pipes/computed
+> @Component({ changeDetection: ChangeDetectionStrategy.OnPush })
+> // Template: {{ item.createdAt | date:'medium' }}  // pure pipe, memoised
+>
+> // Angular's default settings are for CORRECTNESS, not performance
+> // You must explicitly opt into performance patterns
+> ```
+
+**Q4: How does Angular's build pipeline affect runtime performance?**
+> **A:** ng build --configuration production enables: AOT compilation (templates compiled to JS, no runtime compiler), tree-shaking (unused code removed), minification + dead code elimination, differential loading (modern ES2015+ bundle for modern browsers, legacy ES5 for old ones — modern browsers download 20-30% less). Source maps are disabled. Angular's Ivy compiler produces optimal code with less overhead than View Engine. esbuild (default in Angular 16+) is 10-50x faster to build than webpack and produces slightly smaller bundles.
+
+**Q5: FAANG-grade definition of Angular performance optimisation.**
+> **A:** "Angular performance optimisation encompasses change detection strategy (OnPush or signals-based zoneless for surgical updates), bundle optimisation (lazy loading features via loadComponent/loadChildren, @defer for within-page deferral, tree-shaking, AOT compilation), rendering optimisation (pure pipes, trackBy/track in *ngFor/@for, virtual scrolling via CDK for large lists), memory management (takeUntilDestroyed for subscriptions, avoiding closure leaks in effects), and build optimisation (esbuild, differential loading, Brotli compression) — measurable via Core Web Vitals (LCP, FID/INP, CLS) and Angular DevTools profiler."
+
+## BUILD
+
+### 🏗️ Mini Project: Performance Benchmark — Default vs OnPush vs Signals on 1000-Item List
+
+**What you will build:** Three implementations of a filterable 1000-item list — Default CD, OnPush, and Signals — with console.time measurements and Angular DevTools profiler usage demonstrating the difference.
+**Why this project:** Makes performance improvements empirically measurable with real numbers.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new perf-demo --standalone --routing false
+ng generate component item-default --standalone
+ng generate component item-on-push --standalone
+ng generate component item-signal --standalone
+```
+
+#### Step 2 — Default Strategy Item
+```typescript
+// item-default.component.ts
+import { Component, Input } from '@angular/core';
+@Component({
+  standalone: true,
+  selector: 'app-item-default',
+  template: '<div>{{ item.name }} - {{ item.price | number:"1.2-2" }}</div>',
+})
+export class ItemDefaultComponent {
+  @Input() item!: { id: number; name: string; price: number; };
+}
+```
+
+#### Step 3 — OnPush Strategy Item
+```typescript
+// item-on-push.component.ts
+import { Component, Input, ChangeDetectionStrategy } from '@angular/core';
+import { DecimalPipe } from '@angular/common';
+@Component({
+  standalone: true,
+  selector: 'app-item-on-push',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [DecimalPipe],
+  template: '<div>{{ item.name }} - {{ item.price | number:"1.2-2" }}</div>',
+})
+export class ItemOnPushComponent {
+  @Input() item!: { id: number; name: string; price: number; };
+}
+```
+
+#### Step 4 — App With Performance Measurement
+```typescript
+// app.component.ts
+import { Component, signal, computed, OnInit } from '@angular/core';
+import { NgFor, NgIf, DecimalPipe } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { ItemDefaultComponent } from './item-default/item-default.component';
+import { ItemOnPushComponent } from './item-on-push/item-on-push.component';
+
+interface Item { id: number; name: string; price: number; }
+
+@Component({
+  standalone: true,
+  imports: [NgFor, NgIf, DecimalPipe, FormsModule, ItemDefaultComponent, ItemOnPushComponent],
+  template: `
+    <h1>Performance Demo — 1000 Items</h1>
+    <input [(ngModel)]="filter" placeholder="Filter items..." (input)="applyFilter()">
+
+    <h2>Default CD</h2>
+    <p>CD cycles: {{ defaultCycles }}</p>
+    <app-item-default *ngFor="let item of filteredDefault; trackBy: trackById" [item]="item"/>
+
+    <h2>OnPush CD</h2>
+    <p>CD cycles: {{ onPushCycles }}</p>
+    <app-item-on-push *ngFor="let item of filteredOnPush; trackBy: trackById" [item]="item"/>
+
+    <h2>Signals</h2>
+    @for (item of filteredSignals(); track item.id) {
+      <div>{{ item.name }} - {{ item.price | number:"1.2-2" }}</div>
+    }
+  `,
+})
+export class AppComponent implements OnInit {
+  allItems: Item[] = [];
+  filteredDefault: Item[] = [];
+  filteredOnPush: Item[] = [];
+  filter = '';
+  defaultCycles = 0;
+  onPushCycles = 0;
+
+  private _filter = signal('');
+  private _all = signal<Item[]>([]);
+  filteredSignals = computed(() => {
+    const f = this._filter().toLowerCase();
+    return f ? this._all().filter(i => i.name.toLowerCase().includes(f)) : this._all();
+  });
+
+  ngOnInit() {
+    this.allItems = Array.from({ length: 1000 }, (_, i) => ({
+      id: i + 1, name: 'Item ' + (i + 1), price: Math.round(Math.random() * 100 * 100) / 100,
+    }));
+    this.filteredDefault = this.filteredOnPush = this.allItems;
+    this._all.set(this.allItems);
+  }
+
+  applyFilter() {
+    console.time('filter');
+    const f = this.filter.toLowerCase();
+    this.filteredDefault = this.filteredOnPush = f
+      ? this.allItems.filter(i => i.name.toLowerCase().includes(f))
+      : this.allItems;
+    this._filter.set(this.filter);
+    console.timeEnd('filter');
+  }
+
+  trackById(_: number, item: Item) { return item.id; }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+it('filteredSignals computes correctly', () => {
+  const fixture = TestBed.createComponent(AppComponent);
+  fixture.detectChanges();
+  fixture.componentInstance._all.set([
+    { id: 1, name: 'Angular', price: 10 },
+    { id: 2, name: 'React', price: 5 },
+  ]);
+  fixture.componentInstance._filter.set('ang');
+  expect(fixture.componentInstance.filteredSignals().length).toBe(1);
+});
+```
+
+**Expected Output:**
+```
+Open Angular DevTools > Profiler
+Type in filter:
+  Default: 1000 component checks per keystroke (~15ms)
+  OnPush: only changed items checked (~3ms)
+  Signals: surgical updates (~1ms)
+
+console.time('filter'): 1-3ms
+```
+
+**Stretch Challenges:**
+- [ ] Add CDK VirtualScrollViewport and measure scroll FPS
+- [ ] Enable zoneless change detection
+- [ ] Add PerformanceObserver to measure INP for each strategy
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three main Angular performance optimisation categories.
+**Q2:** What does OnPush save compared to Default CD?
+**Q3:** Write a @for loop with track that avoids DOM recreation. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why are function calls in templates slow?
+**Q5:** A junior's 500-component app is slow — first optimisation to make?
+**Q6:** What is virtual scrolling and when should you use it?
+
+### Day 7 — Application
+**Q7:** Profile an Angular app with Angular DevTools and identify the top 3 performance hotspots.
+**Q8:** A PR adds a 1MB D3 chart to the root bundle — fix.
+**Q9:** How does AOT compilation improve runtime performance?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through your Angular performance optimisation checklist — startup, runtime, and interaction."
+**Q11:** Draw: change detection comparison — Default vs OnPush vs signals for a 100-component tree.
+**Q12:** ★ System design: "Optimise a data-heavy Angular app serving 50k users — what are your top 5 performance changes?"

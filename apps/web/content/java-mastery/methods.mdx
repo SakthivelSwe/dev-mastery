@@ -6,175 +6,499 @@ level: 1
 
 ## WHY
 
-If you couldn't group lines of code into named blocks, your program would just be one infinite, unreadable scroll of instructions. Methods (known as functions in other languages) exist to encapsulate logic into reusable, testable, and named units. 
+If you couldn't group lines of code into named blocks, your program would be one infinite, unreadable scroll of instructions. Methods encapsulate logic into reusable, testable, named units — the fundamental building blocks of every Java application.
 
-But calling a method isn't magic. It physically alters the memory state of the application. Every time a method is called, the JVM has to pause the current execution, allocate a new block of memory (a Stack Frame) to hold local variables, pass data across the boundary, execute the logic, and then destroy that memory block before returning to the caller. 
+But calling a method isn't magic. Every method call physically alters the memory state of the JVM. A new **Stack Frame** is allocated to hold local variables, parameters are copied across the boundary, the logic executes, and the frame is destroyed on return. This memory choreography explains five critical behaviors that trip up developers daily:
 
-Understanding exactly how parameters cross this boundary is the source of endless confusion for junior Java developers. "Is Java pass-by-reference or pass-by-value?" Not knowing the answer leads to bugs where you accidentally mutate an object inside a helper method and corrupt the data across your entire application. Furthermore, understanding how the compiler resolves Method Overloading (methods with the same name but different parameters) is crucial when dealing with complex object hierarchies and autoboxing.
+1. **Why local variables vanish** after a method ends (the Stack Frame is destroyed)
+2. **Why Java is pass-by-value** — even for objects (a copy of the pointer is passed)
+3. **Why overloading ambiguity errors occur** (compiler resolves at compile-time using strict rules)
+4. **Why recursion can crash the JVM** (`StackOverflowError` = Stack ran out of frame space)
+5. **Why varargs hide performance costs** (every call allocates a new array on the Heap)
+
+Without understanding these mechanics, you'll write methods that silently fail to mutate objects, create overloads that behave unexpectedly with autoboxing, and build recursive algorithms that explode in production.
 
 ## THEORY
 
-### Stack Frames
-The JVM manages execution using the **Thread Stack**. Every thread has its own stack. 
-When a method is invoked, the JVM creates a **Stack Frame** and pushes it onto the top of the stack. This frame contains:
-1. **Local Variable Array**: Holds all local variables and method parameters. 
-2. **Operand Stack**: The actual workspace where bytecode instructions push and pop values to perform calculations.
-3. **Reference to Constant Pool**: Allows the method to access class-level constants and static variables.
+### Stack Frame Anatomy
+The JVM manages execution via the **Thread Stack** — each thread has its own. Every method call pushes a **Stack Frame** containing:
 
-When the method finishes (hits a `return` statement or the closing brace), its Stack Frame is immediately popped off the stack and destroyed. This is why local variables "disappear" after a method ends. If you call methods recursively too many times without stopping, you fill up the stack memory, causing a fatal `StackOverflowError`.
+```
+┌─────────────────────────────────────────────┐
+│              STACK FRAME                    │
+│  ┌─────────────────────────────────────┐    │
+│  │  Local Variable Array               │    │
+│  │  [0]=this  [1]=param1  [2]=param2   │    │
+│  │  [3]=localVar1  [4]=localVar2 ...   │    │
+│  ├─────────────────────────────────────┤    │
+│  │  Operand Stack (work area)          │    │
+│  │  Temp values during computation     │    │
+│  ├─────────────────────────────────────┤    │
+│  │  Frame Data                         │    │
+│  │  Return address, constant pool ref  │    │
+│  └─────────────────────────────────────┘    │
+└─────────────────────────────────────────────┘
+```
 
-### Pass-By-Value
-Java is strictly, 100% **Pass-By-Value**. It never passes references to variables themselves (like C++ `&` references).
-When you pass an argument to a method, the JVM copies the *binary value* of that variable into the new Stack Frame's local variable array.
-- **For Primitives** (`int`, `double`): The actual numeric value (e.g., `42`) is copied. Changing the parameter inside the method has zero effect on the caller's variable.
-- **For Reference Types** (Objects, Arrays): The value copied is the *memory address pointer* (e.g., `0xAB12`). The new parameter now points to the exact same Object on the Heap. If you mutate the object's fields inside the method, the caller sees the changes because both pointers look at the same Heap location. However, if you reassign the parameter to a `new` object, you only change the local copy of the pointer; the caller's pointer is unaffected.
+When the method returns, the frame is **popped and destroyed**. All local variables cease to exist. This is why you can't return a pointer to a local variable — it's gone.
 
-### Method Overloading and Varargs
-**Overloading** is defining multiple methods in the same class with the same name, but different parameter signatures. The compiler decides which method to call *at compile time* (Static Dispatch) using strict resolution rules:
-1. Exact match by type.
-2. Widening of primitives (e.g., passing an `int` to a `long` parameter).
-3. Autoboxing (e.g., passing an `int` to an `Integer` parameter).
-4. Varargs.
+### Pass-By-Value (The Most Misunderstood Rule in Java)
 
-**Varargs** (`Type... args`) allow a method to accept zero or more arguments of a type. At compile time, the Java compiler literally replaces this syntax with an array creation. `printAll("A", "B")` becomes `printAll(new String[]{"A", "B"})`.
+Java is **strictly, 100% pass-by-value**. Always. No exceptions.
+
+What the JVM copies into the new frame depends on the variable type:
+
+| Variable Type | What Gets Copied | Effect Inside Method |
+|---------------|-----------------|---------------------|
+| `int`, `double`, `boolean` (primitives) | The actual value (`42`, `3.14`) | Changing it has zero effect on caller |
+| Object reference (`String`, `List`, etc.) | The **memory address** (`0xAB12`) | Mutating fields is visible to caller; reassigning (`= new X()`) is NOT |
+| `null` | The null pointer value | `NullPointerException` if dereferenced |
+
+```
+CALLER STACK FRAME          CALLEE STACK FRAME
+┌──────────────────┐        ┌──────────────────┐
+│ primitive = 42   │──copy─▶│ p = 42 (local)   │  ← changing p doesn't affect caller
+│                  │        │                  │
+│ ref = 0xAB12 ───────────▶ │ r = 0xAB12 (copy)│  ← r points to SAME Heap object
+└──────────────────┘        └──────────────────┘
+          Both r and ref point to same Heap object
+          Mutating r.field is visible via ref.field
+          Doing r = new X() only changes local r
+```
+
+### Method Overloading Resolution Order
+
+Overloading = same name, different parameter list. The compiler resolves the call **at compile time** (static dispatch) using strict priority:
+
+| Priority | Rule | Example |
+|----------|------|---------|
+| 1 | **Exact match** | `process(int)` called with `int` |
+| 2 | **Widening primitive** | `process(long)` called with `int` |
+| 3 | **Autoboxing** | `process(Integer)` called with `int` |
+| 4 | **Varargs** | `process(int...)` called with `int` |
+
+If two methods tie at the same priority level → **Ambiguous method call compilation error**.
+
+**Key rules:**
+- Return type is **NOT** part of the method signature
+- Parameter names are **NOT** part of the signature
+- Two methods with same name + same parameter types but different return types = compile error
+- `static` modifier does NOT affect overloading resolution
+
+### Method Types Summary
+
+| Type | Syntax | Memory Location | `this` available? |
+|------|--------|-----------------|-------------------|
+| Instance method | `public void foo()` | Called on object | Yes |
+| Static method | `public static void foo()` | Called on class | No |
+| Final method | `public final void foo()` | Called on object | Yes (can't override) |
+| Abstract method | `public abstract void foo();` | Must be in abstract class | Defined in subclass |
+| Synchronized method | `public synchronized void foo()` | Object monitor lock | Yes |
+
+### Recursion and StackOverflow
+Every recursive call adds a new frame to the stack. Default thread stack size is ~512KB–1MB. At ~5,000–10,000 deep recursive calls, the stack fills up → `StackOverflowError`.
+
+The fix: use **tail recursion optimization** (convert to iterative), or increase stack size with `-Xss4m`.
+
+### Varargs Under the Hood
+`void log(String... messages)` compiles to `void log(String[] messages)`. Every call `log("a", "b", "c")` becomes `log(new String[]{"a", "b", "c"})` — a heap allocation per call. High-frequency calls should use explicit overloads instead.
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "StackFrameVisualizer", "state": "pass-by-value-refs" }
+{ "type": "none" }
 ```
 
 ## CODE
 
 ### Level 1 — Beginner
 ```java
+// Methods: named blocks that group related logic
 public class BasicMethods {
-    public static void main(String[] args) {
-        // Calling a method creates a new Stack Frame
-        int result = add(10, 20);
-        System.out.println(result);
-    }
-    
-    // Method signature: name + parameter types
+
+    // Static method: belongs to the class, no object needed
     public static int add(int a, int b) {
-        return a + b; // Frame destroyed upon return
+        return a + b;  // Frame is destroyed upon return
+    }
+
+    // Instance method: belongs to an object
+    public String greet(String name) {
+        return "Hello, " + name + "!";
+    }
+
+    public static void main(String[] args) {
+        // Calling static method: ClassName.method() or just method() from same class
+        int sum = add(10, 20);
+        System.out.println("Sum: " + sum);  // 30
+
+        // Calling instance method: need an object first
+        BasicMethods obj = new BasicMethods();
+        System.out.println(obj.greet("Alice"));  // Hello, Alice!
     }
 }
 ```
 
 ### Level 2 — Building Blocks
 ```java
+// PASS-BY-VALUE: The most important method concept in Java
 public class PassByValueProof {
-    public static void main(String[] args) {
-        int primitive = 10;
-        int[] reference = {10, 20};
-        
-        attemptToChange(primitive, reference);
-        
-        // Primitive was COPIED. The original is untouched.
-        System.out.println("Primitive: " + primitive); // Prints 10
-        
-        // Reference (pointer) was COPIED. Modifying the array mutates the Heap.
-        System.out.println("Array[0]: " + reference[0]); // Prints 99
+
+    // Demonstrate with primitives
+    static void tryChangePrimitive(int p) {
+        p = 999;  // Only changes the local copy in this frame
+        System.out.println("Inside method: " + p);  // 999
     }
-    
-    public static void attemptToChange(int p, int[] r) {
-        p = 99; // Changes local copy only
-        r[0] = 99; // Follows pointer to heap and mutates data
-        
-        // If we reassign 'r', it only changes the local pointer copy
-        r = new int[]{100, 200}; // Caller will NOT see this!
+
+    // Demonstrate with objects — mutation IS visible, reassignment is NOT
+    static void tryChangeObject(StringBuilder sb) {
+        sb.append(" MUTATED");       // Follows pointer → mutates real Heap object ✓
+        sb = new StringBuilder();    // Only changes LOCAL copy of pointer ✗
+        sb.append("NEW OBJECT");     // Caller never sees this
+    }
+
+    public static void main(String[] args) {
+        // TEST 1: Primitive
+        int x = 42;
+        tryChangePrimitive(x);
+        System.out.println("After call: " + x);  // Still 42!
+
+        // TEST 2: Object mutation
+        StringBuilder name = new StringBuilder("Alice");
+        tryChangeObject(name);
+        System.out.println("After call: " + name);  // Alice MUTATED (mutation IS visible)
+        // NOT "NEW OBJECT" — reassignment inside method doesn't affect caller
     }
 }
 ```
 
 ### Level 3 — Intermediate
 ```java
+// METHOD OVERLOADING: Compiler resolves at compile time
 public class OverloadingResolution {
-    // 1. Exact Match
-    public void process(int i) { System.out.println("Exact int"); }
-    
-    // 2. Widening (int fits into long)
-    public void process(long l) { System.out.println("Widened to long"); }
-    
-    // 3. Autoboxing (int boxed to Integer object)
-    public void process(Integer i) { System.out.println("Autoboxed"); }
-    
-    // 4. Varargs (Array)
-    public void process(int... i) { System.out.println("Varargs"); }
-    
+
+    // Priority 1: Exact match
+    static void process(int i)      { System.out.println("Exact int: " + i); }
+
+    // Priority 2: Widening — int can widen to long
+    static void widen(long l)       { System.out.println("Widened to long: " + l); }
+
+    // Priority 3: Autoboxing — int → Integer
+    static void box(Integer i)      { System.out.println("Autoboxed to Integer: " + i); }
+
+    // Priority 4: Varargs
+    static void vararg(int... arr)  { System.out.println("Varargs, count: " + arr.length); }
+
+    // OVERLOADING PITFALL: List.remove(int index) vs List.remove(Object o)
+    static void removeDemo() {
+        java.util.List<Integer> list = new java.util.ArrayList<>();
+        list.add(10); list.add(20); list.add(30);
+
+        // BUG: remove(20) resolves to remove(int index=20) → IndexOutOfBoundsException!
+        // list.remove(20);  ← NEVER do this with Integer lists
+
+        // CORRECT: Force Object overload via boxing
+        list.remove(Integer.valueOf(20));  // Removes VALUE 20
+        list.remove(0);                    // Removes item at INDEX 0
+
+        System.out.println("After removes: " + list);  // [30]
+    }
+
     public static void main(String[] args) {
-        OverloadingResolution obj = new OverloadingResolution();
-        
-        // Compiler resolves this at compile-time by searching in the exact order above
-        obj.process(5); 
+        process(5);     // Exact int
+        widen(5);       // int widens to long — no exact match for widen(int)
+        box(5);         // Only box(Integer) exists; int autoboxes
+        vararg(1, 2);   // Only vararg exists; compiles to int[]
+
+        removeDemo();
     }
 }
 ```
 
 ### Level 4 — Advanced
 ```java
-public class MethodSignatures {
-    // Return types are NOT part of the method signature for overloading!
-    // The following two methods would cause a Compiler Error if uncommented:
-    
-    /*
-    public int calculate(String data) { return 1; }
-    public String calculate(String data) { return "1"; } // ERROR: Already defined!
-    */
-    
-    // Varargs must ALWAYS be the absolute last parameter
-    public void printLogs(String prefix, String... messages) {
-        // 'messages' is strictly compiled into a String[] array
+// RECURSION, MEMOIZATION, AND METHOD REFERENCES
+import java.util.*;
+import java.util.function.Function;
+
+public class AdvancedMethods {
+
+    // RECURSION WITH MEMOIZATION (avoids repeated computation)
+    private static Map<Integer, Long> memo = new HashMap<>();
+
+    static long fibonacci(int n) {
+        if (n <= 1) return n;  // Base case — no more frames pushed
+        if (memo.containsKey(n)) return memo.get(n);  // Cache hit — O(1)
+
+        long result = fibonacci(n - 1) + fibonacci(n - 2);
+        memo.put(n, result);
+        return result;
+    }
+
+    // VARARGS WITH PREFIX — shows varargs is just a final array parameter
+    static void logMessages(String level, String... messages) {
+        // 'messages' is a String[] — array allocation happens per call
         for (String msg : messages) {
-            System.out.println(prefix + ": " + msg);
+            System.out.printf("[%s] %s%n", level, msg);
         }
+    }
+
+    // FACTORY METHOD PATTERN — static factory instead of constructor
+    static class Connection {
+        private final String host;
+        private final int port;
+        private final boolean ssl;
+
+        private Connection(String host, int port, boolean ssl) {
+            this.host = host;
+            this.port = port;
+            this.ssl = ssl;
+        }
+
+        // Named factory methods are more descriptive than overloaded constructors
+        public static Connection http(String host)  { return new Connection(host, 80,  false); }
+        public static Connection https(String host) { return new Connection(host, 443, true);  }
+        public static Connection custom(String host, int port) { return new Connection(host, port, false); }
+
+        @Override
+        public String toString() {
+            return (ssl ? "https" : "http") + "://" + host + ":" + port;
+        }
+    }
+
+    public static void main(String[] args) {
+        // Fibonacci with memoization — 50th term instantly
+        System.out.println(fibonacci(50));  // 12586269025
+
+        // Varargs
+        logMessages("ERROR", "Database down", "Retrying in 5s");
+        logMessages("INFO");  // Zero varargs = empty array, not null
+
+        // Factory methods
+        System.out.println(Connection.http("example.com"));   // http://example.com:80
+        System.out.println(Connection.https("secure.com"));   // https://secure.com:443
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+// ADVANCED: Method handles, covariant return types, bridge methods
+import java.lang.invoke.*;
+import java.lang.reflect.*;
+import java.util.*;
+
+public class ExpertMethods {
+
+    // COVARIANT RETURN TYPE — overriding method can return a subtype
+    static class Animal {
+        public Animal create() { return new Animal(); }
+        public String sound()  { return "..."; }
+    }
+
+    static class Dog extends Animal {
+        @Override
+        public Dog create() { return new Dog(); }  // Return Dog (subtype) ← covariant ✓
+        @Override
+        public String sound() { return "Woof"; }
+    }
+
+    // BRIDGE METHOD DEMO — compiler generates bridge method for generics
+    // When Dog overrides create(), compiler emits:
+    //   public Animal create() { return (Animal) this.create_Dog(); }  ← bridge
+    // This allows polymorphic dispatch through Animal reference to work
+
+    // METHOD HANDLES — low-level, faster alternative to reflection
+    static void methodHandleDemo() throws Throwable {
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        MethodType mt = MethodType.methodType(String.class);
+        MethodHandle handle = lookup.findVirtual(Dog.class, "sound", mt);
+
+        Dog dog = new Dog();
+        String result = (String) handle.invoke(dog);
+        System.out.println("Via MethodHandle: " + result);  // Woof
+    }
+
+    // TAIL RECURSION → ITERATIVE CONVERSION to avoid StackOverflow
+    // Bad: recursive factorial blows stack for n=100_000
+    // Good: iterative version
+    static long factorial(int n) {
+        long result = 1;
+        // Converts what would be 100,000 stack frames into a single loop iteration
+        for (int i = 2; i <= n; i++) {
+            result *= i;
+        }
+        return result;
+    }
+
+    // BUILDER WITH METHOD CHAINING — fluent API pattern
+    static class QueryBuilder {
+        private final StringBuilder sql = new StringBuilder("SELECT ");
+        private final List<String> params = new ArrayList<>();
+
+        public QueryBuilder select(String... cols) {
+            sql.append(String.join(", ", cols));
+            return this;  // Return 'this' enables chaining
+        }
+        public QueryBuilder from(String table) {
+            sql.append(" FROM ").append(table);
+            return this;
+        }
+        public QueryBuilder where(String condition, Object param) {
+            sql.append(" WHERE ").append(condition);
+            params.add(param.toString());
+            return this;
+        }
+        public String build() { return sql.toString(); }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        // Covariant return
+        Animal animal = new Dog();
+        System.out.println(animal.sound());  // Woof — polymorphic dispatch
+
+        // Method handles
+        methodHandleDemo();
+
+        // Iterative factorial — handles large n safely
+        System.out.println(factorial(20));  // 2432902008176640000
+
+        // Fluent builder
+        String query = new QueryBuilder()
+            .select("id", "name", "email")
+            .from("users")
+            .where("active = ?", true)
+            .build();
+        System.out.println(query);
+        // SELECT id, name, email FROM users WHERE active = ?
     }
 }
 ```
 
 ## REAL_WORLD
 
-A dangerous real-world anti-pattern involves mixing Autoboxing and Method Overloading in heavily utilized APIs, particularly around Collections.
+### Spring Boot: Overloading Pitfall in Production
+A real bug in production Spring apps with `List<Integer>`:
 
-A classic bug happens when working with `List<Integer>`:
 ```java
-List<Integer> ids = new ArrayList<>();
-ids.add(10);
-ids.add(20);
-ids.add(30);
+@Service
+public class OrderService {
 
-// DEVELOPER INTENT: "I want to remove the value 20 from the list"
-ids.remove(20); // BUG! This crashes!
+    // DANGEROUS: remove(int) vs remove(Object) ambiguity
+    public List<Long> removeOrderById(List<Long> orderIds, long targetId) {
+        // BUG: removes at INDEX 'targetId', not the VALUE
+        // orderIds.remove(targetId);  ← IndexOutOfBoundsException for large IDs!
+
+        // CORRECT: Use removeIf (streams-based, no ambiguity)
+        orderIds.removeIf(id -> id.equals(targetId));
+        return orderIds;
+    }
+
+    // HIGH-PERFORMANCE: avoid varargs in hot paths
+    // BAD — allocates String[] per call in tight loop:
+    // log.debug("Processing order {} for user {} at {}", orderId, userId, timestamp);
+
+    // For truly hot paths (>1M calls/sec), use guard:
+    public void processOrder(long orderId) {
+        if (log.isDebugEnabled()) {  // Avoids varargs array allocation if DEBUG off
+            log.debug("Processing order {}", orderId);
+        }
+    }
+
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(OrderService.class);
+}
 ```
-Why does this crash with an `IndexOutOfBoundsException`? 
-Because the `List` interface has TWO overloaded remove methods:
-1. `remove(int index)` — Removes the element at the specified index.
-2. `remove(Object o)` — Removes the first occurrence of the specified object.
 
-Because `20` is an `int` primitive, the compiler strictly resolves to the **exact match** `remove(int index)`. It tries to remove the item at index 20, which doesn't exist.
-To fix this, you must force the compiler to use the `Object` overload by manually autoboxing:
+### Recursive JSON Parser → Stack Overflow in Production
 ```java
-// Correct way to remove the object value '20'
-ids.remove(Integer.valueOf(20));
-```
+// PROBLEM: Deeply nested JSON (10,000+ levels) caused StackOverflow
+// Stack default = 512KB; each frame ~100 bytes = ~5,000 max recursion
 
-Additionally, **Varargs** are heavily used in modern frameworks like Spring Boot (e.g., `RestTemplate.getForObject(String url, Class<T> responseType, Object... uriVariables)`). While convenient, every time you call a varargs method, the JVM allocates a brand new array on the Heap. If you call a varargs method inside a tight loop executing millions of times, you are creating millions of garbage arrays, which will trigger GC pauses. High-performance libraries will often explicitly overload methods up to 3 or 4 parameters (e.g., `log(String a)`, `log(String a, String b)`) to avoid the varargs array allocation penalty for common use cases.
+// BAD — recursive approach
+Object parseRecursive(JsonToken token) {
+    if (token.isObject()) {
+        Map<String, Object> map = new HashMap<>();
+        while (!token.isEnd()) {
+            String key = token.nextKey();
+            map.put(key, parseRecursive(token.nextValue()));  // ← stack bomb
+        }
+        return map;
+    }
+    return token.getValue();
+}
+
+// GOOD — iterative with explicit Deque stack
+Object parseIterative(JsonToken rootToken) {
+    Deque<Object> stack = new ArrayDeque<>();  // Heap-based stack — no overflow!
+    // ... iterative implementation
+    return stack.peek();
+}
+```
 
 ## INTERVIEW
 
-**Q: Is Java pass-by-reference or pass-by-value?**
-A: Java is strictly **pass-by-value**. There is no pass-by-reference in Java. When you pass an Object to a method, you are passing a copy of the *reference pointer* by value. Because the copied pointer points to the same object on the Heap, you can mutate the object's fields. However, if you assign a completely new object to the parameter variable, it only affects the local copy of the pointer, and the original caller's reference remains completely unchanged.
+### Q1: Is Java pass-by-value or pass-by-reference?
+**Difficulty:** Medium | **Companies:** Amazon, Google, Meta
 
-**Q: What causes a `StackOverflowError`?**
-A: A `StackOverflowError` occurs when a thread exhausts its allocated stack memory. Every time a method is called, a new Stack Frame is allocated to hold local variables and execution state. This most commonly happens due to an infinite recursive method call with no base case, causing frames to be pushed onto the stack until memory runs out.
+❌ **Weak:** "Objects are pass-by-reference because you can modify them."
 
-**Q: Can you overload a method by only changing its return type?**
-A: No. Method overloading is resolved by the compiler using the Method Signature. In Java, a Method Signature consists exclusively of the method's name and its parameter types/order. The return type is explicitly excluded from the signature. Therefore, two methods with the same name and parameters but different return types will cause a compilation error.
+✅ **Strong:** "Java is strictly pass-by-value. For primitives, the actual value is copied. For objects, the **reference pointer** (memory address) is copied by value. Since both caller and callee pointers point to the same Heap object, mutations to fields are visible. However, reassigning the parameter (`param = new X()`) only changes the local copy of the pointer — the caller's reference is unaffected. There is no mechanism to change what variable the caller points to."
 
-**Q: In what order does the Java compiler resolve overloaded methods?**
-A: The compiler follows a strict priority chain:
-1. Exact type match.
-2. Primitive widening (e.g., `int` to `long`).
-3. Autoboxing (e.g., `int` to `Integer`).
-4. Varargs (`int...`).
-If the compiler finds two equally valid matches at the same level (which can happen with complex inheritance hierarchies), it will throw an ambiguous method call compilation error.
+---
+
+### Q2: What is the method overloading resolution order?
+**Difficulty:** Hard | **Companies:** Oracle, Goldman Sachs
+
+❌ **Weak:** "The compiler picks the best matching method."
+
+✅ **Strong:** "The compiler uses a strict 3-phase search: (1) Exact type match without boxing or varargs. (2) Widening primitive conversion without boxing. (3) Autoboxing and unboxing. (4) Varargs. The compiler uses the first phase where exactly one matching method is found. If two methods match at the same phase, the call is ambiguous and compilation fails. Return types are never part of the signature."
+
+---
+
+### Q3: What is a StackOverflowError and how do you fix it?
+**Difficulty:** Medium | **Companies:** Netflix, Spotify
+
+❌ **Weak:** "You have infinite recursion."
+
+✅ **Strong:** "A `StackOverflowError` occurs when the JVM thread stack exhausts its allocated memory (~512KB default). Each method call allocates a stack frame (~100-500 bytes) for local variables and metadata. The most common cause is uncontrolled recursion with no base case or a base case that's never reached for the given input. Solutions: (1) Convert recursion to iteration with an explicit `Deque`. (2) Add memoization to reduce recursive depth. (3) Increase stack size with `-Xss4m` as a last resort. (4) Use trampolining for tail-recursive algorithms."
+
+---
+
+### Q4: Why does `list.remove(2)` on a `List<Integer>` remove by index, not by value?
+**Difficulty:** Medium | **Companies:** Morgan Stanley, Barclays
+
+❌ **Weak:** "Because `remove` takes an int."
+
+✅ **Strong:** "The `List` interface has two overloads: `remove(int index)` and `remove(Object o)`. When you call `list.remove(2)`, the literal `2` is an `int` primitive, which exactly matches `remove(int index)` — the highest priority in overload resolution (exact match, no autoboxing needed). The compiler chooses `remove(int index)` and removes the element at position 2, not the value 2. To remove by value, force autoboxing: `list.remove(Integer.valueOf(2))`."
+
+---
+
+### Q5: What are bridge methods and why does the compiler generate them?
+**Difficulty:** Hard | **Companies:** JetBrains, Red Hat
+
+❌ **Weak:** "They bridge between parent and child class methods."
+
+✅ **Strong:** "Bridge methods are synthetic methods generated by the Java compiler to support covariant return types and generics type erasure. When a subclass overrides a method with a more specific return type (covariant return), the compiler generates a bridge method in the subclass that has the parent's signature, calls the real overridden method, and casts the result. This allows the JVM's polymorphic dispatch (which works on exact method signatures) to correctly invoke the subclass method when called via a parent reference. Without bridge methods, `Animal a = new Dog(); a.create()` would fail to dispatch to `Dog.create()` because `Dog.create()` returns `Dog` not `Animal`."
+
+## FEYNMAN CHECK
+
+Explain this to a 12-year-old: Java passes a **copy** of your directions to a method. If you tell the method "go fix the house at 123 Main St", the method can go to that house and paint the walls (mutation). But if the method decides to write a totally new address on ITS copy of the directions, YOUR copy of the directions still says 123 Main St — you'd never know.
+
+The "house at 123 Main St" is the Heap object. The "directions" are the reference pointer. The copy of directions is pass-by-value.
+
+## BUILD
+
+**Challenge:** Implement a `Calculator` class with:
+1. Overloaded `add` methods for `int`, `long`, `double`, and `String` (concatenation)
+2. A recursive `power(base, exp)` method — convert to iterative for safety
+3. A varargs `sum(int... numbers)` that returns the total
+4. Demonstrate the `List.remove(int)` vs `List.remove(Object)` pitfall and fix
+
+**Extension:** Implement `QueryBuilder` fluent API with `select/from/where/orderBy/limit` chaining, where each method returns `this`.
+
+## SPACED REVIEW
+
+- **Day 1:** What are the 4 contents of a Stack Frame?
+- **Day 3:** Write a method that proves Java is pass-by-value for both primitives and objects
+- **Day 7:** What happens when you call `list.remove(5)` on `List<Integer>`? How do you fix it?
+- **Day 14:** Explain the 4-step overload resolution order with a specific example of each step
+- **Day 30:** When should you convert recursion to iteration? What data structure replaces the call stack?

@@ -165,3 +165,222 @@ A: **Synchronous XHR (The Browser Freezer).**
 The third argument in `xhr.open` is `async` (defaults to `true`). If you explicitly set it to `false`, you force the HTTP request to execute synchronously.
 Because JavaScript is single-threaded, a Synchronous XHR request completely locks the main thread until the server responds! The user cannot scroll, animations freeze, and the entire browser tab goes completely dead. If the server takes 10 seconds to respond, the tab is frozen for 10 seconds.
 This is so fundamentally destructive to the User Experience that modern browser vendors completely deprecated Synchronous XHR on the main thread, throwing massive warnings, and eventually planning to remove it entirely.
+
+## FEYNMAN CHECK
+
+### Explain XHR & AJAX Like I'm 10 Years Old
+> AJAX (Asynchronous JavaScript And XML) was the REVOLUTION that made SPAs possible — sending HTTP requests from the browser WITHOUT a page reload (using XMLHttpRequest, 2005). XHR (XMLHttpRequest) is the original API — callback-based, verbose, but still works everywhere and uniquely supports UPLOAD PROGRESS events. In 2015, the Fetch API superseded it for almost everything. Today XHR is relevant for: (1) upload progress via `xhr.upload.onprogress`, (2) legacy code maintenance, (3) environments where fetch isn't available (rare in 2026). The non-obvious historical detail: "XML" in AJAX is a misnomer — most AJAX today transfers JSON; the name stuck. `xhr.responseType = 'json'` auto-parses responses so you don't need JSON.parse.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why did fetch replace XHR for most uses?**
+> **A:** XHR was designed in 2000 for a different era. The API mixes configuration and I/O: you call xhr.open(), set properties on the object, then xhr.send() — no composability. fetch is PROMISE-BASED — chainable, works with async/await, supports Response streams, and cleanly separates concerns. XHR's ONLY edge: upload progress events (`xhr.upload.onprogress`) — fetch doesn't expose per-chunk upload progress. For file uploading with a progress bar, XHR or the newer fetch streaming body approaches are still needed.
+
+**Q2: Mental model for XHR states?**
+> **A:** XHR is a STATE MACHINE with `readyState`: 0 (UNSENT), 1 (OPENED, after open()), 2 (HEADERS_RECEIVED, after send()), 3 (LOADING, while downloading), 4 (DONE). Each transition fires readystatechange. For most uses you only care about state 4. Use the simpler `xhr.onload` (fires when done and status indicates success), `xhr.onerror` (network failure), and `xhr.ontimeout` instead of readystatechange.
+
+**Q3: Most dangerous misconception?**
+> **A:** CORS errors are a fetch/XHR bug:
+> ```js
+> // ❌ CORS is a BROWSER security policy — not your code's fault
+> fetch('https://other-domain.com/api');   // CORS error in browser
+> // The server must include: Access-Control-Allow-Origin: *
+> // or: Access-Control-Allow-Origin: https://your-app.com
+>
+> // ❌ Trying to 'fix' CORS by changing fetch options — only the SERVER can fix CORS
+> fetch(url, { mode: 'no-cors' })   // gives opaque response — can't read body!
+>
+> // ✅ Correct fix: update server CORS headers, or proxy through your own server
+> ```
+
+**Q4: How does CORS preflight work?**
+> **A:** Simple requests (GET/POST with safe content types and standard headers) go directly. Anything else (PUT, DELETE, custom headers like Authorization, Content-Type: application/json) triggers a PREFLIGHT: the browser sends an OPTIONS request first, asking the server "can I send a POST with Authorization header from this origin?" The server responds with Access-Control-Allow-* headers. If approved, the actual request follows. This is automatic — you never write the OPTIONS request.
+
+**Q5: FAANG-grade definition?**
+> **A:** "XMLHttpRequest is the original browser async HTTP client — a stateful object (readyState 0-4) with event-handler-based callbacks, supporting upload progress via xhr.upload.onprogress (fetch's only missing feature) and synchronous mode (avoid — blocks main thread) — largely superseded by the Fetch API but retained for upload-progress scenarios, with CORS controlled entirely by response headers from the server rather than client configuration."
+
+## BUILD
+
+### 🏗️ Mini Project: File Uploader With XHR Progress + Fetch Fallback
+
+**What you will build:** A file uploader component that shows a real upload progress bar using XHR, with a Fetch fallback that shows a spinner when no progress is needed — plus a client-side CORS proxy demo.
+**Why this project:** Forces XHR upload events AND side-by-side comparison with fetch — the one real use-case where XHR still wins.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-xhr && cd js-xhr
+ni index.html, uploader.js -ItemType File
+```
+
+#### Step 2 — XHR Uploader With Progress
+```js
+// uploader.js
+export function uploadWithProgress(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = (e.loaded / e.total * 100).toFixed(0);
+        onProgress?.(Number(pct), e.loaded, e.total);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { resolve(xhr.responseText); }
+      } else {
+        reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
+      }
+    };
+    xhr.onerror   = () => reject(new Error('Network error'));
+    xhr.ontimeout = () => reject(new Error('Upload timeout'));
+    xhr.timeout   = 60_000;
+
+    xhr.open('POST', url);
+    xhr.send(formData);
+  });
+}
+
+// Fetch fallback — no progress, but simpler code
+export async function uploadSimple(url, file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch(url, { method: 'POST', body: formData });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+```
+
+#### Step 3 — UI Integration
+```html
+<!DOCTYPE html>
+<html><body>
+  <input type="file" id="fileInput">
+  <button id="upload">Upload</button>
+  <progress id="bar" max="100" value="0" style="width:100%"></progress>
+  <p id="status">Ready</p>
+  <script type="module">
+    import { uploadWithProgress } from './uploader.js';
+    const fileInput = document.getElementById('fileInput');
+    const status    = document.getElementById('status');
+    const bar       = document.getElementById('bar');
+
+    document.getElementById('upload').onclick = async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      status.textContent = 'Uploading...';
+      try {
+        await uploadWithProgress('/upload', file, (pct) => {
+          bar.value = pct;
+          status.textContent = `${pct}%`;
+        });
+        bar.value = 100;
+        status.textContent = 'Done!';
+      } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+      }
+    };
+  </script>
+</body></html>
+```
+
+#### Step 4 — Error Handling: CORS Proxy Pattern
+```js
+// corsProxy.js — running on YOUR server to avoid CORS
+export async function proxiedFetch(externalUrl, options = {}) {
+  // Client calls YOUR server
+  const res = await fetch('/api/proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: externalUrl, options }),
+  });
+  return res.json();
+}
+
+// YOUR server (Node.js) fetches the external URL
+// (Node has no CORS restrictions — it's a server-to-server call)
+// app.post('/api/proxy', async (req, res) => {
+//   const { url, options } = req.body;
+//   const data = await fetch(url, options).then(r => r.json());
+//   res.json(data);
+// });
+```
+
+#### Step 5 — Tests
+```js
+// xhr.test.js
+import { describe, it, expect, vi } from 'vitest';
+
+class MockXHR {
+  constructor() { this.upload = {}; this.timeout = 0; this.responseText = '{}'; }
+  open(m, u) { this._method = m; this._url = u; }
+  send(body) { setTimeout(() => { this.status = 200; this.onload(); }, 10); }
+}
+
+global.XMLHttpRequest = MockXHR;
+
+describe('uploadWithProgress', () => {
+  it('resolves on successful upload', async () => {
+    const { uploadWithProgress } = await import('./uploader.js');
+    const file = new Blob(['data'], { type: 'text/plain' });
+    const result = await uploadWithProgress('/upload', file);
+    expect(result).toEqual({});
+  });
+  it('calls onProgress callback', async () => {
+    const { uploadWithProgress } = await import('./uploader.js');
+    const progressCalls = [];
+    global.XMLHttpRequest = class extends MockXHR {
+      send(body) {
+        this.upload.onprogress?.({ lengthComputable: true, loaded: 50, total: 100 });
+        super.send(body);
+      }
+    };
+    const file = new Blob(['data'], { type: 'text/plain' });
+    await uploadWithProgress('/upload', file, (p) => progressCalls.push(p));
+    expect(progressCalls).toContain(50);
+  });
+});
+```
+
+**Expected Output:**
+```
+Progress bar fills from 0% to 100% in real time
+Done! on completion
+
+# Tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add pause/resume using xhr.abort() + Range headers
+- [ ] Add chunked upload splitting large files into 5MB chunks
+- [ ] Compare upload speed XHR vs fetch ReadableStream body
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** One thing XHR does that fetch cannot (without streaming tricks).
+**Q2:** What CORS header must the server send?
+**Q3:** Write an XHR GET request with onload and onerror. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `fetch(url, {mode:'no-cors'})` give an opaque response?
+**Q5:** A junior adds a custom header and suddenly gets a CORS preflight — explain why.
+**Q6:** Refactor XHR callback to Promise.
+
+### Day 7 — Application
+**Q7:** Build a download manager with progress and cancel using XHR.
+**Q8:** A PR fetches a cross-origin API and gets CORS errors — name all possible fixes.
+**Q9:** What's the browser limit on concurrent same-origin XHR/fetch connections?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through CORS preflight — every header, every condition."
+**Q11:** Draw: XHR readyState transitions for a successful POST.
+**Q12:** ★ System design: "Design an upload service that handles 1GB files, shows progress, supports pause/resume."

@@ -72,29 +72,13 @@ GC Roots include:
 
 ---
 
+
 ## VISUALIZATION_CONFIG
+
 ```json
-{
-  "title": "Generational Object Promotion Flow",
-  "type": "flowchart",
-  "nodes": [
-    {"id": "alloc", "label": "New Object Allocation", "details": "Placed in Eden Space"},
-    {"id": "minor_gc", "label": "Minor GC Cycle", "details": "Mark-Copy phase triggered"},
-    {"id": "survivor", "label": "Survivor Spaces (S0/S1)", "details": "Objects age here (Age incremented)"},
-    {"id": "old_gen", "label": "Old Generation", "details": "Promoted when Age > MaxTenuringThreshold"}
-  ],
-  "links": [
-    {"source": "alloc", "target": "minor_gc", "label": "Eden fills up"},
-    {"source": "minor_gc", "target": "survivor", "label": "Live objects copied"},
-    {"source": "survivor", "target": "minor_gc", "label": "Next GC cycle"},
-    {"source": "survivor", "target": "old_gen", "label": "Promoted"}
-  ]
-}
+{ "component": "MemoryDiagram", "state": "fullstack-gc-basics" }
 ```
-
----
-
-## CODE_IMPLEMENTATION
+## CODE
 The following code demonstrates how to monitor GC events programmatically using the JVM's built-in MXBeans. It triggers GC cycles and tracks collection times, memory reclamation, and GC pauses.
 
 ```java
@@ -182,3 +166,109 @@ public final class GCMonitoringDemo {
     *   Replace static collections with caches that support soft references (`SoftReference`), weak references (`WeakReference`), or automatic eviction policies (e.g., Caffeine cache).
 
 ---
+
+## REAL_WORLD
+
+### How Node.js / V8 Uses GC
+V8 uses a generational GC: young generation (Scavenger, runs often, fast) + old generation (Mark-Sweep-Compact, runs rarely, can pause). Most allocations die young so the cheap scavenger handles them. Long-lived objects promote to old gen, swept incrementally to avoid stop-the-world pauses.
+
+### Production Gotcha: Closure Leak
+```js
+// ❌ Each handler closes over huge `data` — never GC'd
+app.get('/hit', (req, res) => {
+  const data = new Array(1e6).fill('x');
+  setInterval(() => console.log('alive'), 1000); // closure retains data
+  res.send('ok');
+});
+// ✅ Don't capture large objects in long-lived closures
+```
+
+### Performance Characteristics
+| GC Type | Pause | Frequency |
+|---|---|---|
+| Scavenge (young) | <1ms | Frequent |
+| Mark-Sweep (old) | 10-100ms | Occasional |
+| Mark-Compact | 50-500ms | Rare |
+
+## INTERVIEW
+
+**Q1 (J): What is garbage collection?** A: Automatic memory reclamation — the runtime tracks reachable objects and frees memory used by unreachable ones, so the developer doesn't manually free.
+
+**Q2 (J): Why can a Node app run out of memory?** A: References pin objects: closures over large data, global maps, event listeners not removed, caches without eviction.
+
+**Q3 (M): Generational GC?** A: Most objects die young → use a fast cheap collector (scavenger) for young gen, slower thorough collector for old gen. Reduces total GC cost dramatically.
+
+**Q4 (M): How do you detect a leak in production?** A: Monitor heap size over time, take heap snapshots at intervals, diff in DevTools to find growing retainers.
+
+**Q5 (S): Stop-the-world vs incremental GC?** A: STW pauses all execution; incremental interleaves with work to keep pauses short. V8 uses incremental + concurrent marking to keep pauses under 10ms.
+
+**Q6 (S): When does GC become your bottleneck?** A: High-allocation hot paths (parsing, JSON), large heaps (>4GB), short-lived spikes. Object pools or pre-allocated buffers fix.
+
+## FEYNMAN CHECK
+
+### Explain GC Like I'm 10
+> GC is the runtime's vacuum cleaner. It walks the live objects starting from roots (globals, stack) and any object it CAN'T reach gets swept. Newer objects die quickly so the runtime collects them with a fast cheap pass; survivors are promoted to a slower pass. The non-obvious part: closures and event listeners ROOT objects you forgot about — most "memory leaks" are forgotten references, not real bugs.
+
+---
+
+### 5 Deep Questions
+**Q1: How does GC decide what to collect?** > A: Reachability from roots. Anything not transitively reachable is garbage.
+**Q2: ONE model.** > A: "Roots → trace reachable → sweep unreachable. Young gen = cheap, old gen = expensive."
+**Q3: Misconception+code.** > A: ```js
+// ❌ Cache never evicts
+const cache = new Map();
+function get(k) { if(!cache.has(k)) cache.set(k, load(k)); return cache.get(k); }
+// ✅ WeakMap or LRU
+const cache = new LRU({ max: 1000 });
+```
+**Q4: With event loop?** > A: GC pauses the JS thread; long pauses spike p99 latency.
+**Q5: Senior one-liner.** > A: "GC is automatic reachability-based memory reclamation whose pauses become app latency — closures and global maps are the #1 production leak source."
+
+## BUILD
+
+### 🏗️ Mini Project: Detect a Memory Leak
+**Time:** 25 min
+
+#### Step 2 — Leaky Server
+```js
+const express = require('express');
+const app = express();
+const leaked = [];
+app.get('/work', (req, res) => { leaked.push(new Array(10000).fill(0)); res.json({ heap: process.memoryUsage().heapUsed }); });
+app.listen(3000);
+```
+
+#### Step 3 — Detect with autocannon + heap snapshot
+```bash
+autocannon -c 10 -d 30 http://localhost:3000/work
+# Watch heap grow indefinitely; take snapshot before/after; diff in DevTools
+```
+
+#### Step 5 — Fix
+```js
+// Remove the leaked array; or cap with LRU
+```
+
+**Expected Output:** Heap stable after fix, growing before.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** What is reachability in GC?
+**Q2:** Young vs old gen — why split?
+**Q3:** Write a heap snapshot in 5 lines.
+
+### Day 3
+**Q4:** Closure leak — show and fix.
+**Q5:** Cache-without-eviction bug.
+**Q6:** STW vs incremental.
+
+### Day 7
+**Q7:** Use perf_hooks to alert on GC > 100ms.
+**Q8:** PR adds unbounded cache. Memory impact at 1M users?
+**Q9:** Object pooling — when worth it?
+
+### Day 14
+**Q10:** ★ "Diagnose a Node OOM in production."
+**Q11:** Link GC → event loop → p99 latency.
+**Q12:** ★ "Heap grows 100MB/hour. Investigation steps."

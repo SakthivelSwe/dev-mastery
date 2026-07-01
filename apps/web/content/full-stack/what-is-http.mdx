@@ -103,3 +103,128 @@ Before the HTTP request is sent, the browser and server do cryptographic math to
 ## INTERVIEW
 **Q: Can you explain what the `Content-Length` header does and what happens if it is wrong?**
 A: `Content-Length` tells the receiving side exactly how many bytes the Body of the message contains. Because TCP is a continuous stream of data, the receiver uses `Content-Length` to know exactly when the current HTTP message ends and the next one begins. If the server says `Content-Length: 500` but only sends 400 bytes of data, the browser will literally freeze, waiting indefinitely for the remaining 100 bytes (causing a timeout). If it sends 600 bytes, the last 100 bytes will be ignored or bleed into the next request, causing catastrophic parsing errors.
+
+## FEYNMAN CHECK
+
+### Explain HTTP Like I'm 10 Years Old
+> HTTP is the language browsers and servers use to send letters to each other. Every letter starts with a verb (GET = "please give me", POST = "please save this"), a target (the URL), and headers (envelope notes like "I speak English"). The server answers with a status code (200 = "here you go", 404 = "I don't have it", 500 = "I broke") and a body. The non-obvious part: HTTP is stateless — each letter is independent, the server forgets you exist between requests. This is why cookies and tokens exist: to re-introduce you on every letter.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why is HTTP designed to be stateless, and what is the consequence?**
+> **A:** Statelessness means any server in a load-balanced fleet can handle any request — no session pinning needed, no shared memory between servers, infinite horizontal scaling. The cost: every request must include all context needed to handle it (auth token, content negotiation headers, etc), which is why HTTP request headers grow large in real APIs and why cookies/JWTs exist to re-establish "who you are" on every call.
+
+**Q2: ONE mental model.**
+> **A:** "HTTP request = verb + URL + headers + optional body. Response = status code + headers + body. Both sides are stateless. Everything else (sessions, caching, auth) is built on top using headers."
+
+**Q3: Misconception with code.**
+> **A:** Treating GET as if it could have side effects.
+> ```js
+> // ❌ DANGEROUS — GET is meant to be safe and idempotent
+> app.get('/api/delete-user/:id', (req, res) => {
+>   db.deleteUser(req.params.id);  // browsers/crawlers prefetch GETs → mass deletion
+> });
+> // ✅ Use DELETE for destructive actions
+> app.delete('/api/users/:id', (req, res) => db.deleteUser(req.params.id));
+> ```
+
+**Q4: How do HTTP/1.1, HTTP/2, and HTTP/3 differ at the wire level?**
+> **A:** HTTP/1.1: one request at a time per connection (head-of-line blocking); needs many parallel TCP connections. HTTP/2: multiplexes many requests over one TCP connection using binary framing — but TCP-level head-of-line blocking remains. HTTP/3 runs on QUIC (UDP-based) which moves multiplexing into the protocol itself, so one lost packet only blocks one stream, not all of them.
+
+**Q5: One-sentence senior definition.**
+> **A:** "HTTP is a stateless request/response protocol where a typed verb operates on a URL-addressed resource and returns a numerically-classified status with headers and body — its statelessness is what enables horizontal scaling and CDN caching, and its weakness is that every request pays for its own context."
+
+## BUILD
+
+### 🏗️ Mini Project: HTTP Request Inspector
+
+**What you will build:** A Node.js HTTP server that echoes back the full structure of any request, plus a client showing each HTTP method.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir http-inspector && cd http-inspector
+npm init -y
+touch server.js client.js
+```
+
+#### Step 2 — Core Server
+```js
+// server.js — echoes every request back so you can SEE HTTP structure
+const http = require('http');
+const server = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', chunk => body += chunk);
+  req.on('end', () => {
+    const echo = {
+      method: req.method,
+      url: req.url,
+      httpVersion: req.httpVersion,
+      headers: req.headers,
+      body: body || null,
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(echo, null, 2));
+  });
+});
+server.listen(3000, () => console.log('Inspector on :3000'));
+```
+
+#### Step 3 — Exercise Each Verb
+```bash
+# Safe + idempotent: GET, HEAD, OPTIONS
+curl -X GET http://localhost:3000/users/42
+# Create: POST (body)
+curl -X POST -H "Content-Type: application/json" -d '{"name":"Alice"}' http://localhost:3000/users
+# Replace whole: PUT, Patch partial: PATCH
+curl -X PUT  -d '{"name":"Alice","age":30}' http://localhost:3000/users/42
+curl -X PATCH -d '{"age":31}' http://localhost:3000/users/42
+# Destructive: DELETE
+curl -X DELETE http://localhost:3000/users/42
+```
+
+#### Step 4 — Error Handling
+```js
+// Return correct status codes — not always 200
+if (req.url === '/notfound') { res.writeHead(404); res.end('Not Found'); return; }
+if (req.method === 'POST' && !body) { res.writeHead(400); res.end('Body required'); return; }
+```
+
+#### Step 5 — Tests
+```bash
+# Verify status codes
+curl -o /dev/null -w "%{http_code}\n" http://localhost:3000/users/42      # 200
+curl -o /dev/null -w "%{http_code}\n" http://localhost:3000/notfound       # 404
+curl -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3000/users  # 400 (no body)
+```
+
+**Expected Output:**
+```
+{ "method": "POST", "url": "/users", "httpVersion": "1.1", "headers": { "host": "localhost:3000", "content-type": "application/json" }, "body": "{\"name\":\"Alice\"}" }
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name 6 HTTP methods and the verb-semantics of each (safe, idempotent, has-body).
+**Q2:** What does "stateless" mean for HTTP, and what is the architectural benefit?
+**Q3:** Write a 10-line Node.js HTTP server returning JSON.
+
+### Day 3 — Comprehension
+**Q4:** Difference between 4xx and 5xx status codes — give an example of each.
+**Q5:** Show the GET-with-side-effects bug and the proper DELETE fix.
+**Q6:** What is idempotency? Which HTTP methods are idempotent and why does it matter for retries?
+
+### Day 7 — Application
+**Q7:** Implement a request retry helper that retries idempotent methods up to 3 times with exponential backoff.
+**Q8:** A PR uses GET to delete records. Describe what happens when Google's crawler visits the site.
+**Q9:** What is HTTP/2 multiplexing and what production problem does it solve over HTTP/1.1?
+
+### Day 14 — Synthesis & Interview Prep
+**Q10:** ★ "Explain everything that happens during a single HTTPS GET request from browser to server."
+**Q11:** Map HTTP → REST → API design → caching — each builds on the previous?
+**Q12:** ★ "Your API gets 50k req/s. Latency spikes when one downstream is slow. How does HTTP/2 vs HTTP/1.1 affect this?"

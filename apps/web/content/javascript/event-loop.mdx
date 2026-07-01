@@ -131,3 +131,194 @@ If you wrote a normal synchronous recursive function (`function rec() { rec(); }
 However, with `Promise.resolve().then(recursive)`, you are pushing the recursion into the **Microtask Queue**. 
 The Event Loop executes the Promise, pops it off the Stack (Stack size returns to 0), and then immediately queues up another Microtask. 
 Because the Event Loop *must* drain the Microtask Queue before doing anything else (like UI rendering), it gets trapped in an infinite loop of executing Microtasks. The Call Stack never overflows (because it empties after every step), but the browser tab is permanently frozen!
+
+## FEYNMAN CHECK
+
+### Explain Event Loop Like I'm 10 Years Old
+> The event loop is the SCHEDULER that runs your JavaScript. JS is single-threaded — only ONE thing runs at a time. But asynchronous operations (setTimeout, fetch, click handlers, Promise resolutions) need to run LATER. The runtime keeps queues: MACROTASK QUEUE (setTimeout, setInterval, I/O, UI events) and MICROTASK QUEUE (Promise .then callbacks, queueMicrotask, MutationObserver). The loop is: (1) Run ONE macrotask from the queue. (2) Drain ALL microtasks queued during that macrotask. (3) Browser paints if needed. (4) Go to step 1. The non-obvious power: microtasks always drain BEFORE the next macrotask — that's why `Promise.resolve().then(...)` ALWAYS runs before `setTimeout(..., 0)`.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why was the event loop designed this way?**
+> **A:** JavaScript runs in browsers — it MUST not block UI rendering. Single-threaded execution prevents data races (no locks needed in user code), but requires non-blocking I/O. The event loop is the bridge: native I/O happens in C++ threads underneath, results are posted back to the JS queue, the loop picks them up between synchronous chunks. This let JS scale from "small page scripts" to "Gmail" without redesigning the language.
+
+**Q2: Mental model for queue priority?**
+> **A:** "Sync code runs to completion. Then microtasks drain (priority — including chained .then). Then ONE macrotask runs. Then microtasks drain again. Then maybe a paint. Repeat." Microtasks have a footgun: an infinite chain of microtasks STARVES macrotasks AND blocks paint (frozen UI). Browser dev tools warn about long microtask chains.
+
+**Q3: Most dangerous misconception?**
+> **A:** `setTimeout(fn, 0)` runs "immediately":
+> ```js
+> // ❌ Order is NOT (sync, timer, then microtask)
+> setTimeout(() => console.log('macro'), 0);
+> Promise.resolve().then(() => console.log('micro'));
+> console.log('sync');
+>
+> // Actual output:
+> // sync   (sync code first)
+> // micro  (microtask queue drained next)
+> // macro  (macrotask comes last)
+>
+> // ✅ Use queueMicrotask for "as soon as possible" without timer overhead
+> queueMicrotask(() => console.log('also micro'));
+> ```
+
+**Q4: How does requestAnimationFrame fit in?**
+> **A:** rAF callbacks fire RIGHT BEFORE the browser paints — typically 60 times per second (every 16.67ms) or matching the display refresh rate. They are scheduled BETWEEN microtask drain and paint. This makes rAF the canonical hook for animations: it runs once per frame, no more (avoiding the over-rendering of setInterval), and is automatically paused for inactive tabs. NEVER do heavy work in rAF — you have ~10ms before the next frame.
+
+**Q5: FAANG-grade definition?**
+> **A:** "The JavaScript event loop is the runtime's single-threaded scheduler that processes one macrotask per tick (timers, I/O callbacks, UI events) interleaved with full draining of the microtask queue (Promise reactions, queueMicrotask, MutationObserver) between every macrotask — coordinated with browser paint via requestAnimationFrame and requestIdleCallback — providing non-blocking concurrency without thread-level parallelism."
+
+## BUILD
+
+### 🏗️ Mini Project: Event Loop Visualizer — Log Order Of Sync, Promise, setTimeout, rAF
+
+**What you will build:** A page that schedules every kind of async task and logs their execution order in real-time — proving the microtask-then-macrotask ordering empirically.
+**Why this project:** Forces hands-on observation of the queues — every async ordering interview question relies on understanding this.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-eventloop && cd js-eventloop
+ni index.html, app.js -ItemType File
+```
+
+#### Step 2 — HTML
+```html
+<!DOCTYPE html><html><body>
+  <button id="run">Run scheduling demo</button>
+  <pre id="out"></pre>
+  <script type="module" src="app.js"></script>
+</body></html>
+```
+
+#### Step 3 — The Demo
+```js
+// app.js
+const out = document.getElementById('out');
+const log = (msg) => { out.textContent += msg + '\n'; };
+
+document.getElementById('run').onclick = () => {
+  out.textContent = '';
+
+  log('1. sync start');
+
+  setTimeout(() => log('5. macrotask: setTimeout(0)'),         0);
+  setTimeout(() => log('6. macrotask: setTimeout(50)'),       50);
+
+  Promise.resolve()
+    .then(() => log('3. microtask: Promise.then (1st)'))
+    .then(() => log('4. microtask: Promise.then (2nd, chained)'));
+
+  queueMicrotask(() => log('3b. microtask: queueMicrotask'));
+
+  requestAnimationFrame(() => log('7. rAF: before paint'));
+
+  // Sync runs first
+  log('2. sync end');
+};
+```
+
+#### Step 4 — Error Handling: Starvation Demo
+```js
+// Showing microtask STARVATION — UI freezes
+document.body.insertAdjacentHTML('beforeend',
+  '<button id="starve">Starve macrotasks (locks UI for 3s)</button>');
+
+document.getElementById('starve').onclick = () => {
+  log('--- starting starvation ---');
+  let count = 0;
+  function recurse() {
+    count++;
+    if (count > 100000) {
+      log('Done after ' + count + ' microtasks');
+      return;
+    }
+    queueMicrotask(recurse);   // each microtask schedules another
+  }
+  recurse();
+  // While this runs, setTimeout below CANNOT fire — UI is frozen
+  setTimeout(() => log('Macrotask scheduled — fired only AFTER microtasks drained'), 0);
+};
+```
+
+#### Step 5 — Tests
+```js
+// eventloop.test.js
+import { describe, it, expect, vi } from 'vitest';
+
+describe('event loop ordering', () => {
+  it('microtasks run before macrotasks', async () => {
+    const log = [];
+    setTimeout(() => log.push('macro'), 0);
+    await Promise.resolve().then(() => log.push('micro'));
+    // After await, the microtask has run but macrotask hasn't
+    expect(log).toEqual(['micro']);
+    await new Promise(r => setTimeout(r, 10));
+    expect(log).toEqual(['micro', 'macro']);
+  });
+
+  it('chained .then go on the same microtask queue drain', async () => {
+    const log = [];
+    Promise.resolve().then(() => log.push('a')).then(() => log.push('b'));
+    Promise.resolve().then(() => log.push('c'));
+    await new Promise(r => setTimeout(r, 0));
+    expect(log).toEqual(['a', 'c', 'b']);   // interleaved by FIFO order
+  });
+
+  it('queueMicrotask matches Promise.then in priority', async () => {
+    const log = [];
+    queueMicrotask(() => log.push('qmt'));
+    Promise.resolve().then(() => log.push('pt'));
+    await new Promise(r => setTimeout(r, 0));
+    expect(log).toEqual(['qmt', 'pt']);
+  });
+});
+```
+
+**Expected Output:**
+```
+1. sync start
+2. sync end
+3. microtask: Promise.then (1st)
+3b. microtask: queueMicrotask
+4. microtask: Promise.then (2nd, chained)
+5. macrotask: setTimeout(0)
+7. rAF: before paint            (next frame, ~16ms)
+6. macrotask: setTimeout(50)    (after 50ms)
+```
+
+**Stretch Challenges:**
+- [ ] Add a Worker thread and show messages arrive as macrotasks
+- [ ] Show MessageChannel as a faster macrotask alternative to setTimeout(0)
+- [ ] Build a "low-priority defer" using setTimeout vs queueMicrotask
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between microtask and macrotask?
+**Q2:** Order of: `sync`, `setTimeout(...,0)`, `Promise.resolve().then(...)`?
+**Q3:** What scheduler does requestAnimationFrame integrate with? From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why can a long microtask chain freeze the UI but a long macrotask chain doesn't (as badly)?
+**Q5:** A junior says "setTimeout(0) is immediate" — show three ways it isn't.
+**Q6:** Refactor for non-blocking:
+```js
+function process(items) {
+  for (const x of items) heavyWork(x);    // blocks the UI for 5s
+}
+```
+
+### Day 7 — Application
+**Q7:** Write a scheduler that yields to the event loop every 5ms during a heavy loop.
+**Q8:** A PR uses setInterval for 1ms animation — explain why rAF is correct.
+**Q9:** What is the overhead per microtask vs per macrotask?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through what happens between a Promise resolving and its .then callback running."
+**Q11:** Draw: event loop diagram with stack, microtask queue, macrotask queue, paint cycle.
+**Q12:** ★ System design: "Build a 60fps UI that also runs a CPU-intensive parser — how do you schedule the work?"

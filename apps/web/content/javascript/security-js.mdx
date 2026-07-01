@@ -101,3 +101,207 @@ A: **The `javascript:` Pseudo-Protocol.**
 React (and other frameworks) perfectly escape HTML tags to prevent standard injection. However, React does *not* validate the contents of URL attributes (like `href` or `src`).
 If an `href` begins with `javascript:`, the browser treats the string as executable code instead of a URL path. When clicked, it runs in the context of your application!
 *The Fix:* You must manually validate and sanitize user-provided URLs before rendering them. You must ensure the URL begins with a safe protocol (`http://`, `https://`, or `mailto:`). If it doesn't, you must discard it or replace it with a safe fallback (like `#`)!
+
+## FEYNMAN CHECK
+
+### Explain JS Security Like I'm 10 Years Old
+> Security in JS means protecting users from: XSS (injecting malicious script via innerHTML), CSRF (tricking a browser into sending requests), and Prototype Pollution (breaking all objects by mutating Object.prototype). XSS fix: use textContent or DOMPurify instead of innerHTML. CSRF fix: SameSite cookies + CSRF tokens. Prototype pollution fix: Object.create(null) for user-controlled key-value stores + freeze Object.prototype. Supply-chain attacks (malicious npm packages) need npm audit + lockfiles. Never put API keys in client-side JS — they appear in the bundle.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does XSS work and what prevents it?**
+> **A:** XSS injects executable code into your page via user-controlled HTML. Prevention: (1) textContent instead of innerHTML for user data; (2) DOMPurify for rich HTML; (3) Content-Security-Policy header blocking inline scripts; (4) HttpOnly cookies so JS cannot steal auth tokens; (5) escape user values in all output contexts (HTML, URL, CSS, JS).
+
+**Q2: Mental model for CSP?**
+> **A:** CSP is a HTTP response header instructing the browser which script sources to execute. `script-src 'self' 'nonce-XYZ'` blocks ALL scripts except same-origin ones and those with the matching nonce. Even injected `<script>` tags are blocked because they lack the nonce. Next.js and React frameworks generate nonces automatically.
+
+**Q3: Most dangerous misconception?**
+> **A:** JSON.parse is safe for user input:
+> ```js
+> // Prototype pollution via JSON
+> const input = '{"__proto__": {"admin": true}}';
+> Object.assign({}, JSON.parse(input));
+> console.log(({}).admin);   // true — ALL objects polluted!
+>
+> // Fix: validate schema after parse (zod/joi) or use Object.create(null)
+> const safe = Object.create(null);
+> Object.assign(safe, JSON.parse(input));
+> console.log(({}).admin);   // undefined — prototype intact
+> ```
+
+**Q4: How do supply-chain attacks work?**
+> **A:** A compromised or typosquatted npm package executes code inside your bundle. Defenses: lockfiles (npm ci), npm audit in CI, minimal dependencies, Subresource Integrity for CDN scripts, and reviewing package ownership before install.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript security encompasses XSS prevention (CSP, textContent, DOMPurify, HttpOnly cookies), CSRF mitigation (SameSite cookies, double-submit cookie), prototype-pollution hardening (Object.create(null), Object.freeze on Object.prototype), supply-chain management (audit, lockfiles, SRI), and secrets hygiene (no API keys in bundles, server-side proxy, bundle secrets scanning)."
+
+## BUILD
+
+### 🏗️ Mini Project: Secure Input Sanitizer + CSP Nonce Generator
+
+**What you will build:** escapeHtml, sanitizeUrl (blocks javascript:/data:), prototype-pollution-safe deep merge, and a CSP nonce generator — each with tests.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-security && cd js-security
+npm init -y && npm install -D vitest
+ni secure.js, secure.test.js -ItemType File
+```
+
+#### Step 2 — Security Library
+```js
+// secure.js
+const HTML_ENT = { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;' };
+export function escapeHtml(str) {
+  return String(str).replace(/[&<>"'/]/g, c => HTML_ENT[c]);
+}
+
+const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+export function sanitizeUrl(url) {
+  try {
+    const p = new URL(url);
+    return ALLOWED_PROTOCOLS.has(p.protocol) ? url : 'about:blank';
+  } catch { return 'about:blank'; }
+}
+
+export function safeMerge(target, source) {
+  for (const key of Object.keys(source)) {
+    if (['__proto__','constructor','prototype'].includes(key)) continue;
+    if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+      if (!target[key]) target[key] = Object.create(null);
+      safeMerge(target[key], source[key]);
+    } else { target[key] = source[key]; }
+  }
+  return target;
+}
+
+export function generateNonce() {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr)).replace(/[+/=]/g, c => ({'+':'-','/':'_','=':''}[c]));
+}
+
+export function buildCSP(nonce) {
+  return [
+    "default-src 'self'",
+    "script-src 'self' 'nonce-" + nonce + "'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https:",
+    "connect-src 'self'",
+    "base-uri 'self'",
+  ].join('; ');
+}
+```
+
+#### Step 3 — Demo
+```js
+import { escapeHtml, sanitizeUrl, safeMerge, generateNonce, buildCSP } from './secure.js';
+
+console.log(escapeHtml('<img onerror=alert(1)>'));
+// &lt;img onerror=alert(1)&gt;
+
+console.log(sanitizeUrl('javascript:alert(1)'));  // about:blank
+console.log(sanitizeUrl('https://example.com'));  // https://example.com
+
+const obj = Object.create(null);
+safeMerge(obj, JSON.parse('{"__proto__":{"evil":true},"name":"Ana"}'));
+console.log(({}).evil);    // undefined — not polluted
+console.log(obj.name);     // Ana
+
+const nonce = generateNonce();
+console.log(buildCSP(nonce));
+```
+
+#### Step 4 — Error Handling: Secrets In Bundles
+```js
+const SECRET_RE = [/sk_live_[A-Za-z0-9]{24}/, /AKIA[A-Z0-9]{16}/, /ghp_[A-Za-z0-9]{36}/];
+export function detectSecrets(code) {
+  return SECRET_RE.map(re => re.exec(code)).filter(Boolean).map(m => m[0]);
+}
+
+// Run as a pre-build check
+const bundle = require('fs').readFileSync('./dist/index.js', 'utf8');
+const found = detectSecrets(bundle);
+if (found.length) { console.error('SECRETS IN BUNDLE:', found); process.exit(1); }
+```
+
+#### Step 5 — Tests
+```js
+// secure.test.js
+import { describe, it, expect } from 'vitest';
+import { escapeHtml, sanitizeUrl, safeMerge } from './secure.js';
+
+describe('escapeHtml', () => {
+  it('escapes XSS vectors', () => {
+    expect(escapeHtml('<script>')).toBe('&lt;script&gt;');
+    expect(escapeHtml('"hello"')).toBe('&quot;hello&quot;');
+  });
+  it('handles non-strings', () => { expect(escapeHtml(42)).toBe('42'); });
+});
+
+describe('sanitizeUrl', () => {
+  it('allows safe protocols', () => {
+    expect(sanitizeUrl('https://example.com')).toBe('https://example.com');
+  });
+  it('blocks dangerous protocols', () => {
+    expect(sanitizeUrl('javascript:alert(1)')).toBe('about:blank');
+    expect(sanitizeUrl('data:text/html,<h1>x</h1>')).toBe('about:blank');
+  });
+});
+
+describe('safeMerge', () => {
+  it('merges normally', () => {
+    const a = { x: 1 };
+    safeMerge(a, { y: 2 });
+    expect(a).toEqual({ x: 1, y: 2 });
+  });
+  it('blocks __proto__ pollution', () => {
+    const a = Object.create(null);
+    safeMerge(a, JSON.parse('{"__proto__":{"evil":true}}'));
+    expect(({}).evil).toBeUndefined();
+  });
+});
+```
+
+**Expected Output:**
+```
+&lt;img onerror=alert(1)&gt;
+about:blank
+https://example.com
+undefined  Ana
+default-src 'self'; script-src 'self' 'nonce-...'; ...
+
+# All tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add a sanitiseHTML with allowlist using DOMParser
+- [ ] Add HMAC webhook signature verification
+- [ ] Build a git pre-commit hook that fails on detected secrets
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three main JS security threats.
+**Q2:** Why is textContent safer than innerHTML?
+**Q3:** Write a one-liner HTML escaper. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Show prototype pollution in 3 lines.
+**Q5:** A junior puts user input in a URL: `<a href="${url}">` — what's the attack?
+**Q6:** What HTTP cookie attribute prevents JS from reading it?
+
+### Day 7 — Application
+**Q7:** Build an allowlist-based HTML sanitizer.
+**Q8:** A PR sends API keys in query params — why is this logged in server logs?
+**Q9:** What is SRI and when should you use it?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through all attack surfaces in a React SPA."
+**Q11:** Draw: CSP header → browser enforcement flow.
+**Q12:** ★ System design: "Security architecture for a fintech SPA — CSP, cookies, secret management."

@@ -182,3 +182,666 @@ import java.util.concurrent.locks.StampedLock;
 public final class MetricsAccumulator {
 
     // Shared mutable state protected by
+
+## WHY
+
+Modern applications must handle thousands of simultaneous requests. A single-threaded server processes requests sequentially — request #1000 waits while requests #1 through #999 complete. With concurrency, the server processes all 1000 requests simultaneously, using all CPU cores.
+
+But concurrency introduces the hardest class of bugs in software engineering:
+
+1. **Race conditions**: Two threads read `counter=5`, both add 1, both write 6. Result: 6 instead of 7. Expected: 7. Symptom: random data corruption that only happens under load.
+2. **Visibility failures**: Thread A updates a field. Thread B reads the field 0.1ms later and still sees the old value — because Thread A's write is sitting in L1 cache and hasn't reached main memory.
+3. **Deadlocks**: Thread A holds Lock 1 and waits for Lock 2. Thread B holds Lock 2 and waits for Lock 1. Both wait forever. Application freezes.
+4. **Memory reordering**: The CPU and JIT compiler reorder instructions for performance. Code that looks sequential in Java source may execute in a different order. Without `volatile` or `synchronized`, this causes impossible-seeming bugs.
+5. **Thread overhead**: Each Java platform thread consumes ~1MB of stack memory (off-heap). 10,000 threads = 10GB of memory just for stacks — before processing a single request.
+
+Understanding concurrency at the bytecode level — how `counter++` is 3 separate instructions, how `synchronized` uses the Object Monitor, how `volatile` inserts memory barriers — is the difference between writing systems that work correctly under load and systems that randomly corrupt data in production.
+
+## THEORY
+
+### Thread Architecture: 1:1 Mapping to OS Threads
+
+On HotSpot JVM (Linux/macOS/Windows), a Java `Thread` maps 1:1 to an OS kernel thread:
+
+```
+Java Application
+  ┌──────────────────────┐
+  │  java.lang.Thread    │   ← Java API
+  └──────────┬───────────┘
+             │ JVM JNI call
+  ┌──────────▼───────────┐
+  │  OS Thread (pthread) │   ← ~1MB stack allocation
+  └──────────┬───────────┘
+             │ OS schedules on CPU core
+  ┌──────────▼───────────┐
+  │   CPU Core Execution │   ← Actual hardware computation
+  └──────────────────────┘
+```
+
+**Creating a thread is expensive:**
+- Kernel context switch into privileged mode
+- OS thread descriptor allocation
+- JVM stack allocation (1MB default)
+- Thread registration in OS scheduler
+
+This is why `ExecutorService` thread pools exist — reuse threads instead of creating/destroying them.
+
+### Shared Heap vs. Private Stack
+
+```
+                    JVM HEAP (Shared — ALL threads see this)
+  ┌─────────────────────────────────────────────────────────┐
+  │  User { name="Alice", balance=100 }                     │
+  │  Order { id=42, total=250.0 }                           │
+  └──────────────────┬─────────────────────┬────────────────┘
+                     │ ref                 │ ref
+  ┌──────────────────▼──┐             ┌────▼───────────────┐
+  │  Thread-1 Stack      │             │  Thread-2 Stack    │
+  │  (private — only T1) │             │  (private — only T2│
+  │  local vars          │             │  local vars        │
+  │  method frames       │             │  method frames     │
+  └──────────────────────┘             └────────────────────┘
+```
+
+**Root cause of race conditions**: Both threads have references to the SAME heap object. They can read and write its fields concurrently without coordination.
+
+### Race Condition: Bytecode Level
+
+`counter++` looks atomic in Java but compiles to 3 JVM bytecode instructions:
+
+```
+getfield  #2   // STEP 1: Read counter from heap into operand stack
+iconst_1       // STEP 2: Push 1 onto operand stack
+iadd           // STEP 3: Add them (result on stack)
+putfield  #2   // STEP 4: Write result back to heap
+```
+
+**Thread interleaving with counter=5:**
+
+| Time | Thread A | Thread B | counter (heap) |
+|------|----------|----------|----------------|
+| T1 | getfield → reads 5 | | 5 |
+| T2 | | getfield → reads 5 | 5 |
+| T3 | iadd → computes 6 | | 5 |
+| T4 | | iadd → computes 6 | 5 |
+| T5 | putfield → writes 6 | | 6 |
+| T6 | | putfield → writes 6 | **6** ← WRONG, should be 7! |
+
+Two increments, only one effective. This is a **lost update** race condition.
+
+### `synchronized`: Object Monitor and Lock Inflation
+
+Every Java object has a **Mark Word** (64 bits) in its header that tracks locking state:
+
+| Lock State | Description | Performance |
+|------------|-------------|-------------|
+| **Unlocked** | No thread holds lock | — |
+| **Biased** (deprecated JDK 18+) | One thread "owns" it with no competition | Ultra-fast (~1 ns) |
+| **Thin Lock** (CAS) | Light contention; uses CAS, no OS call | Fast (~10 ns) |
+| **Fat Lock** (OS Mutex) | High contention; blocks via OS futex | Slow (~1000 ns) |
+
+Lock **inflation** is one-way: Unlocked → Thin → Fat. Never deflates.
+
+**`synchronized` memory semantics** (critical for visibility):
+- On **enter**: all CPU caches invalidated → thread reads fresh values from main memory
+- On **exit**: all writes flushed from CPU cache → written to main memory
+
+### `volatile`: Memory Barriers
+
+`volatile` guarantees **visibility** and **ordering** but NOT atomicity for compound operations like `i++`.
+
+When you write to a `volatile` field, the compiler inserts **memory barrier** instructions:
+```
+StoreStore barrier   ← ensures all previous writes are flushed
+VOLATILE WRITE
+StoreLoad barrier    ← prevents reordering with subsequent reads
+```
+
+When you read a `volatile` field:
+```
+LoadLoad barrier     ← ensures subsequent reads see fresh values
+VOLATILE READ
+LoadStore barrier    ← prevents subsequent writes from reordering before this read
+```
+
+On x86 (strong memory model), many barriers are no-ops. On ARM (weak model), explicit `dmb` instructions are emitted.
+
+### Happens-Before Guarantee
+
+The **Java Memory Model (JMM)** defines when one action's effects are **guaranteed visible** to another. Key rules:
+
+| Rule | Guarantee |
+|------|-----------|
+| **Program order** | Within one thread, each action HB the next |
+| **Monitor lock** | Unlock HB every subsequent lock on same monitor |
+| **Volatile write** | Volatile write HB every subsequent read of same field |
+| **Thread start** | `Thread.start()` HB all actions in the started thread |
+| **Thread join** | All actions in thread HB successful `thread.join()` |
+| **Transitivity** | if A HB B and B HB C, then A HB C |
+
+HB = "happens-before" — guarantees the actions and their memory effects are visible in order.
+
+### Thread Lifecycle
+
+```
+new Thread()
+     │
+     ▼
+  NEW ──────── start() ──────► RUNNABLE
+                                   │
+                              OS schedules
+                                   │
+                              ◄────┤────► BLOCKED (waiting for synchronized)
+                              ◄────┤────► WAITING (Object.wait(), LockSupport.park())
+                              ◄────┤────► TIMED_WAITING (sleep(), wait(timeout))
+                                   │
+                              TERMINATED (run() completes or throws)
+```
+
+## VISUALIZATION_CONFIG
+```json
+{ "type": "none" }
+```
+
+## CODE
+
+### Level 1 — Beginner
+```java
+// Creating and starting threads — two ways
+public class ThreadBasics {
+
+    // Way 1: Extend Thread
+    static class MyThread extends Thread {
+        @Override
+        public void run() {
+            System.out.println("Running in: " + Thread.currentThread().getName());
+        }
+    }
+
+    // Way 2: Implement Runnable (PREFERRED — separates task from execution mechanism)
+    static class MyTask implements Runnable {
+        @Override
+        public void run() {
+            System.out.println("Task running in: " + Thread.currentThread().getName());
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        // Way 1
+        Thread t1 = new MyThread();
+        t1.setName("Thread-A");
+        t1.start();  // Creates OS thread and calls run()
+        // t1.run(); ← DON'T! This runs on main thread, no new thread created
+
+        // Way 2 (preferred)
+        Thread t2 = new Thread(new MyTask(), "Thread-B");
+        t2.start();
+
+        // Way 3: Lambda (even more concise)
+        Thread t3 = new Thread(() -> {
+            System.out.println("Lambda task in: " + Thread.currentThread().getName());
+        }, "Thread-C");
+        t3.start();
+
+        // Wait for all threads to complete before main exits
+        t1.join();
+        t2.join();
+        t3.join();
+
+        System.out.println("All threads completed");
+    }
+}
+```
+
+### Level 2 — Building Blocks
+```java
+// RACE CONDITION DEMO + FIX with synchronized
+public class RaceConditionDemo {
+
+    static int unsafeCounter = 0;    // NOT thread-safe
+    static volatile int visibleFlag = 0;  // Visible but not atomic
+
+    // Thread-safe with synchronized (mutual exclusion)
+    static class SafeCounter {
+        private int count = 0;
+
+        // ONLY ONE THREAD AT A TIME can execute this method
+        public synchronized void increment() {
+            count++;  // Read-Modify-Write is now atomic
+        }
+
+        public synchronized int get() {
+            return count;
+        }
+
+        // Alternative: synchronized block (more granular control)
+        public void incrementWithBlock() {
+            // Other non-synchronized work here...
+            synchronized (this) {
+                count++;  // Only this critical section is locked
+            }
+            // Other non-synchronized work here...
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        int NUM_THREADS = 10;
+        int INCREMENTS_PER_THREAD = 10_000;
+
+        // TEST 1: Unsafe counter — will have lost updates
+        Thread[] threads1 = new Thread[NUM_THREADS];
+        for (int i = 0; i < NUM_THREADS; i++) {
+            threads1[i] = new Thread(() -> {
+                for (int j = 0; j < INCREMENTS_PER_THREAD; j++) {
+                    unsafeCounter++;  // RACE CONDITION!
+                }
+            });
+            threads1[i].start();
+        }
+        for (Thread t : threads1) t.join();
+        System.out.println("Unsafe counter: " + unsafeCounter);
+        // Expected: 100,000. Actual: some random value < 100,000 (lost updates)
+
+        // TEST 2: Safe counter — correct result every time
+        SafeCounter safe = new SafeCounter();
+        Thread[] threads2 = new Thread[NUM_THREADS];
+        for (int i = 0; i < NUM_THREADS; i++) {
+            threads2[i] = new Thread(() -> {
+                for (int j = 0; j < INCREMENTS_PER_THREAD; j++) {
+                    safe.increment();
+                }
+            });
+            threads2[i].start();
+        }
+        for (Thread t : threads2) t.join();
+        System.out.println("Safe counter: " + safe.get());
+        // Always: 100,000 ✓
+    }
+}
+```
+
+### Level 3 — Intermediate
+```java
+// volatile, wait/notify, and thread coordination
+public class VolatileAndCoordination {
+
+    // VOLATILE USE CASE: Status flag between threads
+    static volatile boolean shutdownRequested = false;
+
+    static void demonstrateVolatile() throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            System.out.println("Worker started");
+            while (!shutdownRequested) {  // Reads fresh value every iteration due to volatile
+                // Process work...
+                try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            System.out.println("Worker shutting down");
+        });
+        worker.start();
+
+        Thread.sleep(500);
+        shutdownRequested = true;  // volatile write — guaranteed visible to worker thread
+        worker.join();
+        System.out.println("Worker stopped");
+    }
+
+    // WAIT/NOTIFY: Classic producer-consumer coordination
+    static final Object lock = new Object();
+    static boolean dataReady = false;
+    static String sharedData = null;
+
+    static Thread makeProducer() {
+        return new Thread(() -> {
+            try { Thread.sleep(200); } catch (InterruptedException e) {}
+
+            synchronized (lock) {
+                sharedData = "Hello from producer!";
+                dataReady = true;
+                lock.notifyAll();  // Wake up ALL waiting threads
+                System.out.println("Producer: data sent");
+            }
+        }, "Producer");
+    }
+
+    static Thread makeConsumer(int id) {
+        return new Thread(() -> {
+            synchronized (lock) {
+                while (!dataReady) {  // ALWAYS check condition in a while loop, not if!
+                    try {
+                        lock.wait();  // Releases lock + suspends thread until notified
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                System.out.println("Consumer " + id + ": received = " + sharedData);
+            }
+        }, "Consumer-" + id);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        demonstrateVolatile();
+
+        Thread producer = makeProducer();
+        Thread c1 = makeConsumer(1);
+        Thread c2 = makeConsumer(2);
+
+        c1.start(); c2.start();
+        Thread.sleep(100);
+        producer.start();
+
+        producer.join(); c1.join(); c2.join();
+    }
+}
+```
+
+### Level 4 — Advanced
+```java
+// ATOMIC CLASSES + DEADLOCK DETECTION
+import java.util.concurrent.atomic.*;
+
+public class AtomicAndDeadlock {
+
+    // ATOMIC CLASSES: Lock-free thread safety using CAS
+    static final AtomicInteger atomicCounter = new AtomicInteger(0);
+    static final AtomicLong totalRevenue = new AtomicLong(0);
+    static final AtomicReference<String> currentStatus = new AtomicReference<>("IDLE");
+
+    static void demonstrateAtomics() throws InterruptedException {
+        // AtomicInteger.incrementAndGet() = single CAS instruction (lock cmpxchg on x86)
+        // No lock needed — much faster than synchronized for simple operations
+        Thread[] threads = new Thread[10];
+        for (int i = 0; i < 10; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 10_000; j++) {
+                    atomicCounter.incrementAndGet();         // Atomic increment
+                    totalRevenue.addAndGet(100);             // Atomic add
+                }
+            });
+            threads[i].start();
+        }
+        for (Thread t : threads) t.join();
+        System.out.println("Atomic counter: " + atomicCounter.get());       // Always 100,000
+        System.out.println("Total revenue: " + totalRevenue.get());         // Always 1,000,000
+
+        // compareAndSet: CAS-based conditional update
+        boolean swapped = currentStatus.compareAndSet("IDLE", "PROCESSING");
+        System.out.println("Status changed: " + swapped);  // true
+        System.out.println("Status now: " + currentStatus.get());  // PROCESSING
+    }
+
+    // DEADLOCK: Classic "nested lock" pattern
+    static final Object resourceA = new Object();
+    static final Object resourceB = new Object();
+
+    static void demonstrateDeadlock() {
+        Thread t1 = new Thread(() -> {
+            synchronized (resourceA) {
+                System.out.println("T1: acquired A, waiting for B...");
+                try { Thread.sleep(100); } catch (InterruptedException e) {}
+                synchronized (resourceB) {  // ← BLOCKS: T2 holds B
+                    System.out.println("T1: acquired both!");
+                }
+            }
+        }, "T1");
+
+        Thread t2 = new Thread(() -> {
+            synchronized (resourceB) {      // Acquires B first (opposite order from T1!)
+                System.out.println("T2: acquired B, waiting for A...");
+                try { Thread.sleep(100); } catch (InterruptedException e) {}
+                synchronized (resourceA) {  // ← BLOCKS: T1 holds A
+                    System.out.println("T2: acquired both!");
+                }
+            }
+        }, "T2");
+
+        t1.start(); t2.start();
+        // T1 and T2 will DEADLOCK forever!
+        // Fix: ALWAYS acquire locks in the same order: A then B in both threads
+    }
+
+    // DEADLOCK FIX: Consistent lock ordering
+    static void fixedLocking(boolean isFirstCall) throws InterruptedException {
+        // Always lock A before B — consistent ordering prevents deadlock
+        synchronized (resourceA) {
+            synchronized (resourceB) {
+                System.out.println("Both acquired safely");
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        demonstrateAtomics();
+        // demonstrateDeadlock();  // Uncomment to see deadlock — will hang forever
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+// LOCK-FREE COUNTER WITH VarHandle + ThreadLocal for high-throughput
+import java.lang.invoke.*;
+import java.util.concurrent.atomic.*;
+
+public class LockFreeHighThroughput {
+
+    // VarHandle CAS — lower overhead than AtomicLong, same safety
+    static final class VarHandleCounter {
+        private volatile long count = 0L;
+        private static final VarHandle COUNT;
+
+        static {
+            try {
+                COUNT = MethodHandles.lookup()
+                    .findVarHandle(VarHandleCounter.class, "count", long.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        public void increment() {
+            long current, next;
+            do {
+                current = (long) COUNT.getVolatile(this);
+                next = current + 1;
+            } while (!COUNT.compareAndSet(this, current, next));
+            // On low contention, this loop runs once. On high contention, spins briefly.
+        }
+
+        public long get() { return (long) COUNT.getVolatile(this); }
+    }
+
+    // STRIPED COUNTER: LongAdder-style — reduce contention by spreading across cells
+    // Java's LongAdder uses this exact approach internally
+    static final class StripedCounter {
+        // Each thread tends to write to its own cell — no contention!
+        private final AtomicLong[] cells;
+
+        public StripedCounter(int stripes) {
+            cells = new AtomicLong[stripes];
+            for (int i = 0; i < stripes; i++) cells[i] = new AtomicLong(0);
+        }
+
+        public void increment() {
+            // Distribute writes across cells based on thread ID
+            int index = (int)(Thread.currentThread().getId() % cells.length);
+            cells[index].incrementAndGet();
+        }
+
+        // Sum all cells to get total — reads are aggregated
+        public long get() {
+            long sum = 0;
+            for (AtomicLong cell : cells) sum += cell.get();
+            return sum;
+        }
+    }
+
+    // ThreadLocal: Per-thread state — zero contention, zero synchronization
+    static final ThreadLocal<StringBuilder> threadLocalBuilder =
+        ThreadLocal.withInitial(StringBuilder::new);
+
+    public static void main(String[] args) throws InterruptedException {
+        int THREADS = 8, OPS = 1_000_000;
+
+        // LongAdder (Java's implementation of StripedCounter — fastest for pure increment)
+        LongAdder adder = new LongAdder();
+        AtomicLong atomic = new AtomicLong();
+        VarHandleCounter varHandle = new VarHandleCounter();
+
+        // Benchmark each approach
+        for (var entry : new Object[][]{{adder, "LongAdder"}, {atomic, "AtomicLong"}}) {
+            long start = System.nanoTime();
+            Thread[] ts = new Thread[THREADS];
+            for (int i = 0; i < THREADS; i++) {
+                int idx = i;
+                ts[i] = new Thread(() -> {
+                    for (int j = 0; j < OPS; j++) {
+                        if (entry[0] instanceof LongAdder la) la.increment();
+                        else ((AtomicLong) entry[0]).incrementAndGet();
+                    }
+                });
+                ts[i].start();
+            }
+            for (Thread t : ts) t.join();
+            long elapsed = System.nanoTime() - start;
+            System.out.printf("%s: time=%dms%n", entry[1], elapsed / 1_000_000);
+        }
+        // LongAdder ~2x faster than AtomicLong under high contention
+
+        // ThreadLocal: per-thread StringBuilders for zero-allocation string formatting
+        Thread[] workers = new Thread[4];
+        for (int i = 0; i < 4; i++) {
+            int id = i;
+            workers[i] = new Thread(() -> {
+                StringBuilder sb = threadLocalBuilder.get();  // Thread's own StringBuilder
+                sb.setLength(0);  // Reset without allocation
+                sb.append("Thread-").append(id).append(": processed ");
+                sb.append(OPS).append(" items");
+                System.out.println(sb);
+            });
+            workers[i].start();
+        }
+        for (Thread t : workers) t.join();
+    }
+}
+```
+
+## REAL_WORLD
+
+### Thread Pool Sizing — The M/M/1 Queue Formula
+```java
+// CRITICAL: Correct thread pool sizing formula
+// Brian Goetz's formula from "Java Concurrency in Practice":
+// N_threads = N_cores × (1 + W/C)
+// W = wait time per task (DB/network IO wait)
+// C = compute time per task
+
+@Configuration
+public class ThreadPoolConfig {
+
+    @Bean
+    public ThreadPoolTaskExecutor apiTaskExecutor() {
+        int cores = Runtime.getRuntime().availableProcessors();  // e.g., 8
+
+        // Compute-intensive: W/C ≈ 0 → use N_cores threads
+        // IO-intensive: W/C ≈ 9 (90% wait) → use N_cores * 10 threads
+
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(cores * 2);      // For IO-bound API handlers
+        executor.setMaxPoolSize(cores * 4);       // Burst capacity
+        executor.setQueueCapacity(500);           // Task queue before rejection
+        executor.setThreadNamePrefix("api-worker-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+// DEADLOCK PREVENTION: Lock ordering convention
+// Rule: ALWAYS acquire locks in alphabetical/numerical/documented order
+// Account transfer: ALWAYS lock lower-ID account first
+public class BankTransfer {
+    public void transfer(Account from, Account to, double amount) {
+        Account first  = from.getId() < to.getId() ? from : to;   // Lower ID first
+        Account second = from.getId() < to.getId() ? to   : from;
+
+        synchronized (first) {
+            synchronized (second) {
+                from.debit(amount);
+                to.credit(amount);
+            }
+        }
+        // Consistent lock order = no deadlock possible
+    }
+}
+```
+
+## INTERVIEW
+
+### Q1: What is a race condition and how do you prevent it?
+**Difficulty:** Medium | **Companies:** All
+
+❌ **Weak:** "When two threads access the same variable at the same time."
+
+✅ **Strong:** "A race condition occurs when program correctness depends on the relative timing of thread execution — specifically when multiple threads perform non-atomic read-modify-write operations on shared state. `counter++` is not atomic: it's read (getfield), increment (iadd), write (putfield) — three separate bytecode instructions. If two threads interleave these steps, both can read the same value and both write the same incremented value, causing a lost update. Prevention: (1) `synchronized` — mutual exclusion ensures only one thread executes the critical section. (2) `AtomicInteger/AtomicLong` — CAS-based hardware atomic instructions. (3) Immutability — threads can't race to modify what can't be modified. (4) Thread confinement — each thread has its own copy via ThreadLocal."
+
+---
+
+### Q2: What is the difference between `synchronized` and `volatile`?
+**Difficulty:** Hard | **Companies:** Google, Amazon, Oracle
+
+❌ **Weak:** "synchronized is for methods, volatile is for variables."
+
+✅ **Strong:** "`synchronized` provides **mutual exclusion** (only one thread in the block at a time) AND **memory visibility** (flushes writes to main memory on exit, reads from main memory on entry). `volatile` provides only **memory visibility** and **ordering** — not mutual exclusion. A `volatile` write is visible to all subsequent reads of the same field. But `volatile` does NOT make compound operations atomic. `counter++` on a volatile field is still a race condition because read-modify-write is three steps. Use `synchronized` when you need atomicity of multi-step operations. Use `volatile` for single writes that must be immediately visible (flag signals, `instance` in double-checked locking)."
+
+---
+
+### Q3: How can a deadlock occur and what are the four conditions required?
+**Difficulty:** Hard | **Companies:** Netflix, Spotify, trading firms
+
+❌ **Weak:** "Two threads waiting for each other's locks."
+
+✅ **Strong:** "A deadlock requires all four Coffman conditions simultaneously: (1) **Mutual exclusion** — resources can only be held by one thread. (2) **Hold and wait** — threads hold resources while waiting for more. (3) **No preemption** — resources cannot be forcibly taken. (4) **Circular wait** — Thread A waits for B's resource, B waits for A's resource. Prevention: break any one condition. The most practical: enforce **consistent lock ordering** — always acquire locks in the same global order (e.g., by ID). If all threads acquire Lock-A before Lock-B, circular wait is impossible. Alternatively, use `ReentrantLock.tryLock(timeout)` to abandon and retry if deadlock is detected."
+
+---
+
+### Q4: What is happens-before and why does it matter?
+**Difficulty:** Hard | **Companies:** Palantir, Jane Street
+
+❌ **Weak:** "It means one operation happens before another."
+
+✅ **Strong:** "Happens-before (HB) is the JMM's formal guarantee of memory visibility between threads. If action A HB action B, the result of A is guaranteed visible to B — the JVM/JIT cannot reorder them. Without HB, the JIT compiler and CPU can reorder instructions freely for performance. Key HB rules: unlock HB the next lock on the same monitor; volatile write HB all subsequent reads of that field; `Thread.start()` HB all actions in the started thread. Without establishing HB, even reading a value written by another thread may return a stale cached value — not because of a bug, but because the JMM allows it. This is why double-checked locking requires `volatile` — without it, there's no HB between the write and read of the instance field."
+
+---
+
+### Q5: When should you use LongAdder instead of AtomicLong?
+**Difficulty:** Medium | **Companies:** Netflix, Disruptor teams
+
+❌ **Weak:** "LongAdder is faster."
+
+✅ **Strong:** "`AtomicLong` uses a single CAS on one memory location. Under high contention, many threads spin-retrying CAS, creating a 'hot' cache line that bounces between CPU cores. `LongAdder` (Java 8+) maintains an array of `Cell` objects — each thread tends to update its own cell based on its thread ID. Increments are distributed, eliminating the hot cache line. `sum()` aggregates all cells. `LongAdder` is 2-10x faster under high write contention. But: `LongAdder` has no `compareAndSet`, no atomic decrement, and higher memory footprint. Use `AtomicLong` when you need CAS or read-modify-check semantics. Use `LongAdder` / `LongAccumulator` for pure counters and statistics under high contention."
+
+## FEYNMAN CHECK
+
+Concurrency is like multiple cooks in one kitchen. With one cook, everything happens in order — no problems. With ten cooks:
+
+- **Race condition**: Two cooks both grab the last egg. One makes an omelette, one scrambles it. The result is wrong because both read "1 egg available" before either updated the count.
+- **synchronized**: A sign on the fridge that says "one person at a time." Cook A checks and updates atomically — no interference.
+- **volatile**: A whiteboard everyone can see instantly. If Cook A writes "No more milk," all cooks immediately see it — no one reads from their own notes (local cache).
+- **Deadlock**: Cook A holds the pan, waits for the spatula. Cook B holds the spatula, waits for the pan. Both wait forever. The fix: always pick up pan before spatula — consistent ordering.
+
+## BUILD
+
+**Challenge 1:** Implement a thread-safe bank account with `deposit(amount)`, `withdraw(amount)`, and `getBalance()`. Spawn 50 threads each doing 100 deposits and 100 withdrawals of $1. Final balance should always be $0.
+
+**Challenge 2:** Implement a producer-consumer pattern using `wait()`/`notifyAll()` with a bounded buffer of size 10. One producer generates numbers 1-100; two consumers consume them. Verify all 100 numbers are consumed exactly once.
+
+**Challenge 3:** Create a deadlock scenario with two threads and two locks, then fix it using consistent lock ordering. Document the before/after behavior.
+
+## SPACED REVIEW
+
+- **Day 1:** Why is `counter++` not atomic? What 3 bytecodes does it compile to?
+- **Day 3:** What is the difference between synchronized and volatile? When would you use each?
+- **Day 7:** Write a thread-safe counter using AtomicInteger. Explain how CAS avoids locking.
+- **Day 14:** What are the 4 Coffman conditions for deadlock? How do you prevent circular wait?
+- **Day 30:** When is LongAdder faster than AtomicLong? Explain striping and why it reduces contention.

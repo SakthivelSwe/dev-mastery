@@ -152,3 +152,209 @@ A: If you copy an object using the spread operator (`const copy = { ...original 
 
 **Q: Why does `delete obj.property` negatively impact performance?**
 A: V8 creates "Hidden Classes" to optimize object property access into O(1) memory offset lookups. When you use the `delete` keyword, V8 abandons the highly-optimized Hidden Class structure entirely and falls back to a slow "Dictionary Mode" Hash Map execution for that object, significantly degrading property access speeds.
+
+## FEYNMAN CHECK
+
+### Explain JS Objects Like I'm 10 Years Old
+> A JS object is a DICTIONARY — a collection of key-value pairs. Keys are STRINGS (or Symbols); values can be anything. Three creation patterns: literal `{a:1}`, `Object.create(proto)` (with custom prototype), and constructor calls `new Thing()`. Every object has a hidden `[[Prototype]]` link (accessed via `Object.getPrototypeOf` or the deprecated `__proto__`) that points to another object — this is how method lookup works. The non-obvious power: property DESCRIPTORS. Every property has metadata: `writable`, `enumerable`, `configurable`, plus optional `get`/`set` accessors. `Object.defineProperty(obj, 'x', { value: 1, writable: false })` creates a read-only x. V8 optimises objects using HIDDEN CLASSES — adding properties in a CONSISTENT ORDER reuses the same hidden class (fast); inconsistent shape forces megamorphic dispatch (slow).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When do you choose plain object vs Map vs Set?**
+> **A:** Plain object `{}` for STRUCTURED records with KNOWN string keys (configs, DTOs, JSON). Map for arbitrary keys (incl. object keys), key insertion order preservation, frequent add/delete, and large key spaces. Set for uniqueness checks (`set.has(x)` is O(1)). Object property access is faster on tiny known-shape objects (V8 inline cache); Map is faster as the collection grows or keys are dynamic. Records & Tuples (TC39 stage 2) will provide deeply-immutable structural-equality alternatives someday.
+
+**Q2: Mental model for property lookup?**
+> **A:** When you read `obj.x`, the engine: (1) Checks obj's own properties (hash + hidden class). (2) If absent, walks the [[Prototype]] chain — checking each ancestor's own properties. (3) Returns undefined if not found anywhere. Writing `obj.x = 5` ALWAYS creates an own property on obj (it doesn't walk the chain to find where to write — except for accessors). This is why `Array.prototype.push = ...` adds push to ALL arrays.
+
+**Q3: Most dangerous misconception?**
+> **A:** Objects compared by `===` check value equality:
+> ```js
+> // ❌ Object equality is by REFERENCE, not contents
+> { x: 1 } === { x: 1 }    // false — different objects
+> [1, 2] === [1, 2]        // false
+>
+> // ✅ Deep equality requires explicit comparison
+> JSON.stringify(a) === JSON.stringify(b)  // works for plain JSON, breaks on Date/Map/Set/cycles
+> // Or use lodash isEqual, or write your own:
+> function deepEq(a, b) {
+>   if (a === b) return true;
+>   if (typeof a !== 'object' || a === null) return false;
+>   const keys = Object.keys(a);
+>   if (keys.length !== Object.keys(b).length) return false;
+>   return keys.every(k => deepEq(a[k], b[k]));
+> }
+> ```
+
+**Q4: How do V8 hidden classes work?**
+> **A:** When you create `{a:1}`, V8 assigns it Hidden Class C0. When you add b: `obj.b=2`, V8 creates Hidden Class C1 = C0 + b. Every object created the SAME WAY (same property order) shares the same hidden class. Property access compiles to "load from offset N" — blazing fast. Adding properties in DIFFERENT order (e.g. some objects get a-then-b, others b-then-a) creates DIFFERENT hidden classes — the inline cache becomes polymorphic, then megamorphic, 10-100× slower. Lesson: initialise all properties in the constructor in the same order.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript objects are mutable dictionaries of string-keyed (and symbol-keyed) properties, each with descriptor metadata (value/getter/setter, writable, enumerable, configurable), linked via the [[Prototype]] chain to a single prototype object for method inheritance — created via literals, Object.create, constructor invocations, or class instantiation — and optimised by V8's hidden classes when property shape is initialised consistently across instances."
+
+## BUILD
+
+### 🏗️ Mini Project: Observable Object With Getters, Setters, and Property Descriptors
+
+**What you will build:** A reactive object proxy-free clone where assigning to a property automatically notifies subscribers — using only Object.defineProperty and getters/setters, no Proxy.
+**Why this project:** Forces deep understanding of property descriptors and accessor properties.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-objects && cd js-objects
+npm init -y && npm install -D vitest
+ni reactive.js, reactive.test.js -ItemType File
+```
+
+#### Step 2 — Reactive Object
+```js
+// reactive.js
+export function reactive(initial) {
+  const data = { ...initial };
+  const subscribers = new Map();   // key -> Set<callback>
+  const target = {};
+
+  for (const key of Object.keys(initial)) {
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      configurable: false,
+      get() { return data[key]; },
+      set(newValue) {
+        if (data[key] === newValue) return;        // no-op on same value
+        const oldValue = data[key];
+        data[key] = newValue;
+        for (const cb of subscribers.get(key) ?? []) cb(newValue, oldValue);
+      },
+    });
+  }
+
+  target.$on = (key, cb) => {
+    if (!subscribers.has(key)) subscribers.set(key, new Set());
+    subscribers.get(key).add(cb);
+    return () => subscribers.get(key).delete(cb);
+  };
+
+  return target;
+}
+```
+
+#### Step 3 — Use The Reactive Object
+```js
+// demo.js
+import { reactive } from './reactive.js';
+
+const state = reactive({ count: 0, name: 'Ana' });
+
+state.$on('count', (n, old) => console.log(`count: ${old} → ${n}`));
+state.$on('name',  (n, old) => console.log(`name: ${old} → ${n}`));
+
+state.count = 1;       // logs: count: 0 → 1
+state.count = 1;       // no log (no change)
+state.count++;         // logs: count: 1 → 2
+state.name = 'Bob';    // logs: name: Ana → Bob
+
+// Property descriptor introspection
+console.log(Object.getOwnPropertyDescriptor(state, 'count'));
+// { get, set, enumerable: true, configurable: false }
+
+// Cannot delete
+try { delete state.count; } catch (e) { console.log('delete failed:', e.message); }
+```
+
+#### Step 4 — Error Handling: Computed Properties + Symbol Keys
+```js
+// Computed property names — key from variable
+const key = 'dynamic_' + Date.now();
+const obj = { [key]: 'value' };
+
+// Symbol keys — invisible to JSON, Object.keys, for...in
+const SECRET = Symbol('secret');
+const user = { name: 'Ana', [SECRET]: 'hidden-token' };
+console.log(Object.keys(user));               // ['name']  — SECRET hidden
+console.log(JSON.stringify(user));            // {"name":"Ana"}  — SECRET stripped
+console.log(Object.getOwnPropertySymbols(user)); // [Symbol(secret)] — explicit lookup
+console.log(user[SECRET]);                    // 'hidden-token' if you have the symbol
+```
+
+#### Step 5 — Tests
+```js
+// reactive.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { reactive } from './reactive.js';
+
+describe('reactive', () => {
+  it('fires subscriber on change', () => {
+    const s = reactive({ x: 0 });
+    const spy = vi.fn();
+    s.$on('x', spy);
+    s.x = 5;
+    expect(spy).toHaveBeenCalledWith(5, 0);
+  });
+  it('does not fire on same value', () => {
+    const s = reactive({ x: 1 });
+    const spy = vi.fn();
+    s.$on('x', spy);
+    s.x = 1;
+    expect(spy).not.toHaveBeenCalled();
+  });
+  it('disposer removes subscriber', () => {
+    const s = reactive({ x: 0 });
+    const spy = vi.fn();
+    const off = s.$on('x', spy);
+    off();
+    s.x = 1;
+    expect(spy).not.toHaveBeenCalled();
+  });
+  it('properties are not configurable', () => {
+    const s = reactive({ x: 0 });
+    expect(() => Object.defineProperty(s, 'x', { value: 99 })).toThrow();
+  });
+});
+```
+
+**Expected Output:**
+```
+count: 0 → 1
+count: 1 → 2
+name: Ana → Bob
+{ get: [Function], set: [Function], enumerable: true, configurable: false }
+delete failed: Cannot delete property 'count' of #<Object>
+
+# 4/4 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Rewrite using Proxy — easier syntax for arbitrary keys
+- [ ] Add nested reactivity (changes inside obj.user.name fire)
+- [ ] Add computed properties: derived values that auto-update
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three ways to create an object.
+**Q2:** What does `Object.getOwnPropertyDescriptor` return?
+**Q3:** Write a one-liner that creates an object with a getter and a setter. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why do `{x:1} === {x:1}` return false?
+**Q5:** A junior writes objects in inconsistent property order across instances — V8 perf tanks. Diagnose.
+**Q6:** Refactor to read-only fields:
+```js
+class Config { constructor(opts) { Object.assign(this, opts); } }
+const c = new Config({ url: '/api' });
+c.url = '/hacker';   // should not be allowed
+```
+
+### Day 7 — Application
+**Q7:** Build a freezeDeep(obj) that recursively freezes nested objects.
+**Q8:** A PR uses an object as a Map (`map['key'] = val`) — what bugs does it cause?
+**Q9:** Object vs Map lookup performance — when does Map win?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through V8's hidden classes and inline caches."
+**Q11:** Draw: prototype chain for `Array → Array.prototype → Object.prototype → null`.
+**Q12:** ★ System design: "Design a config-merging system across 5 sources where every property is typed and frozen on read."

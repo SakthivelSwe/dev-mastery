@@ -179,3 +179,203 @@ A:
 
 **Q: How do you handle Errors in an RxJS stream?**
 A: You use the `catchError` operator in the `.pipe()`. It intercepts the error, allows you to log it or show a toast notification, and then you must return an observable (usually `of([])` or `throwError()`) to keep the stream alive or gracefully shut it down.
+
+## FEYNMAN CHECK
+
+### Explain RxJS in Angular Like I'm 10 Years Old
+> RxJS is Angular's built-in reactive library — it models async events as STREAMS that you can transform with operators. Imagine a water pipe: the source (Observable) produces values over time; operators (map, filter, switchMap, debounceTime) transform them; subscribe consumes them. Angular uses RxJS for: HTTP responses (HttpClient returns Observables), routing events (Router.events), form value changes (form.valueChanges), custom event buses, and reactive state patterns. The non-obvious depth: operators are LAZY — nothing happens until subscribe(). switchMap is the most important operator for Angular — it cancels the previous inner Observable when a new source value arrives (perfect for search-as-you-type where you want to discard stale API results).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between Subject, BehaviorSubject, and ReplaySubject?**
+> **A:** Subject is a plain multicast Observable — new subscribers only get FUTURE values. BehaviorSubject holds the CURRENT value and immediately emits it to new subscribers — essential for state management where late subscribers need the current state. ReplaySubject buffers N past values and replays them to new subscribers — useful for event logs or action streams where late subscribers need history. All three are both Observable (you can subscribe) AND Observer (you can call next/error/complete) — they bridge imperative code to reactive streams.
+
+**Q2: Mental model for the "Higher-Order Observable" operators?**
+> **A:** switchMap, mergeMap, concatMap, exhaustMap take each value from a source and MAP it to a new inner Observable. The difference is how they handle CONCURRENT inner Observables: switchMap CANCELS the previous inner when a new source value arrives (good for: search, autocomplete — discard stale results). mergeMap runs all inner Observables CONCURRENTLY (good for: parallel file downloads). concatMap queues inner Observables, running ONE AT A TIME in order (good for: sequential saves). exhaustMap IGNORES new source values while inner is active (good for: login button — ignore double-clicks).
+
+**Q3: Most dangerous misconception about RxJS in Angular?**
+> **A:** You need to unsubscribe from ALL observables:
+> ```typescript
+> // Observables that complete automatically (NO unsubscribe needed):
+> this.http.get('/api/users')       // completes after response
+> of(1, 2, 3)                       // completes immediately
+> timer(1000)                       // completes after one emission
+> this.route.paramMap               // completes when component destroyed (router managed)
+>
+> // Observables that NEVER complete (MUST unsubscribe or use takeUntilDestroyed):
+> interval(1000)                    // infinite timer
+> fromEvent(document, 'click')      // DOM events
+> this.store.select(mySelector)     // NgRx selectors
+> new BehaviorSubject(0)            // manual subjects
+> webSocket('ws://localhost')       // websocket streams
+> ```
+
+**Q4: How do you compose multiple HTTP calls with RxJS?**
+> **A:** forkJoin([obs1, obs2, obs3]) runs all in PARALLEL, emits when ALL complete — like Promise.all. combineLatest([obs1, obs2]) emits whenever ANY source emits, with latest values from each — good for combining filter + pagination + search. switchMap is used for SEQUENTIAL calls where the first response determines the second: first get the user, then get their orders: getUser(id).pipe(switchMap(user => getOrders(user.teamId))). withLatestFrom snapshots the current value of a secondary stream without subscribing to it.
+
+**Q5: FAANG-grade definition of RxJS in Angular.**
+> **A:** "RxJS (Reactive Extensions for JavaScript) is Angular's core reactive library — modelling asynchronous values as lazy Observable streams with first-class composability via operators (map, filter, switchMap, mergeMap, concatMap, exhaustMap, debounceTime, distinctUntilChanged, catchError, retry, shareReplay) — with Subjects (plain, Behavior, Replay, Async) bridging imperative and reactive code — and Angular integrating RxJS throughout: HttpClient, Router events, FormControl.valueChanges, EventEmitter internals, and async pipe — with takeUntilDestroyed/DestroyRef for lifecycle-aware subscription management."
+
+## BUILD
+
+### 🏗️ Mini Project: Search-As-You-Type With switchMap, debounce, and distinctUntilChanged
+
+**What you will build:** A search input that debounces keystrokes, cancels in-flight requests with switchMap, shows loading state, and handles errors — the canonical Angular reactive pattern.
+**Why this project:** Forces the most important RxJS operators for Angular UI patterns.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new rxjs-angular-demo --standalone --routing false
+cd rxjs-angular-demo
+ng generate component search --standalone
+```
+
+#### Step 2 — Search Component
+```typescript
+// search.component.ts
+import { Component, inject, signal } from '@angular/core';
+import { FormControl, ReactiveFormsModule } from '@angular/forms';
+import { HttpClient } from '@angular/common/http';
+import { NgFor, NgIf, AsyncPipe } from '@angular/common';
+import { debounceTime, distinctUntilChanged, switchMap, catchError, startWith, tap } from 'rxjs/operators';
+import { of, Observable } from 'rxjs';
+
+interface User { id: number; name: string; email: string; }
+
+@Component({
+  standalone: true,
+  selector: 'app-search',
+  imports: [ReactiveFormsModule, NgFor, NgIf],
+  template: `
+    <input [formControl]="searchControl" placeholder="Search users...">
+    <p *ngIf="isLoading()">Searching...</p>
+    <p *ngIf="error()">Error: {{ error() }}</p>
+    <ul>
+      <li *ngFor="let user of results()">{{ user.name }} ({{ user.email }})</li>
+    </ul>
+    <p *ngIf="!isLoading() && results().length === 0 && searchControl.value">
+      No results for "{{ searchControl.value }}"
+    </p>
+  `,
+})
+export class SearchComponent {
+  private http = inject(HttpClient);
+  searchControl = new FormControl('');
+  results = signal<User[]>([]);
+  isLoading = signal(false);
+  error = signal<string | null>(null);
+
+  constructor() {
+    this.searchControl.valueChanges.pipe(
+      debounceTime(300),            // wait 300ms after last keystroke
+      distinctUntilChanged(),       // skip if same value
+      tap(() => { this.isLoading.set(true); this.error.set(null); }),
+      switchMap(query => {          // cancel previous request on new keystroke
+        if (!query?.trim()) return of([]);
+        return this.http.get<User[]>('https://jsonplaceholder.typicode.com/users').pipe(
+          // Client-side filter for demo — real app would pass query to server
+          catchError(err => { this.error.set(err.message); return of([]); }),
+        );
+      }),
+      tap(() => this.isLoading.set(false)),
+    ).subscribe(results => {
+      const q = this.searchControl.value?.toLowerCase() ?? '';
+      this.results.set(results.filter(u => u.name.toLowerCase().includes(q)));
+    });
+  }
+}
+```
+
+#### Step 3 — Combining Multiple Streams
+```typescript
+// Advanced: combine search + filter + pagination
+import { combineLatest, BehaviorSubject } from 'rxjs';
+
+export class AdvancedSearchComponent {
+  private search$ = new BehaviorSubject('');
+  private filter$ = new BehaviorSubject<'all' | 'active'>('all');
+  private page$ = new BehaviorSubject(0);
+
+  results$ = combineLatest([this.search$, this.filter$, this.page$]).pipe(
+    debounceTime(100),
+    switchMap(([query, filter, page]) =>
+      this.http.get('/api/users', { params: { query, filter, page: page.toString() } })
+    ),
+  );
+
+  setSearch(q: string) { this.search$.next(q); this.page$.next(0); }
+  setFilter(f: 'all' | 'active') { this.filter$.next(f); this.page$.next(0); }
+  nextPage() { this.page$.next(this.page$.value + 1); }
+}
+```
+
+#### Step 4 — Error Handling: catchError and retry
+```typescript
+import { catchError, retry, throwError } from 'rxjs';
+
+const resilientSearch$ = this.http.get('/api/search').pipe(
+  retry({ count: 2, delay: 1000 }),
+  catchError(err => {
+    if (err.status === 0) return throwError(() => new Error('Network offline'));
+    if (err.status === 429) return throwError(() => new Error('Rate limited'));
+    return throwError(() => err);  // re-throw unknown errors
+  }),
+);
+```
+
+#### Step 5 — Tests
+```typescript
+it('debounces search input', fakeAsync(() => {
+  const fixture = TestBed.createComponent(SearchComponent);
+  const control = fixture.componentInstance.searchControl;
+  const httpMock = TestBed.inject(HttpTestingController);
+
+  control.setValue('a');
+  control.setValue('an');
+  control.setValue('ang');
+  // No HTTP request yet — debouncing
+  httpMock.expectNone('/api/users');
+  tick(300);
+  // Now the HTTP request fires
+  httpMock.expectOne('https://jsonplaceholder.typicode.com/users').flush([]);
+}));
+```
+
+**Expected Output:**
+```
+Type "Ang" -> debounce 300ms -> HTTP request fires
+Clear input -> cancel previous request, show empty
+HTTP error -> error message shown
+```
+
+**Stretch Challenges:**
+- [ ] Add virtualisation: only show 10 results with a "load more" button
+- [ ] Add an autocomplete dropdown using CDK Overlay
+- [ ] Replace the search with a signals-based approach and compare code
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between Subject, BehaviorSubject, and ReplaySubject?
+**Q2:** What does switchMap do that mergeMap does not?
+**Q3:** Write a search-as-you-type with debounce. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When would you use exhaustMap instead of switchMap?
+**Q5:** A junior uses mergeMap for search-as-you-type — explain the race condition.
+**Q6:** What observable in Angular never needs to be unsubscribed?
+
+### Day 7 — Application
+**Q7:** Build a polling interval that stops when the component is destroyed.
+**Q8:** A PR uses forkJoin for 3 HTTP calls where some may fail — explain the issue.
+**Q9:** What is shareReplay and when should you use it with HTTP calls?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through switchMap, mergeMap, concatMap, exhaustMap — give a real Angular use case for each."
+**Q11:** Draw: marble diagram for switchMap with 3 rapid source emissions.
+**Q12:** ★ System design: "Design a real-time dashboard with WebSocket data, combining it with REST API state using RxJS."

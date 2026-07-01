@@ -117,3 +117,213 @@ If you are developing locally on `http://localhost`, the browser grants a specia
 ## INTERVIEW
 **Q: Can I store a user's JWT (Authentication Token) or their Credit Card number in `localStorage`?**
 A: **Absolutely NOT.** `localStorage` is vulnerable to **XSS (Cross-Site Scripting)** attacks. If a hacker manages to inject a single line of malicious JavaScript into your website (e.g., via a compromised NPM package or an unescaped comment forum), that script has full, unrestricted access to `localStorage`. The script can read the JWT and send it to the hacker's server, completely stealing the user's account. Authentication tokens should ideally be stored in `HttpOnly` Cookies, which are mathematically impossible for JavaScript (and therefore XSS attackers) to read.
+
+## FEYNMAN CHECK
+
+### Explain HTML5 APIs Like I'm 10 Years Old
+> HTML5 quietly bundled JavaScript with about 40 new built-in APIs that browsers expose to your page — Geolocation, Canvas, Web Storage, History, Drag-and-Drop, File API, Web Workers, IndexedDB, Notifications, Web Audio, WebSockets, Service Workers, Intersection Observer, ResizeObserver, and more. They're all gated by a *permission model*: dangerous ones (camera, GPS, notifications) require explicit user consent; safe ones (localStorage, History) don't. Together they're why a browser tab can now replace what used to require a desktop app — Figma, VS Code, Google Maps all run on these APIs.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do HTML5 APIs fundamentally solve?**
+> **A:** They give web pages access to platform capabilities (storage, location, sensors, files, threads, GPU, networking) that previously required a native app. Without them you couldn't build offline-capable web apps, real-time chat, in-browser image editing, or web-based games — every "Can I move this to the web?" decision since 2010 depended on which HTML5 API closed the gap.
+
+**Q2: What is the ONE mental model that makes HTML5 APIs click?**
+> **A:** Every API is in one of three tiers: (1) always-on (Web Storage, History, Canvas — no permission needed); (2) one-time-prompt (Geolocation, Notifications, Camera — user clicks "Allow"); (3) install-required (Service Worker, Push, Background Sync — only after the page meets PWA criteria over HTTPS). Knowing the tier tells you what UX to design around the API.
+
+**Q3: What is the most dangerous misconception? Show it with code.**
+> **A:** Treating `localStorage` as secure or large-capacity:
+> ```javascript
+> // ❌ DANGEROUS: synchronous (blocks main thread), readable by ANY script on the page, ~5MB cap
+> localStorage.setItem('jwt', 'eyJhbGc...');         // XSS-stealable
+> localStorage.setItem('photos', JSON.stringify(arr)); // hits quota after a few large images
+>
+> // ✅ Use the right API for the job
+> // - Auth tokens: HttpOnly Secure cookie set by server (JS can't read)
+> // - Large/structured data: IndexedDB (async, gigabytes, structured queries)
+> const db = await indexedDB.open('photos', 1);      // async, ~unlimited
+> ```
+
+**Q4: How does the Intersection Observer API interact with the browser's rendering pipeline?**
+> **A:** Instead of running expensive `getBoundingClientRect()` on every scroll event (which forces synchronous layout), Intersection Observer registers a callback that fires AFTER the browser has computed layout — batched, off the critical path. It's why infinite-scroll lists, lazy-loaded images, and viewport analytics scale to thousands of observed elements without jank. The browser groups intersection changes into one callback per animation frame.
+
+**Q5: Write a one-sentence FAANG-precise definition.**
+> **A:** "HTML5 APIs are the suite of browser-exposed platform capabilities — storage, sensors, threading, networking, lifecycle, observers — gated by a three-tier permission model and accessed via JavaScript globals (`navigator`, `window`, `document`, registered service workers) — which together close the gap between web pages and native apps and underpin every offline-capable, real-time, or hardware-aware product running in a browser tab."
+
+## BUILD
+
+### 🏗️ Mini Project: A Mini "Notes" App Using 6 HTML5 APIs
+
+**What you will build:** A note-taking app that uses: localStorage (settings), IndexedDB (notes), History API (back/forward), Service Worker (offline), Notification (reminders), Intersection Observer (lazy-load images). All vanilla JS, no framework.
+**Why this project:** Touches the most-used HTML5 APIs in one realistic product.
+**Time estimate:** 60 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir notes-app && cd notes-app
+ni index.html, app.js, sw.js, manifest.webmanifest -ItemType File
+```
+
+#### Step 2 — Storage Layer (IndexedDB for notes, localStorage for settings)
+```javascript
+// app.js — IndexedDB wrapper for notes
+const dbOpen = indexedDB.open('notes-db', 1);
+dbOpen.onupgradeneeded = (e) => {
+  e.target.result.createObjectStore('notes', { keyPath: 'id', autoIncrement: true });
+};
+const db = await new Promise(r => dbOpen.onsuccess = e => r(e.target.result));
+
+async function addNote(text) {
+  const tx = db.transaction('notes', 'readwrite');
+  await tx.objectStore('notes').add({ text, created: Date.now() });
+}
+
+async function getAllNotes() {
+  const tx = db.transaction('notes', 'readonly');
+  return new Promise(r => {
+    const req = tx.objectStore('notes').getAll();
+    req.onsuccess = () => r(req.result);
+  });
+}
+
+// localStorage for small settings only
+const settings = {
+  get theme()  { return localStorage.getItem('theme') ?? 'light'; },
+  set theme(v) { localStorage.setItem('theme', v); }
+};
+```
+
+#### Step 3 — History API for Deep Linking
+```javascript
+// Each opened note pushes a state — back button works without a router
+function openNote(id) {
+  history.pushState({ noteId: id }, '', '#note-' + id);
+  render(id);
+}
+
+// Restore state when the user navigates back/forward
+window.addEventListener('popstate', (e) => {
+  if (e.state?.noteId) render(e.state.noteId);
+  else renderList();
+});
+```
+
+#### Step 4 — Service Worker for Offline + Notifications API for Reminders
+```javascript
+// app.js — register the service worker
+if ('serviceWorker' in navigator) {
+  await navigator.serviceWorker.register('/sw.js');
+}
+
+// Permission-gated notification (Tier 2)
+async function remindMe(noteId, atTime) {
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') return;            // user denied — fall back gracefully
+  const delay = atTime - Date.now();
+  setTimeout(() => {
+    new Notification('Reminder', { body: 'Open note #' + noteId, tag: 'note-' + noteId });
+  }, delay);
+}
+```
+```javascript
+// sw.js — cache-first for offline support
+const CACHE = 'notes-v1';
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/', '/app.js', '/manifest.webmanifest'])));
+});
+self.addEventListener('fetch', (e) => {
+  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+});
+```
+
+#### Step 5 — Tests
+```javascript
+// Intersection Observer for lazy-loading note thumbnails
+const io = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (entry.isIntersecting) {
+      const img = entry.target;
+      img.src = img.dataset.src;             // swap data-src → src
+      io.unobserve(img);
+    }
+  }
+});
+document.querySelectorAll('img[data-src]').forEach(img => io.observe(img));
+
+// Quick smoke tests
+console.assert('indexedDB' in window,       'IndexedDB required');
+console.assert('localStorage' in window,    'localStorage required');
+console.assert('serviceWorker' in navigator,'Service Worker required');
+console.assert('Notification' in window,    'Notification API required');
+console.assert('IntersectionObserver' in window, 'IntersectionObserver required');
+console.assert('pushState' in history,      'History API required');
+```
+
+**Expected Output:**
+```
+- Adding a note persists to IndexedDB (survives reload AND tab close)
+- Back/forward buttons navigate between notes
+- App loads offline after first visit (Service Worker cache hit)
+- Notification fires at scheduled time
+- Note thumbnails fetch only when scrolled into view
+- All console.asserts pass
+```
+
+**Stretch Challenges:**
+- [ ] Add the Web Share API so users can share a note natively from mobile
+- [ ] Add Background Sync so reminders fire even if the tab is closed
+- [ ] Add the File System Access API for export-to-disk on desktop
+
+## SPACED REVIEW
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name 5 HTML5 APIs and what each one enables.
+
+**Q2:** What is the difference between `localStorage`, `sessionStorage`, and `IndexedDB`? Pick one for: an auth token, user notes, a feature flag.
+
+**Q3:** Write 5 lines that register a service worker if the browser supports it.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What are the THREE permission tiers for HTML5 APIs? Give one API in each tier.
+
+**Q5:** Describe an XSS vulnerability caused by storing a JWT in localStorage. What's the fix?
+
+**Q6:** Refactor this scroll handler into an IntersectionObserver:
+```javascript
+window.addEventListener('scroll', () => {
+  document.querySelectorAll('.lazy').forEach(el => {
+    const rect = el.getBoundingClientRect();
+    if (rect.top < window.innerHeight) el.classList.add('visible');
+  });
+});
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build an "Are you still there?" idle-timeout prompt using the Page Visibility API and `document.visibilityState`.
+
+**Q8:** A feature uses Geolocation. List 4 fallback states you must design for (denied, error, timeout, never-prompted).
+
+**Q9:** What is the Beacon API? When would you use it over `fetch()`? Give an analytics example.
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Interview: "How would you build offline-capable web app?"
+
+**Q11:** Draw the dependency graph: html5-apis ↔ pwa-manifest ↔ performance-html ↔ web-components.
+
+**Q12:** ★ System design: "Design the data-sync layer for a notes app that must work offline, sync across devices, resolve conflicts, and respect browser storage quotas."

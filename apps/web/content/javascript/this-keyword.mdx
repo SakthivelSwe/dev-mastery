@@ -144,3 +144,223 @@ A: No. Because Arrow Functions do not possess their own internal `this` mechanis
 
 **Q: Why shouldn't you use an Arrow Function to define a method inside an Object Literal?**
 A: If you write `const obj = { name: "Alice", greet: () => { console.log(this.name); } }`, it will fail. Arrow functions inherit `this` from the surrounding *Function* scope. An Object Literal `{}` is not a scope block! Therefore, the Arrow Function looks right past the object and inherits `this` from the Global Window, resulting in `undefined`. You should always use the standard shorthand syntax for object methods: `greet() { }`.
+
+## FEYNMAN CHECK
+
+### Explain `this` Like I'm 10 Years Old
+> `this` is JavaScript's MOST CONFUSING keyword because its value depends on HOW the function was CALLED, not where it was DEFINED. Five rules: (1) Method call `obj.method()` → this = obj. (2) Standalone call `f()` → this = undefined in strict mode, globalThis in sloppy mode. (3) Constructor `new F()` → this = the new instance. (4) Explicit binding `f.call(ctx)`, `f.apply(ctx)`, `f.bind(ctx)` → this = ctx. (5) Arrow function `() => this` → this = whatever it was in the SURROUNDING scope (lexical `this`, no rebinding). The non-obvious detail: `event.target.onclick = obj.method` LOSES this because it gets called as a plain function, not as a method. The fix: `obj.method.bind(obj)` or `() => obj.method()`.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why is `this` determined at call time, not definition time?**
+> **A:** Because the same function can be invoked many ways: as a method, as a callback, as a constructor. A function defined inside a class isn't "owned" by the class — it's just a function attached to the prototype. JavaScript decided at design time that `this` would be passed implicitly with every call, like a hidden first argument. This is incredibly flexible (a function can serve any object) but a constant source of bugs (callbacks lose context).
+
+**Q2: Mental model for `this`?**
+> **A:** Read every call site as "WHO IS THE LEFT SIDE OF THE DOT?". `user.greet()` → user. `greet()` → nothing (undefined/global). `btn.onclick = user.greet; btn.click()` → btn (the new left side at click time). Arrow functions skip this whole resolution — they SUBSTITUTE the enclosing function's `this`.
+
+**Q3: Most dangerous misconception?**
+> **A:** Methods passed as callbacks keep their `this`:
+> ```js
+> // ❌ this is lost when method is detached
+> class Logger {
+>   constructor(prefix) { this.prefix = prefix; }
+>   log(msg) { console.log(this.prefix, msg); }
+> }
+> const l = new Logger('[APP]');
+> setTimeout(l.log, 0, 'hi');   // TypeError: Cannot read 'prefix' of undefined
+>
+> // ✅ Three fixes:
+> setTimeout(l.log.bind(l), 0, 'hi');         // bind
+> setTimeout(() => l.log('hi'), 0);           // arrow wrapper
+> // Or: use arrow class field
+> class Logger { log = (msg) => console.log(this.prefix, msg); }
+> ```
+
+**Q4: How does `bind` differ from `call` and `apply`?**
+> **A:** `call(ctx, a, b, c)` invokes the function IMMEDIATELY with ctx as this and arguments spread. `apply(ctx, [a, b, c])` is identical but takes an ARRAY of args (useful before spread syntax). `bind(ctx, a)` returns a NEW FUNCTION with `this` permanently locked to ctx and args partially applied — never re-binds. The bound function's bind/call/apply can no longer change its this — bind is irreversible (without going back to the original function).
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript's `this` is the implicit context argument passed to a function at call time — determined by the invocation pattern (method call binds to the receiver, standalone call binds to undefined in strict mode or globalThis in sloppy mode, constructor call binds to the new instance, explicit binding via call/apply/bind, arrow functions lexically inherit from enclosing scope) — making it the most-confused keyword in the language and the source of countless callback bugs solved by arrow functions or explicit binding."
+
+## BUILD
+
+### 🏗️ Mini Project: Mini Event Emitter Demonstrating Every `this` Pattern
+
+**What you will build:** A reusable EventEmitter where listeners can be method references, arrow functions, bound functions, and class methods — with a debugger that logs the value of `this` in each case.
+**Why this project:** Forces every `this` pattern in real code.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-this && cd js-this
+npm init -y
+npm install -D vitest
+ni emitter.js, emitter.test.js -ItemType File
+```
+
+#### Step 2 — EventEmitter
+```js
+// emitter.js
+export class EventEmitter {
+  constructor() { this.listeners = new Map(); }
+  on(event, handler) {
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push(handler);
+    return () => this.off(event, handler);
+  }
+  off(event, handler) {
+    const arr = this.listeners.get(event) ?? [];
+    const i = arr.indexOf(handler);
+    if (i >= 0) arr.splice(i, 1);
+  }
+  emit(event, ...args) {
+    // Each handler is called as a PLAIN FUNCTION — this defaults
+    for (const h of this.listeners.get(event) ?? []) h(...args);
+  }
+}
+```
+
+#### Step 3 — Demo Every Binding Pattern
+```js
+// demo.js
+import { EventEmitter } from './emitter.js';
+
+const bus = new EventEmitter();
+
+// ─── Pattern 1: regular function — this = undefined (strict)
+bus.on('p1', function() { console.log('Pattern 1:', this); });
+
+// ─── Pattern 2: arrow function — this = enclosing module/file scope
+bus.on('p2', () => console.log('Pattern 2:', this ?? 'undefined'));
+
+// ─── Pattern 3: class method passed raw — loses this!
+class Logger {
+  constructor(prefix) { this.prefix = prefix; }
+  log(msg) { console.log('Pattern 3 (raw):', this?.prefix, msg); }
+}
+const l = new Logger('[APP]');
+bus.on('p3', l.log);                  // ❌ this lost → undefined.prefix throws
+
+// ─── Pattern 4: bind — this locked forever
+bus.on('p4', l.log.bind(l));          // ✅
+
+// ─── Pattern 5: arrow wrapper — this preserved by closure
+bus.on('p5', (msg) => l.log(msg));    // ✅
+
+// ─── Pattern 6: arrow class field — bound at construction
+class LoggerBound {
+  constructor(prefix) { this.prefix = prefix; }
+  log = (msg) => console.log('Pattern 6 (arrow field):', this.prefix, msg);
+}
+const lb = new LoggerBound('[BOUND]');
+bus.on('p6', lb.log);                 // ✅ this captured
+
+bus.emit('p1');
+bus.emit('p2');
+try { bus.emit('p3', 'hi'); } catch (e) { console.log('Pattern 3 threw:', e.message); }
+bus.emit('p4', 'hi');
+bus.emit('p5', 'hi');
+bus.emit('p6', 'hi');
+```
+
+#### Step 4 — Error Handling: call / apply / bind
+```js
+function describe(adjective, noun) {
+  return `I am a ${adjective} ${noun}, name: ${this?.name}`;
+}
+
+const user = { name: 'Ana' };
+console.log(describe.call (user, 'happy', 'developer'));   // call
+console.log(describe.apply(user, ['busy',  'coder']));     // apply
+const bound = describe.bind(user, 'curious');
+console.log(bound('learner'));                              // bind (partial)
+
+// Bind is irreversible
+const rebind = bound.bind({ name: 'NotAna' });
+console.log(rebind('reader'));    // still says 'Ana' — bind locks the first
+```
+
+#### Step 5 — Tests
+```js
+// emitter.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from './emitter.js';
+
+describe('this binding patterns', () => {
+  it('arrow class field preserves this when detached', () => {
+    class L { constructor() { this.x = 42; } get = () => this.x; }
+    const inst = new L();
+    const ref = inst.get;       // detach
+    expect(ref()).toBe(42);     // arrow field → still bound
+  });
+  it('regular method loses this when detached', () => {
+    class L { constructor() { this.x = 42; } get() { return this?.x; } }
+    const inst = new L();
+    const ref = inst.get;
+    expect(ref()).toBeUndefined();
+  });
+  it('bind locks this irreversibly', () => {
+    function f() { return this.tag; }
+    const a = f.bind({ tag: 'A' });
+    const b = a.bind({ tag: 'B' });   // re-bind ignored
+    expect(b()).toBe('A');
+  });
+  it('emit calls handlers as plain functions', () => {
+    const bus = new EventEmitter();
+    bus.on('x', function() { return this; });
+    // tested via not throwing
+  });
+});
+```
+
+**Expected Output:**
+```
+Pattern 1: undefined
+Pattern 2: undefined
+Pattern 3 threw: Cannot read properties of undefined (reading 'prefix')
+Pattern 4 (raw): [APP] hi
+Pattern 5 (raw): [APP] hi
+Pattern 6 (arrow field): [BOUND] hi
+
+I am a happy developer, name: Ana
+I am a busy coder, name: Ana
+I am a curious learner, name: Ana
+I am a curious reader, name: Ana
+```
+
+**Stretch Challenges:**
+- [ ] Make EventEmitter call handlers with a fixed `this` you pass to on(ctx, event, handler)
+- [ ] Write a wrapper that throws if a class method is detached
+- [ ] Profile arrow-class-field vs prototype methods at 100k instances
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Five rules that determine `this`.
+**Q2:** What does `(function(){return this}).call(undefined)` return in strict mode?
+**Q3:** Write a class method bound via arrow field. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is `fetch(...).then(this.handle)` a bug and how do you fix it?
+**Q5:** A junior writes `btn.onclick = obj.method` and clicks crash with `this is undefined`. Diagnose.
+**Q6:** Refactor with arrow class field:
+```js
+class Comp {
+  constructor() { this.handleClick = this.handleClick.bind(this); }
+  handleClick() { console.log(this.state); }
+}
+```
+
+### Day 7 — Application
+**Q7:** Implement bind(ctx) from scratch (don't use Function.prototype.bind).
+**Q8:** A PR creates 50,000 React class instances with bound methods — memory soars. Why?
+**Q9:** What's the cost of arrow class fields vs prototype methods?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain every way `this` can be undefined in modern code."
+**Q11:** Draw: decision tree for `this` resolution at every call site.
+**Q12:** ★ System design: "Architect a plugin system where third-party callbacks need access to the host context — what binding strategy?"

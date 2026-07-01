@@ -136,3 +136,238 @@ To tell the browser engine that `app.js` is an ES6 Module, you MUST add the `typ
 <script type="module" src="app.js"></script>
 ```
 *Bonus:* When a script is loaded as `type="module"`, it automatically acts like it has a `defer` attribute, meaning the browser won't block HTML parsing while it downloads the JavaScript!
+
+## FEYNMAN CHECK
+
+### Explain ES Modules Like I'm 10 Years Old
+> ES Modules (ESM) are JavaScript's STANDARD module system (since 2015 in the spec, 2020 in Node.js). Each file is a MODULE with its own scope — top-level let/const are NOT global, exports are explicit (`export const x`, `export default y`), imports are static (`import {x} from './x.js'`). Two big differences from CommonJS: imports are HOISTED and STATICALLY ANALYZABLE (bundlers can tree-shake unused exports), and bindings are LIVE — if a module updates its exported value, importers see the new value (CJS exports are copied at import time). The non-obvious detail: ESM requires explicit `.js` extension in import specifiers (Node strict ESM), supports top-level await (the module's evaluation is itself async), and dynamic imports `await import('./mod.js')` return a Promise for code-splitting.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do ES modules solve over CommonJS?**
+> **A:** Three things: (1) STATIC ANALYSIS — bundlers can determine exactly which exports are used, tree-shaking dead code (CommonJS's dynamic requires make this impossible). (2) ASYNC LOADING — `import()` is a Promise, enabling code-splitting for huge apps. (3) BROWSER NATIVE — modern browsers load ESM directly via `<script type="module">`, no bundling required for small projects. (4) Top-level await for cleaner async initialization.
+
+**Q2: Mental model for ESM vs CommonJS?**
+> **A:** CJS is REQUIRE-TIME EXECUTION — `require('foo')` runs foo.js synchronously, returns module.exports value. ESM is PARSE-THEN-EVALUATE — parse the entire module graph first (collect imports/exports statically), then evaluate modules in dependency order. ESM imports are READ-ONLY LIVE BINDINGS to the exporting module's variables (CJS just gets a snapshot). This is why circular imports behave differently — ESM may have undefined values mid-load that resolve later; CJS leaves you with the partial state at require time.
+
+**Q3: Most dangerous misconception?**
+> **A:** Default and named exports are interchangeable:
+> ```js
+> // ❌ Importing default as named
+> // export.js
+> export default function greet() {}
+> // import.js
+> import { greet } from './export.js';   // undefined — there's no NAMED 'greet'
+>
+> // ✅ Match the export form
+> import greet from './export.js';             // for default
+> import { greet } from './export.js';         // for named
+> import * as mod from './export.js';          // import everything; mod.default + mod.greet
+> ```
+
+**Q4: How does top-level await change module evaluation?**
+> **A:** Without TLA, modules evaluate synchronously top-to-bottom. With TLA (`const config = await fetch('/cfg.json').then(r => r.json())` at module top level), the module's evaluation becomes a Promise. Modules that import a TLA module wait for it to resolve before they evaluate. This enables clean async initialization (config loading, lazy WASM) without the IIFE workaround. Caveat: it blocks every importer; misuse causes long startup times.
+
+**Q5: FAANG-grade definition?**
+> **A:** "ECMAScript Modules are JavaScript's standardized module system with static, hoisted imports/exports — enabling compile-time tree-shaking and dependency analysis — featuring read-only live bindings (importers see updated values), dynamic `import()` returning Promises for code-splitting, top-level await for async module initialization, and native browser support via type='module' — superseding CommonJS (which remains dominant in legacy Node.js but is being phased out for new code) while requiring careful handling of dual-format publishing for libraries that must support both."
+
+## BUILD
+
+### 🏗️ Mini Project: Mini Plugin System With Dynamic Imports + Tree-Shaking Demo
+
+**What you will build:** A plugin loader that uses dynamic import() for lazy loading, a tree-shaking demo showing unused exports stripped by bundlers, and a circular-import scenario showing ESM's live-binding behavior.
+**Why this project:** Forces every modern module pattern — static imports, dynamic imports, default vs named, TLA, circular handling.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-modules && cd js-modules
+npm init -y
+# add to package.json: "type": "module"
+node -e "const p=require('./package.json'); p.type='module'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2))"
+npm install -D vitest
+mkdir plugins
+ni plugins/auth.js, plugins/logger.js, plugins/cache.js, loader.js, demo.js -ItemType File
+```
+
+#### Step 2 — Plugins (Each Default-Exports A Class)
+```js
+// plugins/auth.js
+export default class AuthPlugin {
+  name = 'auth';
+  async init(app) { console.log(`[auth] init for ${app}`); }
+  middleware(req, res, next) { req.user = { id: 1 }; next(); }
+}
+
+// plugins/logger.js
+export default class LoggerPlugin {
+  name = 'logger';
+  async init() { console.log('[logger] init'); }
+  middleware(req, res, next) { console.log(`${req.method} ${req.url}`); next(); }
+}
+
+// plugins/cache.js
+export default class CachePlugin {
+  name = 'cache';
+  store = new Map();
+  async init() { console.log('[cache] init'); }
+  get(k) { return this.store.get(k); }
+  set(k, v) { this.store.set(k, v); }
+}
+```
+
+#### Step 3 — Dynamic-Loading Loader
+```js
+// loader.js
+export async function loadPlugins(names) {
+  const plugins = [];
+  for (const name of names) {
+    // Dynamic import — code is loaded lazily, only when needed
+    const mod = await import(`./plugins/${name}.js`);
+    const PluginClass = mod.default;
+    const instance = new PluginClass();
+    await instance.init('my-app');
+    plugins.push(instance);
+  }
+  return plugins;
+}
+
+// Tree-shaking demo: only used exports survive bundling
+// utils.js
+export function used() { return 'used'; }
+export function unused() { return 'never imported — bundler removes this'; }
+
+// caller.js
+import { used } from './utils.js';
+console.log(used());   // bundler keeps 'used', strips 'unused'
+```
+
+#### Step 4 — Top-Level Await + Circular Imports
+```js
+// config.js — TLA
+const cfg = await fetch('/api/config').then(r => r.json()).catch(() => ({ env: 'dev' }));
+export default cfg;
+
+// Now importing config waits for the fetch
+// app.js
+import config from './config.js';
+console.log('app starts with env:', config.env);
+
+// Circular imports — a.js imports b.js, b.js imports a.js
+// a.js
+import { foo } from './b.js';
+export const a = 1;
+export function fromA() { return foo() + a; }
+
+// b.js
+import { a } from './a.js';
+export function foo() { return 'foo: a=' + a; }   // a may be undefined during initial load
+```
+
+#### Step 5 — Demo + Tests
+```js
+// demo.js
+import { loadPlugins } from './loader.js';
+
+const plugins = await loadPlugins(['auth', 'logger', 'cache']);
+console.log('Loaded:', plugins.map(p => p.name));
+
+// Use them
+const fakeReq = { method: 'GET', url: '/users' };
+const fakeRes = {};
+plugins[0].middleware(fakeReq, fakeRes, () => {});
+plugins[1].middleware(fakeReq, fakeRes, () => {});
+
+// Code splitting with conditional import
+async function loadIfNeeded(featureFlag) {
+  if (featureFlag) {
+    const { default: HeavyFeature } = await import('./plugins/cache.js');
+    return new HeavyFeature();
+  }
+}
+
+// modules.test.js
+import { describe, it, expect } from 'vitest';
+
+describe('ESM features', () => {
+  it('dynamic import returns a module namespace', async () => {
+    const mod = await import('./plugins/auth.js');
+    expect(typeof mod.default).toBe('function');
+    expect(mod.default.name).toBe('AuthPlugin');
+  });
+
+  it('imports are read-only live bindings', async () => {
+    const counter = await import('./counter.js');
+    const initial = counter.count;
+    counter.increment();
+    expect(counter.count).toBe(initial + 1);   // see live update
+  });
+
+  it('default vs named exports are distinct', async () => {
+    const mod = await import('./mixed.js');
+    expect(mod.default).toBeDefined();
+    expect(mod.named).toBeDefined();
+    expect(mod.default).not.toBe(mod.named);
+  });
+});
+
+// counter.js
+export let count = 0;
+export function increment() { count++; }
+
+// mixed.js
+export default 'default-value';
+export const named = 'named-value';
+```
+
+**Expected Output:**
+```
+[auth] init for my-app
+[logger] init
+[cache] init
+Loaded: [ 'auth', 'logger', 'cache' ]
+GET /users
+GET /users
+app starts with env: dev
+
+# Tree-shaking — bundle includes 'used' but not 'unused'
+# Bundle size before: 4.2 KB
+# Bundle size after:  1.1 KB
+
+# Tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add a plugin manifest (JSON) listing available plugins to lazy-load
+- [ ] Convert a CJS library to dual-format (ESM + CJS) using package.json "exports"
+- [ ] Use import.meta.url to load files relative to the current module
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three differences between ESM and CommonJS.
+**Q2:** Difference between default and named exports.
+**Q3:** Write a dynamic import wrapped in a function. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `import { greet } from './default-export.js'` give undefined when the file uses default export?
+**Q5:** A junior writes `require('./module')` in an ESM file — what happens?
+**Q6:** Refactor to use top-level await:
+```js
+let config;
+fetch('/config').then(r => r.json()).then(c => { config = c; init(); });
+```
+
+### Day 7 — Application
+**Q7:** Set up a project with code-splitting via dynamic import based on user role.
+**Q8:** A PR uses CJS require in a new file — explain the migration steps to ESM.
+**Q9:** What is the cost of top-level await on app startup time?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how tree-shaking works in webpack/rollup using ESM static analysis."
+**Q11:** Draw: dependency graph for a circular ESM import — when do bindings resolve?
+**Q12:** ★ System design: "Architect a 200-package monorepo publishing strategy supporting both ESM-only consumers and legacy CJS — package.json exports map, conditional exports, dual-publishing."

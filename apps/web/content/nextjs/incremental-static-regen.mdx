@@ -107,3 +107,217 @@ Now, the database only receives *one query per minute per product*, regardless o
 A: **No.** This is the genius of ISR (specifically the `stale-while-revalidate` cache control header).
 
 The user is served the *stale* HTML immediately from the CDN. Their page load is instantaneous. The background rebuild is triggered asynchronously. Only the *subsequent* visitors will see the updated content. This ensures that no single user ever pays the performance penalty of waiting for the server to generate the page.
+
+## FEYNMAN CHECK
+
+### Explain ISR Like I'm 10 Years Old
+> Incremental Static Regeneration (ISR) is the best of both worlds between SSG and SSR. With SSG, pages are fast but go stale. With SSR, pages are fresh but slow (server processes every request). ISR pre-builds pages like SSG, but when the page is older than your revalidate interval, the NEXT request triggers a background rebuild — the current user still gets the cached (fast) page, and the rebuilt page replaces the cache for future visitors. It's like a restaurant that pre-cooks popular dishes — when the last one is served, they start cooking a fresh batch in the background without making the current customer wait. The non-obvious depth: ISR is stale-while-revalidate — the cached page is ALWAYS served instantly, even while revalidation is happening. The new page only becomes active after the background rebuild completes.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the stale-while-revalidate model?**
+> **A:** Stale-While-Revalidate is a caching strategy: serve the cached response immediately (even if stale), and simultaneously trigger a background refresh. In Next.js ISR: if the page's cache age > revalidate seconds, the first request after expiry gets the stale page BUT triggers a background regeneration. The NEXT visitor (after regeneration completes) gets the fresh page. This means maximum cache TTL before an update requires two requests: one that triggers revalidation (gets stale), one that gets fresh content. The stale page is never shown for more than one extra request cycle.
+
+**Q2: Mental model for App Router revalidation vs Pages Router ISR?**
+> **A:** Pages Router uses getStaticProps with revalidate: 60 (seconds). App Router uses fetch with next: { revalidate: 60 } or exports export const revalidate = 60 from the page. Both implement stale-while-revalidate. The App Router addition: on-demand revalidation via revalidatePath('/products/1') or revalidateTag('products') in Server Actions or API routes — invalidating the cache immediately when content changes (CMS webhook, form submission), rather than waiting for the time interval.
+
+**Q3: Most dangerous misconception about ISR?**
+> **A:** ISR guarantees the cache is updated exactly at the revalidate interval:
+> ```typescript
+> // WRONG: ISR updates at exactly revalidate: 60 seconds
+> // CORRECT: ISR uses stale-while-revalidate
+> // The cache is updated ONLY when a request arrives AFTER the interval expires
+>
+> export const revalidate = 60;  // 60 seconds
+> // Page last built at: 12:00:00
+> // No requests from 12:00:00 to 12:05:00
+> // Request at 12:05:30 -> STALE page (built at 12:00:00) is served
+> //                     -> Background rebuild triggered
+> // Request at 12:05:32 -> NEW page (fresh) is served
+>
+> // If your site has no traffic for 10 minutes, the page is still 10 minutes old
+> // ISR only rebuilds when a request arrives after the interval
+> ```
+
+**Q4: When should you use on-demand revalidation vs time-based ISR?**
+> **A:** TIME-BASED ISR (revalidate: N) is best for: content that changes on a schedule (news articles, prices), content where slight staleness is acceptable (blog posts, product descriptions), or when you don't control when content changes. ON-DEMAND revalidation is best for: CMS-driven content (revalidate immediately when editor publishes), user-generated content (revalidate when a review is posted), e-commerce (revalidate when inventory changes). Combined strategy: set a long revalidate as a safety net (1 hour) PLUS on-demand revalidation for immediate updates.
+
+**Q5: FAANG-grade definition of Next.js ISR.**
+> **A:** "Next.js Incremental Static Regeneration implements stale-while-revalidate caching — pre-generating static HTML at build time and serving it from CDN cache — triggering background regeneration on the first request after the revalidate interval expires (serving the stale page to the triggering request) and replacing the cache with fresh HTML for subsequent requests — with on-demand revalidation via revalidatePath() and revalidateTag() for immediate cache invalidation triggered by Server Actions or API routes — enabling large-scale sites to maintain CDN-speed performance while serving near-real-time content without per-request server rendering."
+
+## BUILD
+
+### 🏗️ Mini Project: E-Commerce Product Page With ISR + On-Demand Revalidation
+
+**What you will build:** A product detail page with time-based ISR (1 hour) plus a CMS webhook endpoint that triggers on-demand revalidation when a product is updated — the standard e-commerce ISR pattern.
+**Why this project:** Forces both ISR strategies: time-based and on-demand.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest isr-demo --typescript --tailwind --app
+```
+
+#### Step 2 — Product Page With ISR
+```typescript
+// src/app/products/[id]/page.tsx
+interface Product { id: string; name: string; price: number; stock: number; description: string; }
+
+// Simulate a CMS/database product fetch
+async function fetchProduct(id: string): Promise<Product | null> {
+  const res = await fetch(`https://dummyjson.com/products/${id}`, {
+    next: { revalidate: 3600, tags: [`product-${id}`, 'products'] },
+    // revalidate: 3600 = ISR every hour
+    // tags: enables on-demand revalidation by tag
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return {
+    id: String(data.id), name: data.title, price: data.price,
+    stock: data.stock, description: data.description,
+  };
+}
+
+// Pre-generate top 10 products at build time
+export async function generateStaticParams() {
+  const res = await fetch('https://dummyjson.com/products?limit=10');
+  const { products } = await res.json();
+  return products.map((p: any) => ({ id: String(p.id) }));
+}
+
+export const dynamicParams = true;  // generate other IDs on demand
+
+interface Props { params: { id: string } }
+
+export default async function ProductPage({ params }: Props) {
+  const product = await fetchProduct(params.id);
+  if (!product) return <div>Product not found</div>;
+
+  return (
+    <main className="max-w-2xl mx-auto p-8">
+      <h1 className="text-2xl font-bold">{product.name}</h1>
+      <p className="text-3xl text-green-600 mt-2">${product.price}</p>
+      <p className="text-gray-500">Stock: {product.stock} units</p>
+      <p className="mt-4">{product.description}</p>
+      <p className="text-xs text-gray-400 mt-8">
+        Page generated: {new Date().toISOString()}
+      </p>
+    </main>
+  );
+}
+
+export async function generateMetadata({ params }: Props) {
+  const product = await fetchProduct(params.id);
+  return { title: product?.name ?? 'Product Not Found' };
+}
+```
+
+#### Step 3 — On-Demand Revalidation Webhook
+```typescript
+// src/app/api/cms-webhook/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { revalidateTag, revalidatePath } from 'next/cache';
+
+export async function POST(request: NextRequest) {
+  const authHeader = request.headers.get('x-webhook-secret');
+  if (authHeader !== process.env.WEBHOOK_SECRET) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const body = await request.json();
+  const { event, productId } = body;
+
+  switch (event) {
+    case 'product.updated':
+    case 'product.published':
+      // Invalidate this specific product's cache
+      revalidateTag(`product-${productId}`);
+      revalidatePath(`/products/${productId}`);
+      break;
+    case 'products.all_updated':
+      // Invalidate all products
+      revalidateTag('products');
+      break;
+  }
+
+  return NextResponse.json({
+    revalidated: true,
+    event,
+    productId,
+    timestamp: new Date().toISOString(),
+  });
+}
+```
+
+#### Step 4 — Testing ISR Revalidation
+```bash
+# Start the production server
+npm run build && npm start
+
+# Test time-based ISR:
+# 1. Visit /products/1 -> note the "Page generated" timestamp
+# 2. Wait 1+ hour OR manually expire via API
+# 3. Visit /products/1 -> same timestamp (stale, triggers background regen)
+# 4. Visit /products/1 again -> new timestamp (fresh)
+
+# Test on-demand revalidation:
+curl -X POST http://localhost:3000/api/cms-webhook   -H "Content-Type: application/json"   -H "x-webhook-secret: your-secret"   -d '{"event": "product.updated", "productId": "1"}'
+
+# Immediately visit /products/1 -> fresh page (no waiting for interval)
+```
+
+#### Step 5 — Tests
+```typescript
+// Test the webhook endpoint
+import { POST } from '@/app/api/cms-webhook/route';
+
+it('rejects invalid webhook secret', async () => {
+  const req = new Request('http://localhost/api/cms-webhook', {
+    method: 'POST',
+    headers: { 'x-webhook-secret': 'wrong-secret', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ event: 'product.updated', productId: '1' }),
+  });
+  const res = await POST(req as any);
+  expect(res.status).toBe(401);
+});
+```
+
+**Expected Output:**
+```
+next build: 10 product pages pre-generated
+/products/11 (not pre-generated): ISR on-demand generation on first visit
+"Page generated" timestamp updates after revalidation
+curl webhook -> immediate cache invalidation -> next visit shows fresh page
+Test: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a cache status header showing if the page was served from cache
+- [ ] Implement optimistic ISR that pre-renders new pages during the build
+- [ ] Add rate limiting to the webhook endpoint
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is stale-while-revalidate and how does ISR implement it?
+**Q2:** Does ISR update the cache exactly at the revalidate interval?
+**Q3:** Write fetch() with ISR revalidation and a cache tag. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When should you use on-demand revalidation vs time-based ISR?
+**Q5:** A user complains content is stale 10 minutes after publishing — diagnose.
+**Q6:** What is the difference between revalidatePath and revalidateTag?
+
+### Day 7 — Application
+**Q7:** Add a CMS webhook that revalidates specific pages on content publish.
+**Q8:** An e-commerce site shows outdated stock counts — implement ISR + on-demand revalidation.
+**Q9:** What happens to ISR pages during next build when content changes?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain ISR stale-while-revalidate — exactly what happens on the first request after the interval expires?"
+**Q11:** Draw: ISR cache lifecycle — build → cache → expire → revalidation request → fresh cache.
+**Q12:** ★ System design: "Design the caching strategy for a news site with 1M articles — ISR intervals, on-demand revalidation, CDN strategy."

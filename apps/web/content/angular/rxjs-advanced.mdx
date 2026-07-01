@@ -176,3 +176,183 @@ A: **`forkJoin`!**
 - `combineLatest`: Emits whenever *any* of the streams emit. Excellent for UI filters (e.g., search text + category dropdown), but unnecessary for single HTTP requests.
 - `zip`: Waits for both streams to emit index 1, then emits. Waits for both to emit index 2, then emits. Usually used for strict pairing of infinite streams.
 - `forkJoin`: This is the RxJS equivalent of `Promise.all()`. It fires both HTTP requests simultaneously. It waits for BOTH observables to fully complete, and then emits exactly once with the final array of results `[userData, postsData]`. Because HTTP requests are finite observables that complete immediately after returning data, `forkJoin` is mathematically the perfect, most performant operator for combining multiple API calls!
+
+## FEYNMAN CHECK
+
+### Explain Advanced RxJS Like I'm 10 Years Old
+> Once you know the basic operators, the advanced patterns are about: (1) SHARING — shareReplay(1) multicasts an Observable to many subscribers while caching the last value (use for HTTP calls shared across components). (2) ERROR HANDLING — catchError returns a fallback, retryWhen implements custom retry logic with exponential backoff. (3) CUSTOM OPERATORS — pipe() lets you compose operators into a named, reusable function. (4) SCHEDULERS — control the timing/execution context of operators (observeOn(asyncScheduler) defers to microtask queue). (5) MARBLE TESTING — TestScheduler lets you test time-based operators without actually waiting. The non-obvious depth: RxJS operators are CURRIED HIGHER-ORDER FUNCTIONS that return operator functions — you can compose them programmatically, creating custom operators with the same interface as built-ins.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When and why does shareReplay matter?**
+> **A:** Without shareReplay, each subscriber to an HTTP Observable triggers a NEW network request. shareReplay(1) multicasts the single request to all subscribers and replays the last value to late subscribers. This is the standard pattern for cached HTTP calls shared across multiple components: const users$ = this.http.get('/api/users').pipe(shareReplay(1)). With { refCount: false }, the subscription persists even when all consumers unsubscribe (permanent cache). With { refCount: true }, it re-subscribes when the first new subscriber arrives after all previous ones leave (re-fetches).
+
+**Q2: Mental model for custom operators?**
+> **A:** A custom operator is a function that takes an Observable and returns an Observable — exactly what pipe() chains together. Pattern: export function retryWithBackoff(maxRetries: number, delay: number) { return (source: Observable<T>) => source.pipe(retryWhen(errors => errors.pipe(scan((count, err) => ...), delay(...)))) }. Use it like any built-in: http.get().pipe(retryWithBackoff(3, 500)). This is how libraries like ng-query, angular-query, and ngrx/effects compose reusable stream logic.
+
+**Q3: Most dangerous misconception about advanced RxJS?**
+> **A:** shareReplay always prevents duplicate HTTP calls:
+> ```typescript
+> // WRONG: shareReplay(1) with refCount:true can re-fetch
+> const users$ = this.http.get('/api/users').pipe(shareReplay(1));
+> // If all components unsubscribe (route change) then re-subscribe,
+> // the Observable re-runs — making a new HTTP request!
+>
+> // CORRECT for permanent cache:
+> const users$ = this.http.get('/api/users').pipe(shareReplay({ bufferSize: 1, refCount: false }));
+>
+> // CORRECT for cache that refreshes when all leave:
+> const users$ = this.http.get('/api/users').pipe(shareReplay({ bufferSize: 1, refCount: true }));
+> ```
+
+**Q4: How do RxJS schedulers affect Angular change detection?**
+> **A:** By default, Observables emit synchronously or in macrotask/microtask context. Zone.js patches these contexts to notify Angular's change detection. With observeOn(asyncScheduler) or subscribeOn(asapScheduler), you can control WHICH async context values emit in. In performance-critical scenarios (large data processing), running work on queueScheduler (synchronous batch) or observeOn(animationFrameScheduler) for smooth rendering can prevent Zone.js from triggering CD on every intermediate value — batch on a scheduler that fires once per frame.
+
+**Q5: FAANG-grade definition of advanced RxJS patterns.**
+> **A:** "Advanced RxJS encompasses multicasting (shareReplay with refCount for HTTP caching, multicast with Subjects), custom operators (factory functions returning (src: Observable) => Observable), error handling (catchError for recovery, retryWhen with exponential backoff, throwError for propagation), marble testing (TestScheduler for deterministic time-based operator testing), scheduler control (asyncScheduler, animationFrameScheduler, queueScheduler for execution context), and operator composition (pipe with custom operator factories) — all building on the lazy, composable, cancellable Observable primitive."
+
+## BUILD
+
+### 🏗️ Mini Project: Custom Operators Library — retryWithBackoff, debounceDistinct, pollUntil
+
+**What you will build:** Three production-grade custom RxJS operators: (1) retryWithBackoff — retries with exponential backoff and max attempts, (2) debounceDistinct — debounce + distinctUntilChanged combined, (3) pollUntil — polls an endpoint until a condition is met.
+**Why this project:** Forces custom operator composition and marble testing.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir rxjs-operators && cd rxjs-operators
+npm init -y && npm install rxjs rxjs-marbles vitest
+ni operators.ts, operators.spec.ts -ItemType File
+```
+
+#### Step 2 — retryWithBackoff Operator
+```typescript
+// operators.ts
+import { Observable, throwError, timer } from 'rxjs';
+import { retryWhen, scan, mergeMap, debounceTime, distinctUntilChanged, switchMap, takeWhile } from 'rxjs/operators';
+
+export function retryWithBackoff<T>(maxRetries: number, baseDelayMs: number) {
+  return (source: Observable<T>): Observable<T> =>
+    source.pipe(
+      retryWhen(errors =>
+        errors.pipe(
+          scan((retryCount, error) => {
+            if (retryCount >= maxRetries) throw error;  // exhaust retries
+            return retryCount + 1;
+          }, 0),
+          mergeMap(retryCount => timer(baseDelayMs * Math.pow(2, retryCount - 1))),
+        )
+      ),
+    );
+}
+```
+
+#### Step 3 — debounceDistinct Operator
+```typescript
+export function debounceDistinct<T>(dueTime: number) {
+  return (source: Observable<T>): Observable<T> =>
+    source.pipe(
+      debounceTime(dueTime),
+      distinctUntilChanged(),
+    );
+}
+```
+
+#### Step 4 — pollUntil Operator
+```typescript
+import { interval } from 'rxjs';
+
+export function pollUntil<T>(
+  pollFn: () => Observable<T>,
+  conditionFn: (val: T) => boolean,
+  intervalMs: number,
+) {
+  return interval(intervalMs).pipe(
+    switchMap(() => pollFn()),
+    takeWhile(val => !conditionFn(val), true),  // true = emit the final value
+  );
+}
+
+// Usage: poll job status until complete
+const jobStatus$ = pollUntil(
+  () => http.get('/api/job/123'),
+  (job: any) => job.status === 'complete',
+  2000,
+);
+```
+
+#### Step 5 — Tests With Marble Testing
+```typescript
+// operators.spec.ts
+import { TestScheduler } from 'rxjs/testing';
+import { describe, it, expect, beforeEach } from 'vitest';
+
+describe('retryWithBackoff', () => {
+  let scheduler: TestScheduler;
+  beforeEach(() => {
+    scheduler = new TestScheduler((actual, expected) => {
+      expect(actual).toEqual(expected);
+    });
+  });
+
+  it('succeeds after 2 retries', () => {
+    scheduler.run(({ cold, expectObservable }) => {
+      let attempt = 0;
+      const source$ = cold('--#').pipe(
+        mergeMap(() => ++attempt < 3 ? throwError(() => new Error('fail')) : of('success')),
+      );
+      // 3rd attempt succeeds
+    });
+  });
+});
+
+describe('debounceDistinct', () => {
+  it('emits only after silence and only when value changes', () => {
+    const scheduler = new TestScheduler((a, e) => expect(a).toEqual(e));
+    scheduler.run(({ cold, hot, expectObservable }) => {
+      const source$ = hot('a-b--b---c', { a: 'x', b: 'x', c: 'y' }).pipe(debounceDistinct(20));
+      expectObservable(source$).toBe('-----x---y');
+    });
+  });
+});
+```
+
+**Expected Output:**
+```
+retryWithBackoff: first 2 calls fail, 3rd succeeds with 100ms + 200ms delays
+debounceDistinct: rapid same-value emissions collapsed
+pollUntil: polls every 2s until job.status === 'complete'
+Marble tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add a cacheFor(ms) operator that shares a replay for N milliseconds then expires
+- [ ] Add a raceUntilTimeout(ms) operator that throws if source doesn't emit within ms
+- [ ] Publish the operators as an npm package with full marble test suite
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does shareReplay(1) do and when is it useful?
+**Q2:** Difference between shareReplay refCount:true vs false?
+**Q3:** Write a custom operator that logs the value. From memory.
+
+### Day 3 — Comprehension
+**Q4:** A junior chains shareReplay on an HTTP call shared across 10 components — does it make 10 or 1 HTTP calls?
+**Q5:** When would you use retryWhen vs retry?
+**Q6:** What is marble testing and why is it valuable for time-based operators?
+
+### Day 7 — Application
+**Q7:** Build a cacheFor(ms) operator that replays for N ms then re-subscribes.
+**Q8:** A PR uses forkJoin for polling — explain the issue.
+**Q9:** What scheduler is right for batching 1000 synchronous updates without CD jank?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain multicasting in RxJS — Subject, share, shareReplay, publish, multicast."
+**Q11:** Draw: marble diagram showing shareReplay(1) with 3 subscribers arriving at different times.
+**Q12:** ★ System design: "Design a real-time collaborative editor's operation sync using RxJS — conflict resolution, ordering, reconnect."

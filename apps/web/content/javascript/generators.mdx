@@ -150,3 +150,288 @@ A: **`async/await` is essentially syntactic sugar over Generators and Promises!*
 Before `async/await` was officially added to JavaScript in ES2017, libraries like `co` allowed developers to write asynchronous code that looked synchronous by using Generators!
 They would write a Generator function that `yield`ed a Promise. A helper function would intercept the yielded Promise, wait for it to resolve, and then call `.next(resolvedValue)` to inject the data back into the frozen Generator. 
 The JavaScript committee saw how brilliant this pattern was, and literally hardcoded it into the language engine, giving us the `async` (which acts like the helper function) and `await` (which acts like `yield`) keywords!
+
+## FEYNMAN CHECK
+
+### Explain Generators Like I'm 10 Years Old
+> A generator is a FUNCTION YOU CAN PAUSE. Declared with `function*` (note the asterisk). Inside, `yield expr` pauses execution and produces `{value: expr, done: false}` to the caller. The next `.next()` call resumes from where it paused. `yield`'s expression is the VALUE returned to the caller; `.next(arg)`'s arg becomes the RESULT of yield inside the generator — making it BIDIRECTIONAL communication. Generators are perfect for: lazy sequences, infinite streams, custom iterators, coroutines, simple state machines. The non-obvious power: `async function*` (async generator) lets you `yield await fetch(...)` — combined with `for await...of`, this is the foundation of Node.js streams, server-sent events, and observable patterns.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do generators solve over plain functions?**
+> **A:** Three things: (1) LAZY EVALUATION — yield only when asked; an infinite Fibonacci sequence doesn't blow memory. (2) STATE MACHINE simplicity — yield in a loop expresses "produce value, wait, continue from here" without manual state-tracking. (3) COROUTINES — `.next(arg)` lets the caller send data IN, enabling two-way communication between caller and callee (used by redux-saga to model side effects as effects yielded to the runtime).
+
+**Q2: Mental model for generator execution?**
+> **A:** "A generator FUNCTION is a factory; calling it returns a paused-at-the-start iterator. Each .next() runs until the next yield (or return) and returns {value, done}. The yield's expression is sent to the caller AS value; the caller's .next(arg) sends arg back INTO the generator as the yield expression's result." Pause-and-resume — the generator's local state (variables, position) is preserved across yields.
+
+**Q3: Most dangerous misconception?**
+> **A:** Generators are async by default:
+> ```js
+> // ❌ Sync generator — yields immediately, no async involved
+> function* gen() { yield fetch('/api'); }   // yields the Promise, not the resolved value
+> const it = gen();
+> console.log(it.next().value);   // Promise<Response> — caller must await
+>
+> // ✅ Use ASYNC generator for async yield
+> async function* asyncGen() {
+>   const data = await fetch('/api').then(r => r.json());
+>   yield data;
+> }
+> for await (const item of asyncGen()) console.log(item);
+> ```
+
+**Q4: How do generators interact with try/catch and return?**
+> **A:** `gen.throw(err)` injects err AT THE current yield point — the generator can catch it with try/catch around the yield. `gen.return(value)` finishes the generator early, running any finally blocks. This makes generators a clean way to implement resource cleanup (close DB connection in finally regardless of how iteration ended). for-of automatically calls gen.return() if the loop is broken early.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Generators are JavaScript functions declared with function* that produce iterator objects supporting lazy, pausable execution via yield expressions — with bidirectional communication via .next(value) and exception injection via .throw(error) — and async generators (async function*) integrating with for-await-of for asynchronous streaming — collectively enabling lazy sequences, coroutines, simple state machines, and the underpinning of effect-based libraries like redux-saga."
+
+## BUILD
+
+### 🏗️ Mini Project: Async Generator Streaming A Paginated API + Backpressure
+
+**What you will build:** An async generator that paginates through a REST API, yielding records one at a time, with proper cancellation and the for-await-of consumer pattern.
+**Why this project:** Forces async generators, pagination, and consumer-driven flow — the foundation of every modern streaming API.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-generators && cd js-generators
+npm init -y && npm install -D vitest
+ni gen.js, gen.test.js -ItemType File
+```
+
+#### Step 2 — Async Pagination Generator
+```js
+// gen.js
+
+// Fake API returning pages of users
+async function fetchPage(page) {
+  await new Promise(r => setTimeout(r, 50));   // simulate latency
+  if (page > 5) return { data: [], hasMore: false };
+  return {
+    data: Array.from({ length: 10 }, (_, i) => ({ id: page * 10 + i, name: `User ${page * 10 + i}` })),
+    hasMore: page < 5,
+  };
+}
+
+// Async generator yields ONE user at a time, fetching pages on demand
+export async function* paginate(signal) {
+  let page = 0;
+  while (true) {
+    if (signal?.aborted) return;
+    const { data, hasMore } = await fetchPage(page++);
+    for (const item of data) {
+      if (signal?.aborted) return;
+      yield item;
+    }
+    if (!hasMore) return;
+  }
+}
+
+// Composable: take only first N
+export async function* take(asyncIter, n) {
+  let i = 0;
+  for await (const x of asyncIter) {
+    if (i++ >= n) return;
+    yield x;
+  }
+}
+
+// Composable: filter
+export async function* filter(asyncIter, pred) {
+  for await (const x of asyncIter) if (await pred(x)) yield x;
+}
+```
+
+#### Step 3 — Sync Generators For Coroutines
+```js
+// coroutine.js
+// State machine via generator
+export function* trafficLight() {
+  while (true) {
+    yield 'green';
+    yield 'yellow';
+    yield 'red';
+  }
+}
+
+// Bidirectional — caller sends control
+export function* interactiveSum() {
+  let total = 0;
+  while (true) {
+    const n = yield total;     // yields current total, awaits next number
+    if (n === null) return total;
+    total += n;
+  }
+}
+
+const it = interactiveSum();
+it.next();             // start: yields 0
+console.log(it.next(5).value);   // 5
+console.log(it.next(10).value);  // 15
+console.log(it.next(20).value);  // 35
+console.log(it.next(null).value); // 35 (done)
+```
+
+#### Step 4 — Error Handling: Cleanup On Early Break
+```js
+// cleanup.js
+export function* withDbConnection(db) {
+  console.log('Opening DB connection');
+  try {
+    yield db.query('SELECT 1');
+    yield db.query('SELECT 2');
+    yield db.query('SELECT 3');
+  } finally {
+    console.log('Closing DB connection');   // ALWAYS runs, even on early break
+    db.close();
+  }
+}
+
+// Even if caller breaks early, finally runs
+const fakeDb = { query: (q) => 'result of ' + q, close: () => console.log('closed!') };
+for (const result of withDbConnection(fakeDb)) {
+  console.log(result);
+  break;   // early exit — finally still runs
+}
+```
+
+#### Step 5 — Use Everything
+```js
+// demo.js
+import { paginate, take, filter } from './gen.js';
+import { trafficLight } from './coroutine.js';
+
+// Sync generator
+const light = trafficLight();
+for (let i = 0; i < 6; i++) console.log(light.next().value);
+// green, yellow, red, green, yellow, red
+
+// Async pagination — only fetch what we consume
+const controller = new AbortController();
+const first5 = take(paginate(controller.signal), 5);
+for await (const user of first5) console.log('Got user:', user.id);
+
+// Filtering inline
+console.log('--- only even IDs, first 3 ---');
+const evenOnly = take(filter(paginate(controller.signal), u => u.id % 2 === 0), 3);
+for await (const user of evenOnly) console.log('Even user:', user.id);
+
+// Cancel mid-stream
+const ctrl2 = new AbortController();
+setTimeout(() => ctrl2.abort(), 100);
+let count = 0;
+for await (const _ of paginate(ctrl2.signal)) count++;
+console.log('Got', count, 'before cancel');
+```
+
+#### Step 6 — Tests
+```js
+// gen.test.js
+import { describe, it, expect } from 'vitest';
+import { paginate, take, filter } from './gen.js';
+import { trafficLight, interactiveSum } from './coroutine.js';
+
+describe('generators', () => {
+  it('trafficLight cycles forever', () => {
+    const it = trafficLight();
+    expect(it.next().value).toBe('green');
+    expect(it.next().value).toBe('yellow');
+    expect(it.next().value).toBe('red');
+    expect(it.next().value).toBe('green');   // cycles
+  });
+
+  it('interactiveSum is bidirectional', () => {
+    const it = interactiveSum();
+    it.next();
+    expect(it.next(5).value).toBe(5);
+    expect(it.next(10).value).toBe(15);
+  });
+});
+
+describe('async generators', () => {
+  it('paginate yields all items lazily', async () => {
+    const ids = [];
+    for await (const u of paginate()) ids.push(u.id);
+    expect(ids.length).toBe(50);   // 5 pages × 10 items
+  });
+
+  it('take stops the underlying generator early', async () => {
+    const ids = [];
+    for await (const u of take(paginate(), 3)) ids.push(u.id);
+    expect(ids).toEqual([0, 1, 2]);
+  });
+
+  it('filter composes correctly', async () => {
+    const ids = [];
+    for await (const u of take(filter(paginate(), u => u.id % 5 === 0), 4)) ids.push(u.id);
+    expect(ids).toEqual([0, 5, 10, 15]);
+  });
+
+  it('AbortSignal cancels mid-stream', async () => {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 75);
+    let count = 0;
+    for await (const _ of paginate(ctrl.signal)) count++;
+    expect(count).toBeLessThan(50);
+  });
+});
+```
+
+**Expected Output:**
+```
+green
+yellow
+red
+green
+yellow
+red
+Got user: 0
+Got user: 1
+Got user: 2
+Got user: 3
+Got user: 4
+--- only even IDs, first 3 ---
+Even user: 0
+Even user: 2
+Even user: 4
+Got 10 before cancel
+
+# All 7 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add concurrent paginate that overlaps fetches (lookahead)
+- [ ] Implement merge(asyncIter1, asyncIter2) that interleaves both
+- [ ] Compare with RxJS Observable for the same use case
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Syntax to declare a generator vs async generator.
+**Q2:** What does yield's expression become to the caller?
+**Q3:** Write a generator yielding 1, 2, 3. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does for-of automatically call gen.return() on early break?
+**Q5:** A junior writes `function gen() { yield 1 }` (no asterisk) — what happens?
+**Q6:** Refactor to lazy generator:
+```js
+function getAll() { return arr.map(transform).filter(test).slice(0, 10); }
+// arr is 1M items — wasted work!
+```
+
+### Day 7 — Application
+**Q7:** Build an async generator that streams CSV rows from a fetch response.
+**Q8:** A PR uses gen.throw inside a try/catch in the generator — explain the mechanics.
+**Q9:** What's the perf overhead of yield vs raw iteration?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain how redux-saga uses generators to model side effects."
+**Q11:** Draw: state diagram of a generator (suspended → running → suspended at yield → done).
+**Q12:** ★ System design: "Stream-process 100GB of JSON-lines — generators vs streams vs workers, which wins?"

@@ -154,3 +154,179 @@ A: A Pure Pipe guarantees that if the input value hasn't changed, the output wil
 
 **Q: Why is the `async` pipe considered impure?**
 A: Because an Observable stream doesn't change its memory reference, but it continuously emits new data over time. If the `async` pipe were pure, it would never detect the new data arriving from the API. It must be impure so it can evaluate on every change detection cycle to see if the stream emitted a new value.
+
+## FEYNMAN CHECK
+
+### Explain Angular Pipes Like I'm 10 Years Old
+> Pipes are template FILTERS — they take a value, transform it, and display the result WITHOUT changing the original data. {{ price | currency:'USD' }} takes a number and displays "$42.00". The template-only nature is deliberate: pipes encourage pure transformations (no side effects, no mutation). Built-in pipes: DatePipe, CurrencyPipe, DecimalPipe, PercentPipe, UpperCasePipe, LowerCasePipe, TitleCasePipe, JsonPipe, AsyncPipe, KeyValuePipe, SlicePipe. The non-obvious performance detail: PURE pipes (the default) are memoised — Angular only re-runs them when the input reference changes. IMPURE pipes run on every change detection cycle. AsyncPipe is technically impure (it subscribes and re-runs when the Observable emits) but Angular handles it specially to avoid memory leaks.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between pure and impure pipes?**
+> **A:** PURE pipes run only when the input value or reference changes — Angular caches the result and reuses it until the input changes. They must be pure functions (same input → same output, no side effects). IMPURE pipes run on EVERY change detection cycle regardless of input change. Use impure only when the pipe's output depends on external state that changes outside the input (e.g., a translate pipe reading a locale service, a filter pipe that must re-run when the filter criteria change). Impure pipes can tank performance — Angular runs them 60+ times per second in active apps.
+
+**Q2: Mental model for AsyncPipe?**
+> **A:** AsyncPipe subscribes to an Observable or Promise and returns the latest emitted value. When the component is destroyed, AsyncPipe AUTOMATICALLY unsubscribes — no manual ngOnDestroy needed. It also calls markForCheck() to trigger change detection in OnPush components when a new value arrives. The pattern "observable$ | async as value" in a template replaces the manual subscribe-in-ngOnInit + ngOnDestroy pattern entirely, and is the recommended way to handle async data in templates.
+
+**Q3: Most dangerous misconception about pipes?**
+> **A:** Piping an array filter makes it reactive:
+> ```typescript
+> // WRONG: pure pipe with array input only re-runs when the array REFERENCE changes
+> @Pipe({ name: 'filter', pure: true })
+> export class FilterPipe implements PipeTransform {
+>   transform(items: Item[], query: string): Item[] {
+>     return items.filter(i => i.name.includes(query));
+>   }
+> }
+> // Template: {{ items | filter:searchTerm }}
+> // If you push to 'items' without creating a new reference,
+> // the pipe does NOT re-run even though the contents changed!
+>
+> // CORRECT: either make the pipe impure (performance cost)
+> // or replace the array reference: this.items = [...this.items, newItem];
+> ```
+
+**Q4: When should you create a custom pipe vs a component method?**
+> **A:** Create a PIPE when: the transformation is PURE (same input → same output), used in MULTIPLE templates, and conceptually a view transformation (formatting, filtering, mapping). Use a COMPONENT METHOD when: the transformation requires component state, is used only in that component, or has side effects. Pipes are also unit-testable without a TestBed — just instantiate and call transform(). This makes them ideal for formatting logic shared across the app.
+
+**Q5: FAANG-grade definition of Angular pipes.**
+> **A:** "Angular pipes are pure (by default) or impure template transformation functions implementing PipeTransform — applied in templates as value | pipeName:arg1:arg2 — with pure pipes memoised per input reference (safe to use in any template, zero re-run cost when inputs don't change), impure pipes running every CD cycle (expensive, use sparingly), and AsyncPipe as the reactive bridge between Observables/Promises and template rendering — automatically subscribing, unwrapping values, triggering markForCheck() on OnPush components, and unsubscribing on destroy."
+
+## BUILD
+
+### 🏗️ Mini Project: Custom Pipe Library — TimeAgo, Highlight, SafeHtml, Currency Locale
+
+**What you will build:** Four production-grade custom pipes: (1) timeAgo — converts timestamp to "3 hours ago", (2) highlight — wraps matching text in mark tags, (3) safeHtml — sanitizes HTML for innerHTML, (4) currencyLocale — formats currency per user locale.
+**Why this project:** Forces pure/impure distinction, DomSanitizer usage, and parameterised pipes.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new pipe-library --standalone --routing false
+ng generate pipe time-ago --standalone
+ng generate pipe highlight --standalone
+ng generate pipe safe-html --standalone
+```
+
+#### Step 2 — TimeAgo Pipe
+```typescript
+// time-ago.pipe.ts
+import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({ name: 'timeAgo', standalone: true, pure: false })  // impure — time changes
+export class TimeAgoPipe implements PipeTransform {
+  transform(value: Date | string | number): string {
+    const date = new Date(value);
+    const now = Date.now();
+    const diff = Math.floor((now - date.getTime()) / 1000);
+
+    if (diff < 60)  return diff + ' seconds ago';
+    if (diff < 3600) return Math.floor(diff / 60) + ' minutes ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' hours ago';
+    if (diff < 604800) return Math.floor(diff / 86400) + ' days ago';
+    return date.toLocaleDateString();
+  }
+}
+```
+
+#### Step 3 — Highlight Pipe
+```typescript
+// highlight.pipe.ts
+import { Pipe, PipeTransform } from '@angular/core';
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
+
+@Pipe({ name: 'highlight', standalone: true, pure: true })
+export class HighlightPipe implements PipeTransform {
+  constructor(private sanitizer: DomSanitizer) {}
+
+  transform(text: string, query: string): SafeHtml {
+    if (!query || !text) return text;
+    const escaped = query.split('').map(c => /[a-zA-Z0-9]/.test(c) ? c : '\' + c).join('');
+    const re = new RegExp('(' + escaped + ')', 'gi');
+    const highlighted = text.replace(re, '<mark>$1</mark>');
+    return this.sanitizer.bypassSecurityTrustHtml(highlighted);
+  }
+}
+```
+
+#### Step 4 — SafeHtml Pipe
+```typescript
+// safe-html.pipe.ts
+import { Pipe, PipeTransform } from '@angular/core';
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
+
+@Pipe({ name: 'safeHtml', standalone: true, pure: true })
+export class SafeHtmlPipe implements PipeTransform {
+  constructor(private sanitizer: DomSanitizer) {}
+  transform(value: string): SafeHtml {
+    return this.sanitizer.bypassSecurityTrustHtml(value);
+  }
+}
+
+// Usage: <div [innerHTML]="htmlContent | safeHtml"></div>
+// Note: only use with trusted content — not for user input
+```
+
+#### Step 5 — Tests
+```typescript
+describe('TimeAgoPipe', () => {
+  let pipe: TimeAgoPipe;
+  beforeEach(() => { pipe = new TimeAgoPipe(); });
+
+  it('returns seconds ago for recent times', () => {
+    const d = new Date(Date.now() - 30000);  // 30 seconds ago
+    expect(pipe.transform(d)).toBe('30 seconds ago');
+  });
+  it('returns minutes ago', () => {
+    const d = new Date(Date.now() - 3 * 60 * 1000);  // 3 minutes ago
+    expect(pipe.transform(d)).toBe('3 minutes ago');
+  });
+  it('returns hours ago', () => {
+    const d = new Date(Date.now() - 2 * 3600 * 1000);  // 2 hours ago
+    expect(pipe.transform(d)).toBe('2 hours ago');
+  });
+});
+```
+
+**Expected Output:**
+```
+timeAgo: "3 minutes ago", "2 hours ago", "yesterday"
+highlight: matching text wrapped in <mark>
+safeHtml: HTML rendered safely
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Make TimeAgoPipe auto-update every minute using an interval
+- [ ] Add a plural pipe: {{ count | plural:'item' }} -> "1 item" / "5 items"
+- [ ] Benchmark pure vs impure pipe performance with 1000 items
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between pure and impure pipes?
+**Q2:** What does AsyncPipe do that manual subscribe does not?
+**Q3:** Write a pipe that uppercases only the first word. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When should you make a pipe impure?
+**Q5:** A junior writes a filter pipe as pure but items.push does not re-filter — diagnose.
+**Q6:** Refactor to async pipe:
+```typescript
+users$ = this.userService.getUsers();
+// ngOnInit subscribes manually
+```
+
+### Day 7 — Application
+**Q7:** Build a currency pipe that reads the user's locale from a service.
+**Q8:** A PR has an impure pipe on every row of a 1000-row table — explain the performance issue.
+**Q9:** When would you use JsonPipe in production?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain AsyncPipe internals — how does it subscribe, trigger CD, and clean up?"
+**Q11:** Draw: pure pipe memoisation decision tree in Angular's change detection.
+**Q12:** ★ System design: "Design an internationalisation pipe system for an Angular app in 20 languages."

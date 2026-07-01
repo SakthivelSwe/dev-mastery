@@ -1,155 +1,640 @@
 ---
-slug: "reflection"
-title: "Reflection API"
-level: 4
+slug: reflection
+title: Reflection in Java — Runtime Introspection and Metaprogramming
+level: advanced
 ---
 
 ## WHY
-In Java, if a class field is marked as `private`, it is strictly impossible for an external class to read or modify it. That is the absolute bedrock of Encapsulation.
-But wait. How does a library like Google GSON or Jackson convert a JSON string into a Java Object if your fields are `private` and you didn't write any setter methods? How does Spring Boot scan your entire project, find methods marked with `@GetMapping`, and execute them dynamically when an HTTP request arrives, without you ever explicitly calling the method?
 
-They use the **Reflection API**. Reflection is a magical, dangerous "backdoor" that allows Java code to inspect itself, read private fields, execute private methods, and dynamically instantiate classes at Runtime without knowing anything about them at Compile Time. It is the engine that powers every major Java framework in existence.
+Reflection lets Java code examine and modify its own structure at runtime. It's the foundation of every major Java framework:
+
+1. **Spring** — Uses reflection for `@Autowired` (inject private fields), `@AOP` (create proxies)
+2. **JUnit** — Uses reflection to find and run `@Test` methods
+3. **Jackson** — Uses reflection to serialize/deserialize object fields to/from JSON
+4. **Hibernate** — Uses reflection to map Java fields to database columns
+5. **Lombok** — Uses annotation processing (compile-time reflection) to generate code
+
+---
 
 ## THEORY
-### The `Class` Object
-In Java, everything is an object, including classes themselves! 
-When the JVM loads your `User` class, it creates a special metaphysical object of type `java.lang.Class<User>`. This object contains the complete blueprint of your class: a list of every constructor, every field, every method, and every annotation. By grabbing this `Class` object, you can programmatically analyze and manipulate the blueprint.
 
-### Performance and Security Costs
-Reflection is incredibly powerful, but it comes with severe penalties:
-1. **Performance**: Calling a method via Reflection is significantly slower than a direct method call because the JVM cannot perform JIT compiler optimizations (like method inlining) on reflective calls.
-2. **Security**: Reflection completely bypasses the compiler's safety checks. You can accidentally crash the JVM or violate critical security sandbox rules if you randomly execute unknown methods.
+### What Reflection Can Do
+
+```
+Reflection APIs allow:
+1. Inspect class metadata: name, superclass, interfaces, modifiers
+2. Inspect fields: name, type, modifiers
+3. Inspect methods: name, parameters, return type, modifiers
+4. Inspect constructors: parameters
+5. Invoke methods on objects (even private ones!)
+6. Get/set field values (even private ones!)
+7. Create new instances dynamically
+8. Read annotations at runtime
+```
+
+### Entry Points — Getting Class Objects
+
+```java
+// 3 ways to get a Class object:
+
+// 1. .class literal (compile time, no instance needed)
+Class<String> strClass = String.class;
+Class<int[]> intArrClass = int[].class;
+
+// 2. getClass() on an instance (runtime type)
+String s = "hello";
+Class<?> cls = s.getClass(); // class java.lang.String
+
+// 3. Class.forName() — load by fully qualified name (runtime, dynamic)
+Class<?> cls2 = Class.forName("java.util.ArrayList");
+// Throws ClassNotFoundException if not found
+```
+
+### Class API — What You Can Inspect
+
+```java
+Class<?> cls = Person.class;
+
+// Basic info
+cls.getName()              // "com.example.Person"
+cls.getSimpleName()        // "Person"
+cls.getPackageName()       // "com.example"
+cls.getSuperclass()        // class java.lang.Object
+cls.getInterfaces()        // [interface java.io.Serializable, ...]
+cls.getModifiers()         // int (Modifier.isPublic, Modifier.isAbstract, etc.)
+cls.isInterface()          // false
+cls.isEnum()               // false
+cls.isRecord()             // false (Java 16+)
+cls.isAnnotation()         // false
+
+// Fields
+cls.getFields()            // public fields (including inherited)
+cls.getDeclaredFields()    // all declared fields (including private)
+
+// Methods
+cls.getMethods()           // public methods (including inherited)
+cls.getDeclaredMethods()   // all declared methods (including private)
+
+// Constructors
+cls.getConstructors()      // public constructors
+cls.getDeclaredConstructors() // all constructors
+
+// Annotations
+cls.getAnnotations()       // all annotations
+cls.getAnnotation(MyAnnotation.class) // specific annotation
+```
+
+### Accessing Private Members — setAccessible(true)
+
+```java
+Field privateField = SomeClass.class.getDeclaredField("privateField");
+privateField.setAccessible(true); // bypass access control
+Object value = privateField.get(instance);
+privateField.set(instance, newValue);
+
+// In Java 9+: setAccessible may require --add-opens JVM arg
+// for modules outside the module's exports
+```
+
+### Generics and Type Erasure
+
+```java
+// Generic types are erased at runtime!
+List<String> list = new ArrayList<>();
+list.getClass() // class java.util.ArrayList — no String info!
+
+// But generic info IS available for:
+// 1. Field declarations
+// 2. Method parameters/return types
+// 3. Class/interface declarations (via Type API)
+
+Field field = MyClass.class.getDeclaredField("myList"); // List<String> myList
+ParameterizedType paramType = (ParameterizedType) field.getGenericType();
+Type typeArg = paramType.getActualTypeArguments()[0]; // class java.lang.String
+System.out.println(typeArg); // class java.lang.String
+```
+
+### Performance Warning
+
+Reflection is significantly slower than direct code:
+- `Field.get()` ≈ 10-50x slower than direct field access
+- `Method.invoke()` ≈ 10-50x slower than direct call
+- JIT can optimize some reflection calls after warmup
+
+**Always cache** `Field`, `Method`, `Constructor` objects — `getDeclaredField()` itself is expensive.
+
+---
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureDiagram", "type": "java-reflection-api" }
+{
+  "type": "none"
+}
 ```
+
+---
 
 ## CODE
 
-### Level 1 — Beginner (Inspecting a Class)
+### Level 1 — Beginner: Inspecting Classes
+
 ```java
-import java.lang.reflect.Method;
-import java.lang.reflect.Field;
+// ClassInspector.java
+import java.lang.reflect.*;
 
-class SecretAgent {
-    private String codeName = "007";
-    public void executeMission() { System.out.println("Mission Go!"); }
-}
+public class ClassInspector {
 
-public class BasicReflection {
+    static class Animal {
+        public String name;
+        protected int age;
+        private String secret;
+
+        public Animal(String name, int age) {
+            this.name = name; this.age = age; this.secret = "hidden";
+        }
+        public void speak() { System.out.println(name + " speaks"); }
+        protected void breathe() {}
+        private void digest() {}
+    }
+
+    static class Dog extends Animal {
+        public String breed;
+        public Dog(String name, int age, String breed) {
+            super(name, age); this.breed = breed;
+        }
+        @Override public void speak() { System.out.println(name + " barks!"); }
+        public void fetch() {}
+    }
+
     public static void main(String[] args) throws Exception {
-        // 1. Get the Blueprint (Class object)
-        Class<?> clazz = SecretAgent.class;
-        
-        System.out.println("Class Name: " + clazz.getName()); // SecretAgent
-        
-        // 2. Inspect its Methods dynamically
-        for (Method m : clazz.getDeclaredMethods()) {
-            System.out.println("Found method: " + m.getName());
+        Class<?> cls = Dog.class;
+
+        // Basic info
+        System.out.println("Name: " + cls.getName()); // com.example.ClassInspector$Dog
+        System.out.println("Simple: " + cls.getSimpleName()); // Dog
+        System.out.println("Super: " + cls.getSuperclass().getSimpleName()); // Animal
+        System.out.println("Package: " + cls.getPackageName()); // com.example
+
+        // Fields
+        System.out.println("\nPublic fields (including inherited):");
+        for (Field f : cls.getFields()) {
+            System.out.printf("  %s %s%n", f.getType().getSimpleName(), f.getName());
+        }
+        // name, age, breed (public + protected actually, only public shown by getFields)
+
+        System.out.println("\nDeclared fields only (Dog's own):");
+        for (Field f : cls.getDeclaredFields()) {
+            System.out.printf("  %s %s (access=%s)%n",
+                f.getType().getSimpleName(), f.getName(),
+                Modifier.toString(f.getModifiers()));
+        }
+
+        // Methods
+        System.out.println("\nDeclared methods:");
+        for (Method m : cls.getDeclaredMethods()) {
+            System.out.printf("  %s %s(%s)%n",
+                m.getReturnType().getSimpleName(), m.getName(),
+                Arrays.stream(m.getParameterTypes())
+                    .map(Class::getSimpleName)
+                    .collect(java.util.stream.Collectors.joining(",")));
+        }
+
+        // Constructors
+        System.out.println("\nConstructors:");
+        for (Constructor<?> c : cls.getDeclaredConstructors()) {
+            System.out.printf("  %s(%s)%n", cls.getSimpleName(),
+                Arrays.stream(c.getParameterTypes())
+                    .map(Class::getSimpleName)
+                    .collect(java.util.stream.Collectors.joining(",")));
         }
     }
 }
 ```
 
-### Level 2 — Building Blocks (Breaking Encapsulation)
-```java
-import java.lang.reflect.Field;
+---
 
-public class BreakEncapsulation {
+### Level 2 — Elementary: Invoking Methods and Accessing Fields
+
+```java
+// ReflectionInvocation.java
+import java.lang.reflect.*;
+
+public class ReflectionInvocation {
+
+    static class Calculator {
+        private double memory = 0;
+
+        public double add(double a, double b) { return a + b; }
+        public double multiply(double a, double b) { return a * b; }
+
+        private double divideInternal(double a, double b) {
+            if (b == 0) throw new ArithmeticException("Division by zero");
+            return a / b;
+        }
+
+        private void storeInMemory(double value) { memory = value; }
+        private double recallMemory() { return memory; }
+    }
+
     public static void main(String[] args) throws Exception {
-        SecretAgent agent = new SecretAgent();
-        Class<?> clazz = agent.getClass();
-        
-        // 1. Find the exact private field named "codeName"
-        Field secretField = clazz.getDeclaredField("codeName");
-        
-        // 2. OVERRIDE ENCAPSULATION! (The magic backdoor)
-        // This disables Java's access checks, allowing us to read/write private data!
-        secretField.setAccessible(true);
-        
-        // 3. Read the private data
-        String stolenName = (String) secretField.get(agent);
-        System.out.println("Stolen: " + stolenName); // 007
-        
-        // 4. Modify the private data!
-        secretField.set(agent, "006"); 
+        Calculator calc = new Calculator();
+
+        // 1. Invoke public method
+        Method addMethod = Calculator.class.getMethod("add", double.class, double.class);
+        double result = (double) addMethod.invoke(calc, 3.0, 4.0);
+        System.out.println("3 + 4 = " + result); // 7.0
+
+        // 2. Invoke method by name (dynamic dispatch)
+        String[] methodNames = {"add", "multiply"};
+        for (String methodName : methodNames) {
+            Method m = Calculator.class.getMethod(methodName, double.class, double.class);
+            System.out.println(methodName + "(5, 3) = " + m.invoke(calc, 5.0, 3.0));
+        }
+
+        // 3. Access and invoke PRIVATE method
+        Method privateMethod = Calculator.class.getDeclaredMethod("divideInternal",
+            double.class, double.class);
+        privateMethod.setAccessible(true); // bypass private!
+        System.out.println("10 / 4 = " + privateMethod.invoke(calc, 10.0, 4.0)); // 2.5
+
+        // 4. Access and modify PRIVATE field
+        Field memoryField = Calculator.class.getDeclaredField("memory");
+        memoryField.setAccessible(true);
+
+        System.out.println("Memory before: " + memoryField.get(calc)); // 0.0
+        memoryField.set(calc, 42.0); // set private field!
+        System.out.println("Memory after: " + memoryField.get(calc));  // 42.0
+
+        // 5. Create instance dynamically
+        Constructor<Calculator> ctor = Calculator.class.getDeclaredConstructor();
+        Calculator calc2 = ctor.newInstance();
+        System.out.println("New instance: " + calc2);
     }
 }
 ```
 
-### Level 3 — Intermediate (Dynamic Execution)
-```java
-import java.lang.reflect.Method;
+---
 
-public class DynamicExecution {
-    public static void main(String[] args) throws Exception {
-        // Imagine this string came from a database or a config file
-        String classNameToLoad = "SecretAgent";
-        
-        // 1. Dynamically load the class at runtime
-        Class<?> clazz = Class.forName(classNameToLoad);
-        
-        // 2. Instantiate an object of this class dynamically!
-        Object instance = clazz.getDeclaredConstructor().newInstance();
-        
-        // 3. Find the method and execute it dynamically!
-        Method missionMethod = clazz.getDeclaredMethod("executeMission");
-        
-        // Invoke requires the instance to run on, and any parameters
-        missionMethod.invoke(instance); 
+### Level 3 — Intermediate: Annotation Processing via Reflection
+
+```java
+// AnnotationProcessor.java
+import java.lang.annotation.*;
+import java.lang.reflect.*;
+import java.util.*;
+
+// Define annotations
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+@interface Test {
+    String description() default "";
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+@interface BeforeEach {}
+
+// Test class
+class MathTests {
+    private int setupCount = 0;
+
+    @BeforeEach
+    public void setup() {
+        setupCount++;
+        System.out.println("Setup #" + setupCount);
+    }
+
+    @Test(description = "Addition should work correctly")
+    public void testAddition() {
+        assert 2 + 2 == 4 : "Addition failed";
+        System.out.println("✓ Addition test passed");
+    }
+
+    @Test(description = "Multiplication check")
+    public void testMultiplication() {
+        assert 3 * 4 == 12 : "Multiplication failed";
+        System.out.println("✓ Multiplication test passed");
+    }
+
+    @Test(description = "Intentional failure demo")
+    public void testShouldFail() {
+        throw new RuntimeException("Simulated test failure");
     }
 }
-```
 
-### Level 4 — Advanced (Dynamic Proxies)
-```java
-import java.lang.reflect.Proxy;
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
+// Mini test runner — reads @Test annotations via reflection
+public class AnnotationProcessor {
+    static void runTests(Class<?> testClass) throws Exception {
+        Object instance = testClass.getDeclaredConstructor().newInstance();
 
-// Advanced Architecture: Intercepting method calls!
-public class ProxyDemo {
-    interface Database { void save(); }
-    
-    public static void main(String[] args) {
-        InvocationHandler handler = new InvocationHandler() {
-            @Override
-            public Object invoke(Object proxy, Method method, Object[] args) {
-                System.out.println("TRANSACTION STARTED...");
-                System.out.println("Executing: " + method.getName());
-                System.out.println("TRANSACTION COMMITTED!");
-                return null;
+        // Find @BeforeEach methods
+        List<Method> beforeMethods = new ArrayList<>();
+        for (Method m : testClass.getDeclaredMethods()) {
+            if (m.isAnnotationPresent(BeforeEach.class)) beforeMethods.add(m);
+        }
+
+        // Find and run @Test methods
+        int passed = 0, failed = 0;
+        for (Method m : testClass.getDeclaredMethods()) {
+            if (!m.isAnnotationPresent(Test.class)) continue;
+
+            Test testAnnotation = m.getAnnotation(Test.class);
+            System.out.printf("Running: %s — %s%n", m.getName(), testAnnotation.description());
+
+            // Run @BeforeEach
+            for (Method before : beforeMethods) before.invoke(instance);
+
+            try {
+                m.invoke(instance);
+                passed++;
+            } catch (InvocationTargetException e) {
+                // Unwrap the actual exception
+                System.out.println("✗ FAILED: " + e.getCause().getMessage());
+                failed++;
             }
-        };
-        
-        // The JVM dynamically generates a FAKE class that implements Database at runtime!
-        Database db = (Database) Proxy.newProxyInstance(
-            Database.class.getClassLoader(),
-            new Class<?>[]{ Database.class },
-            handler
-        );
-        
-        // When we call save(), it is intercepted by our InvocationHandler!
-        db.save();
+        }
+        System.out.printf("%nResults: %d passed, %d failed%n", passed, failed);
+    }
+
+    public static void main(String[] args) throws Exception {
+        runTests(MathTests.class);
     }
 }
 ```
+
+---
+
+### Level 4 — Advanced: Generic Type Tokens and Type Resolution
+
+```java
+// GenericReflection.java
+import java.lang.reflect.*;
+import java.util.*;
+import java.util.function.*;
+
+public class GenericReflection {
+
+    // Type token — captures generic type at compile time for runtime use
+    abstract static class TypeToken<T> {
+        private final Type type;
+        TypeToken() {
+            Type superclass = getClass().getGenericSuperclass();
+            type = ((ParameterizedType) superclass).getActualTypeArguments()[0];
+        }
+        Type getType() { return type; }
+        @SuppressWarnings("unchecked")
+        Class<T> getRawType() { return (Class<T>) ((ParameterizedType) type).getRawType(); }
+    }
+
+    // Read generic type of a field
+    static void inspectGenericField() throws Exception {
+        class Container {
+            Map<String, List<Integer>> complexMap;
+            Optional<String> optStr;
+        }
+
+        for (Field field : Container.class.getDeclaredFields()) {
+            Type genType = field.getGenericType();
+            System.out.printf("Field '%s': %s%n", field.getName(), genType);
+            if (genType instanceof ParameterizedType pt) {
+                System.out.println("  Raw type: " + pt.getRawType());
+                for (Type arg : pt.getActualTypeArguments()) {
+                    System.out.println("  Type arg: " + arg);
+                }
+            }
+        }
+    }
+
+    // Dynamic proxy — intercept method calls
+    static <T> T createLoggingProxy(T target, Class<T> interfaceType) {
+        return interfaceType.cast(
+            java.lang.reflect.Proxy.newProxyInstance(
+                interfaceType.getClassLoader(),
+                new Class[]{interfaceType},
+                (proxy, method, args) -> {
+                    System.out.printf("[LOG] Calling %s.%s(%s)%n",
+                        interfaceType.getSimpleName(), method.getName(),
+                        args != null ? Arrays.toString(args) : "");
+                    long start = System.nanoTime();
+                    Object result = method.invoke(target, args);
+                    System.out.printf("[LOG] %s returned %s in %dns%n",
+                        method.getName(), result, System.nanoTime() - start);
+                    return result;
+                }
+            )
+        );
+    }
+
+    interface Calculator {
+        double add(double a, double b);
+        double multiply(double a, double b);
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Generic type inspection
+        inspectGenericField();
+
+        // TypeToken usage (like Guava's TypeToken)
+        TypeToken<List<String>> token = new TypeToken<List<String>>() {};
+        System.out.println("\nTypeToken type: " + token.getType());
+        System.out.println("Raw type: " + token.getRawType());
+
+        // Dynamic proxy with logging
+        Calculator impl = (a, b) -> a + b;
+        // Wait, Calculator has 2 methods — need full impl
+        Calculator realCalc = new Calculator() {
+            public double add(double a, double b) { return a + b; }
+            public double multiply(double a, double b) { return a * b; }
+        };
+        Calculator loggingCalc = createLoggingProxy(realCalc, Calculator.class);
+
+        System.out.println("\nWith logging proxy:");
+        loggingCalc.add(3, 4);
+        loggingCalc.multiply(5, 6);
+    }
+}
+```
+
+---
+
+### Level 5 — Expert: Object Cloner and JSON Serializer via Reflection
+
+```java
+// ReflectiveSerializer.java
+import java.lang.reflect.*;
+import java.util.*;
+import java.util.stream.*;
+
+/**
+ * Simple reflective JSON serializer — demonstrates how Jackson works internally.
+ */
+public class ReflectiveSerializer {
+
+    // Cache Field objects for performance
+    private static final Map<Class<?>, Field[]> fieldCache = new HashMap<>();
+
+    static Field[] getFields(Class<?> cls) {
+        return fieldCache.computeIfAbsent(cls, c -> {
+            List<Field> fields = new ArrayList<>();
+            while (c != null && c != Object.class) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (!java.lang.reflect.Modifier.isStatic(f.getModifiers()) &&
+                        !java.lang.reflect.Modifier.isTransient(f.getModifiers())) {
+                        f.setAccessible(true);
+                        fields.add(f);
+                    }
+                }
+                c = c.getSuperclass();
+            }
+            return fields.toArray(new Field[0]);
+        });
+    }
+
+    // Convert object to JSON string
+    public static String toJson(Object obj) {
+        if (obj == null) return "null";
+        if (obj instanceof String s) return "\"" + s.replace("\"", "\\\"") + "\"";
+        if (obj instanceof Number || obj instanceof Boolean) return obj.toString();
+        if (obj instanceof Collection<?> coll) {
+            return "[" + coll.stream().map(ReflectiveSerializer::toJson)
+                .collect(Collectors.joining(",")) + "]";
+        }
+        if (obj instanceof Map<?,?> map) {
+            return "{" + map.entrySet().stream()
+                .map(e -> "\"" + e.getKey() + "\":" + toJson(e.getValue()))
+                .collect(Collectors.joining(",")) + "}";
+        }
+
+        // POJO — use reflection
+        try {
+            Field[] fields = getFields(obj.getClass());
+            StringBuilder sb = new StringBuilder("{");
+            for (int i = 0; i < fields.length; i++) {
+                if (i > 0) sb.append(",");
+                sb.append("\"").append(fields[i].getName()).append("\":");
+                sb.append(toJson(fields[i].get(obj)));
+            }
+            return sb.append("}").toString();
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    // Deep clone via reflection
+    @SuppressWarnings("unchecked")
+    public static <T> T deepClone(T obj) throws Exception {
+        if (obj == null) return null;
+        Class<T> cls = (Class<T>) obj.getClass();
+        T clone = cls.getDeclaredConstructor().newInstance();
+        for (Field f : getFields(cls)) {
+            Object value = f.get(obj);
+            f.set(clone, value); // shallow clone of nested objects
+        }
+        return clone;
+    }
+
+    static class Address {
+        String street, city;
+        Address() {}
+        Address(String street, String city) { this.street = street; this.city = city; }
+    }
+
+    static class Person {
+        String name;
+        int age;
+        Address address;
+        List<String> hobbies;
+        Person() {}
+        Person(String name, int age, Address addr, List<String> hobbies) {
+            this.name = name; this.age = age; this.address = addr; this.hobbies = hobbies;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Person p = new Person("Alice", 30,
+            new Address("123 Main St", "NYC"),
+            List.of("reading", "coding", "hiking"));
+
+        System.out.println(toJson(p));
+        // {"name":"Alice","age":30,"address":{"street":"123 Main St","city":"NYC"},"hobbies":["reading","coding","hiking"]}
+
+        // Deep clone demo
+        Person clone = deepClone(p);
+        System.out.println("Clone name: " + clone.name); // Alice
+        System.out.println("Same address? " + (p.address == clone.address)); // true (shallow)
+    }
+}
+```
+
+---
 
 ## REAL_WORLD
-Reflection and Dynamic Proxies are the beating heart of the **Spring Framework**.
 
-When you write a Spring `@Transactional` or `@Cacheable` annotation on a method, how does Spring actually wrap your code in a database transaction? 
-Spring uses `java.lang.reflect.Proxy` (or CGLIB) to generate a fake subclass of your Service at runtime. When the REST Controller calls your Service, it is actually calling the Dynamic Proxy. The Proxy starts the database transaction, uses Reflection (`method.invoke()`) to call your real business logic, and then commits the transaction when your method finishes.
+### Spring @Autowired Implementation (Simplified)
 
-Similarly, when you declare `@Autowired private UserService userService;`, Spring Boot uses Reflection to find the private field, calls `setAccessible(true)`, and forcibly injects the dependency into the field without needing a setter method. Without the Reflection API, Dependency Injection and modern Java frameworks simply would not exist.
+```java
+// How Spring injects @Autowired fields
+for (Field field : bean.getClass().getDeclaredFields()) {
+    if (field.isAnnotationPresent(Autowired.class)) {
+        Class<?> depType = field.getType();
+        Object dependency = applicationContext.getBean(depType);
+        field.setAccessible(true);
+        field.set(bean, dependency);
+    }
+}
+```
+
+### JUnit Test Discovery
+
+```java
+// How JUnit 5 discovers @Test methods
+for (Method method : testClass.getDeclaredMethods()) {
+    if (method.isAnnotationPresent(org.junit.jupiter.api.Test.class)) {
+        Object testInstance = testClass.getDeclaredConstructor().newInstance();
+        // Run @BeforeEach, then test, then @AfterEach
+        method.invoke(testInstance);
+    }
+}
+```
+
+---
 
 ## INTERVIEW
-**Q: What does `setAccessible(true)` do?**
-A: It overrides the Java compiler's access control checks (public/private/protected) for that specific `Field`, `Method`, or `Constructor` object during runtime. It allows external classes to read and write to private fields, or execute private methods, completely bypassing encapsulation.
 
-**Q: Can you prevent someone from using Reflection to read your private fields?**
-A: Historically, you could use the Java SecurityManager to block reflection, but this was deprecated. In modern Java (Java 9+), the Module System (JPMS) fundamentally locks down reflection. If you put your code in a strict Module and do not explicitly `opens` your package to other modules, `setAccessible(true)` will throw an `InaccessibleObjectException`, completely blocking frameworks like Spring or Hibernate from hacking into your private data.
+**Q1: What is Java Reflection and when would you use it?**
 
-**Q: Why is Reflection considered slow?**
-A: When you write `obj.method()`, the JVM's JIT compiler optimizes it, calculates the exact memory offset, and can often inline the method entirely. When you use `method.invoke()`, the JVM has to perform security access checks, unbox/box arguments, and dynamically resolve the method pointer at runtime, completely defeating the JIT optimizer.
+> **Strong answer:** Reflection is the ability of a program to inspect and manipulate its own structure at runtime — classes, fields, methods, annotations. Use cases: (1) Frameworks — Spring, JUnit, Hibernate use reflection extensively for dependency injection, test discovery, ORM mapping. (2) Libraries — Jackson uses reflection to serialize/deserialize object fields. (3) Tools — IDEs use reflection to provide code completion. (4) Testing — accessing private fields/methods in unit tests (though arguable). Generally, avoid reflection in application code — it bypasses type safety, has poor performance, and breaks encapsulation. Use it in framework/library code where runtime flexibility is needed.
+
+**Q2: What is the performance impact of reflection?**
+
+> **Strong answer:** Reflection is significantly slower than direct code — 10-50x for simple operations before JIT optimization. Main costs: (1) Security checks on every access (`checkAccess()`). (2) Method lookup in metadata tables. (3) Boxing/unboxing arguments and return values. Mitigation: (1) Cache `Method`, `Field`, `Constructor` objects — lookup is expensive; invocation is cheaper with cached objects. (2) `setAccessible(true)` eliminates per-call security checks. (3) JIT can optimize cached reflection calls somewhat. Modern Java also has `MethodHandle` and `VarHandle` in `java.lang.invoke` — lower-level, JIT-friendlier than reflection.
+
+**Q3: How do dynamic proxies work in Java?**
+
+> **Strong answer:** `java.lang.reflect.Proxy.newProxyInstance()` creates a runtime-generated class that implements specified interfaces. Every method call on the proxy is dispatched to the `InvocationHandler.invoke()` method, which receives the proxy object, the `Method` object, and the args array. This is how Spring AOP works: Spring creates a proxy of your `@Service` bean, and each method call goes through the `InvocationHandler` which applies advice (transactions, logging, security). For classes (not just interfaces), Spring uses CGLIB-based subclass proxying.
+
+---
+
+## FEYNMAN CHECK
+
+Reflection is like giving Java a mirror. Normally, code just runs — it doesn't know what class it is or what methods it has. With reflection, code can look in the mirror and say "I am a Dog class, I have 3 fields, my second method is called `bark`." Then it can use that information to act differently — like a magic robot that can read any book and follow its instructions, even books it's never seen before.
+
+---
+
+## BUILD
+
+Build a simple dependency injection container using reflection:
+1. `@Injectable` annotation to mark classes for injection
+2. `Container.register(Class<?>)` — scans for `@Injectable` and stores
+3. `Container.get(Class<T>)` — creates instance, injects `@Inject` fields
+4. Handle constructor injection for `@Inject` constructors
+5. Detect circular dependencies with a depth counter
+
+---
+
+## SPACED REVIEW
+
+- Day 1: List what reflection can do — inspect/modify fields, methods, annotations
+- Day 3: Write a reflective object printer that prints all field name=value pairs
+- Day 7: Build a mini @Test framework that discovers and runs annotated methods
+- Day 14: Implement a dynamic proxy that logs all method calls with timing

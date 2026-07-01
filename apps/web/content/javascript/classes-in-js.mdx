@@ -180,3 +180,252 @@ A: No. JavaScript, like Java, strictly forbids multiple inheritance. An object c
 
 **Q: Are JavaScript Private Fields (`#`) truly secure?**
 A: Yes. Historically, JS developers used the underscore convention (`this._balance = 0`) to signal to other developers that a property was private, but it was just a gentleman's agreement; you could still hack into it. The modern `#balance` syntax is enforced at the engine level. It is a true, hard-private field. Even if you loop over the object using `Object.keys()`, the private field is completely invisible.
+
+## FEYNMAN CHECK
+
+### Explain JS Classes Like I'm 10 Years Old
+> JS classes (ES2015) are SYNTACTIC SUGAR over the prototype system. `class Dog extends Animal {}` compiles to a constructor function + prototype linkage. Modern classes have: constructor, instance fields, static fields/methods, getters/setters, true private fields (`#name`, ES2022 — actually private, not just convention), and inheritance via `extends` + `super`. The non-obvious detail: classes are NOT hoisted (unlike function declarations) — accessing before the class statement throws ReferenceError (TDZ). `class X {}` always runs in strict mode regardless of file-level setting. And methods defined in the class body are NON-ENUMERABLE — they don't show up in `for...in` loops or `Object.keys`.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When do you choose class vs factory function vs plain object?**
+> **A:** Use CLASS when you have STATEFUL OBJECTS with shared methods, hierarchy via extends, or framework requirements (Web Components, Spring). Use FACTORY function when you want true privacy via closures, easier composition over inheritance, no `this` confusion. Use PLAIN OBJECTS when no methods needed. Modern React/Vue compose state via hooks/refs instead of classes; backend Node.js still uses classes heavily (ORMs, services).
+
+**Q2: Mental model for super and extends?**
+> **A:** `class Cat extends Animal` makes `Cat.prototype` inherit from `Animal.prototype` (instance methods), and `Cat` itself inherit from `Animal` (static methods). `super()` in the constructor calls Animal's constructor and BINDS `this`. You cannot use `this` before `super()`. `super.method()` in an instance method calls the parent's version. `super.staticMethod()` in a static method calls the parent's static.
+
+**Q3: Most dangerous misconception?**
+> **A:** Class methods are bound to instances:
+> ```js
+> // ❌ Method loses this when detached
+> class Counter {
+>   count = 0;
+>   inc() { this.count++; }    // prototype method — this NOT bound
+> }
+> const c = new Counter();
+> const ref = c.inc;
+> ref();   // TypeError: Cannot read 'count' of undefined
+>
+> // ✅ Arrow class field is bound at construction
+> class CounterBound {
+>   count = 0;
+>   inc = () => { this.count++; }   // arrow field — per-instance, bound
+> }
+> // Trade-off: arrow fields use more memory (one function per instance vs shared prototype)
+> ```
+
+**Q4: How do true private fields differ from underscore convention?**
+> **A:** `_name` is just a CONVENTION — anyone can read `obj._name`. `#name` (ES2022) is a HARD private field — accessing `obj.#name` from outside the class throws SyntaxError at parse time. Private fields exist in a separate WeakMap-like slot per instance, invisible to JSON, reflection, console.log, Proxy traps. Subclasses cannot access parent's privates. Use # for security/encapsulation that MATTERS; _ remains acceptable for "internal but introspectable".
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript classes are syntactic sugar over prototype-based inheritance — desugaring into a constructor function plus prototype methods — featuring instance fields, static fields/methods, getters/setters, hard private fields (#) with per-instance hidden slots, extends-based prototype chaining with super for parent invocation, and strict-mode-by-default semantics — distinct from class-based languages by lacking interfaces, traits, abstract enforcement, or method overloading at the language level."
+
+## BUILD
+
+### 🏗️ Mini Project: User Class With Private Fields, Static Factory, Getters, And Inheritance
+
+**What you will build:** A complete User class with hard-private password storage, static "fromJSON" factory, computed display-name getter, and an AdminUser subclass with extra capabilities.
+**Why this project:** Forces every modern class feature (private #, static, getters, extends, super, instanceof).
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-classes && cd js-classes
+npm init -y && npm install -D vitest
+ni user.js, user.test.js -ItemType File
+```
+
+#### Step 2 — Base User Class
+```js
+// user.js
+export class User {
+  // True private fields (#)
+  #passwordHash;
+  #createdAt;
+
+  // Public instance fields
+  id;
+  email;
+  name;
+
+  constructor({ id, email, name, passwordHash }) {
+    if (!email.includes('@')) throw new TypeError('Invalid email');
+    this.id    = id;
+    this.email = email;
+    this.name  = name;
+    this.#passwordHash = passwordHash;
+    this.#createdAt    = new Date();
+  }
+
+  // Computed accessor
+  get displayName() { return this.name || this.email.split('@')[0]; }
+
+  get createdAt() { return this.#createdAt; }   // controlled exposure
+
+  verifyPassword(plain) {
+    return hash(plain) === this.#passwordHash;
+  }
+
+  toJSON() {
+    // Notice: #passwordHash and #createdAt are NOT serialised — security
+    return { id: this.id, email: this.email, name: this.name };
+  }
+
+  static fromJSON(json) {
+    return new User({ ...JSON.parse(json), passwordHash: hash('default') });
+  }
+}
+
+function hash(s) { return 'sha256$' + s.split('').reverse().join(''); }
+```
+
+#### Step 3 — Subclass With extends + super
+```js
+// admin.js
+import { User } from './user.js';
+
+export class AdminUser extends User {
+  #permissions;
+
+  constructor(opts) {
+    super(opts);   // must come before any 'this' access
+    this.#permissions = new Set(opts.permissions ?? ['read']);
+  }
+
+  hasPermission(perm) { return this.#permissions.has(perm); }
+  grant(perm)         { this.#permissions.add(perm); }
+  revoke(perm)        { this.#permissions.delete(perm); }
+
+  // Override + extend parent
+  toJSON() {
+    return { ...super.toJSON(), permissions: [...this.#permissions] };
+  }
+
+  // Static factory using parent's parsing
+  static promote(user, perms = ['read', 'write']) {
+    return new AdminUser({
+      id: user.id, email: user.email, name: user.name,
+      passwordHash: 'preserved',
+      permissions: perms,
+    });
+  }
+}
+```
+
+#### Step 4 — Error Handling: Private Field Access + instanceof
+```js
+// demo.js
+import { User } from './user.js';
+import { AdminUser } from './admin.js';
+
+const u = new User({ id: 1, email: 'ana@dev.io', name: 'Ana', passwordHash: 'x' });
+console.log(u.displayName);          // 'Ana'
+console.log(u.verifyPassword('y'));   // false
+
+const a = AdminUser.promote(u, ['read', 'write', 'delete']);
+console.log(a.hasPermission('delete'));   // true
+console.log(JSON.stringify(a));            // includes permissions, NOT private fields
+
+console.log(a instanceof AdminUser);   // true
+console.log(a instanceof User);         // true (chain)
+
+// ❌ Private fields cannot be accessed from outside
+try { console.log(u.#passwordHash); } catch (e) { console.log('hidden!'); }
+// Actually: SyntaxError at parse time — you can't even write that line
+
+// ❌ Cannot use this before super()
+class Bad extends User { constructor(o) { /* this.x = 1; */ super(o); } }
+```
+
+#### Step 5 — Tests
+```js
+// user.test.js
+import { describe, it, expect } from 'vitest';
+import { User } from './user.js';
+import { AdminUser } from './admin.js';
+
+describe('User', () => {
+  it('rejects invalid email', () => {
+    expect(() => new User({ id: 1, email: 'noatsign', name: 'X', passwordHash: 'x' })).toThrow();
+  });
+  it('toJSON does not leak private fields', () => {
+    const u = new User({ id: 1, email: 'a@b.io', name: 'X', passwordHash: 'secret' });
+    const json = JSON.stringify(u);
+    expect(json).not.toContain('passwordHash');
+    expect(json).not.toContain('secret');
+  });
+  it('displayName uses email when name is empty', () => {
+    const u = new User({ id: 1, email: 'ana@dev.io', name: '', passwordHash: 'x' });
+    expect(u.displayName).toBe('ana');
+  });
+});
+
+describe('AdminUser', () => {
+  it('extends User (instanceof chain)', () => {
+    const a = new AdminUser({ id: 1, email: 'a@b.io', name: 'A', passwordHash: 'x' });
+    expect(a).toBeInstanceOf(User);
+    expect(a).toBeInstanceOf(AdminUser);
+  });
+  it('grant/revoke updates permissions', () => {
+    const a = new AdminUser({ id: 1, email: 'a@b.io', name: 'A', passwordHash: 'x' });
+    a.grant('write');
+    expect(a.hasPermission('write')).toBe(true);
+    a.revoke('write');
+    expect(a.hasPermission('write')).toBe(false);
+  });
+  it('overridden toJSON includes permissions', () => {
+    const a = new AdminUser({ id: 1, email: 'a@b.io', name: 'A', passwordHash: 'x', permissions: ['read'] });
+    expect(JSON.parse(JSON.stringify(a)).permissions).toEqual(['read']);
+  });
+});
+```
+
+**Expected Output:**
+```
+Ana
+false
+true
+{"id":1,"email":"ana@dev.io","name":"Ana","permissions":["read","write","delete"]}
+true
+true
+hidden!
+
+# 6/6 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add a Mixin pattern for sharing capabilities across unrelated classes
+- [ ] Add an abstract Repository base class that throws if save() isn't overridden
+- [ ] Profile prototype method vs arrow class field at 100k instances
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between `#field` and `_field`?
+**Q2:** Can a class use `this` before `super()` in the constructor?
+**Q3:** Write a class with a static factory method. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why are class methods non-enumerable?
+**Q5:** A junior assigns `this.inc = this.inc.bind(this)` in every constructor — show the cleaner alternative.
+**Q6:** Refactor to use private fields:
+```js
+class Wallet {
+  constructor(amt) { this._balance = amt; }
+  get balance() { return this._balance; }
+}
+```
+
+### Day 7 — Application
+**Q7:** Build an abstract Repository<T> base class with abstract save() that throws if not overridden.
+**Q8:** A PR uses inheritance 5 levels deep — explain why composition is usually better.
+**Q9:** Cost of arrow class fields vs prototype methods at scale?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how `class X extends Y` compiles to prototype-chain code under the hood."
+**Q11:** Draw: prototype chain for an AdminUser instance (instance → AdminUser.prototype → User.prototype → Object.prototype → null).
+**Q12:** ★ System design: "Choose class vs hook-based composition for a state library — when does each win?"

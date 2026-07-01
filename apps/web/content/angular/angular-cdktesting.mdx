@@ -142,3 +142,221 @@ When you create a standard `TestbedHarnessEnvironment.loader(fixture)`, that loa
 const rootLoader = TestbedHarnessEnvironment.documentRootLoader(fixture);
 const dialog = await rootLoader.getHarness(MatDialogHarness);
 ```
+
+## FEYNMAN CHECK
+
+### Explain Angular CDK Testing Like I'm 10 Years Old
+> Angular CDK Testing provides COMPONENT HARNESSES — a stable testing API that abstracts over the component's internal DOM. Instead of fixture.nativeElement.querySelector('.mat-button .mdc-button__label'), you write (await loader.getHarness(MatButtonHarness)).getText(). Harnesses give you: semantic queries (get a button by its text, not its CSS class), automatic async handling (no need to call detectChanges or waitForAsync manually), resilience to HTML structure changes, and the same test code running in both the DOM (real browser/jsdom) and headless environments. Angular Material ships harnesses for every component; you can write custom harnesses for your own components.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between harness testing and direct DOM querying?**
+> **A:** Direct DOM querying (fixture.nativeElement.querySelector('.mat-input-element')) is BRITTLE — it depends on Angular Material's internal CSS class names, which may change between versions. Harness queries (loader.getHarness(MatInputHarness).then(h => h.getValue())) are SEMANTIC — they use the component's public API, not internal implementation. When Angular Material 15 changed from MDC to non-MDC components (renaming CSS classes), tests using DOM queries broke; tests using harnesses continued to work.
+
+**Q2: Mental model for HarnessLoader and ComponentHarness?**
+> **A:** TestbedHarnessEnvironment.loader(fixture) creates a HarnessLoader scoped to the component's DOM. loader.getHarness(MatButtonHarness) finds the FIRST MatButton and returns its harness. loader.getAllHarnesses(MatButtonHarness) finds ALL buttons. A ComponentHarness wraps a component and exposes semantic methods: click(), getText(), getValue(), isDisabled(), isFocused(). For your own components: extend ComponentHarness with a static hostSelector and add methods wrapping nativeElement interactions.
+
+**Q3: Most dangerous misconception about CDK testing?**
+> **A:** CDK harnesses replace all DOM testing:
+> ```typescript
+> // WRONG: trying to use harnesses for everything
+> const harness = await loader.getHarness(MatTableHarness);
+> const rows = await harness.getRows();
+> // This works but is slow for large tables
+>
+> // CORRECT: use harnesses for components with complex interaction semantics
+> // (date pickers, autocomplete, dialogs, form fields)
+>
+> // Use direct DOM queries for:
+> // - Custom components without harnesses
+> // - Simple presence/text assertions
+> // - Performance-sensitive tests with many elements
+>
+> // Harnesses shine for: form interaction, dialog opening/closing, Material components
+> ```
+
+**Q4: How do custom component harnesses work?**
+> **A:** Extend ComponentHarness, set static hostSelector to your component's selector, and implement methods that delegate to locator APIs: async getButtonText() { return (await this.locatorFor('button')()).text(); }. Register the harness with ComponentHarnessConstructor. Tests use loader.getHarness(MyButtonHarness) the same way they use Material harnesses. Custom harnesses make your component's test API stable — consumers test behaviour, not implementation — enabling refactoring without breaking tests.
+
+**Q5: FAANG-grade definition of Angular CDK Testing.**
+> **A:** "Angular CDK Component Test Harnesses provide a stable, semantic testing layer above component DOM — ComponentHarness subclasses exposing the component's public interaction API (click, getValue, isDisabled, setText) via HarnessLoader (TestbedHarnessEnvironment for unit, ProtractorHarnessEnvironment/PlaywrightHarnessEnvironment for E2E) — shielding tests from internal DOM structure changes, automatically handling async operations, and enabling the same test code across DOM environments — with Angular Material shipping harnesses for all 50+ components and a ComponentHarness base class enabling custom harnesses for application components."
+
+## BUILD
+
+### 🏗️ Mini Project: Custom Harness + Material Harnesses for a Search Form
+
+**What you will build:** Tests for a search form using MatInputHarness + MatButtonHarness + a custom SearchFormHarness — demonstrating the harness pattern at both library-component and custom-component level.
+**Why this project:** Forces the full harness pattern — Material harnesses for library components, custom harness for your own component.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new harness-demo --standalone --routing false
+ng add @angular/material
+ng generate component search-form --standalone
+```
+
+#### Step 2 — Search Form Component
+```typescript
+// search-form.component.ts
+import { Component, Output, EventEmitter, inject } from '@angular/core';
+import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
+import { MatButtonModule } from '@angular/material/button';
+import { NgIf } from '@angular/common';
+
+@Component({
+  standalone: true,
+  selector: 'app-search-form',
+  imports: [ReactiveFormsModule, MatFormFieldModule, MatInputModule, MatButtonModule, NgIf],
+  template: `
+    <form [formGroup]="form" (ngSubmit)="onSubmit()">
+      <mat-form-field>
+        <mat-label>Search</mat-label>
+        <input matInput formControlName="query" data-testid="search-input">
+        <mat-error *ngIf="form.get('query')?.errors?.['required']">Required</mat-error>
+        <mat-error *ngIf="form.get('query')?.errors?.['minlength']">Min 3 chars</mat-error>
+      </mat-form-field>
+      <button mat-raised-button color="primary" type="submit" [disabled]="form.invalid">Search</button>
+    </form>
+  `,
+})
+export class SearchFormComponent {
+  private fb = inject(FormBuilder);
+  @Output() searched = new EventEmitter<string>();
+
+  form = this.fb.group({
+    query: ['', [Validators.required, Validators.minLength(3)]],
+  });
+
+  onSubmit() { if (this.form.valid) this.searched.emit(this.form.value.query!); }
+}
+```
+
+#### Step 3 — Custom SearchForm Harness
+```typescript
+// search-form.harness.ts
+import { ComponentHarness } from '@angular/cdk/testing';
+import { MatInputHarness } from '@angular/material/input/testing';
+import { MatButtonHarness } from '@angular/material/button/testing';
+import { MatErrorHarness } from '@angular/material/form-field/testing';
+
+export class SearchFormHarness extends ComponentHarness {
+  static hostSelector = 'app-search-form';
+
+  private getInput = this.locatorFor(MatInputHarness);
+  private getButton = this.locatorFor(MatButtonHarness);
+
+  async setQuery(value: string) { return (await this.getInput()).setValue(value); }
+  async getQuery() { return (await this.getInput()).getValue(); }
+  async clickSearch() { return (await this.getButton()).click(); }
+  async isSearchDisabled() { return (await this.getButton()).isDisabled(); }
+  async getErrors() {
+    const errors = await this.locatorForAll(MatErrorHarness)();
+    return Promise.all(errors.map(e => e.getText()));
+  }
+}
+```
+
+#### Step 4 — Tests Using Harnesses
+```typescript
+// search-form.component.spec.ts
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { TestbedHarnessEnvironment } from '@angular/cdk/testing/testbed';
+import { SearchFormHarness } from './search-form.harness';
+import { SearchFormComponent } from './search-form.component';
+import { NoopAnimationsModule } from '@angular/platform-browser/animations';
+
+describe('SearchFormComponent (with harness)', () => {
+  let fixture: ComponentFixture<SearchFormComponent>;
+  let harness: SearchFormHarness;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [SearchFormComponent, NoopAnimationsModule],
+    }).compileComponents();
+    fixture = TestBed.createComponent(SearchFormComponent);
+    const loader = TestbedHarnessEnvironment.loader(fixture);
+    harness = await loader.getHarness(SearchFormHarness);
+  });
+
+  it('disables search button when form is empty', async () => {
+    expect(await harness.isSearchDisabled()).toBe(true);
+  });
+
+  it('disables search when query is too short', async () => {
+    await harness.setQuery('ab');
+    expect(await harness.isSearchDisabled()).toBe(true);
+  });
+
+  it('enables search when query is valid', async () => {
+    await harness.setQuery('angular');
+    expect(await harness.isSearchDisabled()).toBe(false);
+  });
+
+  it('emits searched event with query', async () => {
+    const emits: string[] = [];
+    fixture.componentInstance.searched.subscribe((q: string) => emits.push(q));
+    await harness.setQuery('angular testing');
+    await harness.clickSearch();
+    expect(emits).toEqual(['angular testing']);
+  });
+});
+```
+
+#### Step 5 — Harness vs DOM Query Comparison
+```typescript
+// WITHOUT harness — brittle DOM query
+it('brittle test', () => {
+  const input = fixture.nativeElement.querySelector('.mat-mdc-input-element');
+  input.value = 'angular';
+  input.dispatchEvent(new Event('input'));
+  fixture.detectChanges();
+  const button = fixture.nativeElement.querySelector('.mdc-button--raised');
+  expect(button.disabled).toBe(false);
+  // These CSS classes change between Angular Material versions!
+});
+
+// WITH harness — stable semantic query (see above)
+```
+
+**Expected Output:**
+```
+disables search button when form is empty ✓
+disables search when query too short ✓
+enables search when valid ✓
+emits searched event ✓
+All tests pass without CSS class dependency
+```
+
+**Stretch Challenges:**
+- [ ] Add a MatSelectHarness test for a search filter dropdown
+- [ ] Build a harness for a custom data-table component
+- [ ] Run the same harness tests in a Playwright E2E environment
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is a component harness and why is it better than DOM querying?
+**Q2:** How do you get a MatButtonHarness in a test?
+**Q3:** Write the minimal custom ComponentHarness class. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When would you use direct DOM queries instead of harnesses?
+**Q5:** A team updates Angular Material and half their tests break — explain why.
+**Q6:** What does locatorFor() do in a custom harness?
+
+### Day 7 — Application
+**Q7:** Write a complete harness for a custom autocomplete component.
+**Q8:** A PR tests a MatDialog by querying DOM CSS classes — why will this break?
+**Q9:** How do you test a harness's async methods without calling detectChanges manually?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Angular CDK component harnesses — what problem they solve and how to write a custom harness."
+**Q11:** Draw: harness class hierarchy — ComponentHarness, HarnessLoader, TestbedHarnessEnvironment.
+**Q12:** ★ System design: "Design a test harness library for a custom Angular component library — coverage, stability, migration path."

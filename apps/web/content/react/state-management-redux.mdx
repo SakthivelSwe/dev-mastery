@@ -142,3 +142,232 @@ However, if your selector looks like this:
 `const data = useSelector(state => state.items.filter(i => i.name.includes(state.search)));`
 The `filter()` method creates a **brand new Array reference in memory** every single time Redux evaluates it (even if the search string didn't change the actual items!). React sees a new array reference and forces a massive re-render.
 *The Fix:* Use **Reselect** (or RTK's `createSelector`). It creates a "Memoized" selector. It caches the resulting array and only recalculates (and returns a new reference) if the underlying data *actually* changed, completely solving the performance leak!
+
+## FEYNMAN CHECK
+
+### Explain Redux Like I'm 10 Years Old
+> Redux is a CENTRALISED STATE STORE. One JavaScript object holds ALL app state. You change it only by dispatching ACTIONS (`{ type: 'cart/addItem', payload: item }`). A REDUCER handles each action and returns NEW state (never mutates old). Components subscribe via SELECTORS. Redux Toolkit (RTK) is the modern Redux — it eliminates boilerplate, uses Immer for "mutate-but-immutable" syntax, and includes RTK Query for server state. Classic Redux with switch/case is legacy.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you use Redux vs Context vs Zustand vs local state?**
+> **A:** LOCAL STATE: component-specific. CONTEXT: low-frequency cross-cutting (auth, theme) — no fine-grained subscription. ZUSTAND: simplest global state with selectors, no boilerplate, 90% of apps. REDUX (RTK): large teams with complex state — time-travel debugging, strict action pattern, RTK Query for server state, complex async. Start with local → Context → Zustand → Redux. Add Redux when: multiple devs share complex state, time-travel debugging needed, or RTK Query replaces complex data fetching.
+
+**Q2: What is the Redux data flow?**
+> **A:** ONE-WAY FLOW: (1) Component dispatches Action. (2) Redux passes Action to all Reducers. (3) Matching Reducer returns new state immutably. (4) Store saves new state. (5) Selectors recompute. (6) Subscribed components re-render. Like a database transaction log — every change recorded, replayable. Time-travel: step through action log to see any historical state.
+
+**Q3: Most dangerous misconception about Redux?**
+> **A:** Putting everything in Redux:
+> ```tsx
+> // ❌ Redux for local UI state — expensive, unnecessary
+> const uiSlice = createSlice({
+>   name: 'ui',
+>   initialState: { modalOpen: false, inputValue: '' },
+>   reducers: { setModalOpen: (s, a) => { s.modalOpen = a.payload; } }
+> });
+> // Every keystroke dispatches to global Redux store — 2ms overhead per keystroke
+>
+> // ✅ useState for UI-only concerns
+> const [modalOpen, setModalOpen] = useState(false);
+> const [input, setInput] = useState('');
+> // Redux for: user session, cart, server-fetched data, cross-feature concerns
+> ```
+
+**Q4: How does RTK Query differ from Redux Thunk?**
+> **A:** RTK Query is purpose-built: define an API with `createApi`, use `useGetUserQuery(id)` in components. It handles: caching (same query from 10 components = 1 request), invalidation (mutation triggers refetch), loading/error states, optimistic updates, polling. Replaces manually written thunks + loading/error state slices + cache management. Much of what React Query does, integrated in Redux.
+
+**Q5: FAANG-grade definition of Redux.**
+> **A:** "Redux is a predictable state container implementing Flux architecture — single immutable store updated via dispatched plain-object Actions processed by pure Reducers — implemented via Redux Toolkit (RTK) with Immer for apparent-mutation syntax, createSlice for reducer+action-creator definition, and RTK Query for declarative server-state management — providing time-travel debugging, auditable action log, strict separation of concerns — appropriate for large-team codebases with complex shared state — overkill for apps served by Context + Zustand."
+
+## BUILD
+
+### 🏗️ Mini Project: Shopping Cart With Redux Toolkit + RTK Query
+
+**What you will build:** A shop using RTK: product listing (RTK Query), cart management (createSlice), memoised selectors, Redux DevTools.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npm create vite@latest redux-demo -- --template react-ts
+cd redux-demo && npm install @reduxjs/toolkit react-redux
+```
+
+#### Step 2 — Cart Slice + Selectors
+```ts
+// src/store/cartSlice.ts
+import { createSlice, PayloadAction, createSelector } from '@reduxjs/toolkit';
+interface CartItem { id: number; name: string; price: number; quantity: number; }
+interface CartState { items: CartItem[]; }
+
+const cartSlice = createSlice({
+  name: 'cart',
+  initialState: { items: [] } as CartState,
+  reducers: {
+    addItem(state, { payload }: PayloadAction<Omit<CartItem, 'quantity'>>) {
+      const ex = state.items.find(i => i.id === payload.id);
+      if (ex) ex.quantity++;
+      else state.items.push({ ...payload, quantity: 1 });
+    },
+    removeItem(state, { payload }: PayloadAction<number>) {
+      state.items = state.items.filter(i => i.id !== payload);
+    },
+    clearCart(state) { state.items = []; },
+  },
+});
+
+const selectItems = (s: { cart: CartState }) => s.cart.items;
+export const selectCartTotal = createSelector(selectItems, items =>
+  items.reduce((sum, i) => sum + i.price * i.quantity, 0)
+);
+export const selectCartCount = createSelector(selectItems, items =>
+  items.reduce((sum, i) => sum + i.quantity, 0)
+);
+export const { addItem, removeItem, clearCart } = cartSlice.actions;
+export default cartSlice.reducer;
+```
+
+#### Step 3 — RTK Query API
+```ts
+// src/store/productsApi.ts
+import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+interface Product { id: number; title: string; price: number; image: string; }
+
+export const productsApi = createApi({
+  reducerPath: 'productsApi',
+  baseQuery: fetchBaseQuery({ baseUrl: 'https://fakestoreapi.com/' }),
+  endpoints: b => ({ getProducts: b.query<Product[], void>({ query: () => 'products?limit=8' }) }),
+});
+export const { useGetProductsQuery } = productsApi;
+
+// src/store/index.ts
+import { configureStore } from '@reduxjs/toolkit';
+import cartReducer from './cartSlice';
+import { productsApi } from './productsApi';
+export const store = configureStore({
+  reducer: { cart: cartReducer, [productsApi.reducerPath]: productsApi.reducer },
+  middleware: gDM => gDM().concat(productsApi.middleware),
+});
+export type RootState = ReturnType<typeof store.getState>;
+```
+
+#### Step 4 — Components
+```tsx
+// src/App.tsx
+import { Provider } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
+import { store, RootState } from './store';
+import { addItem, removeItem, clearCart, selectCartTotal, selectCartCount } from './store/cartSlice';
+import { useGetProductsQuery } from './store/productsApi';
+
+function ProductList() {
+  const { data, isLoading } = useGetProductsQuery();
+  const dispatch = useDispatch();
+  if (isLoading) return <div className="p-4">Loading...</div>;
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      {data?.map(p => (
+        <div key={p.id} className="border rounded p-3">
+          <img src={p.image} alt={p.title} className="h-20 object-contain mx-auto" />
+          <p className="text-sm font-medium mt-2 line-clamp-2">{p.title}</p>
+          <p className="text-blue-600">${p.price}</p>
+          <button onClick={() => dispatch(addItem({ id: p.id, name: p.title, price: p.price }))}
+            className="mt-2 w-full bg-blue-500 text-white rounded py-1 text-sm">Add</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CartPanel() {
+  const dispatch = useDispatch();
+  const items = useSelector((s: RootState) => s.cart.items);
+  const total = useSelector(selectCartTotal);
+  const count = useSelector(selectCartCount);
+  return (
+    <aside className="border rounded p-4 w-64">
+      <h2 className="font-bold mb-2">Cart ({count})</h2>
+      {items.map(i => (
+        <div key={i.id} className="flex justify-between text-sm mb-1">
+          <span className="flex-1 truncate">{i.name} ×{i.quantity}</span>
+          <button onClick={() => dispatch(removeItem(i.id))} className="text-red-400">×</button>
+        </div>
+      ))}
+      <hr className="my-2" />
+      <p className="font-bold">Total: ${total.toFixed(2)}</p>
+      <button onClick={() => dispatch(clearCart())} className="text-xs text-red-400 mt-1">Clear</button>
+    </aside>
+  );
+}
+
+export default function App() {
+  return (
+    <Provider store={store}>
+      <main className="max-w-4xl mx-auto p-4">
+        <h1 className="text-2xl font-bold mb-4">Shop — Redux Toolkit</h1>
+        <div className="flex gap-4"><ProductList /><CartPanel /></div>
+      </main>
+    </Provider>
+  );
+}
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect } from 'vitest';
+import cartReducer, { addItem, clearCart, selectCartTotal } from './store/cartSlice';
+
+describe('cartSlice', () => {
+  it('adds item', () => {
+    const s = cartReducer({ items: [] }, addItem({ id: 1, name: 'Book', price: 10 }));
+    expect(s.items[0].quantity).toBe(1);
+  });
+  it('increments on duplicate', () => {
+    let s = cartReducer({ items: [] }, addItem({ id: 1, name: 'Book', price: 10 }));
+    s = cartReducer(s, addItem({ id: 1, name: 'Book', price: 10 }));
+    expect(s.items[0].quantity).toBe(2);
+  });
+  it('clears cart', () => {
+    let s = cartReducer({ items: [] }, addItem({ id: 1, name: 'Book', price: 10 }));
+    s = cartReducer(s, clearCart());
+    expect(s.items).toHaveLength(0);
+  });
+  it('calculates total', () => {
+    const s = { cart: { items: [{ id: 1, name: 'B', price: 10, quantity: 2 }] } };
+    expect(selectCartTotal(s)).toBe(20);
+  });
+});
+```
+
+**Expected Output:**
+```
+Products load from API (RTK Query — cached on revisit)
+Add → cart panel updates, total recalculates
+Redux DevTools: every dispatched action visible, time-travel works
+Tests: 4 passed
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** 4 core concepts of Redux?
+**Q2:** What does Immer do in Redux Toolkit?
+**Q3:** Write a createSlice with add/remove. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Redux vs Zustand — when to choose each?
+**Q5:** A PR puts form input value in Redux — diagnose.
+**Q6:** How does RTK Query differ from a thunk?
+
+### Day 7 — Application
+**Q7:** Add RTK Query mutation (checkout) with cache invalidation.
+**Q8:** A selector runs expensive filter every render — fix with createSelector.
+**Q9:** How do you persist Redux state to localStorage?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through Redux data flow end-to-end."
+**Q11:** Draw: action → reducer → store → selector → component → dispatch.
+**Q12:** ★ System design: "Design Redux architecture for a multi-module SaaS — slices, selectors, RTK Query."

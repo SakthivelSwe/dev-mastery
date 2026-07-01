@@ -145,3 +145,180 @@ A: Both can define object shapes. Key differences: `interface` supports **Declar
 
 **Q: What does `tsc` do exactly?**
 A: The TypeScript Compiler (`tsc`) reads all `.ts` files, resolves module imports, performs full type checking, and if no errors are found, transpiles the TypeScript into pure JavaScript. In production builds (Vite, Next.js), `tsc` is used only for type checking. The actual transpilation is done by much faster tools like **esbuild** or **SWC**.
+
+## FEYNMAN CHECK
+
+### Explain TypeScript Like I'm 10 Years Old
+> TypeScript is JavaScript with a SPELL-CHECKER for your data. You annotate `name: string`, `age: number`, and the TypeScript compiler reads your code at BUILD TIME — long before any user runs it — and screams if you try to pass a number where a string was expected, or call `.toUpperCase()` on `null`. Critically, all this type information is ERASED before the code reaches the browser — TS compiles to plain JS. So there is zero runtime cost. Types are a developer tool, not a runtime feature. This is why `typeof user === "User"` doesn't work — at runtime the User interface is gone, replaced by a plain object.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does TypeScript fundamentally solve that ESLint and unit tests don't?**
+> **A:** It catches an entirely different class of bug — TYPE MISMATCHES — at compile time across module boundaries, with full intellisense as a side-effect. ESLint catches style and a few simple bugs (unused vars, no-unreachable); unit tests verify behaviour you remembered to test. TypeScript verifies that EVERY call site of EVERY function passes the right shape, every time, with zero runtime cost and no tests required. At Google scale, Microsoft reports TS prevents ~15% of bugs that would otherwise reach production.
+
+**Q2: What is the ONE mental model that makes TypeScript click?**
+> **A:** "Types are a parallel universe that describes the shape of values, erased before runtime." Every type — `string`, `User`, `Promise<T>`, `keyof T` — exists ONLY in the .ts source. The compiler reads the type universe, validates that your values are consistent, then THROWS THE TYPES AWAY. Output is plain ES2020+ JavaScript. Once you internalise the type/value split, you stop trying to do impossible things like `if (typeof x === 'User')` or storing types in variables.
+
+**Q3: What is the most dangerous misconception about TypeScript? Show with code.**
+> **A:** Believing TS checks types at runtime:
+> ```ts
+> // ❌ Wrong: assumes TS validates JSON at runtime
+> interface User { name: string; age: number }
+> const data: User = JSON.parse(apiResponse);   // TS trusts the cast — NO validation
+> console.log(data.age.toFixed(2));   // 💥 if api sent age as a string
+>
+> // ✅ Right: use a runtime validator (zod, valibot, io-ts)
+> import { z } from 'zod';
+> const UserSchema = z.object({ name: z.string(), age: z.number() });
+> const data = UserSchema.parse(JSON.parse(apiResponse));   // throws if invalid
+> ```
+
+**Q4: How does TypeScript interact with JavaScript's runtime at the engine level?**
+> **A:** It doesn't — and that's the point. The TypeScript compiler (`tsc`) is a transpiler. It parses .ts, builds an AST, runs the type checker (which validates the type universe), emits .js with types stripped, and exits. V8 never sees a type. This is why decorators, enums, and namespaces — which DO emit runtime code — are different from regular type annotations: they have actual JS output. Pure types are zero bytes.
+
+**Q5: One-sentence FAANG-grade definition?**
+> **A:** "TypeScript is a structurally-typed, gradually-applied static type checker that transpiles to JavaScript — providing build-time type validation, IDE intellisense, and refactoring safety with zero runtime overhead, while requiring external runtime validators for any data crossing system boundaries (network, disk, user input)."
+
+## BUILD
+
+### 🏗️ Mini Project: Convert a Buggy JavaScript Module to TypeScript
+
+**What you will build:** Take a real JavaScript user-service module with hidden bugs, convert it to TypeScript with proper types, and watch tsc surface the bugs at compile time.
+**Why this project:** Forces you to see TS catch bugs that no JS tool would catch.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Project Setup
+```bash
+mkdir ts-intro && cd ts-intro
+npm init -y
+npm install --save-dev typescript @types/node
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/userService.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — The Module With Bugs (Typed Version)
+```ts
+// src/userService.ts
+export interface User {
+  id: number;
+  email: string;
+  age: number;
+  isAdmin: boolean;
+}
+
+export function findUser(users: User[], id: number): User | undefined {
+  return users.find(u => u.id === id);
+}
+
+export function getDisplayName(user: User): string {
+  // Bug in original JS: user.name didn't exist; original JS returned undefined silently
+  return user.email.split('@')[0];
+}
+
+export function promoteToAdmin(user: User): User {
+  return { ...user, isAdmin: true };
+}
+```
+
+#### Step 3 — Caller With a Type Mismatch
+```ts
+// src/main.ts
+import { findUser, getDisplayName, promoteToAdmin, type User } from './userService.js';
+
+const users: User[] = [
+  { id: 1, email: 'alice@dev.io', age: 30, isAdmin: false },
+  { id: 2, email: 'bob@dev.io',   age: 25, isAdmin: false },
+];
+
+// TS will catch: "Argument of type 'string' is not assignable to type 'number'"
+const found = findUser(users, '1');           // ❌ compile error
+const promoted = promoteToAdmin({ id: 3, email: 'eve@dev.io' });  // ❌ missing age + isAdmin
+console.log(getDisplayName(found));            // ❌ found can be undefined
+```
+
+#### Step 4 — Error Handling: Fix Each Compile Error
+```ts
+// src/main.ts (corrected)
+const found = findUser(users, 1);
+const promoted = promoteToAdmin({ id: 3, email: 'eve@dev.io', age: 28, isAdmin: false });
+if (found) {
+  console.log(getDisplayName(found));         // narrowed: now User, not User|undefined
+} else {
+  console.log('No user found');
+}
+```
+
+#### Step 5 — Tests + Verification
+```ts
+// src/userService.test.ts
+import { describe, it, expect } from 'vitest';
+import { findUser, getDisplayName, promoteToAdmin } from './userService.js';
+
+const sample = { id: 1, email: 'a@b.c', age: 20, isAdmin: false };
+
+describe('userService', () => {
+  it('findUser returns undefined for missing id', () => {
+    expect(findUser([sample], 99)).toBeUndefined();
+  });
+  it('getDisplayName splits before @', () => {
+    expect(getDisplayName(sample)).toBe('a');
+  });
+  it('promoteToAdmin sets isAdmin true (immutable)', () => {
+    const promoted = promoteToAdmin(sample);
+    expect(promoted.isAdmin).toBe(true);
+    expect(sample.isAdmin).toBe(false);
+  });
+});
+```
+```bash
+npx tsc --noEmit          # type check only
+npx tsc                   # emit .js to dist/
+node dist/main.js
+```
+
+**Expected Output:**
+```
+$ npx tsc --noEmit
+src/main.ts:7:31 - error TS2345: Argument of type 'string' is not assignable to 'number'.
+src/main.ts:8:35 - error TS2345: missing 'age', 'isAdmin'.
+src/main.ts:9:27 - error TS2345: Argument of type 'undefined' is not assignable.
+Found 3 errors.
+
+# After fix:
+$ npx tsc && node dist/main.js
+alice
+```
+
+**Stretch Challenges:**
+- [ ] Enable `"exactOptionalPropertyTypes": true` and see what new errors appear
+- [ ] Add a zod schema to validate User parsed from JSON at runtime
+- [ ] Use `satisfies` to validate a literal without widening
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does TypeScript do at compile time vs runtime?
+**Q2:** Name 3 things TypeScript catches that ESLint cannot.
+**Q3:** Write a TS function `add(a: number, b: number): number`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why doesn't `typeof x === 'User'` work for checking an interface?
+**Q5:** A junior parses JSON with `as User` cast and gets runtime crashes. Diagnose.
+**Q6:** Refactor this JS to TS, adding types:
+```js
+function findById(items, id) { return items.find(i => i.id === id); }
+```
+
+### Day 7 — Application
+**Q7:** Convert a 50-line JS module to TS — what's the order of operations?
+**Q8:** A PR adds `any` to silence an error. Why is this bad? Show the proper fix.
+**Q9:** What is the cost of TS compilation on a 10k-file project? How is it mitigated?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every thing TypeScript validates and everything it doesn't validate."
+**Q11:** Draw: how does the TS compilation pipeline (source → AST → check → emit) interact with the bundler?
+**Q12:** ★ System design: "A 100-engineer team has 2M LOC of JavaScript. Plan the incremental TypeScript migration — what tools, what order, what risks?"

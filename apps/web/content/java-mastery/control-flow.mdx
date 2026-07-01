@@ -6,183 +6,571 @@ level: 1
 
 ## WHY
 
-Imagine writing a program without control flow. Code would execute top-to-bottom, exactly once, with no ability to skip lines or repeat actions. If you wanted to process 1,000 users, you would literally have to copy and paste the processing logic 1,000 times. If you wanted to show an error message *only* if the user's password was wrong, you couldn't; the error message would print for everyone.
+Imagine writing a program without control flow. Code would execute top-to-bottom, exactly once, with no ability to skip lines or repeat actions. To process 1,000 users, you'd copy-paste the logic 1,000 times. To show an error only on wrong passwords, you couldn't — the error would print for everyone.
 
-Control flow constructs (`if`, `switch`, `for`, `while`) are the steering wheel and engine of programming. They allow the execution path of the code to branch dynamically based on runtime data, and to loop over operations iteratively.
+Control flow constructs are the **steering wheel and engine** of programming. But they go far deeper than syntax — they directly affect:
 
-However, traditional control flow has always been a major source of bugs. The old C-style `switch` statement in Java, for example, forces you to manually write `break;` at the end of every case. If you forget it, the execution silently "falls through" to the next case, causing catastrophic bugs in production. Java recognized this pain and introduced modern **Switch Expressions** (Java 14+) that eliminate fall-through entirely and allow control flow to *return* a value directly. Understanding how the JVM compiles these different constructs into bytecode is essential for writing both safe and extremely fast code.
+1. **Performance**: A 50-branch `if-else` chain is O(n). A `switch` with `tableswitch` bytecode is O(1). Wrong choice = measurable slowdown at scale.
+2. **Safety**: C-style `switch` fall-through silently executes wrong cases in production. Java 14+ switch expressions eliminate this by design.
+3. **Readability**: Deeply nested `if-else` creates the "arrow anti-pattern" — code that pyramids rightward, impossible to read or test.
+4. **Compiler guarantees**: `switch` expressions over `enum` and sealed classes enforce exhaustiveness — the compiler refuses to build if you miss a case.
+5. **Modern Java patterns**: Pattern Matching for Switch (Java 21) lets you type-check and destructure in one expression, eliminating entire `instanceof` + cast chains.
+
+Senior developers don't just know the syntax — they know which construct the JVM compiles to `tableswitch` vs `lookupswitch`, when to replace `if-else if` chains with `Map<String, Strategy>`, and how Java 21 pattern matching eliminates verbosity.
 
 ## THEORY
 
-### `if` vs `switch` at the Bytecode Level
-When you write an `if-else if` chain, the Java compiler generates conditional branch instructions (like `ifeq`, `if_icmplt`). The JVM evaluates these conditions sequentially. If you have 50 `if-else if` branches, evaluating the 50th branch takes 50 comparisons. 
+### `if-else` vs `switch` at the Bytecode Level
 
-When you write a `switch` statement on an `int` or `String`, the compiler generates entirely different bytecode. It creates a `tableswitch` or a `lookupswitch`. 
-- **`tableswitch`**: Used when case values are dense (e.g., 1, 2, 3, 4). The JVM essentially creates an array of memory addresses. It uses the `switch` variable as an index to jump *instantly* in O(1) time to the correct block of code.
-- **`lookupswitch`**: Used when case values are sparse (e.g., 10, 1000, 50000). The JVM creates a sorted table of keys and uses Binary Search to find the jump target in O(log n) time.
+When you write `if-else if`, the compiler generates **sequential branch bytecodes**:
+```
+iload_1          // push variable onto operand stack
+bipush 18        // push constant 18
+if_icmpge L1     // if var >= 18, jump to L1
+...
+L1: ...
+```
+With 50 branches, the 50th evaluation requires 50 comparisons. Performance degrades linearly: O(n).
 
-Because of this, a `switch` statement is almost always faster than a long `if-else if` chain.
+When you write a `switch` on integers/strings, the compiler generates fundamentally different bytecode:
 
-### Traditional `switch` vs Enhanced Switch Expressions
-The traditional `switch` is a **statement**. It performs actions but doesn't resolve to a value. It also suffers from "fall-through": if a case matches, it executes that case and *every case below it* unless stopped by a `break;`. Fall-through exists because C programmers used it for Duff's Device (loop unrolling), but in modern Java, it's mostly a liability.
+| Bytecode | When Used | Complexity | Mechanism |
+|----------|-----------|------------|-----------|
+| `tableswitch` | Dense cases (1,2,3,4,5) | **O(1)** | Array of jump addresses; uses value as index |
+| `lookupswitch` | Sparse cases (1, 1000, 5000) | **O(log n)** | Sorted key-value pairs; binary search |
 
-Java 14 introduced the **Switch Expression**.
-1. It uses `->` syntax instead of `:`.
-2. It completely eliminates fall-through. No `break;` needed.
-3. It resolves to a single value, making it perfect for assignments.
-4. If a block of code is needed, you use the `yield` keyword to return the value from that block.
+The `tableswitch` is essentially a jump table — the JVM takes the switch variable, uses it as an array index, and jumps directly to the correct code block in a single operation. This is why `switch` dramatically outperforms `if-else if` for large numbers of cases.
 
-### Labeled `break` and `continue`
-In deeply nested loops, a normal `break` only exits the immediate, innermost loop. Java does not have `goto` (it is a reserved but unused keyword). Instead, Java provides labeled breaks. By tagging a loop with a label (e.g., `OUTER_LOOP:`), you can forcefully terminate the entire outer execution context from deep within a nested loop.
+### Traditional `switch` Statement Problems
+
+The old C-style switch is a **statement** (performs actions, produces no value) with two critical flaws:
+
+**Flaw 1: Fall-through** — execution continues to the next case unless stopped by `break`:
+```java
+switch (status) {
+    case "NEW":
+        initOrder();      // Executes
+        // ← Missing break!
+    case "PROCESSING":
+        processOrder();   // Also executes — SILENT BUG
+        break;
+}
+```
+
+**Flaw 2: No exhaustiveness check** — if you handle 5 of 6 enum values, the compiler doesn't warn you. The uncovered case silently falls to `default` (or does nothing if no default exists).
+
+### Java 14+ Switch Expressions (The Modern Standard)
+
+The switch **expression** (preview Java 12-13, stable Java 14+) solves both problems:
+
+| Feature | Old switch Statement | New switch Expression |
+|---------|---------------------|----------------------|
+| Syntax | `case X:` with `:` | `case X ->` with `->` |
+| Fall-through | Yes (by default) | **Impossible** |
+| Returns value | No | **Yes** — assigns to variable |
+| Exhaustiveness | Not checked | **Compiler enforced** |
+| Multiple labels | No | Yes — `case A, B, C ->` |
+| Block syntax | N/A | Use `yield` to return from block |
+
+### Pattern Matching for Switch (Java 21)
+
+Java 21 added type patterns, guarded patterns, and `null` handling:
+
+```java
+// Before Java 21 — verbose instanceof + cast
+String describe(Object obj) {
+    if (obj instanceof String s) {
+        return "String of length " + s.length();
+    } else if (obj instanceof Integer i && i > 0) {
+        return "Positive int: " + i;
+    } else if (obj == null) {
+        return "null";
+    }
+    return "other";
+}
+
+// Java 21 — clean pattern matching switch
+String describe(Object obj) {
+    return switch (obj) {
+        case String s  -> "String of length " + s.length();
+        case Integer i when i > 0 -> "Positive int: " + i;
+        case null      -> "null";
+        default        -> "other: " + obj.getClass().getSimpleName();
+    };
+}
+```
+
+### Loop Types and Use Cases
+
+| Loop | When to Use | Key Feature |
+|------|-------------|-------------|
+| `for` | Known iteration count | Compact; `i` scoped to loop |
+| `while` | Unknown count, condition-first | Tests before each iteration |
+| `do-while` | Must run at least once | Tests after each iteration |
+| Enhanced `for-each` | Iterating collections/arrays | Clean; no index needed |
+| `Iterator` | Need `remove()` during iteration | Avoids `ConcurrentModificationException` |
+
+### Labeled Break and Continue
+
+Java has no `goto` (reserved keyword but never used). Instead, labels let you break/continue outer loops:
+
+```
+OUTER:                    ← label on outer loop
+for (...) {
+    INNER:                ← label on inner loop
+    for (...) {
+        break OUTER;      ← exits outer loop entirely
+        continue OUTER;   ← skips to next outer iteration
+    }
+}
+```
+
+Labels are legitimate — not spaghetti code — for matrix traversal, graph search, and multi-level state machine exit conditions.
+
+### The Arrow Anti-Pattern (and How to Fix It)
+
+```java
+// ARROW ANTI-PATTERN — impossible to read or test
+if (user != null) {
+    if (user.isActive()) {
+        if (user.hasPermission("ADMIN")) {
+            if (request != null) {
+                // actual logic buried 4 levels deep
+            }
+        }
+    }
+}
+
+// GUARD CLAUSE pattern — early return flattens nesting
+if (user == null) throw new IllegalArgumentException("user required");
+if (!user.isActive()) throw new IllegalStateException("user inactive");
+if (!user.hasPermission("ADMIN")) throw new SecurityException("denied");
+if (request == null) throw new IllegalArgumentException("request required");
+// actual logic at top level — easy to read and test
+```
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "BytecodeVisualizer", "operation": "tableswitch-vs-ifelse" }
+{ "type": "none" }
 ```
 
 ## CODE
 
 ### Level 1 — Beginner
 ```java
-public class BasicIf {
+// Basic control flow: if-else, for, while, do-while
+public class BasicControlFlow {
     public static void main(String[] args) {
         int age = 15;
-        
-        // Basic sequential branching
+
+        // if-else if-else: sequential branching
         if (age >= 18) {
             System.out.println("Adult");
         } else if (age >= 13) {
-            System.out.println("Teen");
+            System.out.println("Teen");      // prints this
         } else {
             System.out.println("Child");
         }
+
+        // Classic for loop
+        System.out.print("Counting: ");
+        for (int i = 1; i <= 5; i++) {
+            System.out.print(i + " ");       // 1 2 3 4 5
+        }
+        System.out.println();
+
+        // while loop — unknown iteration count
+        int n = 1;
+        while (n < 100) {
+            n *= 2;
+        }
+        System.out.println("First power of 2 >= 100: " + n);  // 128
+
+        // do-while — runs at least once
+        int attempts = 0;
+        do {
+            attempts++;
+            System.out.println("Attempt " + attempts);
+        } while (attempts < 3);  // runs 3 times
     }
 }
 ```
 
 ### Level 2 — Building Blocks
 ```java
-public class OldSwitch {
+// Traditional switch vs modern switch expression
+public class SwitchComparison {
     public static void main(String[] args) {
         String role = "ADMIN";
-        
-        // TRADITIONAL SWITCH (Statement)
+
+        // OLD switch statement — fall-through danger
         switch (role) {
             case "ADMIN":
-                System.out.println("Full Access");
-                break; // If you forget this, it falls through to USER!
+                System.out.println("Full access");
+                break;  // ← REQUIRED — without this, falls through to USER!
+            case "EDITOR":
+            case "MODERATOR":
+                System.out.println("Write access");
+                break;
             case "USER":
-                System.out.println("Read Access");
+                System.out.println("Read access");
                 break;
             default:
-                System.out.println("No Access");
+                System.out.println("No access");
         }
+
+        // NEW switch expression (Java 14+) — no fall-through possible
+        int accessLevel = switch (role) {
+            case "ADMIN"               -> 100;  // Arrow → no fall-through
+            case "EDITOR", "MODERATOR" -> 50;   // Multiple labels in one case
+            case "USER"                -> 10;
+            default                    -> 0;
+        };
+        System.out.println("Access level: " + accessLevel);  // 100
+
+        // Switch expression with block + yield
+        String description = switch (role) {
+            case "ADMIN" -> {
+                System.out.println("Computing admin description...");
+                yield "Administrator with full system access";  // yield returns value
+            }
+            default -> "Standard user";
+        };
+        System.out.println(description);
     }
 }
 ```
 
 ### Level 3 — Intermediate
 ```java
-public class EnhancedSwitch {
-    public static void main(String[] args) {
-        String role = "ADMIN";
-        
-        // JAVA 14+ SWITCH EXPRESSION
-        // 1. Evaluates to a value (assigned to 'access')
-        // 2. Uses arrow syntax '->'
-        // 3. NO FALL-THROUGH possible
-        int accessLevel = switch (role) {
-            case "ADMIN" -> 100;
-            case "EDITOR", "MODERATOR" -> 50; // Multiple matching allowed
-            case "USER" -> {
-                // If you need complex logic inside a branch, use a block
-                System.out.println("Calculating user access...");
-                // Use 'yield' to return the value from the block
-                yield 10; 
+// Loop control: break, continue, labeled break
+public class LoopControl {
+
+    // Find first prime in a 2D grid
+    static int[] findFirstPrime(int[][] grid) {
+        GRID_SEARCH:                          // label on outer loop
+        for (int row = 0; row < grid.length; row++) {
+            for (int col = 0; col < grid[row].length; col++) {
+                if (isPrime(grid[row][col])) {
+                    System.out.println("Found prime " + grid[row][col]
+                        + " at [" + row + "][" + col + "]");
+                    break GRID_SEARCH;        // exits BOTH loops immediately
+                }
             }
-            default -> 0; // Exhaustiveness is enforced by compiler!
-        };
-        
-        System.out.println("Access Level: " + accessLevel);
+        }
+        return new int[]{0, 0};
+    }
+
+    static boolean isPrime(int n) {
+        if (n < 2) return false;
+        for (int i = 2; i * i <= n; i++) {
+            if (n % i == 0) return false;
+        }
+        return true;
+    }
+
+    // Labeled continue: skip rest of OUTER iteration
+    static void printOddRows(int[][] matrix) {
+        OUTER:
+        for (int i = 0; i < matrix.length; i++) {
+            for (int j = 0; j < matrix[i].length; j++) {
+                if (matrix[i][j] % 2 == 0) {
+                    continue OUTER;  // Row has even number — skip entire row
+                }
+            }
+            System.out.println("All-odd row: " + java.util.Arrays.toString(matrix[i]));
+        }
+    }
+
+    public static void main(String[] args) {
+        int[][] grid = {{4, 6, 8}, {9, 10, 13}, {15, 17, 19}};
+        findFirstPrime(grid);
+
+        int[][] matrix = {{1, 3, 5}, {1, 2, 3}, {7, 9, 11}};
+        printOddRows(matrix);  // Prints row 0 and row 2 only
     }
 }
 ```
 
 ### Level 4 — Advanced
 ```java
-public class LabeledBreak {
-    public static void main(String[] args) {
-        int[][] matrix = {
-            {1, 2, 3},
-            {4, 5, 6},
-            {7, 8, 9}
+// Pattern Matching for Switch (Java 21) + Sealed Classes
+public class PatternMatchingSwitch {
+
+    // Sealed class hierarchy — compiler knows all subtypes
+    sealed interface Shape permits Circle, Rectangle, Triangle {}
+    record Circle(double radius)                    implements Shape {}
+    record Rectangle(double width, double height)   implements Shape {}
+    record Triangle(double base, double height)     implements Shape {}
+
+    // EXHAUSTIVE switch — compiler enforces coverage of all subtypes
+    static double area(Shape shape) {
+        return switch (shape) {
+            case Circle c          -> Math.PI * c.radius() * c.radius();
+            case Rectangle r       -> r.width() * r.height();
+            case Triangle t        -> 0.5 * t.base() * t.height();
+            // No default needed! sealed interface + all cases = exhaustive
         };
-        
-        int target = 5;
-        boolean found = false;
-        
-        // Label the outer loop
-        SEARCH_MATRIX:
-        for (int row = 0; row < matrix.length; row++) {
-            for (int col = 0; col < matrix[row].length; col++) {
-                if (matrix[row][col] == target) {
-                    found = true;
-                    // Breaks the OUTER loop entirely, skipping remaining rows
-                    break SEARCH_MATRIX; 
-                }
+    }
+
+    // Guarded patterns with 'when' clause (Java 21)
+    static String classify(Object obj) {
+        return switch (obj) {
+            case Integer i when i < 0    -> "Negative int: " + i;
+            case Integer i when i == 0   -> "Zero";
+            case Integer i               -> "Positive int: " + i;
+            case String s when s.isEmpty() -> "Empty string";
+            case String s                -> "String: " + s;
+            case null                    -> "null value";
+            default                      -> "Unknown: " + obj.getClass().getSimpleName();
+        };
+    }
+
+    public static void main(String[] args) {
+        Shape[] shapes = {
+            new Circle(5),
+            new Rectangle(4, 6),
+            new Triangle(3, 8)
+        };
+
+        for (Shape s : shapes) {
+            System.out.printf("Area of %s = %.2f%n",
+                s.getClass().getSimpleName(), area(s));
+        }
+        // Area of Circle = 78.54
+        // Area of Rectangle = 24.00
+        // Area of Triangle = 12.00
+
+        System.out.println(classify(-5));       // Negative int: -5
+        System.out.println(classify(0));        // Zero
+        System.out.println(classify("hello"));  // String: hello
+        System.out.println(classify(""));       // Empty string
+        System.out.println(classify(null));     // null value
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+// ADVANCED: Eliminating control flow with Maps and Strategy pattern
+import java.util.*;
+import java.util.function.*;
+
+public class EliminateControlFlow {
+
+    // STRATEGY PATTERN: Replace if-else chains with Map<String, Function>
+    // Before: 10-branch if-else for tax calculation
+    // After: lookup table — O(1), easy to extend without modifying existing code
+
+    interface TaxStrategy {
+        double calculate(double income);
+    }
+
+    static final Map<String, TaxStrategy> TAX_RULES = Map.of(
+        "EMPLOYEE",   income -> income * 0.30,
+        "CONTRACTOR", income -> income * 0.35,
+        "FREELANCER", income -> income > 100_000 ? income * 0.28 : income * 0.20,
+        "STUDENT",    income -> income > 20_000   ? income * 0.10 : 0.0
+    );
+
+    static double calculateTax(String employmentType, double income) {
+        TaxStrategy strategy = TAX_RULES.get(employmentType);
+        if (strategy == null) {
+            throw new IllegalArgumentException("Unknown type: " + employmentType);
+        }
+        return strategy.calculate(income);
+    }
+
+    // LOOP OPTIMIZATION: Prefer iteration patterns that the JIT can vectorize
+    static long sumArray(int[] arr) {
+        long sum = 0;
+        // Simple indexed loop — JIT can auto-vectorize with SIMD instructions
+        for (int i = 0; i < arr.length; i++) {
+            sum += arr[i];
+        }
+        return sum;
+    }
+
+    // ITERATOR WITH REMOVAL — avoids ConcurrentModificationException
+    static void removeExpiredSessions(List<String> sessions) {
+        Iterator<String> it = sessions.iterator();
+        while (it.hasNext()) {
+            String session = it.next();
+            if (session.startsWith("EXPIRED_")) {
+                it.remove();  // Safe removal via Iterator — not sessions.remove()
             }
         }
+    }
+
+    // TRAMPOLINE PATTERN — tail-recursive algorithms without StackOverflow
+    @FunctionalInterface
+    interface Trampoline<T> {
+        T get();
+        default boolean isDone() { return true; }
+
+        static <T> T run(Trampoline<T> t) {
+            while (!t.isDone()) {
+                t = (Trampoline<T>) t.get();
+            }
+            return t.get();
+        }
+    }
+
+    public static void main(String[] args) {
+        // Strategy pattern tax calculation
+        System.out.println(calculateTax("EMPLOYEE", 80_000));     // 24000.0
+        System.out.println(calculateTax("FREELANCER", 120_000));  // 33600.0
+
+        // Array sum
+        int[] data = new int[1_000_000];
+        Arrays.fill(data, 1);
+        System.out.println(sumArray(data));  // 1000000
+
+        // Safe removal
+        List<String> sessions = new ArrayList<>(List.of(
+            "ACTIVE_abc", "EXPIRED_xyz", "ACTIVE_def", "EXPIRED_123"
+        ));
+        removeExpiredSessions(sessions);
+        System.out.println(sessions);  // [ACTIVE_abc, ACTIVE_def]
     }
 }
 ```
 
 ## REAL_WORLD
 
-In production Spring Boot applications, developers often misuse massive `if-else if` chains to route incoming webhook events or apply strategy patterns. 
-
+### Spring Boot Webhook Router — Eliminating if-else with Map
 ```java
-// ANTI-PATTERN: The "God Method" of if-else
-public void handleWebhook(String eventType, String payload) {
-    if (eventType.equals("USER_CREATED")) {
-        userHandler.handle(payload);
-    } else if (eventType.equals("USER_DELETED")) {
-        deleteHandler.handle(payload);
-    } else if (eventType.equals("PAYMENT_FAILED")) {
-        paymentHandler.handle(payload);
-    } // ... 50 more branches
+// ANTI-PATTERN: "God method" — every new event type requires modifying this file
+@Service
+public class WebhookServiceBad {
+    public void handle(String eventType, String payload) {
+        if (eventType.equals("USER_CREATED"))        userHandler.handle(payload);
+        else if (eventType.equals("USER_DELETED"))   deleteHandler.handle(payload);
+        else if (eventType.equals("PAYMENT_FAILED")) paymentHandler.handle(payload);
+        // Adding PAYMENT_REFUNDED requires editing this file — violates OCP
+    }
 }
-```
-This is an anti-pattern because adding a new event type requires modifying the core routing file, violating the Open-Closed Principle (OCP).
 
-However, if you *must* use direct routing logic, modern Java dictates you should use a Switch Expression, as the compiler enforces **Exhaustiveness**. If `eventType` was an `enum` rather than a `String`, the compiler would physically prevent the code from building if you forgot to handle a specific event type.
+// GOOD PATTERN: Spring auto-discovers handlers by event type
+public interface WebhookHandler {
+    String eventType();
+    void handle(String payload);
+}
 
-The absolute best production pattern to replace complex `if-else` control flow is using a `Map` of strategies or the Strategy Pattern combined with Spring's `@Component` mapping.
-```java
-// GOOD PATTERN: Eliminating control flow entirely via Maps
+@Component
+public class UserCreatedHandler implements WebhookHandler {
+    public String eventType() { return "USER_CREATED"; }
+    public void handle(String payload) { /* ... */ }
+}
+
 @Service
 public class WebhookRouter {
-    // Spring automatically injects all beans implementing WebhookHandler
     private final Map<String, WebhookHandler> handlers;
-    
+
+    // Spring injects all WebhookHandler beans; we index them by eventType
+    public WebhookRouter(List<WebhookHandler> handlers) {
+        this.handlers = handlers.stream()
+            .collect(java.util.stream.Collectors.toMap(
+                WebhookHandler::eventType,
+                h -> h
+            ));
+    }
+
     public void route(String eventType, String payload) {
         WebhookHandler handler = handlers.get(eventType);
-        if (handler != null) {
-            handler.handle(payload);
-        }
+        if (handler == null) throw new IllegalArgumentException("No handler for: " + eventType);
+        handler.handle(payload);
+    }
+    // Adding a new event type = add a new @Component. ZERO modification to router.
+}
+```
+
+### Enum Switch with Exhaustiveness
+```java
+// Using enum + switch expression for state machine with compiler-checked exhaustiveness
+public enum OrderStatus { PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED }
+
+@Service
+public class OrderStateMachine {
+
+    public OrderStatus transition(OrderStatus current, String action) {
+        return switch (current) {
+            case PENDING   -> action.equals("confirm") ? CONFIRMED : CANCELLED;
+            case CONFIRMED -> action.equals("ship")    ? SHIPPED   : CONFIRMED;
+            case SHIPPED   -> DELIVERED;   // Can only deliver after shipping
+            case DELIVERED, CANCELLED -> {
+                throw new IllegalStateException("Terminal state: " + current);
+                // yield not needed after throw
+            }
+        };
+        // If OrderStatus gains a new value (e.g., REFUNDED),
+        // compiler FAILS with "switch expression is not exhaustive"
+        // — you MUST handle the new case. Bug found at compile time, not runtime!
     }
 }
 ```
 
 ## INTERVIEW
 
-**Q: Does a `switch` statement perform faster than an `if-else if` chain? Why?**
-A: Yes, generally. For an `if-else if` chain, the JVM executes sequential branch comparisons (O(n) complexity). For a `switch` statement, the compiler generates a `tableswitch` (O(1) direct memory jump for dense values) or a `lookupswitch` (O(log n) binary search for sparse values). This makes `switch` significantly faster for a large number of conditions.
+### Q1: What bytecode does the JVM use for switch statements and why is it faster?
+**Difficulty:** Hard | **Companies:** Oracle, Netflix
 
-**Q: What is the difference between `break` and `yield` inside a switch block?**
-A: `break` is used in traditional switch *statements* to prevent fall-through to the next case block and exit the switch. `yield` is used in Java 14+ switch *expressions* (when a `{}` block is utilized) to return a specific value back to the caller of the expression.
+❌ **Weak:** "Switch is optimized so it's faster."
 
-**Q: Can you use a `switch` statement on objects in Java?**
-A: Historically, no. You could only switch on primitives (`int`, `char`, etc.), `Enum` types, and (since Java 7) `String`. However, starting with Java 17 and Java 21's Pattern Matching for Switch, you can now switch on any Object type, and even extract variables simultaneously (e.g., `case User u -> process(u)`).
+✅ **Strong:** "The JVM compiles switch statements into one of two bytecodes. `tableswitch` is used for dense integer cases (e.g., 1-10) and creates an array of jump addresses — the switch value indexes directly into the array for O(1) dispatch. `lookupswitch` is used for sparse cases and stores sorted key-value pairs searched with binary search for O(log n) dispatch. Both are faster than an `if-else if` chain which sequentially evaluates each condition at O(n)."
 
-**Q: Explain how labeled `break` differs from the `goto` statement found in C++.**
-A: `goto` allows jumping to any arbitrary line of code anywhere in a function, which leads to unpredictable, "spaghetti" control flow. Java's labeled `break` is strictly constrained: you can only jump outward to the end of a specific enclosing loop block. You cannot jump into a loop, nor can you jump backward in execution.
+---
+
+### Q2: What is the difference between a switch statement and a switch expression in Java?
+**Difficulty:** Medium | **Companies:** Amazon, Goldman Sachs
+
+❌ **Weak:** "Switch expression uses arrows and returns values."
+
+✅ **Strong:** "A switch **statement** (pre-Java 14 style) executes side effects but produces no value. It uses `case X:` colon syntax and requires explicit `break` to prevent fall-through. A switch **expression** (Java 14+) evaluates to a value that can be assigned to a variable or returned. It uses `case X ->` arrow syntax with no fall-through possible. When a block is needed, `yield` returns the value from the block. Switch expressions over enums and sealed classes are exhaustiveness-checked by the compiler."
+
+---
+
+### Q3: How do you safely remove items from a List while iterating over it?
+**Difficulty:** Medium | **Companies:** Spotify, Airbnb
+
+❌ **Weak:** "Use a for-each loop and call remove."
+
+✅ **Strong:** "You cannot call `list.remove()` inside a for-each loop — it throws `ConcurrentModificationException` because the for-each loop uses an `Iterator` internally, and direct list modification while an iterator is active fails the modification check. The correct approaches are: (1) Use the `Iterator` directly and call `iterator.remove()`. (2) Use `list.removeIf(predicate)` for filter-based removal. (3) Use `list.stream().filter(...).collect(...)` to produce a new list. Never use indexed `for` loop with `remove(int index)` while iterating forward — indices shift."
+
+---
+
+### Q4: What is fall-through in switch statements and when is it intentional?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak:** "It's when you forget a break."
+
+✅ **Strong:** "Fall-through means when a switch case matches, execution continues into the next case block even though its case label doesn't match, unless stopped by `break`. It's usually a bug when unintentional. It's intentionally used when multiple cases share the same logic — e.g., `case 'a': case 'e': case 'i':` all fall through to vowel-handling code. However, Java 14+ switch expressions make fall-through physically impossible with arrow syntax, which is why they're preferred in modern code."
+
+---
+
+### Q5: Explain pattern matching for switch in Java 21 and its benefits.
+**Difficulty:** Hard | **Companies:** Google, Palantir
+
+❌ **Weak:** "You can use instanceof in switch cases."
+
+✅ **Strong:** "Pattern matching for switch (Java 21, finalized) allows switching on the type of an `Object` reference, automatically binding the matched value to a typed variable. Instead of `if (obj instanceof String s) { use s; } else if (obj instanceof Integer i) { use i; }`, you write `switch (obj) { case String s -> use(s); case Integer i -> use(i); }`. Guarded patterns add `when` conditions for fine-grained matching. Combined with sealed classes, the compiler enforces exhaustiveness — if you add a new subtype and forget to handle it in a switch expression, the code won't compile. This eliminates entire categories of runtime ClassCastExceptions."
+
+## FEYNMAN CHECK
+
+Control flow is a set of decision signs on a road. `if-else` is a series of "turn left if X" signs — you read each sign in order until one applies. `switch` is a roundabout with numbered exits — you go directly to exit N without checking exits 1, 2, 3, ... N-1 first. The switch roundabout is faster when there are many exits. Pattern matching for switch is a smart security scanner — it checks your bag's contents, immediately identifies what type of item is inside, and routes you to the correct security lane — all in one step.
+
+## BUILD
+
+**Challenge 1:** Implement a grade calculator using a switch expression over integer ranges (use `when` guards in Java 21, or divide by 10 trick in older Java).
+
+**Challenge 2:** Write a state machine for a traffic light (`RED → GREEN → YELLOW → RED`) using an enum and switch expression. Make the transition method exhaustive — adding a new light state must break compilation until handled.
+
+**Challenge 3:** Implement the webhook router pattern: Create 3 handlers implementing a `Handler` interface, register them in a `Map<String, Handler>`, and route events without any `if-else`.
+
+## SPACED REVIEW
+
+- **Day 1:** What's the difference between `tableswitch` and `lookupswitch` bytecodes?
+- **Day 3:** Write a switch expression that returns a string for each day of the week
+- **Day 7:** What happens if you iterate a list with for-each and call `list.remove()` inside?
+- **Day 14:** How does pattern matching for switch differ from `instanceof` + cast?
+- **Day 30:** Refactor a 5-branch `if-else if` chain into a `Map<String, Strategy>` solution

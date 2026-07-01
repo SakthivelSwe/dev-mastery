@@ -222,3 +222,258 @@ export const config = {
 ```
 
 Middleware runs before the route handler — if unauthorized, the request never reaches the route. This is more efficient and centralized than checking in each route handler individually.
+
+## FEYNMAN CHECK
+
+### Explain Next.js API Routes (Route Handlers) Like I'm 10 Years Old
+> Route Handlers are Next.js's way to build REST API endpoints inside your Next.js app — no separate Express/Fastify server needed. Create a file app/api/users/route.ts that exports GET, POST, PUT, DELETE, PATCH functions. Each function receives a Request object and returns a Response object. Next.js handles routing automatically based on the file path. The non-obvious depth: Route Handlers run in either Node.js runtime (default — full Node.js APIs available, slower cold start) or Edge runtime (faster cold start, runs at CDN edge, limited APIs — no Node.js filesystem). Choose runtime per route via export const runtime = 'edge'.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you use Route Handlers vs Server Actions?**
+> **A:** Route Handlers for: external API consumption (mobile apps, third-party integrations call your endpoints), webhooks from external services (Stripe, GitHub, CMS), public APIs with versioning, file uploads/downloads with streaming, OAuth callbacks, SSE/streaming responses. Server Actions for: internal mutations from your own UI, form submissions, optimistic UI updates, anything that's tightly coupled to specific Next.js pages. Rule: if a non-Next.js client needs to call it, use Route Handler; if only your Next.js UI calls it, prefer Server Action.
+
+**Q2: Mental model for NextRequest and NextResponse?**
+> **A:** Route Handlers receive a NextRequest (extends standard Request) which adds: nextUrl (parsed URL with query params), cookies (typed cookie API), geo (Vercel-detected location), ip. They return NextResponse (extends Response) which adds: cookies.set/delete for setting response cookies, NextResponse.json() for JSON responses, NextResponse.redirect(), NextResponse.rewrite(). Using standard Request/Response also works but loses the Next.js-specific conveniences.
+
+**Q3: Most dangerous misconception about Route Handlers?**
+> **A:** Route Handlers automatically cache GET responses:
+> ```typescript
+> // WRONG: assuming GET handlers are cached
+> // src/app/api/products/route.ts
+> export async function GET() {
+>   const products = await db.getAll();
+>   return NextResponse.json(products);
+> }
+> // This is NOT cached by default since Next.js 15
+> // Each request runs the handler -- expensive for high-traffic endpoints
+>
+> // CORRECT: explicitly opt in to caching for cacheable GETs
+> export const dynamic = 'force-static';     // cache indefinitely
+> export const revalidate = 60;              // cache for 60 seconds
+>
+> // Or for SSR-like behaviour (no cache):
+> export const dynamic = 'force-dynamic';
+> ```
+
+**Q4: How do you stream responses from a Route Handler?**
+> **A:** Use ReadableStream to send chunked responses for AI completions, file downloads, SSE: const stream = new ReadableStream({ async start(controller) { for (const chunk of generateChunks()) { controller.enqueue(new TextEncoder().encode(chunk)); } controller.close(); } }); return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });. The browser receives chunks as they arrive — perfect for OpenAI/Anthropic streaming responses, large file downloads, and real-time logs.
+
+**Q5: FAANG-grade definition of Next.js Route Handlers.**
+> **A:** "Next.js Route Handlers are file-system-based API endpoints in app/[...]/route.ts exporting HTTP method functions (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) — receiving NextRequest with nextUrl parsing, cookies, and geolocation utilities — returning NextResponse with typed JSON, cookie management, redirects, and rewrites — running in Node.js or Edge Runtime (selectable per route via export const runtime) — supporting streaming responses via ReadableStream for AI/SSE patterns, dynamic vs static rendering via export const dynamic — and integrating with middleware for auth, rate limiting, and CORS — providing the external API surface complementing Server Actions for internal mutations."
+
+## BUILD
+
+### 🏗️ Mini Project: Full REST API With Auth, Validation, Streaming, and Webhooks
+
+**What you will build:** A complete REST API: GET /api/products (cached), POST /api/products (auth + validation), PATCH /api/products/[id], DELETE /api/products/[id], GET /api/stream (SSE for live updates), POST /api/webhook/stripe (verified webhook).
+**Why this project:** Forces every Route Handler pattern in one realistic API.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest api-demo --typescript --tailwind --app
+npm install zod better-sqlite3 @types/better-sqlite3
+```
+
+#### Step 2 — Products CRUD API
+```typescript
+// src/app/api/products/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
+import Database from 'better-sqlite3';
+
+const db = new Database('products.db');
+db.exec(`CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price REAL, category TEXT)`);
+
+const ProductSchema = z.object({
+  name: z.string().min(1).max(100),
+  price: z.number().positive(),
+  category: z.enum(['books', 'electronics', 'tools']),
+});
+
+// Cache for 60 seconds — re-runs only after expiry
+export const revalidate = 60;
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = request.nextUrl;
+  const category = searchParams.get('category');
+  const limit = Number(searchParams.get('limit') ?? '50');
+
+  let query = 'SELECT * FROM products';
+  const params: any[] = [];
+  if (category) { query += ' WHERE category = ?'; params.push(category); }
+  query += ' LIMIT ?'; params.push(limit);
+
+  const products = db.prepare(query).all(...params);
+  return NextResponse.json({ products, count: products.length });
+}
+
+export async function POST(request: NextRequest) {
+  // Auth check via cookie or Authorization header
+  const auth = request.headers.get('authorization');
+  if (auth !== 'Bearer SECRET_API_KEY') {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  let body: unknown;
+  try { body = await request.json(); }
+  catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }); }
+
+  const result = ProductSchema.safeParse(body);
+  if (!result.success) {
+    return NextResponse.json({ error: 'Validation failed', issues: result.error.issues }, { status: 400 });
+  }
+
+  const { name, price, category } = result.data;
+  const insertResult = db.prepare('INSERT INTO products (name, price, category) VALUES (?, ?, ?)')
+    .run(name, price, category);
+
+  return NextResponse.json(
+    { id: insertResult.lastInsertRowid, name, price, category },
+    { status: 201, headers: { Location: `/api/products/${insertResult.lastInsertRowid}` } },
+  );
+}
+```
+
+#### Step 3 — Dynamic Route Handler [id]
+```typescript
+// src/app/api/products/[id]/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import Database from 'better-sqlite3';
+const db = new Database('products.db');
+
+interface Params { params: { id: string } }
+
+export async function GET(_req: NextRequest, { params }: Params) {
+  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(params.id);
+  if (!product) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  return NextResponse.json(product);
+}
+
+export async function PATCH(request: NextRequest, { params }: Params) {
+  const body = await request.json();
+  const updates = Object.entries(body).filter(([k]) => ['name', 'price', 'category'].includes(k));
+  if (updates.length === 0) return NextResponse.json({ error: 'No valid fields' }, { status: 400 });
+
+  const setClause = updates.map(([k]) => `${k} = ?`).join(', ');
+  const values = updates.map(([, v]) => v);
+  db.prepare(`UPDATE products SET ${setClause} WHERE id = ?`).run(...values, params.id);
+
+  return NextResponse.json({ updated: true });
+}
+
+export async function DELETE(_req: NextRequest, { params }: Params) {
+  const result = db.prepare('DELETE FROM products WHERE id = ?').run(params.id);
+  if (result.changes === 0) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  return new NextResponse(null, { status: 204 });
+}
+```
+
+#### Step 4 — Streaming Response (SSE)
+```typescript
+// src/app/api/stream/route.ts
+export const dynamic = 'force-dynamic';  // never cache streaming
+
+export async function GET() {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      for (let i = 1; i <= 5; i++) {
+        const message = `data: {"count": ${i}, "time": "${new Date().toISOString()}"}\n\n`;
+        controller.enqueue(encoder.encode(message));
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
+}
+```
+
+#### Step 5 — Webhook With Signature Verification + Tests
+```typescript
+// src/app/api/webhook/stripe/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
+
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function POST(request: NextRequest) {
+  const signature = request.headers.get('stripe-signature');
+  if (!signature) return NextResponse.json({ error: 'Missing signature' }, { status: 400 });
+
+  const rawBody = await request.text();  // MUST use raw body for signature verification
+
+  // Verify HMAC signature (simplified — real Stripe SDK does the full verification)
+  const expected = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(rawBody).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
+  }
+
+  const event = JSON.parse(rawBody);
+  // Process the event...
+  console.log('Stripe event:', event.type);
+
+  return NextResponse.json({ received: true });
+}
+
+// Tests
+describe('POST /api/products', () => {
+  it('rejects without auth', async () => {
+    const res = await fetch('http://localhost:3000/api/products', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'A', price: 10, category: 'books' }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+```
+
+**Expected Output:**
+```
+GET /api/products?category=books&limit=10 -> JSON list, cached 60s
+POST /api/products (with auth) -> 201 with new product
+PATCH /api/products/1 -> updates fields
+DELETE /api/products/1 -> 204 No Content
+GET /api/stream -> SSE stream with 5 events (1 per second)
+POST /api/webhook/stripe -> verifies signature, processes event
+```
+
+**Stretch Challenges:**
+- [ ] Add rate limiting via IP tracking in a KV store
+- [ ] Add OpenAPI/Swagger spec generation
+- [ ] Add CORS handling for cross-origin requests
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When should you use Route Handlers vs Server Actions?
+**Q2:** Difference between NextRequest and standard Request?
+**Q3:** Write a basic POST handler with JSON validation. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Are GET Route Handlers cached by default in Next.js 15?
+**Q5:** A junior parses body with request.json() then verifies signature — explain the bug.
+**Q6:** How do you handle dynamic route params like [id] in a Route Handler?
+
+### Day 7 — Application
+**Q7:** Build a streaming SSE endpoint for real-time notifications.
+**Q8:** A PR's webhook endpoint doesn't verify signatures — diagnose security risk.
+**Q9:** When would you choose Edge runtime over Node.js runtime?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare Server Actions, Route Handlers, and external API in Next.js — when to use each?"
+**Q11:** Draw: Route Handler request flow with middleware → handler → response.
+**Q12:** ★ System design: "Design the API layer for a mobile app + web Next.js app sharing the same backend — auth, versioning, rate limiting."

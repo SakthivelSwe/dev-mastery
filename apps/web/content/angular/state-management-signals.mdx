@@ -181,3 +181,235 @@ A: **No, `toSignal` handles it automatically!**
 This is one of the greatest benefits of the new `rxjs-interop` package.
 When you call `toSignal()`, it binds itself to the exact *Injection Context* it was called in (in this case, the Component). 
 When Angular destroys the Component, it destroys the Injection Context. `toSignal` detects this destruction and instantly, automatically unsubscribes from the underlying Observable stream! It completely eliminates the notorious RxJS memory leak problem and removes the need for the `takeUntilDestroyed()` boilerplate.
+
+## FEYNMAN CHECK
+
+### Explain Signals State Management Like I'm 10 Years Old
+> Signals-based state management is Angular's alternative to NgRx for apps that don't need the full Redux overhead. Instead of actions/reducers/selectors, you create a SERVICE with signals: signal() for raw state, computed() for derived state, and methods that call .set()/.update() to transition state. Multiple components inject the same service — because it is providedIn: 'root', they all share the SAME signal instances. When one component updates a signal, ALL components that read it automatically re-render. The non-obvious depth: you can compose multiple signal services (AuthStore, CartStore, UIStore) using computed() to derive cross-store computed values — like computed(() => cartStore.items().filter(i => productStore.getById(i.id).inStock)).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you use NgRx vs signals state management?**
+> **A:** Choose NGRX when: you need Redux DevTools time-travel debugging, you have complex reducer logic across many actions, you need action/effect traceability for auditing, you have a very large team with strict state discipline, or you need the Effects system for complex async flows. Choose SIGNALS when: the app is medium complexity, you want simpler code, components need shared state without the ceremony, or you're building a new app without legacy NgRx. Signals handle 80% of state management needs with 20% of the code. NgRx's real advantage is AUDITABILITY and TOOLING, not capability.
+
+**Q2: Mental model for SignalStore (NgRx SignalStore)?**
+> **A:** NgRx 17+ ships SignalStore — a hybrid that uses signals internally but adds NgRx patterns: withState() for initial state, withComputed() for derived signals, withMethods() for state transitions, withHooks() for lifecycle. It gives you the signals reactivity without building your own store from scratch, while preserving ability to use Effects for complex async. The output is an Angular service using signals under the hood — injectable, reactive, and compatible with DevTools.
+
+**Q3: Most dangerous misconception about signals state management?**
+> **A:** Signals automatically handle async state (loading, error, data):
+> ```typescript
+> // WRONG: this is incomplete — no loading/error state
+> @Injectable({ providedIn: 'root' })
+> export class UserStore {
+>   users = signal<User[]>([]);
+>   loadUsers() {
+>     this.http.get('/api/users').subscribe(users => this.users.set(users));
+>   }
+> }
+>
+> // CORRECT: always model the full async state shape
+> interface AsyncState<T> { data: T | null; loading: boolean; error: string | null; }
+> users = signal<AsyncState<User[]>>({ data: null, loading: false, error: null });
+>
+> loadUsers() {
+>   this.users.update(s => ({ ...s, loading: true, error: null }));
+>   this.http.get<User[]>('/api/users').subscribe({
+>     next: data => this.users.set({ data, loading: false, error: null }),
+>     error: err => this.users.update(s => ({ ...s, loading: false, error: err.message })),
+>   });
+> }
+> ```
+
+**Q4: How do you handle optimistic updates with signals?**
+> **A:** Optimistic update pattern: (1) Immediately update the local signal (fast UI). (2) Call the API. (3) On success: replace with server-confirmed state. (4) On error: revert to pre-update state. With signals: const previous = this.items(); items.update(items => [...items, newItem]); http.post().subscribe({ error: () => this.items.set(previous) }). This gives instant UI feedback while being resilient to server failures.
+
+**Q5: FAANG-grade definition of signals state management.**
+> **A:** "Angular signals-based state management uses injectable services with signal() primitives for mutable state, computed() for derived state, and effect() for side effects — providing shared reactive state across components without NgRx ceremony — with the full async state shape (data, loading, error) modelled explicitly, optimistic updates via state snapshotting and rollback, cross-store computed values via computed() reading multiple service signals, and NgRx SignalStore (Angular 17+) providing a structured, tooling-compatible signals state store for larger applications."
+
+## BUILD
+
+### 🏗️ Mini Project: Multi-Store Signals App — Auth + Products + UI Stores
+
+**What you will build:** Three signal stores: AuthStore (user session), ProductStore (product list with async loading), UIStore (theme, sidebar state) — with cross-store computed values and effect() for localStorage persistence.
+**Why this project:** Forces multi-store composition, async state modelling, and cross-store computed values.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new signals-stores --standalone --routing false
+cd signals-stores
+ng generate service stores/auth-store
+ng generate service stores/product-store
+ng generate service stores/ui-store
+```
+
+#### Step 2 — Auth Store
+```typescript
+// auth-store.service.ts
+import { Injectable, signal, computed, effect } from '@angular/core';
+
+export interface User { id: string; name: string; role: 'admin' | 'user'; email: string; }
+
+@Injectable({ providedIn: 'root' })
+export class AuthStore {
+  private _user = signal<User | null>(null);
+  private _loading = signal(false);
+
+  user = this._user.asReadonly();
+  isLoggedIn = computed(() => this._user() !== null);
+  isAdmin = computed(() => this._user()?.role === 'admin');
+  loading = this._loading.asReadonly();
+
+  constructor() {
+    effect(() => {
+      const user = this._user();
+      if (user) localStorage.setItem('user', JSON.stringify(user));
+      else localStorage.removeItem('user');
+    });
+    const saved = localStorage.getItem('user');
+    if (saved) this._user.set(JSON.parse(saved));
+  }
+
+  login(email: string, password: string): Promise<void> {
+    this._loading.set(true);
+    return new Promise(resolve => setTimeout(() => {
+      this._user.set({ id: '1', name: 'Ana Dev', role: 'admin', email });
+      this._loading.set(false);
+      resolve();
+    }, 500));
+  }
+
+  logout() { this._user.set(null); }
+}
+```
+
+#### Step 3 — Product Store With Full Async State
+```typescript
+// product-store.service.ts
+import { Injectable, signal, computed, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+
+export interface Product { id: number; title: string; price: number; category: string; }
+interface AsyncState<T> { data: T | null; loading: boolean; error: string | null; }
+
+@Injectable({ providedIn: 'root' })
+export class ProductStore {
+  private http = inject(HttpClient);
+  private state = signal<AsyncState<Product[]>>({ data: null, loading: false, error: null });
+
+  products   = computed(() => this.state().data ?? []);
+  isLoading  = computed(() => this.state().loading);
+  error      = computed(() => this.state().error);
+  hasProducts= computed(() => this.products().length > 0);
+
+  categories = computed(() => [...new Set(this.products().map(p => p.category))]);
+
+  load() {
+    this.state.update(s => ({ ...s, loading: true, error: null }));
+    this.http.get<Product[]>('https://fakestoreapi.com/products').subscribe({
+      next: data => this.state.set({ data, loading: false, error: null }),
+      error: err => this.state.update(s => ({ ...s, loading: false, error: err.message })),
+    });
+  }
+
+  getByCategory(cat: string) {
+    return computed(() => this.products().filter(p => p.category === cat));
+  }
+}
+```
+
+#### Step 4 — Cross-Store Computed
+```typescript
+// app.component.ts — reads from multiple stores
+import { Component, inject, computed } from '@angular/core';
+import { AuthStore } from './stores/auth-store.service';
+import { ProductStore } from './stores/product-store.service';
+
+@Component({
+  standalone: true,
+  template: `
+    @if (!auth.isLoggedIn()) {
+      <button (click)="auth.login('a@b.com', 'pass')">Login</button>
+    } @else {
+      <p>Welcome {{ auth.user()?.name }}</p>
+      <p>Role: {{ auth.user()?.role }}</p>
+      @if (auth.isAdmin()) { <p>Admin products: {{ adminProductCount() }}</p> }
+      @if (productStore.isLoading()) { <p>Loading...</p> }
+      @for (p of productStore.products(); track p.id) { <p>{{ p.title }}</p> }
+    }
+  `,
+})
+export class AppComponent {
+  auth = inject(AuthStore);
+  productStore = inject(ProductStore);
+
+  // Cross-store computed — derived from both stores
+  adminProductCount = computed(() =>
+    this.auth.isAdmin() ? this.productStore.products().length : 0
+  );
+
+  ngOnInit() { this.productStore.load(); }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('AuthStore', () => {
+  let store: AuthStore;
+  beforeEach(() => { TestBed.configureTestingModule({}); store = TestBed.inject(AuthStore); store.logout(); });
+
+  it('is not logged in initially', () => { expect(store.isLoggedIn()).toBe(false); });
+
+  it('logs in and sets user', async () => {
+    await store.login('test@a.com', 'pass');
+    expect(store.isLoggedIn()).toBe(true);
+    expect(store.user()?.email).toBe('test@a.com');
+  });
+
+  it('isAdmin reflects user role', async () => {
+    await store.login('test@a.com', 'pass');
+    expect(store.isAdmin()).toBe(true);
+  });
+});
+```
+
+**Expected Output:**
+```
+Before login: not logged in state
+Login -> user signal set, isLoggedIn true, isAdmin computed
+Load products -> loading: true, then products list
+Admin sees product count cross-store computed
+Refresh page -> auth state restored from localStorage
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add NgRx SignalStore for the ProductStore
+- [ ] Add DevTools instrumentation using @angular/devtools
+- [ ] Compare bundle size: NgRx full vs signals stores for the same feature
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When should you use NgRx vs signals state management?
+**Q2:** What is the correct shape for async state (loading/error/data)?
+**Q3:** Write a signal store for a counter. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do you compose state from two different services using signals?
+**Q5:** A junior's signal store doesn't model loading state — what breaks?
+**Q6:** How do optimistic updates work with signals?
+
+### Day 7 — Application
+**Q7:** Build a notifications store with a list of messages and dismiss functionality.
+**Q8:** A PR reads a signal in effect() and also sets a signal — explain the risk.
+**Q9:** What is NgRx SignalStore and when would you choose it over a plain service?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare NgRx and signals state management — what does each excel at?"
+**Q11:** Draw: reactive data flow for a signals-based app — store, computed, component, DOM.
+**Q12:** ★ System design: "Design state architecture for a 50-feature Angular SPA — which state goes in signals, which needs NgRx?"

@@ -212,3 +212,339 @@ A:
 - Multi-step wizard forms
 
 The two approaches can be combined: React Hook Form handles client-side validation/UX, and on submit it calls a Server Action for the server-side operation. This gives you the best of both worlds — great UX with progressive enhancement.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Forms Like I'm 10 Years Old
+> Next.js forms use the standard HTML <form> tag but with a Server Action as the action prop: <form action={createPost}>. When submitted, the Server Action runs on the server, accesses the database, and returns either a success state or validation errors. React 19's useFormState hook captures the action's return value for error display. useFormStatus gives you the pending state during submission. The big win: forms work WITHOUT JavaScript loaded — pure HTML POST submission falls back to a server-rendered response. The non-obvious depth: file uploads work the same way — Server Actions receive FormData with files, you process them server-side (validate size/type, save to S3, store URL in DB). No multipart parsing library needed, no API endpoint to write — the entire upload flow is one Server Action.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does form validation work end-to-end?**
+> **A:** Three layers: (1) BROWSER: HTML5 required, pattern, minLength attributes — instant feedback, but bypassable. (2) CLIENT JS: React + Zod schema for live validation as user types — better UX, also bypassable. (3) SERVER: ALWAYS re-validate in the Server Action with the same Zod schema — non-bypassable, source of truth. Pattern: share the Zod schema between client and server via a /lib/validation.ts module — single source of truth, type-safe on both sides. Server Action returns { errors: result.error.flatten().fieldErrors } which useFormState exposes to the form for inline display.
+
+**Q2: Mental model for useFormState + useFormStatus?**
+> **A:** useFormState(action, initialState) wraps a Server Action — returns [state, formAction]. Pass formAction to <form action={formAction}>. The state is whatever your action returns (success/error object). useFormStatus is called INSIDE a child of the form (typically the submit button) — returns { pending, data, method, action }. Pattern: put useFormStatus in a separate SubmitButton component (it must be a CHILD of the form, not the form itself) — pending becomes true during submission, false when complete. This lets you disable buttons and show spinners without managing state yourself.
+
+**Q3: Most dangerous misconception about forms?**
+> **A:** Server Actions automatically prevent double-submission:
+> ```typescript
+> // WRONG: assuming user can't double-click submit
+> 'use server';
+> export async function chargeCardAction(formData: FormData) {
+>   await chargeCustomer(formData.get('amount'));  // What if user clicks twice in 100ms?
+> }
+> // Result: charged twice -> furious customer
+>
+> // CORRECT: idempotency via unique request token + DB constraint
+> 'use server';
+> export async function chargeCardAction(formData: FormData) {
+>   const idempotencyKey = formData.get('idempotency_key') as string;
+>   if (!idempotencyKey) throw new Error('Missing idempotency key');
+>
+>   const existing = await db.charge.findUnique({ where: { idempotencyKey } });
+>   if (existing) return existing;  // already processed, return same result
+>
+>   return db.charge.create({
+>     data: { idempotencyKey, amount: Number(formData.get('amount')) }
+>   });
+> }
+>
+> // Form: <input type="hidden" name="idempotency_key" value={crypto.randomUUID()} />
+> ```
+
+**Q4: How do you handle file uploads with Server Actions?**
+> **A:** <form action={uploadAction} encType="multipart/form-data"><input type="file" name="avatar" /></form>. In the Server Action: const file = formData.get('avatar') as File; const buffer = Buffer.from(await file.arrayBuffer()); — now you have the file bytes. Validate type/size (if (file.size > 5_000_000) throw 'Too large'), upload to S3/Cloudinary, store the URL. Multiple files: input multiple → formData.getAll('avatar'). The Server Action automatically handles multipart parsing — no formidable/multer needed. For large files (>4MB), use direct browser-to-S3 uploads (presigned URLs) to avoid the Next.js function size limit.
+
+**Q5: FAANG-grade definition of Next.js forms.**
+> **A:** "Next.js forms use standard HTML form elements with Server Actions as the action attribute — enabling progressive enhancement (functional without JavaScript via standard form submission) — with React 19's useFormState capturing action return values for inline validation errors, useFormStatus exposing submission pending state in child components — server-side Zod validation as the source of truth — automatic CSRF protection via Server Action ID obfuscation — multipart file upload handling via FormData.get() returning File objects — idempotency patterns via client-generated UUIDs for safe retries — and the optimistic UI pattern via useOptimistic for instant feedback before server confirmation — eliminating the traditional API endpoint + client fetch + JSON serialisation boilerplate."
+
+## BUILD
+
+### 🏗️ Mini Project: Production Form — Validation, File Upload, Optimistic UI, Progressive Enhancement
+
+**What you will build:** A profile editor form with text fields, avatar upload, Zod validation shared client/server, useFormState errors, useFormStatus loading, useOptimistic preview, and works without JS.
+**Why this project:** Forces every modern Next.js form pattern.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest forms-demo --typescript --tailwind --app
+npm install zod better-sqlite3 @types/better-sqlite3
+mkdir -p public/uploads
+```
+
+#### Step 2 — Shared Validation Schema
+```typescript
+// src/lib/validation.ts
+import { z } from 'zod';
+
+export const ProfileSchema = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters').max(100),
+  email: z.string().email('Invalid email format'),
+  bio: z.string().max(500, 'Bio must be less than 500 characters').optional(),
+});
+
+export type ProfileInput = z.infer<typeof ProfileSchema>;
+
+export const MAX_AVATAR_SIZE = 2 * 1024 * 1024;  // 2MB
+export const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+```
+
+#### Step 3 — Server Action With File Upload
+```typescript
+// src/app/profile/actions.ts
+'use server';
+import { writeFile, mkdir } from 'fs/promises';
+import path from 'path';
+import { revalidatePath } from 'next/cache';
+import { ProfileSchema, MAX_AVATAR_SIZE, ALLOWED_TYPES } from '@/lib/validation';
+import Database from 'better-sqlite3';
+
+const db = new Database('profiles.db');
+db.exec(`CREATE TABLE IF NOT EXISTS profiles (
+  id INTEGER PRIMARY KEY,
+  name TEXT, email TEXT, bio TEXT, avatar_url TEXT,
+  updated_at TEXT
+)`);
+
+export type FormState = {
+  status: 'idle' | 'success' | 'error';
+  errors?: Record<string, string[]>;
+  message?: string;
+  profile?: any;
+};
+
+export async function updateProfileAction(
+  prevState: FormState,
+  formData: FormData,
+): Promise<FormState> {
+  // Validate text fields
+  const result = ProfileSchema.safeParse({
+    name: formData.get('name'),
+    email: formData.get('email'),
+    bio: formData.get('bio') || undefined,
+  });
+
+  if (!result.success) {
+    return {
+      status: 'error',
+      errors: result.error.flatten().fieldErrors,
+      message: 'Please fix the errors below',
+    };
+  }
+
+  // Handle file upload
+  let avatarUrl: string | undefined;
+  const avatar = formData.get('avatar') as File | null;
+  if (avatar && avatar.size > 0) {
+    if (avatar.size > MAX_AVATAR_SIZE) {
+      return { status: 'error', message: 'Avatar must be less than 2MB' };
+    }
+    if (!ALLOWED_TYPES.includes(avatar.type)) {
+      return { status: 'error', message: 'Avatar must be JPEG, PNG, or WebP' };
+    }
+
+    const buffer = Buffer.from(await avatar.arrayBuffer());
+    const ext = avatar.type.split('/')[1];
+    const filename = `avatar-${Date.now()}.${ext}`;
+    const uploadDir = path.join(process.cwd(), 'public/uploads');
+    await mkdir(uploadDir, { recursive: true });
+    await writeFile(path.join(uploadDir, filename), buffer);
+    avatarUrl = `/uploads/${filename}`;
+  }
+
+  // Idempotency check (prevent double-submission)
+  const idempotencyKey = formData.get('idempotency_key') as string;
+  // ... lookup and skip if exists
+
+  // Save to DB
+  db.prepare(`INSERT OR REPLACE INTO profiles (id, name, email, bio, avatar_url, updated_at)
+    VALUES (1, ?, ?, ?, ?, ?)`).run(
+    result.data.name, result.data.email, result.data.bio ?? '',
+    avatarUrl ?? null, new Date().toISOString(),
+  );
+
+  const updated = db.prepare('SELECT * FROM profiles WHERE id = 1').get();
+  revalidatePath('/profile');
+  return { status: 'success', message: 'Profile updated', profile: updated };
+}
+```
+
+#### Step 4 — Client Form With All Patterns
+```typescript
+// src/components/ProfileForm.tsx
+'use client';
+import { useFormState, useFormStatus } from 'react-dom';
+import { useState } from 'react';
+import { updateProfileAction, FormState } from '@/app/profile/actions';
+import { ProfileSchema } from '@/lib/validation';
+
+const initialState: FormState = { status: 'idle' };
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button
+      type="submit"
+      disabled={pending}
+      className="px-4 py-2 bg-blue-500 text-white rounded disabled:bg-gray-400"
+    >
+      {pending ? 'Saving...' : 'Save Profile'}
+    </button>
+  );
+}
+
+interface Props { initialProfile: any; }
+
+export function ProfileForm({ initialProfile }: Props) {
+  const [state, formAction] = useFormState(updateProfileAction, initialState);
+  const [avatarPreview, setAvatarPreview] = useState<string | undefined>(initialProfile?.avatar_url);
+  const [clientErrors, setClientErrors] = useState<Record<string, string>>({});
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
+
+  const validateField = (name: string, value: string) => {
+    try {
+      const fieldSchema = ProfileSchema.shape[name as keyof typeof ProfileSchema.shape];
+      fieldSchema?.parse(value);
+      setClientErrors(prev => ({ ...prev, [name]: '' }));
+    } catch (err: any) {
+      setClientErrors(prev => ({ ...prev, [name]: err.errors?.[0]?.message ?? '' }));
+    }
+  };
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) setAvatarPreview(URL.createObjectURL(file));
+  };
+
+  return (
+    <form action={formAction} encType="multipart/form-data" className="space-y-4 max-w-md">
+      <input type="hidden" name="idempotency_key" value={idempotencyKey} />
+
+      <div>
+        <label className="block text-sm font-medium mb-1">Avatar</label>
+        {avatarPreview && (
+          <img src={avatarPreview} alt="Preview" className="w-20 h-20 rounded-full mb-2 object-cover" />
+        )}
+        <input type="file" name="avatar" accept="image/*" onChange={handleFile} />
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium mb-1">Name</label>
+        <input
+          name="name"
+          defaultValue={initialProfile?.name}
+          onBlur={e => validateField('name', e.target.value)}
+          className="w-full px-3 py-2 border rounded"
+        />
+        {(clientErrors.name || state.errors?.name?.[0]) && (
+          <p className="text-red-500 text-sm mt-1">{clientErrors.name || state.errors?.name?.[0]}</p>
+        )}
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium mb-1">Email</label>
+        <input
+          name="email" type="email"
+          defaultValue={initialProfile?.email}
+          onBlur={e => validateField('email', e.target.value)}
+          className="w-full px-3 py-2 border rounded"
+        />
+        {(clientErrors.email || state.errors?.email?.[0]) && (
+          <p className="text-red-500 text-sm mt-1">{clientErrors.email || state.errors?.email?.[0]}</p>
+        )}
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium mb-1">Bio</label>
+        <textarea
+          name="bio" rows={3}
+          defaultValue={initialProfile?.bio}
+          className="w-full px-3 py-2 border rounded"
+        />
+      </div>
+
+      <SubmitButton />
+
+      {state.status === 'success' && (
+        <p className="text-green-600">{state.message}</p>
+      )}
+      {state.status === 'error' && !state.errors && (
+        <p className="text-red-600">{state.message}</p>
+      )}
+    </form>
+  );
+}
+```
+
+#### Step 5 — Page + Tests
+```typescript
+// src/app/profile/page.tsx
+import Database from 'better-sqlite3';
+import { ProfileForm } from '@/components/ProfileForm';
+
+const db = new Database('profiles.db');
+
+export default function ProfilePage() {
+  const profile = db.prepare('SELECT * FROM profiles WHERE id = 1').get();
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-bold mb-6">Edit Profile</h1>
+      <ProfileForm initialProfile={profile} />
+    </main>
+  );
+}
+
+// Tests
+import { updateProfileAction } from '@/app/profile/actions';
+it('rejects too-short name', async () => {
+  const fd = new FormData();
+  fd.set('name', 'A');
+  fd.set('email', 'a@b.com');
+  const result = await updateProfileAction({ status: 'idle' }, fd);
+  expect(result.status).toBe('error');
+  expect(result.errors?.name).toBeDefined();
+});
+```
+
+**Expected Output:**
+```
+Submit form -> Server Action validates, uploads avatar, saves to DB
+Avatar preview shows before submit (URL.createObjectURL)
+Pending state: button shows "Saving..." during submission
+Validation errors: shown inline next to fields
+Disable JS -> form still POSTs, server validates and re-renders
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Replace local file upload with presigned S3 URLs
+- [ ] Add useOptimistic for instant preview before server confirms
+- [ ] Add a multi-step form wizard with shared schema
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between useFormState and useFormStatus?
+**Q2:** Three layers of form validation and why all are needed?
+**Q3:** Write a Server Action that handles a file upload. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do you prevent double-form-submission charges?
+**Q5:** A PR validates only client-side with Zod — diagnose the security issue.
+**Q6:** Why must useFormStatus be in a CHILD of the form?
+
+### Day 7 — Application
+**Q7:** Build a multi-step wizard sharing a single Zod schema across steps.
+**Q8:** A PR uses formidable to parse uploads — refactor to native Server Actions.
+**Q9:** When should large uploads go directly to S3 instead of through Next.js?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through a production form in Next.js — validation, errors, uploads, optimistic UI, idempotency."
+**Q11:** Draw: form submission lifecycle — HTML form → Server Action → validation → DB → revalidation.
+**Q12:** ★ System design: "Design a complex form system for a job-application platform — multi-step, file uploads, async validation, draft auto-save."

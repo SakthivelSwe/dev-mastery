@@ -131,3 +131,211 @@ A: `NaN` stands for "Not a Number". It is the result of an invalid mathematical 
 
 **Q: Explain the difference between `null` and `undefined`.**
 A: `undefined` means a variable has been declared in RAM, but it currently has no value. It is the engine's default placeholder. `null` is an explicit, empty value that a programmer manually assigns to signify "I deliberately want this variable to be empty". When dealing with optional API fields, you should almost always check for both.
+
+## FEYNMAN CHECK
+
+### Explain JS Data Types Like I'm 10 Years Old
+> JavaScript has 8 types — 7 PRIMITIVES (`string`, `number`, `bigint`, `boolean`, `undefined`, `null`, `symbol`) and 1 OBJECT type (which covers everything else: arrays, functions, dates, regexps, Maps, Sets, plain objects). Primitives are IMMUTABLE and PASSED BY VALUE — `let a = 5; let b = a; b = 6` leaves a as 5. Objects are MUTABLE and PASSED BY REFERENCE — two variables can point to the SAME underlying object. The non-obvious detail: `typeof null === 'object'` is a famous bug from JS's first month that can never be fixed without breaking the web. `typeof NaN === 'number'`. `typeof []` is also 'object' — use `Array.isArray()` for arrays. `number` is always a 64-bit IEEE 754 float — there is no separate int type, which is why 0.1 + 0.2 !== 0.3.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does `0.1 + 0.2` equal `0.30000000000000004`?**
+> **A:** JavaScript numbers are IEEE 754 double-precision floats. 0.1 cannot be represented exactly in binary (just like 1/3 cannot be exact in decimal); it's a repeating fraction approximated to ~17 significant digits. When you add two approximations, the rounding errors add up. The fix for money: use integers in cents (`19_99` cents = $19.99), use BigInt for arbitrary integer precision, or use a decimal library (Decimal.js).
+
+**Q2: Mental model for primitives vs objects?**
+> **A:** A primitive value is COPIED when assigned or passed; modifying the copy does NOT affect the original. An object is a REFERENCE — both variables point to the SAME memory location. `let a = {x:1}; let b = a; b.x = 5` → a.x is also 5 because a and b reference the same object. This is why "immutable update patterns" (`{...obj, x: 5}`) matter — they create a new object rather than mutate.
+
+**Q3: Most dangerous misconception?**
+> **A:** `typeof null === 'object'`:
+> ```js
+> // ❌ Famous bug — typeof null is 'object', not 'null'
+> typeof null;        // 'object'
+> typeof undefined;   // 'undefined'
+> typeof [];          // 'object' (yes, arrays are objects)
+> typeof function(){};// 'function' (special case)
+> typeof NaN;         // 'number' (NaN is a number)
+>
+> // ✅ Robust type checks
+> Array.isArray(x);                          // for arrays
+> x === null;                                 // for null
+> Object.prototype.toString.call(x);         // returns '[object Date]', '[object RegExp]', etc.
+> ```
+
+**Q4: How does the JS engine store these types internally?**
+> **A:** V8 uses TAGGED POINTERS — every value is a 64-bit pointer where the LOW BITS indicate the type tag (e.g., 1 = small integer "Smi", 0 = pointer to heap object). Small integers (-2^31 to 2^31-1) are stored INLINE in the pointer — no heap allocation, blazing fast. Floats, large numbers, strings, and objects live on the heap with a hidden "Map" pointer at offset 0 describing the shape (used for property-access optimisation). This is why monomorphic code (same shape) is 10× faster than polymorphic.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript values are typed at runtime as one of 7 primitive types (string, number, bigint, boolean, undefined, null, symbol) or as an object — primitives are immutable and copy-by-value, objects are mutable references stored on the heap with V8 hidden classes describing their shape — with type coercion governed by abstract equality and string/number conversion algorithms that produce many of the language's famous footguns."
+
+## BUILD
+
+### 🏗️ Mini Project: Money Library That Avoids Float Errors
+
+**What you will build:** A small Money class that stores amounts as INTEGER cents internally — avoiding the 0.1 + 0.2 problem — with add/subtract/format methods and currency-symbol support.
+**Why this project:** Forces understanding of float limits, integer math, and the primitive-vs-object distinction.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-money && cd js-money
+npm init -y
+npm install -D vitest
+ni money.js, money.test.js -ItemType File
+```
+
+#### Step 2 — Money Class
+```js
+// money.js
+export class Money {
+  /** @param {number} cents - integer cents (NOT dollars) */
+  constructor(cents, currency = 'USD') {
+    if (!Number.isInteger(cents)) {
+      throw new TypeError(`Money requires integer cents, got ${cents}`);
+    }
+    this._cents = cents;
+    this._currency = currency;
+    Object.freeze(this);   // immutable
+  }
+
+  static fromDollars(dollars, currency = 'USD') {
+    // Multiply by 100 then round to avoid 1.10 * 100 = 110.00000000000001
+    return new Money(Math.round(dollars * 100), currency);
+  }
+
+  add(other) {
+    this._sameCurrency(other);
+    return new Money(this._cents + other._cents, this._currency);
+  }
+
+  subtract(other) {
+    this._sameCurrency(other);
+    return new Money(this._cents - other._cents, this._currency);
+  }
+
+  multiply(factor) {
+    return new Money(Math.round(this._cents * factor), this._currency);
+  }
+
+  format(locale = 'en-US') {
+    return new Intl.NumberFormat(locale, {
+      style: 'currency', currency: this._currency,
+    }).format(this._cents / 100);
+  }
+
+  _sameCurrency(other) {
+    if (this._currency !== other._currency) {
+      throw new Error(`Currency mismatch: ${this._currency} vs ${other._currency}`);
+    }
+  }
+}
+```
+
+#### Step 3 — Float Bug Demo (Before)
+```js
+// demo.js
+console.log('Float math:', 0.1 + 0.2);          // 0.30000000000000004
+console.log('Float compare:', 0.1 + 0.2 === 0.3); // false
+
+import { Money } from './money.js';
+const a = Money.fromDollars(0.10);
+const b = Money.fromDollars(0.20);
+const c = a.add(b);
+console.log('Money math:', c.format());          // $0.30 — exact
+```
+
+#### Step 4 — Error Handling: BigInt for Very Large Amounts
+```js
+// For amounts > Number.MAX_SAFE_INTEGER (2^53 - 1)
+export class BigMoney {
+  constructor(cents) {
+    this._cents = typeof cents === 'bigint' ? cents : BigInt(cents);
+  }
+  add(other) { return new BigMoney(this._cents + other._cents); }
+  toString() { return (this._cents / 100n) + '.' + String(this._cents % 100n).padStart(2, '0'); }
+}
+
+const huge = new BigMoney(10n ** 20n);
+const more = new BigMoney(50n);
+console.log(huge.add(more).toString());
+```
+
+#### Step 5 — Tests
+```js
+// money.test.js
+import { describe, it, expect } from 'vitest';
+import { Money } from './money.js';
+
+describe('Money', () => {
+  it('avoids 0.1 + 0.2 float bug', () => {
+    const a = Money.fromDollars(0.10);
+    const b = Money.fromDollars(0.20);
+    expect(a.add(b).format()).toBe('$0.30');
+  });
+  it('rejects non-integer cents', () => {
+    expect(() => new Money(1.5)).toThrow(TypeError);
+  });
+  it('is immutable (frozen)', () => {
+    const m = new Money(100);
+    expect(() => { m._cents = 999; }).toThrow();
+  });
+  it('refuses to mix currencies', () => {
+    const usd = new Money(100, 'USD');
+    const eur = new Money(100, 'EUR');
+    expect(() => usd.add(eur)).toThrow(/Currency mismatch/);
+  });
+  it('multiply rounds correctly', () => {
+    const m = Money.fromDollars(10);
+    expect(m.multiply(0.30).format()).toBe('$3.00');
+  });
+});
+```
+
+**Expected Output:**
+```
+Float math: 0.30000000000000004
+Float compare: false
+Money math: $0.30
+
+# All tests pass:
+✓ avoids 0.1 + 0.2 float bug
+✓ rejects non-integer cents
+✓ is immutable (frozen)
+✓ refuses to mix currencies
+✓ multiply rounds correctly
+```
+
+**Stretch Challenges:**
+- [ ] Add a Currency exchange method that pulls rates from an API
+- [ ] Make Money serialise/deserialise to JSON safely
+- [ ] Compare Money to Stripe's amount handling (smallest currency unit)
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name the 7 primitive types in JS.
+**Q2:** Why does `typeof null` return `'object'`?
+**Q3:** Write a one-liner that proves `0.1 + 0.2 !== 0.3`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between pass-by-value and pass-by-reference. Give a 4-line example for each.
+**Q5:** A junior compares two arrays with `===` and gets unexpected false. Diagnose.
+**Q6:** Refactor for safety:
+```js
+const price = 19.99;
+const tax = price * 0.10;
+const total = price + tax;   // 21.989000000000003 — leaked to UI!
+```
+
+### Day 7 — Application
+**Q7:** Build an immutable Set wrapper using `Object.freeze` and `structuredClone`.
+**Q8:** A PR adds `if (x == null)` — explain what types this matches and why it's actually clever.
+**Q9:** When should you reach for BigInt instead of number?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every implicit type coercion JavaScript performs in equality comparisons."
+**Q11:** Draw: how V8 stores small integers vs floats vs strings — Smi tagging, heap pointers, hidden classes.
+**Q12:** ★ System design: "Design the money/currency layer for a global payments SaaS — what types, what precision, what serialisation?"

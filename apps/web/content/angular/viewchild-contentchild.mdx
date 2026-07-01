@@ -167,3 +167,203 @@ A: No! This is a massive trap. `*ngIf` completely removes the element from the D
 
 **Q: What is the `{ static: true }` flag in `@ViewChild`?**
 A: If you write `@ViewChild('myDiv', { static: true })`, you are guaranteeing to the Angular Compiler that this element will *always* be visible and is *never* inside an `*ngIf` or `*ngFor`. Because you guarantee it is static, Angular will actually resolve the query early, making it available inside `ngOnInit()` instead of waiting for `ngAfterViewInit()`.
+
+## FEYNMAN CHECK
+
+### Explain @ViewChild and @ContentChild Like I'm 10 Years Old
+> @ViewChild and @ContentChild are Angular's way of getting direct references to child elements, components, or directives from your TypeScript code. @ViewChild grabs elements from the component's OWN template. @ContentChild grabs elements projected into the component via ng-content (content that a PARENT passes into your component's slot). Think of @ViewChild as "grab my own child" and @ContentChild as "grab what someone gave me to hold." The non-obvious depth: @ViewChild references are not available until ngAfterViewInit fires — before that they are undefined. @ContentChild references are not available until ngAfterContentInit.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When is @ViewChild set and when is it undefined?**
+> **A:** @ViewChild is undefined in the constructor and ngOnInit because the view hasn't been rendered yet. Angular sets it in ngAfterViewInit when the component's template DOM is fully initialised. If you use the @ViewChild with { static: true }, it's resolved in ngOnInit but ONLY if the reference is NOT inside *ngIf, *ngFor, or @if blocks (because those may not yet exist). The default { static: false } resolves after the full view is rendered — always use false for conditional content.
+
+**Q2: Mental model for ng-content and @ContentChild?**
+> **A:** ng-content is Angular's content projection — a SLOT inside your component's template where a parent can inject content. @ContentChild lets the component access what was projected into that slot. Example: a tabs component has ng-content; the parent projects tab panels. The tabs component uses @ContentChild(TabPanelComponent) to get a reference to the first panel, or @ContentChildren(TabPanelComponent) to get ALL panels. This enables reusable "container components" that work with arbitrary projected content.
+
+**Q3: Most dangerous misconception about @ViewChild?**
+> **A:** @ViewChild({static: true}) always works:
+> ```typescript
+> // WRONG: static: true inside *ngIf — reference will be undefined
+> @ViewChild('myInput', { static: true }) myInput!: ElementRef;
+>
+> @Component({ template: \'<div *ngIf="show"><input #myInput></div>\' })
+> export class MyComponent implements OnInit {
+>   ngOnInit() { this.myInput?.nativeElement.focus(); }
+>   // myInput is UNDEFINED — the *ngIf hasn't rendered yet
+> }
+>
+> // CORRECT: Use static: false and access in ngAfterViewInit
+> @ViewChild('myInput', { static: false }) myInput?: ElementRef;
+> ngAfterViewInit() { this.myInput?.nativeElement.focus(); }
+> ```
+
+**Q4: What is the difference between ViewChild and ViewChildren?**
+> **A:** @ViewChild gets the FIRST matching element/component/directive. @ViewChildren gets ALL matches as a QueryList — a live collection that updates when elements are added/removed (e.g., when *ngFor adds new items). QueryList has an Observable changes$ that emits whenever the list changes. Use @ViewChild for unique references (one form, one chart component). Use @ViewChildren for collections (multiple form fields, a list of item components you need to call methods on).
+
+**Q5: FAANG-grade definition of @ViewChild/@ContentChild.**
+> **A:** "@ViewChild and @ContentChild are Angular queries that resolve references to child elements, components, or directives after the view lifecycle — @ViewChild querying the component's own template DOM (available after ngAfterViewInit), @ContentChild querying projected ng-content nodes (available after ngAfterContentInit) — with @ViewChildren/@ContentChildren returning live QueryList collections for multiple matches — supporting ElementRef (DOM node), TemplateRef (template reference), or component/directive class type queries — and static: true for resolution before change detection (only valid for non-conditional elements in OnInit)."
+
+## BUILD
+
+### 🏗️ Mini Project: Custom Accordion — Parent Queries Child Components via @ContentChildren
+
+**What you will build:** A reusable accordion widget where the parent AccordionComponent uses @ContentChildren to query all projected AccordionPanelComponents — controlling which panel is open without parent knowing the panel contents.
+**Why this project:** Forces @ContentChildren, QueryList.changes, and the container-child component pattern.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new viewchild-demo --standalone --routing false
+ng generate component accordion --standalone
+ng generate component accordion-panel --standalone
+```
+
+#### Step 2 — AccordionPanel Component
+```typescript
+// accordion-panel.component.ts
+import { Component, Input, signal } from '@angular/core';
+
+@Component({
+  standalone: true,
+  selector: 'app-accordion-panel',
+  template: `
+    <div class="panel">
+      <div class="header" (click)="toggle()">
+        <strong>{{ title }}</strong>
+        <span>{{ isOpen() ? '-' : '+' }}</span>
+      </div>
+      <div class="body" [style.display]="isOpen() ? 'block' : 'none'">
+        <ng-content/>
+      </div>
+    </div>
+  `,
+})
+export class AccordionPanelComponent {
+  @Input({ required: true }) title = '';
+  isOpen = signal(false);
+  open()   { this.isOpen.set(true); }
+  close()  { this.isOpen.set(false); }
+  toggle() { this.isOpen.update(v => !v); }
+}
+```
+
+#### Step 3 — Accordion Container With @ContentChildren
+```typescript
+// accordion.component.ts
+import { Component, ContentChildren, QueryList, AfterContentInit, Input } from '@angular/core';
+import { AccordionPanelComponent } from '../accordion-panel/accordion-panel.component';
+
+@Component({
+  standalone: true,
+  selector: 'app-accordion',
+  template: '<ng-content/>',   // just a slot for panels
+})
+export class AccordionComponent implements AfterContentInit {
+  @Input() allowMultiple = false;
+  @ContentChildren(AccordionPanelComponent) panels!: QueryList<AccordionPanelComponent>;
+
+  ngAfterContentInit() {
+    // Listen for changes if panels are added/removed dynamically
+    this.panels.changes.subscribe(() => console.log('Panel count changed:', this.panels.length));
+
+    // Subscribe to each panel's isOpen to enforce single-open mode
+    if (!this.allowMultiple) {
+      this.panels.forEach(panel => {
+        // Override toggle to close siblings
+        const originalToggle = panel.toggle.bind(panel);
+        panel.toggle = () => {
+          const wasOpen = panel.isOpen();
+          this.panels.forEach(p => p.close());
+          if (!wasOpen) panel.open();
+        };
+      });
+    }
+  }
+
+  openAll()  { this.panels.forEach(p => p.open()); }
+  closeAll() { this.panels.forEach(p => p.close()); }
+}
+```
+
+#### Step 4 — Usage and @ViewChild for form focus
+```typescript
+// app.component.ts
+import { Component, ViewChild, AfterViewInit } from '@angular/core';
+import { AccordionComponent } from './accordion/accordion.component';
+import { AccordionPanelComponent } from './accordion-panel/accordion-panel.component';
+
+@Component({
+  standalone: true,
+  imports: [AccordionComponent, AccordionPanelComponent],
+  template: `
+    <h1>Accordion Demo</h1>
+    <button (click)="accordion.openAll()">Open All</button>
+    <button (click)="accordion.closeAll()">Close All</button>
+    <app-accordion #accordion>
+      <app-accordion-panel title="Section 1">Content 1</app-accordion-panel>
+      <app-accordion-panel title="Section 2">Content 2</app-accordion-panel>
+      <app-accordion-panel title="Section 3">Content 3</app-accordion-panel>
+    </app-accordion>
+  `,
+})
+export class AppComponent {
+  @ViewChild('accordion') accordion!: AccordionComponent;
+}
+```
+
+#### Step 5 — Tests
+```typescript
+it('opens first panel on open()', () => {
+  const fixture = TestBed.createComponent(AccordionPanelComponent);
+  fixture.componentRef.setInput('title', 'Test');
+  fixture.detectChanges();
+  fixture.componentInstance.open();
+  expect(fixture.componentInstance.isOpen()).toBe(true);
+});
+
+it('AccordionComponent queries content children', () => {
+  const fixture = TestBed.createComponent(TestHostAccordionComponent);
+  fixture.detectChanges();
+  expect(fixture.componentInstance.accordion.panels.length).toBe(3);
+});
+```
+
+**Expected Output:**
+```
+Click panel header -> opens (closes siblings in single mode)
+Open All -> all panels open (allowMultiple mode)
+Close All -> all panels close
+Tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add @ViewChild to an input element and auto-focus it on init
+- [ ] Add animations to panel open/close using Angular Animations
+- [ ] Add keyboard navigation (arrow keys to move between panels)
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between @ViewChild and @ContentChild?
+**Q2:** When is @ViewChild available?
+**Q3:** Write a @ViewChild that accesses a child component method. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When would you use @ViewChildren instead of @ViewChild?
+**Q5:** A junior uses @ViewChild({static: true}) inside *ngIf — diagnose.
+**Q6:** What is QueryList.changes and when do you use it?
+
+### Day 7 — Application
+**Q7:** Build a tab group where the parent queries all tab components via @ContentChildren.
+**Q8:** A PR accesses @ViewChild in ngOnInit and gets undefined — fix.
+**Q9:** How would you imperatively scroll a list item into view using @ViewChild?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain @ViewChild vs @ContentChild — what is content projection and how does @ContentChildren enable compound components?"
+**Q11:** Draw: component tree showing template vs projected content boundaries.
+**Q12:** ★ System design: "Design a reusable data-grid component that accepts sortable column definitions via content projection."

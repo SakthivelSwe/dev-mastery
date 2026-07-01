@@ -133,3 +133,231 @@ useEffect(() => {
   return () => clearInterval(timerId); 
 }, []);
 ```
+
+## FEYNMAN CHECK
+
+### Explain setTimeout vs setInterval Like I'm 10 Years Old
+> `setTimeout(fn, ms)` schedules fn to run ONCE after at least ms milliseconds. `setInterval(fn, ms)` schedules fn to run REPEATEDLY every ms milliseconds. Both return a handle you can cancel with clearTimeout/clearInterval. The non-obvious traps: (1) ms is the MINIMUM delay, not exact — the runtime guarantees "at least" ms, but heavy load can push it later. (2) setInterval does NOT wait for the previous run to FINISH — if your handler takes 200ms and interval is 100ms, runs overlap and queue up. (3) Browsers throttle timers in BACKGROUND TABS to 1000ms minimum (Chrome) to save battery. (4) For animations, NEVER use setInterval — use requestAnimationFrame which syncs with display refresh. Most modern code uses a "self-rescheduling setTimeout" instead of setInterval for predictable spacing.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does setInterval often misbehave at scale?**
+> **A:** setInterval queues a callback at fixed intervals from the START of the timer — not from the END of the previous handler. If handler takes 80ms and interval is 100ms, you get a 20ms gap. If handler suddenly takes 150ms (network slow, GC pause), the runtime queues TWO handlers — they back up and may run back-to-back. Self-rescheduling setTimeout avoids this: `function tick() { doWork(); setTimeout(tick, 100); }` — always has the FULL interval after the work finishes.
+
+**Q2: Mental model for timers in the event loop?**
+> **A:** Timers go into the TIMERS PHASE queue. The event loop processes them in order of expiry time. setTimeout(fn, 0) actually has a minimum delay of 1ms historically (and 4ms after the 4th nested call). `queueMicrotask` or `setImmediate` are faster alternatives if you just want "as soon as possible after current sync code." Background tabs throttle to 1000ms minimum to save CPU.
+
+**Q3: Most dangerous misconception?**
+> **A:** clearInterval/clearTimeout handle still leaks the closure:
+> ```js
+> // ❌ Closure prevents GC even after clear
+> function setup() {
+>   const bigData = new Array(1e6).fill({ heavy: true });
+>   const id = setInterval(() => {
+>     console.log(bigData[0]);   // captures bigData
+>   }, 1000);
+>   // Even after clearInterval(id), if id is reachable, bigData stays
+> }
+>
+> // ✅ Null the handler reference when canceling
+> let handler = () => doWork();
+> const id = setInterval(handler, 1000);
+> clearInterval(id);
+> handler = null;   // releases the closure
+> ```
+
+**Q4: How do timers interact with requestAnimationFrame?**
+> **A:** requestAnimationFrame is SYNCHRONISED with the browser's vsync (typically 60Hz = 16.67ms per frame). Tasks run BETWEEN microtask drain and the paint step. setTimeout/setInterval are macrotasks — fire on their own schedule, may run multiple times per frame (drops frames) or be delayed by GC. For animations: rAF. For "do work later but not on every frame": setTimeout. For "polling": prefer event-based APIs (Observable, IntersectionObserver, MutationObserver) over interval polling.
+
+**Q5: FAANG-grade definition?**
+> **A:** "setTimeout schedules a single callback to fire after at least the specified milliseconds (minimum clamped to 4ms after 5 nested calls per HTML spec); setInterval schedules callbacks at fixed-rate intervals from timer creation, not accounting for handler duration — both processed in the timers phase of the event loop, throttled to 1000ms in inactive tabs, and superseded by requestAnimationFrame for visual updates and by event-driven APIs for state-change reactions."
+
+## BUILD
+
+### 🏗️ Mini Project: Self-Rescheduling Timer vs setInterval — Drift Comparison
+
+**What you will build:** Two timers running the same heavy workload — one with setInterval, one with self-rescheduling setTimeout — visualised with a real-time chart showing how interval drifts as workload increases.
+**Why this project:** Forces empirical observation of interval drift — the #1 timer bug in production.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-timers && cd js-timers
+ni index.html, app.js -ItemType File
+```
+
+#### Step 2 — HTML
+```html
+<!DOCTYPE html><html><body>
+  <button id="start">Start both timers</button>
+  <button id="stop">Stop</button>
+  <h3>setInterval (drifts):</h3><pre id="interval"></pre>
+  <h3>Self-rescheduling setTimeout (stable):</h3><pre id="timeout"></pre>
+  <script type="module" src="app.js"></script>
+</body></html>
+```
+
+#### Step 3 — Two Timer Implementations
+```js
+// app.js
+const $interval = document.getElementById('interval');
+const $timeout  = document.getElementById('timeout');
+
+let intervalId, timeoutId;
+let intervalLast, timeoutLast;
+
+function heavyWork(ms = 20) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {}   // synchronous CPU burn
+}
+
+document.getElementById('start').onclick = () => {
+  $interval.textContent = '';
+  $timeout.textContent  = '';
+  intervalLast = timeoutLast = performance.now();
+
+  // ─── setInterval: drifts as work piles up ───
+  intervalId = setInterval(() => {
+    const now = performance.now();
+    const elapsed = (now - intervalLast).toFixed(0);
+    $interval.textContent += `tick — elapsed since last: ${elapsed}ms\n`;
+    intervalLast = now;
+    heavyWork(20);   // simulate work
+  }, 100);
+
+  // ─── Self-rescheduling setTimeout: stable spacing ───
+  function tick() {
+    const now = performance.now();
+    const elapsed = (now - timeoutLast).toFixed(0);
+    $timeout.textContent += `tick — elapsed since last: ${elapsed}ms\n`;
+    timeoutLast = now;
+    heavyWork(20);
+    timeoutId = setTimeout(tick, 100);
+  }
+  timeoutId = setTimeout(tick, 100);
+};
+
+document.getElementById('stop').onclick = () => {
+  clearInterval(intervalId);
+  clearTimeout(timeoutId);
+};
+```
+
+#### Step 4 — Error Handling: Throttling + Cleanup
+```js
+// Robust timer wrapper
+export function createTimer(fn, intervalMs) {
+  let id = null;
+  let cancelled = false;
+
+  async function tick() {
+    if (cancelled) return;
+    const start = performance.now();
+    try { await fn(); }
+    catch (e) { console.error('Timer fn threw:', e); }
+    const elapsed = performance.now() - start;
+    const delay = Math.max(0, intervalMs - elapsed);   // adjust for work time
+    if (!cancelled) id = setTimeout(tick, delay);
+  }
+
+  return {
+    start() { if (id === null) tick(); },
+    stop()  { cancelled = true; clearTimeout(id); id = null; },
+  };
+}
+
+// Usage
+const timer = createTimer(async () => {
+  await fetch('/heartbeat');
+}, 5000);
+timer.start();
+// timer.stop();   when done
+```
+
+#### Step 5 — Tests
+```js
+// timers.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { createTimer } from './app.js';
+
+describe('createTimer', () => {
+  it('starts and stops cleanly', async () => {
+    vi.useFakeTimers();
+    let count = 0;
+    const t = createTimer(() => count++, 100);
+    t.start();
+    await vi.advanceTimersByTimeAsync(350);
+    expect(count).toBeGreaterThanOrEqual(2);
+    t.stop();
+    const after = count;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(count).toBe(after);   // no more increments after stop
+    vi.useRealTimers();
+  });
+
+  it('caller errors do not stop the timer', async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    const t = createTimer(() => { calls++; if (calls === 1) throw new Error('x'); }, 10);
+    t.start();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(calls).toBeGreaterThan(1);
+    t.stop();
+    vi.useRealTimers();
+  });
+});
+```
+
+**Expected Output:**
+```
+setInterval (drifts):
+tick — elapsed since last: 102ms
+tick — elapsed since last: 121ms   ← drifting
+tick — elapsed since last: 119ms
+tick — elapsed since last: 134ms
+...
+
+Self-rescheduling setTimeout (stable):
+tick — elapsed since last: 121ms
+tick — elapsed since last: 122ms   ← consistent
+tick — elapsed since last: 121ms
+tick — elapsed since last: 122ms
+...
+```
+
+**Stretch Challenges:**
+- [ ] Add a pause-on-tab-hidden (document.visibilityState)
+- [ ] Add an exponential-backoff version for retry-with-delay
+- [ ] Replace setTimeout with MessageChannel for sub-1ms scheduling
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does setInterval do when the handler takes longer than the interval?
+**Q2:** Minimum throttled delay in background tabs?
+**Q3:** Write a self-rescheduling setTimeout pattern. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is setInterval bad for animations? What's the alternative?
+**Q5:** A junior uses setInterval for a heartbeat — under load, heartbeats pile up. Diagnose.
+**Q6:** Refactor to self-rescheduling:
+```js
+setInterval(async () => {
+  const data = await fetchSlowly();   // sometimes takes 2s
+  update(data);
+}, 1000);
+```
+
+### Day 7 — Application
+**Q7:** Build a debounce that survives rapid tab switching (use Page Visibility API).
+**Q8:** A PR sets timeout to 0 expecting immediate execution — show 3 alternatives that are faster.
+**Q9:** What's the granularity of setTimeout in modern browsers vs Node?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every consideration for picking between setTimeout, setInterval, rAF, queueMicrotask, and setImmediate."
+**Q11:** Draw: drift over time for setInterval(100) when handler takes 80ms / 120ms / 200ms.
+**Q12:** ★ System design: "Build a polling layer with adaptive interval based on response latency — what timer pattern, what backoff strategy?"

@@ -1,44 +1,55 @@
 package com.devmastery.admin.internal;
 
 import com.devmastery.admin.api.AdminService;
+import com.devmastery.content.api.ContentCommandService;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
 
 @Service
 class AdminServiceImpl implements AdminService {
 
+    private static final Logger log = LoggerFactory.getLogger(AdminServiceImpl.class);
+
+    private static final List<String> VALID_SECTIONS = List.of(
+            "why", "theory", "visual", "code",
+            "realworld", "interview", "feynman", "build", "spacedreview");
+
     @PersistenceContext private EntityManager em;
     private final RunnerTemplateRepository runners;
+    private final ContentCommandService content;
 
-    AdminServiceImpl(RunnerTemplateRepository runners) { this.runners = runners; }
+    AdminServiceImpl(RunnerTemplateRepository runners, ContentCommandService content) {
+        this.runners = runners;
+        this.content = content;
+    }
 
     @Override
     public DashboardStats getDashboard() {
-        long users = count("users");
-        long topics = count("topics");
-        long lessons = count("lessons");
-        long completions = count("lesson_completions");
-        long quizzes = count("quiz_questions"); // proxy for quiz attempts
-        return new DashboardStats(users, topics, lessons, completions, quizzes);
+        return new DashboardStats(count("users"), count("topics"), count("lessons"),
+                count("lesson_completions"), count("quiz_questions"));
     }
 
     @Override
     @Transactional
-    public void updateTopicSection(String slug, String section, String content) {
-        // Validate section name
-        List<String> validSections = List.of("why", "theory", "visual", "code",
-                "real_world", "interview", "feynman", "build", "spaced_review");
-        if (!validSections.contains(section)) {
-            throw new IllegalArgumentException("Invalid section: " + section);
-        }
-        em.createNativeQuery("UPDATE topics SET " + section + " = :content WHERE slug = :slug")
-                .setParameter("content", content)
-                .setParameter("slug", slug)
-                .executeUpdate();
+    public void updateTopicSection(String slug, String section, String mdxContent) {
+        content.upsertTopicSection(slug, section, mdxContent);
+    }
+
+    @Override
+    @Transactional
+    public void importTopicLayers(List<TopicLayerImport> topicImports) {
+        // Map AdminService.TopicLayerImport → ContentCommandService.TopicImport
+        List<ContentCommandService.TopicImport> mapped = topicImports.stream()
+                .map(ti -> new ContentCommandService.TopicImport(ti.slug(), ti.layers()))
+                .toList();
+        content.importTopicLayers(mapped);
     }
 
     @Override
@@ -60,7 +71,11 @@ class AdminServiceImpl implements AdminService {
     }
 
     private long count(String table) {
-        return ((Number) em.createNativeQuery("SELECT count(*) FROM " + table)
-                .getSingleResult()).longValue();
+        try {
+            return ((Number) em.createNativeQuery("SELECT count(*) FROM " + table)
+                    .getSingleResult()).longValue();
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 }

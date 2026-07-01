@@ -152,3 +152,228 @@ A: No! This is called "Property Shadowing". When you *read* a property, JS walks
 
 **Q: Why shouldn't you manually reassign `obj.__proto__` in production code?**
 A: Because modern JavaScript engines (like V8) aggressively optimize object property access by creating "Hidden Classes" (Shapes). Mutating the `__proto__` pointer of a living object instantly destroys these optimizations, forcing the engine to fall back to a significantly slower dictionary lookup mode. If you need to set a prototype, you should do it at the exact moment of creation using `Object.create(parentPrototype)`.
+
+## FEYNMAN CHECK
+
+### Explain Prototype Chain Like I'm 10 Years Old
+> Every JS object has a hidden link `[[Prototype]]` to ANOTHER object — its prototype. When you access `obj.foo`, the engine first checks obj's OWN properties. If missing, it checks `Object.getPrototypeOf(obj).foo`. If still missing, it walks UP the chain until it reaches `null`. This is JavaScript's INHERITANCE mechanism — older than classes, more flexible, still underneath every class. Built-ins: `[1,2,3]` → Array.prototype → Object.prototype → null. `"hello"` → String.prototype → Object.prototype → null. `class Cat extends Animal` just sets `Cat.prototype.__proto__ = Animal.prototype`. The non-obvious payoff: you can add methods to ALL existing arrays via `Array.prototype.myMethod = ...` (but please don't, in production — it pollutes globals).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does JavaScript use prototypal inheritance instead of class inheritance?**
+> **A:** Historical accident — Brendan Eich wanted Self-style prototypes (1990s research language) and was asked to "make it look like Java." The result: prototype mechanism under the hood, class syntax bolted on top. The advantage: more dynamic — you can add methods at runtime, delegate to ANOTHER object, change prototype mid-life. The disadvantage: harder to reason about than classical OOP, easier to subtly break performance via shape changes.
+
+**Q2: Mental model for the chain?**
+> **A:** Three things to remember: (1) Every value has a prototype (except null at the chain's end). (2) Method lookup walks UP the chain; property writes always create OWN properties on the instance. (3) `instanceof` checks if a constructor's .prototype appears anywhere in the chain. Once you internalise "lookup walks up, writes stay local", every weird inheritance bug clicks.
+
+**Q3: Most dangerous misconception?**
+> **A:** Mutating Array.prototype:
+> ```js
+> // ❌ Polluting prototype affects EVERY array in the program
+> Array.prototype.first = function() { return this[0]; };
+> [1, 2, 3].first();   // 1 — works for everyone
+> for (const x in [1, 2, 3]) console.log(x);   // '0', '1', '2', 'first' — leaked!
+>
+> // ✅ Use a free function or Object.defineProperty with enumerable:false
+> Object.defineProperty(Array.prototype, 'first', {
+>   value: function() { return this[0]; },
+>   enumerable: false,
+> });
+> // Better: avoid prototype mutation entirely — wrap in a utility function
+> ```
+
+**Q4: How do hasOwnProperty, in, and Object.keys differ?**
+> **A:** `'x' in obj` checks own OR inherited properties. `obj.hasOwnProperty('x')` checks only own (but breaks if hasOwnProperty was overridden — use `Object.hasOwn(obj, 'x')` ES2022). `Object.keys(obj)` returns own ENUMERABLE string keys. `for...in` walks own + inherited enumerable string keys (gotcha for polluted prototypes). For arrays use `for...of` (iterator) or indexed for-loop, not for-in.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript's prototype chain is the language's inheritance mechanism — every object has an internal [[Prototype]] reference to another object (or null), and property access walks the chain until found — with classes (`extends`) configuring chain links syntactically, and Object.create / Object.setPrototypeOf manipulating them programmatically — providing dynamic, mutable inheritance that classes desugar onto."
+
+## BUILD
+
+### 🏗️ Mini Project: Build instanceof, Object.create, And A Class Polyfill From Scratch
+
+**What you will build:** Implement `Object.create(proto)`, an `isInstanceOf(obj, ctor)` that walks the chain, and a tiny class-like factory using only prototype links — exposing exactly how class syntax compiles.
+**Why this project:** Forces hands-on prototype-chain manipulation — what every "JS internals" interview question tests.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-proto && cd js-proto
+npm init -y && npm install -D vitest
+ni proto.js, proto.test.js -ItemType File
+```
+
+#### Step 2 — Polyfills
+```js
+// proto.js
+
+// Object.create — links the new object's [[Prototype]] to the given proto
+export function create(proto) {
+  function F() {}
+  F.prototype = proto;
+  return new F();
+}
+
+// instanceof — walks the chain
+export function isInstanceOf(obj, ctor) {
+  let cur = Object.getPrototypeOf(obj);
+  while (cur !== null) {
+    if (cur === ctor.prototype) return true;
+    cur = Object.getPrototypeOf(cur);
+  }
+  return false;
+}
+
+// Tiny "class" using only prototypes
+export function defineClass({ init, methods = {}, parent = null }) {
+  function Ctor(...args) {
+    if (parent) parent.call(this, ...args);
+    if (init)   init.call(this, ...args);
+  }
+  if (parent) {
+    Ctor.prototype = create(parent.prototype);   // chain to parent
+    Ctor.prototype.constructor = Ctor;
+  }
+  for (const [name, fn] of Object.entries(methods)) {
+    Object.defineProperty(Ctor.prototype, name, { value: fn, enumerable: false });
+  }
+  return Ctor;
+}
+```
+
+#### Step 3 — Use The Factory To Build A Class Hierarchy
+```js
+// demo.js
+import { defineClass, isInstanceOf } from './proto.js';
+
+const Animal = defineClass({
+  init(name) { this.name = name; },
+  methods: {
+    describe() { return `I am ${this.name}, a ${this.constructor.name}`; },
+  },
+});
+
+const Dog = defineClass({
+  parent: Animal,
+  init(name, breed) { this.breed = breed; },
+  methods: {
+    bark() { return `${this.name} the ${this.breed} barks!`; },
+  },
+});
+
+const rex = new Dog('Rex', 'corgi');
+console.log(rex.describe());     // from Animal.prototype
+console.log(rex.bark());          // from Dog.prototype
+
+// Walk the chain manually
+let cur = rex;
+while (cur !== null) {
+  console.log('chain:', cur);
+  cur = Object.getPrototypeOf(cur);
+}
+
+console.log(isInstanceOf(rex, Dog));    // true
+console.log(isInstanceOf(rex, Animal)); // true
+console.log(rex instanceof Dog);         // true (native check matches)
+```
+
+#### Step 4 — Error Handling: hasOwn vs in
+```js
+// hasOwn.js
+const proto = { inherited: true };
+const obj   = Object.create(proto);
+obj.own = true;
+
+console.log('inherited' in obj);                     // true
+console.log(Object.hasOwn(obj, 'inherited'));        // false
+console.log(Object.hasOwn(obj, 'own'));              // true
+
+// Buggy old pattern — breaks if obj has its own hasOwnProperty
+const bad = { hasOwnProperty: () => 'lol' };
+console.log(bad.hasOwnProperty('x'));                // 'lol' !!! shadowed
+console.log(Object.prototype.hasOwnProperty.call(bad, 'x'));   // false — safe
+console.log(Object.hasOwn(bad, 'x'));                // false — safest modern check
+```
+
+#### Step 5 — Tests
+```js
+// proto.test.js
+import { describe, it, expect } from 'vitest';
+import { create, isInstanceOf, defineClass } from './proto.js';
+
+describe('create', () => {
+  it('links prototype', () => {
+    const proto = { greet() { return 'hi'; } };
+    const obj = create(proto);
+    expect(obj.greet()).toBe('hi');
+    expect(Object.getPrototypeOf(obj)).toBe(proto);
+  });
+});
+
+describe('isInstanceOf', () => {
+  it('matches direct constructor', () => {
+    const Animal = defineClass({ init(n) { this.n = n; } });
+    const a = new Animal('rex');
+    expect(isInstanceOf(a, Animal)).toBe(true);
+  });
+  it('walks the chain to parent', () => {
+    const A = defineClass({ init() {} });
+    const B = defineClass({ parent: A, init() {} });
+    const b = new B();
+    expect(isInstanceOf(b, A)).toBe(true);
+    expect(isInstanceOf(b, B)).toBe(true);
+  });
+  it('returns false when not in chain', () => {
+    const X = defineClass({ init() {} });
+    const Y = defineClass({ init() {} });
+    expect(isInstanceOf(new X(), Y)).toBe(false);
+  });
+});
+```
+
+**Expected Output:**
+```
+I am Rex, a Ctor
+Rex the corgi barks!
+chain: Dog { name: 'Rex', breed: 'corgi' }
+chain: { bark: [Function] }       # Dog.prototype
+chain: { describe: [Function] }   # Animal.prototype
+chain: [Object: null prototype] {}  # Object.prototype
+chain: null
+true true true
+```
+
+**Stretch Challenges:**
+- [ ] Implement `super.method()` calls in defineClass
+- [ ] Add a mixin helper that copies methods from another object's prototype
+- [ ] Detect prototype-pollution (`obj.__proto__.polluted`) and throw
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Where does the prototype chain end?
+**Q2:** Difference between `obj.hasOwnProperty('x')` and `'x' in obj`?
+**Q3:** Write `Object.create(proto)` using only constructor functions. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `Array.prototype.x = ...` cause for-in bugs?
+**Q5:** A junior says "instanceof checks the class" — explain why that's only partly true.
+**Q6:** Refactor to use Object.create instead of new:
+```js
+function User(name) { this.name = name; }
+User.prototype.greet = function() { return 'hi ' + this.name; };
+```
+
+### Day 7 — Application
+**Q7:** Build a mixin system that composes methods from multiple sources.
+**Q8:** A PR uses prototype mutation for a "global polyfill" — show 3 risks.
+**Q9:** What's the lookup cost for property access at chain depth 1 vs 5 vs 10?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compile `class A extends B` to ES5 prototype code."
+**Q11:** Draw: prototype chain diagram for an array literal vs a Set instance.
+**Q12:** ★ System design: "Frameworks like jQuery extended Array.prototype heavily — what tradeoffs and modern alternatives?"

@@ -5,10 +5,426 @@ level: 3
 ---
 
 ## WHY
-The inventor of the Null Reference, Tony Hoare, famously called it his "Billion Dollar Mistake". 
-In traditional Java, if a method returned a `User` object, you never actually knew if it was going to return a real `User` or `null`. If you forgot to write `if (user != null)` and attempted to call `user.getName()`, the entire application would crash with a `NullPointerException` (NPE).
+The inventor of the Null Reference, Tony Hoare, famously called it his "Billion Dollar Mistake." In Java, a method returning a `User` object could return `null` with no warning in the method signature. Developers forgot to check for null constantly, causing `NullPointerException` in production — a crash with no explanation of WHY the value was null or WHERE it was supposed to come from.
 
-Java 8 introduced `java.util.Optional` to force developers to deal with missing values at compile time. An `Optional<User>` is a wrapper box. It either contains a `User`, or it is empty. Because the method returns an `Optional` instead of a raw `User`, you cannot accidentally call `.getName()`. The compiler forces you to "open the box" safely using methods like `.ifPresent()` or `.orElse()`, virtually eliminating unexpected NPEs.
+`Optional<T>` solves this at the **type system level**. When a method returns `Optional<User>`, the return type ITSELF communicates: "this might not exist." The caller can't accidentally call `user.getName()` — they must "unwrap" the Optional safely. The compiler enforces the contract.
+
+Why Optional matters beyond null-checks:
+1. **Self-documenting APIs**: `Optional<User>` vs `User` signals intent
+2. **Chainable operations**: Transform and filter without nested null checks
+3. **Eliminates defensive null checks**: 80% of NPEs are from forgotten null guards
+4. **Stream-compatible**: Optional works seamlessly with Streams
+5. **Spring Data JPA standard**: Every `findById()` returns `Optional<T>`
+
+## THEORY
+
+### How Optional Works Internally
+`Optional<T>` is a simple final class wrapping a single private nullable reference:
+```java
+public final class Optional<T> {
+    private final T value;  // Null if empty
+
+    private Optional(T value) { this.value = value; }
+
+    public static <T> Optional<T> of(T value) {
+        return new Optional<>(Objects.requireNonNull(value)); // Throws if null!
+    }
+
+    public static <T> Optional<T> ofNullable(T value) {
+        return value == null ? empty() : of(value);  // Safe
+    }
+
+    public static <T> Optional<T> empty() {
+        return new Optional<>(null);
+    }
+
+    public boolean isPresent() { return value != null; }
+}
+```
+
+### Creating Optionals
+| Method | Behavior |
+|--------|---------|
+| `Optional.of(value)` | Creates Optional with non-null value. NPE if null passed! |
+| `Optional.ofNullable(value)` | Creates Optional with value, or empty if null |
+| `Optional.empty()` | Creates empty Optional |
+
+### Extracting Values — The Safe Methods
+| Method | Behavior |
+|--------|---------|
+| `get()` | Returns value or throws `NoSuchElementException` — AVOID! |
+| `orElse(default)` | Returns value or default |
+| `orElseGet(Supplier)` | Returns value or calls supplier (lazy!) |
+| `orElseThrow(Supplier)` | Returns value or throws custom exception |
+| `ifPresent(Consumer)` | Calls action if value present |
+| `ifPresentOrElse(Consumer, Runnable)` | Either action if present, or else action |
+
+### Transforming Optionals
+| Method | Behavior |
+|--------|---------|
+| `map(Function)` | Transform value if present, stay empty if not |
+| `flatMap(Function)` | Transform to another Optional (flatten nested Optionals) |
+| `filter(Predicate)` | Keep value only if predicate passes, else empty |
+| `stream()` | Convert to Stream (0 or 1 elements) — Java 9+ |
+
+### Anti-Patterns — When NOT to Use Optional
+```java
+// ❌ NEVER use Optional as a field (breaks serialization)
+class User {
+    private Optional<String> middleName; // WRONG!
+}
+
+// ❌ NEVER use Optional as a method parameter
+void processUser(Optional<User> user) { ... } // WRONG! Just use @Nullable
+
+// ❌ NEVER use Optional.get() without checking
+String name = optional.get(); // Could throw NoSuchElementException!
+
+// ❌ NEVER do null check on Optional itself
+if (optional != null && optional.isPresent()) { ... } // Defeats the purpose!
+```
+
+## VISUALIZATION_CONFIG
+```json
+{ "component": "ArchitectureDiagram", "type": "optional-wrapper-pattern" }
+```
+
+## CODE
+
+### Level 1 — Beginner: Creating and Extracting
+```java
+import java.util.Optional;
+
+public class OptionalBasics {
+
+    static Optional<String> findUser(int id) {
+        return switch (id) {
+            case 1  -> Optional.of("Alice");
+            case 2  -> Optional.of("Bob");
+            default -> Optional.empty(); // No NPE risk!
+        };
+    }
+
+    public static void main(String[] args) {
+        Optional<String> found    = findUser(1);
+        Optional<String> notFound = findUser(999);
+
+        // isPresent() check (old style)
+        if (found.isPresent()) {
+            System.out.println("Found: " + found.get()); // Safe because we checked
+        }
+
+        // orElse — provide default if empty
+        String name = notFound.orElse("Anonymous");
+        System.out.println(name); // "Anonymous"
+
+        // orElseGet — lazy supplier (only called if empty)
+        String lazyDefault = notFound.orElseGet(() -> {
+            System.out.println("Computing default...");
+            return "Default_" + System.currentTimeMillis();
+        });
+
+        // orElseThrow — throw custom exception (most common in REST APIs)
+        try {
+            String user = notFound.orElseThrow(() ->
+                new RuntimeException("User not found in system"));
+        } catch (RuntimeException e) {
+            System.out.println(e.getMessage());
+        }
+
+        // ifPresent — execute action only if present
+        found.ifPresent(u -> System.out.println("Hello, " + u + "!")); // "Hello, Alice!"
+        notFound.ifPresent(u -> System.out.println("This won't print"));
+    }
+}
+```
+
+### Level 2 — Building Blocks: Map, Filter, FlatMap
+```java
+import java.util.Optional;
+
+public class OptionalTransformations {
+
+    record Address(String city, String country) {}
+    record User(String name, String email, Address address) {}
+
+    static Optional<User> findUser(String email) {
+        if ("alice@example.com".equals(email)) {
+            return Optional.of(new User("Alice", email, new Address("New York", "USA")));
+        }
+        return Optional.empty();
+    }
+
+    static Optional<Address> getAddress(User user) {
+        return Optional.ofNullable(user.address());
+    }
+
+    public static void main(String[] args) {
+        // map: transform value if present
+        Optional<String> userName = findUser("alice@example.com")
+            .map(User::name)              // User → String (name)
+            .map(String::toUpperCase);    // String → String (UPPERCASE)
+
+        System.out.println(userName.orElse("UNKNOWN")); // "ALICE"
+
+        // filter: keep value only if predicate passes
+        Optional<User> usUser = findUser("alice@example.com")
+            .filter(u -> "USA".equals(u.address().country()));
+        System.out.println("US user present: " + usUser.isPresent()); // true
+
+        // flatMap: for methods that return Optional (avoid Optional<Optional<T>>)
+        // map would give Optional<Optional<Address>> — WRONG
+        // flatMap gives Optional<Address> — CORRECT
+        Optional<String> city = findUser("alice@example.com")
+            .flatMap(u -> getAddress(u))  // flatMap flattens Optional<Optional<Address>>
+            .map(Address::city);
+
+        System.out.println("City: " + city.orElse("Unknown")); // "New York"
+
+        // Chain of operations — reads like English
+        String result = findUser("nobody@example.com")
+            .filter(u -> u.address() != null)
+            .map(u -> u.name() + " from " + u.address().city())
+            .orElse("No user found");
+        System.out.println(result); // "No user found"
+
+        // Java 9+ ifPresentOrElse
+        findUser("alice@example.com").ifPresentOrElse(
+            u  -> System.out.println("Found: " + u.name()),
+            () -> System.out.println("Not found")
+        );
+
+        // Java 9+ or() — return alternative Optional if empty
+        Optional<User> result2 = findUser("nobody@test.com")
+            .or(() -> findUser("alice@example.com")); // Fallback to Alice
+        System.out.println("Final user: " + result2.map(User::name).orElse("none"));
+    }
+}
+```
+
+### Level 3 — Intermediate: Optional with Streams
+```java
+import java.util.*;
+import java.util.stream.*;
+
+public class OptionalWithStreams {
+
+    record Product(String sku, String name, Double price) {}
+
+    static Optional<Product> findProduct(String sku) {
+        Map<String, Product> catalog = Map.of(
+            "SKU-001", new Product("SKU-001", "Laptop", 999.99),
+            "SKU-002", new Product("SKU-002", "Mouse", 29.99)
+        );
+        return Optional.ofNullable(catalog.get(sku));
+    }
+
+    public static void main(String[] args) {
+        List<String> skuList = List.of("SKU-001", "SKU-999", "SKU-002", "SKU-888");
+
+        // Java 9+: Optional.stream() converts Optional to 0-or-1 element Stream
+        // flatMap with stream() filters out empty Optionals!
+        List<Product> foundProducts = skuList.stream()
+            .map(sku -> findProduct(sku))    // Stream<Optional<Product>>
+            .flatMap(Optional::stream)        // Stream<Product> (empties dropped!)
+            .collect(Collectors.toList());
+
+        foundProducts.forEach(p -> System.out.println(p.name())); // Laptop, Mouse
+
+        // Find total price of found products
+        double total = skuList.stream()
+            .map(OptionalWithStreams::findProduct)
+            .flatMap(Optional::stream)
+            .mapToDouble(Product::price)
+            .sum();
+        System.out.printf("Total: $%.2f%n", total); // $1029.98
+
+        // First found product matching criteria
+        Optional<Product> expensive = skuList.stream()
+            .map(OptionalWithStreams::findProduct)
+            .flatMap(Optional::stream)
+            .filter(p -> p.price() > 100)
+            .findFirst();
+        expensive.ifPresent(p -> System.out.println("Expensive: " + p.name()));
+    }
+}
+```
+
+### Level 4 — Advanced: `orElse` vs `orElseGet` Performance
+```java
+import java.util.Optional;
+
+public class OptionalPerformance {
+
+    // Simulates an expensive operation
+    static String loadFromDatabase() {
+        System.out.println("  --> Querying database...");
+        return "DB_RESULT";
+    }
+
+    static String generateDefault() {
+        System.out.println("  --> Generating default value...");
+        return "DEFAULT_" + System.currentTimeMillis();
+    }
+
+    public static void main(String[] args) {
+        Optional<String> present = Optional.of("CACHED_VALUE");
+        Optional<String> empty   = Optional.empty();
+
+        System.out.println("--- orElse (EAGER) ---");
+        // orElse ALWAYS evaluates the default, even if Optional is present!
+        String r1 = present.orElse(generateDefault()); // generateDefault() IS called
+        System.out.println("Result: " + r1); // CACHED_VALUE (but default was computed!)
+
+        System.out.println("--- orElseGet (LAZY) ---");
+        // orElseGet ONLY calls the supplier if Optional is empty
+        String r2 = present.orElseGet(() -> generateDefault()); // NOT called
+        System.out.println("Result: " + r2); // CACHED_VALUE (default NOT computed!)
+
+        System.out.println("--- orElseGet when empty ---");
+        String r3 = empty.orElseGet(() -> generateDefault()); // IS called now
+        System.out.println("Result: " + r3);
+
+        // Rule: Use orElseGet when default computation is EXPENSIVE
+        // Use orElse only for cheap, already-computed constants like "unknown" or 0
+    }
+}
+```
+
+### Level 5 — Expert: Optional in Repository Pattern and Error Handling
+```java
+import java.util.Optional;
+
+public class OptionalProductionPatterns {
+
+    // Spring Data JPA repository signature
+    interface UserRepository {
+        Optional<User> findById(Long id);
+        Optional<User> findByEmail(String email);
+    }
+
+    record User(Long id, String name, String email, String role) {}
+
+    // Service layer — the proper Optional chain
+    static class UserService {
+        private final UserRepository repo;
+
+        UserService(UserRepository repo) { this.repo = repo; }
+
+        // ✅ GOOD: orElseThrow with domain exception
+        public User getOrThrow(Long id) {
+            return repo.findById(id)
+                .orElseThrow(() -> new UserNotFoundException(id));
+        }
+
+        // ✅ GOOD: Transform and return DTO
+        public String getUserDisplayName(Long id) {
+            return repo.findById(id)
+                .map(u -> u.name() + " (" + u.email() + ")")
+                .orElse("Unknown User");
+        }
+
+        // ✅ GOOD: Conditional logic via filter + map
+        public Optional<String> getAdminEmail(Long id) {
+            return repo.findById(id)
+                .filter(u -> "ADMIN".equals(u.role()))
+                .map(User::email);
+        }
+
+        // ❌ WRONG: Don't return Optional from methods that should always succeed
+        // Optional<User> getCurrentUser() { ... } // Wrong! getCurrentUser MUST succeed
+
+        // ✅ CORRECT for fallback lookups
+        public User findByEmailOrId(String email, Long id) {
+            return repo.findByEmail(email)
+                .or(() -> repo.findById(id))  // Fallback to ID lookup
+                .orElseThrow(() -> new UserNotFoundException(id));
+        }
+    }
+
+    static class UserNotFoundException extends RuntimeException {
+        UserNotFoundException(Long id) { super("User not found: " + id); }
+    }
+}
+```
+
+## REAL_WORLD
+
+### Spring Boot Repository Pattern
+`Optional` is the standard return type for Spring Data JPA repository lookup methods:
+
+```java
+// Spring Data JPA
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+    Optional<User> findByUsernameAndActiveTrue(String username);
+}
+
+@Service
+public class UserService {
+    private final UserRepository userRepo;
+
+    // Pattern 1: Fetch or throw 404
+    @GetMapping("/users/{id}")
+    public ResponseEntity<UserDTO> getUser(@PathVariable Long id) {
+        return userRepo.findById(id)
+            .map(this::toDTO)               // User → UserDTO
+            .map(ResponseEntity::ok)         // UserDTO → ResponseEntity
+            .orElse(ResponseEntity.notFound().build()); // 404 if not found
+    }
+
+    // Pattern 2: Create if not exists
+    public User getOrCreate(String email) {
+        return userRepo.findByEmail(email)
+            .orElseGet(() -> userRepo.save(new User(email))); // Lazy creation!
+    }
+
+    // Pattern 3: Update if exists, throw if not
+    public User updateUsername(Long id, String newName) {
+        return userRepo.findById(id)
+            .map(user -> { user.setName(newName); return userRepo.save(user); })
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    }
+}
+```
+
+## INTERVIEW
+
+**Q: Should you use `Optional` as a field in a POJO or JPA Entity?**
+A: No. `Optional` is not serializable, so using it as a field breaks Java serialization and JPA. It also adds unnecessary heap allocation overhead. `Optional` was designed exclusively for method return types to communicate "this might not exist" to callers.
+
+**Q: What is the difference between `orElse` and `orElseGet`?**
+A: `orElse(T default)` is **eager** — the default value expression is always evaluated even if the Optional contains a value. `orElseGet(Supplier<T>)` is **lazy** — the supplier is only called if the Optional is empty. Always prefer `orElseGet` when the default computation is expensive (like a database query or object construction).
+
+**Q: What is the difference between `Optional.of()` and `Optional.ofNullable()`?**
+A: `Optional.of(value)` requires a non-null value and throws `NullPointerException` if null is passed. `Optional.ofNullable(value)` safely handles null by returning `Optional.empty()`. Use `of()` when you're certain the value is non-null; use `ofNullable()` when working with potentially null values from external sources.
+
+**Q: What does `flatMap` do with Optional?**
+A: If you call `optional.map(fn)` where `fn` itself returns an `Optional<T>`, you get `Optional<Optional<T>>` — a nested Optional. `flatMap` "flattens" this by one level, giving you `Optional<T>`. Rule: use `flatMap` when the mapping function returns an Optional; use `map` when it returns a regular value.
+
+**Q: What is the `or()` method (Java 9+)?**
+A: `optional.or(Supplier<Optional<T>>)` returns the Optional if present, or the result of calling the supplier if empty. This enables elegant fallback chains: `findById(id).or(() -> findByEmail(email)).orElseThrow(...)`.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Optional is like a **gift box**. Sometimes the box has a toy inside (a value), sometimes it's empty. The difference from Java's old way: with Optional, when someone hands you the box, the box itself TELLS you "I might be empty." So you can't just rip it open — you have to check first (or tell the box what to do if it's empty). Old Java just handed you `null` with no warning, like handing you an invisible non-existent toy.
+
+## BUILD
+
+**Challenge**: Build a safe user lookup service:
+1. `UserCache` class that stores users in a `Map<Long, User>`.
+2. `findById(Long)`, `findByEmail(String)` return `Optional<User>`.
+3. `getSummary(Long id)` uses Optional chaining: find user → filter for active users → map to formatted string → orElse "User not available".
+4. `getFirstAdminEmail()` — stream over all users, filter admins, map to email, findFirst.
+5. Demonstrate the `or()` fallback: try ID lookup, fallback to email lookup.
+
+## SPACED REVIEW
+
+**Day 1**: What are the 3 ways to create an Optional? When does each throw?
+**Day 3**: Explain `orElse` vs `orElseGet` with an example showing the performance difference.
+**Day 7**: Implement `findUserWithFallback(id, email)` using `or()` chaining.
+**Day 14**: How does `Optional.stream()` enable elegant stream pipelines that filter out missing values?
 
 ## THEORY
 ### The Wrapper Concept

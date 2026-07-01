@@ -1,134 +1,543 @@
 ---
-slug: "serialization"
-title: "Serialization"
-level: 4
+slug: serialization
+title: Serialization in Java — Objects to Bytes and Back
+level: intermediate
 ---
 
 ## WHY
-Imagine you have a `User` object living in the RAM of your Java server. You want to save this exact object to a hard drive so that if the server crashes, you can restart it and restore the user's state. Or, you want to send this object over a TCP network socket to a different Java server on the other side of the world.
 
-You cannot just copy the RAM bytes directly, because memory pointers are meaningless outside of the current JVM process. 
-**Serialization** is the process of converting a living Java object into a linear stream of bytes (a byte array). 
-**Deserialization** is the reverse: taking that stream of bytes and reconstructing a perfect, identical clone of the original object in a completely different JVM's memory.
+Serialization is converting objects to a byte stream and back. You need it for:
+
+1. **Persistence** — Save objects to files or databases (JPA, Hibernate do this internally)
+2. **Network communication** — RMI, socket communication between JVMs
+3. **Caching** — Distributed caches (Redis, Memcached) serialize Java objects
+4. **Session management** — HTTP sessions in servlet containers can be serialized
+5. **Security** — Deserialization vulnerabilities are among the most dangerous Java exploits (Log4Shell related)
+
+---
 
 ## THEORY
-### Native Java Serialization
-Java has a built-in mechanism for this. If you make your class implement the `java.io.Serializable` interface (which is a "Marker Interface" with zero methods), the JVM takes over. You can use an `ObjectOutputStream` to instantly blast the object into a file.
 
-### The Security Nightmare
-Native Java Serialization is widely considered the worst design flaw in the history of Java. 
-When the JVM deserializes an object, it reads the class name from the byte stream, loads the class, and blindly instantiates it using Reflection, bypassing constructors. If a hacker sends a malicious byte stream to your server, they can trick your JVM into instantiating dangerous classes (like `Runtime.exec()`) and execute arbitrary remote code on your server. This vulnerability (Insecure Deserialization) caused massive global breaches, including the Equifax hack. 
+### Serializable Interface
 
-Because of this, modern applications almost **never** use native Java Serialization. Instead, they serialize objects into human-readable text formats like JSON or XML using safe libraries like Jackson or GSON.
+```java
+// Just implement Serializable — no methods needed! (marker interface)
+import java.io.Serializable;
+
+public class Employee implements Serializable {
+    private static final long serialVersionUID = 1L; // version control
+
+    private String name;
+    private int age;
+    private transient String password; // NOT serialized
+    private static String company;    // NOT serialized (static fields never are)
+
+    // constructors, getters, setters...
+}
+```
+
+**serialVersionUID:** Version stamp for compatibility. If you change the class (add/remove fields) and the `serialVersionUID` doesn't match what was serialized, `InvalidClassException` is thrown during deserialization. Always declare it explicitly to control compatibility.
+
+### What Gets Serialized?
+
+```
+✓ instance fields
+✓ private/protected/public fields
+✓ fields of superclass (if superclass also implements Serializable)
+✗ static fields (belong to class, not instance)
+✗ transient fields (explicitly excluded)
+✗ fields of non-Serializable superclass (get default values on deserialization)
+```
+
+### Basic Serialization Flow
+
+```
+Serialization:
+Object → ObjectOutputStream → FileOutputStream → file.ser
+
+Deserialization:
+file.ser → FileInputStream → ObjectInputStream → Object
+```
+
+### Externalizable vs Serializable
+
+| | Serializable | Externalizable |
+|--|-------------|----------------|
+| Control | Automatic | Full manual control |
+| Methods to implement | 0 (marker interface) | `writeExternal()`, `readExternal()` |
+| Performance | Slower (reflection) | Faster (direct) |
+| No-arg constructor needed | No | YES |
+| Use when | Simple persistence | Performance-critical, custom format |
+
+### Custom Serialization
+
+```java
+public class SecureEmployee implements Serializable {
+    private String name;
+    private String encryptedPassword;
+
+    // Called during serialization
+    private void writeObject(ObjectOutputStream out) throws IOException {
+        out.defaultWriteObject(); // serialize normal fields
+        out.writeUTF(encrypt(encryptedPassword)); // custom encryption
+    }
+
+    // Called during deserialization
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        in.defaultReadObject(); // deserialize normal fields
+        this.encryptedPassword = decrypt(in.readUTF()); // custom decryption
+    }
+}
+```
+
+### Serialization Alternatives (Modern Java)
+
+| Approach | Library | Speed | Cross-language |
+|----------|---------|-------|----------------|
+| Java Serialization | JDK built-in | Slow | No |
+| JSON (Jackson) | jackson-databind | Fast | Yes |
+| Protobuf | protobuf-java | Very fast | Yes |
+| Avro | avro | Fast | Yes |
+| Kryo | com.esotericsoftware:kryo | Very fast | No |
+
+**Java serialization is largely considered a legacy feature.** Modern applications use JSON (Jackson, Gson) or Protobuf for object exchange.
+
+### Security Warning
+
+```java
+// DANGER: Never deserialize untrusted data with Java serialization!
+// Gadget chains can execute arbitrary code during deserialization.
+// CVE-2015-4852, CVE-2016-4437 (Apache Commons Collections)
+//
+// Safe alternatives:
+// 1. Use JSON instead of Java serialization
+// 2. If you must use Java serialization, use ObjectInputFilter (Java 9+):
+ObjectInputStream ois = new ObjectInputStream(input);
+ois.setObjectInputFilter(ObjectInputFilter.Config.createFilter(
+    "java.base/*;!*"  // only allow java.base classes
+));
+```
+
+---
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureDiagram", "type": "java-serialization-vulnerability" }
+{
+  "type": "none"
+}
 ```
+
+---
 
 ## CODE
 
-### Level 1 — Beginner (Native Serialization)
+### Level 1 — Beginner: Basic Serialize/Deserialize
+
 ```java
-import java.io.Serializable;
-import java.io.FileOutputStream;
-import java.io.ObjectOutputStream;
+// BasicSerialization.java
+import java.io.*;
 
-// 1. MUST implement Serializable, otherwise JVM throws NotSerializableException
-class GameSave implements Serializable {
-    String player = "Alice";
-    int level = 10;
-}
+public class BasicSerialization {
 
-public class SerializeDemo {
-    public static void main(String[] args) throws Exception {
-        GameSave save = new GameSave();
-        
-        // 2. Blast the object to a file!
-        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream("save.dat"))) {
-            out.writeObject(save);
-            System.out.println("Object serialized successfully!");
+    static class Point implements Serializable {
+        private static final long serialVersionUID = 1L;
+        double x, y;
+        Point(double x, double y) { this.x = x; this.y = y; }
+        @Override public String toString() { return "(" + x + ", " + y + ")"; }
+    }
+
+    public static void serialize(Object obj, String filename) throws IOException {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filename))) {
+            oos.writeObject(obj);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> T deserialize(String filename) throws Exception {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(filename))) {
+            return (T) ois.readObject();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Point p = new Point(3.14, 2.71);
+
+        serialize(p, "point.ser");
+        System.out.println("Serialized: " + p);
+
+        Point loaded = deserialize("point.ser");
+        System.out.println("Deserialized: " + loaded);
+        System.out.println("Same object? " + (p == loaded));   // false — new object
+        System.out.println("Same values? " + p.toString().equals(loaded.toString())); // true
+
+        // In-memory serialization (useful for deep copy)
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+            oos.writeObject(p);
+        }
+        byte[] bytes = bos.toByteArray();
+        System.out.println("Serialized bytes: " + bytes.length);
+
+        Point copy;
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+            copy = (Point) ois.readObject();
+        }
+        System.out.println("Deep copy: " + copy);
     }
 }
 ```
 
-### Level 2 — Building Blocks (Deserialization)
-```java
-import java.io.FileInputStream;
-import java.io.ObjectInputStream;
+---
 
-public class DeserializeDemo {
-    public static void main(String[] args) throws Exception {
-        // 1. Read the raw bytes back from the file
-        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream("save.dat"))) {
-            
-            // 2. Reconstruct the object in memory!
-            // Notice: The constructor of GameSave is NEVER called!
-            GameSave restored = (GameSave) in.readObject();
-            
-            System.out.println("Restored Player: " + restored.player); // Alice
-            System.out.println("Restored Level: " + restored.level); // 10
+### Level 2 — Elementary: transient, serialVersionUID, Inheritance
+
+```java
+// SerializationDetails.java
+import java.io.*;
+
+public class SerializationDetails {
+
+    static class Animal implements Serializable {
+        private static final long serialVersionUID = 1L;
+        String species;
+        Animal(String s) { species = s; }
+    }
+
+    // Subclass is also Serializable (parent is Serializable)
+    static class Dog extends Animal {
+        private static final long serialVersionUID = 1L;
+        String name;
+        transient String secret = "hidden"; // transient — won't serialize
+        static int count = 0;              // static — never serializes
+
+        Dog(String species, String name) {
+            super(species);
+            this.name = name;
+            count++;
         }
+
+        @Override public String toString() {
+            return name + " (" + species + ") secret=" + secret + " count=" + count;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Dog.count = 5;
+        Dog dog = new Dog("Canine", "Buddy");
+        System.out.println("Before: " + dog); // Buddy (Canine) secret=hidden count=5
+
+        // Serialize
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        new ObjectOutputStream(bos).writeObject(dog);
+
+        // Simulate class reload: reset static
+        Dog.count = 99;
+
+        // Deserialize
+        Dog loaded = (Dog) new ObjectInputStream(new ByteArrayInputStream(bos.toByteArray())).readObject();
+        System.out.println("After: " + loaded);
+        // After: Buddy (Canine) secret=null count=99
+        // secret=null because transient — NOT restored
+        // count=99 because static — class state, not object state
     }
 }
 ```
 
-### Level 3 — Intermediate (The `transient` keyword)
-```java
-import java.io.Serializable;
+---
 
-class UserProfile implements Serializable {
-    String username;
-    
-    // The 'transient' keyword tells the JVM: 
-    // "Do NOT include this field in the serialized byte stream!"
-    // When the object is deserialized, this field will just be null.
-    // Extremely important for passwords, API keys, or large cached data.
-    transient String plainTextPassword;
-    
-    // Static fields belong to the Class, not the Object, 
-    // so they are NEVER serialized.
-    static String companyName = "Acme Corp"; 
+### Level 3 — Intermediate: Custom Serialization & Externalizable
+
+```java
+// CustomSerialization.java
+import java.io.*;
+import java.util.Base64;
+
+public class CustomSerialization {
+
+    // Custom writeObject/readObject
+    static class EncryptedData implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private String data;
+
+        EncryptedData(String plaintext) { this.data = plaintext; }
+
+        // Simple XOR "encryption" for demo (use AES in production)
+        private String xor(String input) {
+            char[] chars = input.toCharArray();
+            for (int i = 0; i < chars.length; i++) chars[i] ^= 42;
+            return new String(chars);
+        }
+
+        private void writeObject(ObjectOutputStream out) throws IOException {
+            out.defaultWriteObject();
+            out.writeUTF(Base64.getEncoder().encodeToString(xor(data).getBytes()));
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            in.defaultReadObject();
+            String encoded = in.readUTF();
+            this.data = xor(new String(Base64.getDecoder().decode(encoded)));
+        }
+
+        @Override public String toString() { return "EncryptedData{" + data + "}"; }
+    }
+
+    // Externalizable — full control
+    static class Config implements Externalizable {
+        String host;
+        int port;
+        boolean ssl;
+
+        public Config() {} // REQUIRED no-arg constructor for Externalizable!
+
+        Config(String host, int port, boolean ssl) {
+            this.host = host; this.port = port; this.ssl = ssl;
+        }
+
+        @Override
+        public void writeExternal(ObjectOutput out) throws IOException {
+            out.writeUTF(host);
+            out.writeInt(port);
+            out.writeBoolean(ssl);
+        }
+
+        @Override
+        public void readExternal(ObjectInput in) throws IOException {
+            host = in.readUTF();
+            port = in.readInt();
+            ssl = in.readBoolean();
+        }
+
+        @Override public String toString() { return host + ":" + port + " ssl=" + ssl; }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Custom serialization
+        EncryptedData ed = new EncryptedData("my secret data");
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        new ObjectOutputStream(bos).writeObject(ed);
+        EncryptedData loaded = (EncryptedData) new ObjectInputStream(
+            new ByteArrayInputStream(bos.toByteArray())).readObject();
+        System.out.println(loaded); // EncryptedData{my secret data}
+
+        // Externalizable
+        Config config = new Config("localhost", 5432, true);
+        bos.reset();
+        new ObjectOutputStream(bos).writeObject(config);
+        Config configLoaded = (Config) new ObjectInputStream(
+            new ByteArrayInputStream(bos.toByteArray())).readObject();
+        System.out.println(configLoaded); // localhost:5432 ssl=true
+    }
 }
 ```
 
-### Level 4 — Advanced (serialVersionUID)
-```java
-import java.io.Serializable;
+---
 
-class Document implements Serializable {
-    // If you don't define this, the JVM calculates a cryptographic hash of the class structure.
-    // If you add a new field later, the hash changes. 
-    // If you try to deserialize an old file, the JVM compares the hashes, sees they don't match, 
-    // and violently throws an InvalidClassException!
-    
-    // By hardcoding this ID, we guarantee backwards compatibility!
-    private static final long serialVersionUID = 1L;
-    
-    String title;
-    
-    // We added this field in Version 2. 
-    // Because the UID matches, old Version 1 files will still deserialize successfully 
-    // (the author field will just default to null).
-    String author; 
+### Level 4 — Advanced: JSON Serialization with Jackson (Modern Approach)
+
+```java
+// JacksonSerialization.java
+// pom.xml: com.fasterxml.jackson.core:jackson-databind:2.15.x
+import com.fasterxml.jackson.annotation.*;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import java.time.*;
+
+public class JacksonSerialization {
+
+    record Product(
+        @JsonProperty("product_id") Long id,
+        String name,
+        double price,
+        @JsonIgnore String internalCode,  // exclude from JSON
+        @JsonFormat(pattern = "yyyy-MM-dd") LocalDate releaseDate
+    ) {}
+
+    @JsonIgnoreProperties(ignoreUnknown = true) // ignore extra JSON fields
+    record ApiResponse<T>(
+        boolean success,
+        T data,
+        @JsonInclude(JsonInclude.Include.NON_NULL) String error // only if non-null
+    ) {}
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .enable(SerializationFeature.INDENT_OUTPUT);
+
+        Product product = new Product(1L, "Java Mastery Book", 49.99,
+            "INTERNAL_SKU_001", LocalDate.of(2024, 1, 15));
+
+        // Serialize to JSON
+        String json = mapper.writeValueAsString(product);
+        System.out.println(json);
+        // {
+        //   "product_id": 1,
+        //   "name": "Java Mastery Book",
+        //   "price": 49.99,
+        //   "releaseDate": "2024-01-15"
+        // }
+        // internalCode is @JsonIgnore — NOT in output
+
+        // Deserialize from JSON
+        String input = "{\"product_id\":2,\"name\":\"Spring Boot\",\"price\":55.0,\"releaseDate\":\"2024-03-01\",\"extraField\":\"ignored\"}";
+        Product loaded = mapper.readValue(input, Product.class);
+        System.out.println(loaded.name() + " $" + loaded.price());
+
+        // Collection serialization
+        java.util.List<Product> products = java.util.List.of(product, loaded);
+        String jsonList = mapper.writeValueAsString(products);
+        java.util.List<Product> loadedList = mapper.readValue(jsonList,
+            mapper.getTypeFactory().constructCollectionType(java.util.List.class, Product.class));
+        System.out.println("Loaded " + loadedList.size() + " products");
+    }
 }
 ```
+
+---
+
+### Level 5 — Expert: Serialization Security & ObjectInputFilter
+
+```java
+// SerializationSecurity.java
+import java.io.*;
+
+/**
+ * Demonstrates safe deserialization practices.
+ * Java serialization is a known attack vector — always filter what you accept.
+ */
+public class SerializationSecurity {
+
+    static class SafeDeserializer {
+
+        /**
+         * Safe deserialization with allowlist filter.
+         * Only allows classes from your own packages + java.base.
+         */
+        @SuppressWarnings("unchecked")
+        public static <T> T safeDeserialize(byte[] data, Class<T> expected)
+                throws IOException, ClassNotFoundException {
+
+            try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data))) {
+                // Java 9+ ObjectInputFilter — allowlist approach
+                ObjectInputFilter filter = ObjectInputFilter.Config.createFilter(
+                    "com.myapp.**;" +           // allow my app classes
+                    "java.util.ArrayList;" +     // allow ArrayList
+                    "java.util.HashMap;" +       // allow HashMap
+                    "java.base/**;" +            // allow java.base module
+                    "maxdepth=10;" +             // limit object graph depth
+                    "maxrefs=1000;" +            // limit object references
+                    "maxbytes=100000;" +         // max 100KB
+                    "maxarray=1000;" +           // max array size
+                    "!*"                         // deny everything else
+                );
+                ois.setObjectInputFilter(filter);
+
+                Object obj = ois.readObject();
+                if (!expected.isInstance(obj)) {
+                    throw new ClassCastException("Expected " + expected + " got " + obj.getClass());
+                }
+                return expected.cast(obj);
+            }
+        }
+    }
+
+    // Serialization-based deep copy (works for Serializable objects)
+    public static <T extends Serializable> T deepCopy(T obj) throws IOException, ClassNotFoundException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+            oos.writeObject(obj);
+        }
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bos.toByteArray()))) {
+            @SuppressWarnings("unchecked")
+            T copy = (T) ois.readObject();
+            return copy;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Demonstrate deep copy
+        java.util.List<String> original = new java.util.ArrayList<>(java.util.List.of("a","b","c"));
+        java.util.List<String> copy = deepCopy((java.io.Serializable) original);
+        copy.add("d");
+        System.out.println("Original: " + original); // [a, b, c] — unmodified
+        System.out.println("Copy:     " + copy);     // [a, b, c, d]
+
+        System.out.println("\nSecurity tips:");
+        System.out.println("1. Never deserialize untrusted data with Java serialization");
+        System.out.println("2. Use ObjectInputFilter allowlists if you must deserialize");
+        System.out.println("3. Prefer JSON (Jackson) for external data exchange");
+        System.out.println("4. Use Protobuf/Avro for high-performance serialization");
+    }
+}
+```
+
+---
 
 ## REAL_WORLD
-Because Native Serialization is a massive security vulnerability and produces a binary format that Python and JavaScript cannot read, the entire software industry shifted to **JSON Serialization**.
 
-In Spring Boot, when you return a `User` object from a `@RestController`, Spring does not use `Serializable`. It uses the **Jackson** library. 
-Jackson uses the Reflection API to read the fields of your `User` object, manually constructs a JSON String (`{"username":"Alice"}`), and sends the text over the HTTP network. When another microservice receives the JSON, its Jackson library parses the text and instantiates a new `User` object safely. 
+### Redis Serialization with Spring
 
-If you are caching data in Redis (using `Spring Data Redis`), you should configure the `RedisTemplate` to use the `GenericJackson2JsonRedisSerializer`. If you leave the default configuration, it will use Native Java Serialization, filling your Redis database with unreadable binary garbage that is highly vulnerable to deserialization attacks.
+```java
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        // Use Jackson JSON serialization instead of Java serialization
+        Jackson2JsonRedisSerializer<Object> jsonSerializer =
+            new Jackson2JsonRedisSerializer<>(Object.class);
+
+        template.setValueSerializer(jsonSerializer);
+        template.setHashValueSerializer(jsonSerializer);
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        return template;
+    }
+}
+```
+
+---
 
 ## INTERVIEW
-**Q: What is the `transient` keyword used for?**
-A: It is used strictly in Native Java Serialization to mark a field that should NOT be serialized. When the object is written to a byte stream, the transient field is completely ignored. Upon deserialization, the field is initialized to its default value (e.g., `null` for objects, `0` for ints). 
 
-**Q: What is the `serialVersionUID`?**
-A: It is a version control ID used during deserialization to verify that the sender and receiver of a serialized object have loaded classes for that object that are compatible. If the receiver has loaded a class with a different `serialVersionUID` than the sender, deserialization results in an `InvalidClassException`. 
+**Q1: What is serialVersionUID and why should you always declare it?**
 
-**Q: Does the constructor get called during deserialization?**
-A: No! The JVM allocates memory and populates the fields directly from the byte stream using internal JVM magic (similar to Reflection). The constructor of the deserialized class is entirely bypassed. However, the no-arg constructor of the *first non-serializable superclass* in the hierarchy WILL be called.
+> **Strong answer:** `serialVersionUID` is a version stamp embedded in the serialized byte stream. During deserialization, Java compares the serialized UID with the class's current UID. If they don't match, `InvalidClassException` is thrown. If you don't declare it, Java auto-computes it based on class structure — any change to the class (adding a field, changing access modifiers) changes the auto-UID, breaking compatibility with previously serialized data. Always declare `serialVersionUID = 1L` explicitly. Increment it when you make incompatible changes.
+
+**Q2: What is the transient keyword?**
+
+> **Strong answer:** `transient` marks a field to be excluded from serialization. Useful for: passwords/sensitive data (security), fields that can be recomputed (caches), fields that reference non-serializable objects, volatile state that doesn't make sense to persist (open database connections, threads). On deserialization, transient fields get their default values (0, false, null). If you need custom initialization of transient fields after deserialization, use `readObject()` to do it.
+
+**Q3: Why is Java serialization considered dangerous and what are the alternatives?**
+
+> **Strong answer:** Java serialization executes code during deserialization — attackers can craft malicious byte streams using "gadget chains" (sequences of method calls in existing libraries) to execute arbitrary code. Famous exploits: Apache Commons Collections (2015), Spring Framework, WebLogic RCE. Mitigations: (1) Use Jackson/Gson for external data — JSON deserialization doesn't execute arbitrary code. (2) If you must use Java serialization, use `ObjectInputFilter` (Java 9+) with allowlists. (3) Sign and verify serialized data. Modern advice: don't use Java serialization for data exchange; use it only for deep-copy within your own code.
+
+---
+
+## FEYNMAN CHECK
+
+Serialization is like taking a photograph of a Java object and saving it to disk or sending it over the network. The photo captures all the object's fields. When you "deserialize," you recreate the object from the photo. Some fields are marked `transient` — like a photographer saying "don't capture the passport number." The danger is that the photo-recreation process is powerful enough to be hijacked — like a photo that, when printed, runs a hidden program.
+
+---
+
+## BUILD
+
+Build a simple file-based object store:
+1. `save(String key, Serializable obj)` — serialize to `key.ser` file
+2. `load(String key, Class<T> type)` — deserialize with type safety
+3. `delete(String key)` — remove file
+4. `listKeys()` — list all saved objects
+5. Use JSON (Jackson) instead of Java serialization for security
+
+---
+
+## SPACED REVIEW
+
+- Day 1: Explain serialVersionUID, transient, static — which gets serialized?
+- Day 3: Implement custom writeObject/readObject for a class with sensitive data
+- Day 7: Explain the security risks of Java serialization and safe alternatives
+- Day 14: Compare Java serialization vs Jackson JSON vs Protobuf for different use cases

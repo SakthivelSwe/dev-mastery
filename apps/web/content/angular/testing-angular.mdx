@@ -189,3 +189,217 @@ it('should update after a delay', fakeAsync(() => {
   expect(component.isReady).toBeTrue(); // Now it passes! The test took 0.01s to run.
 }));
 ```
+
+## FEYNMAN CHECK
+
+### Explain Angular Testing Like I'm 10 Years Old
+> Angular tests run in two ways: UNIT tests (TestBed — creates a mini Angular environment for one component/service/pipe) and E2E tests (Cypress/Playwright — drives a real browser). TestBed.configureTestingModule() sets up a mini-Angular with only the pieces your test needs — mocked dependencies, test doubles for services. detectChanges() tells Angular to run change detection and update the DOM. The non-obvious insight: Angular services are just TypeScript classes — test them WITHOUT TestBed using plain new. TestBed is only needed when you need Angular's DI, templates, or directives. Services with no Angular dependencies: just instantiate and call methods.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between shallow and deep component testing?**
+> **A:** SHALLOW testing renders only the component itself — child components are replaced with stubs (by declaring NO_ERRORS_SCHEMA or using CUSTOM_ELEMENTS_SCHEMA). Tests focus on the component's logic, @Input/@Output bindings, and template rendering of the component alone. DEEP testing renders the full component tree with real child components. Use shallow for unit testing a component's own logic; use deep (or integration) testing when you need to verify interactions between parent and child components.
+
+**Q2: Mental model for ComponentFixture and DebugElement?**
+> **A:** ComponentFixture wraps the component instance — fixture.componentInstance is your TypeScript class, fixture.nativeElement is the rendered HTML element, fixture.debugElement is Angular's wrapper around the DOM node. DebugElement provides Angular-aware querying: By.css('.my-class') finds elements, By.directive(MyDirective) finds elements with a specific directive. After changing component state, call fixture.detectChanges() to run Angular's change detection and update the DOM, then assert against fixture.nativeElement.
+
+**Q3: Most dangerous misconception about Angular testing?**
+> **A:** You must mock every dependency:
+> ```typescript
+> // WRONG: mocking primitive dependencies adds test noise
+> TestBed.configureTestingModule({
+>   providers: [
+>     { provide: LoggerService, useValue: { log: jasmine.createSpy() } },
+>     { provide: DateService, useValue: { now: () => new Date('2024-01-01') } },
+>   ],
+> });
+>
+> // CORRECT: only mock dependencies with OBSERVABLE SIDE EFFECTS
+> // Mock: HTTP calls, navigation, localStorage, timers, other Angular services
+> // Don't mock: pure utility functions, simple value providers
+>
+> // For HTTP: use HttpClientTestingModule + HttpTestingController
+> // For Router: use RouterTestingModule
+> // For services: use jasmine.createSpyObj or simple stub objects
+> ```
+
+**Q4: How do you test async operations in Angular?**
+> **A:** Three options: (1) async/await with fixture.whenStable() — waits for all pending async work before asserting. (2) fakeAsync + tick(ms) — synchronously advances a virtual clock, resolving timers and Promises without real waiting. (3) waitForAsync — wraps test in an async zone. For HTTP tests: HttpTestingController.expectOne('/api/url').flush(mockData) synchronously resolves the pending HTTP Observable — no real waiting. fakeAsync is the most deterministic choice for time-dependent code.
+
+**Q5: FAANG-grade definition of Angular testing.**
+> **A:** "Angular testing uses TestBed for integration-style component/service testing — configureTestingModule setting up an Angular testing environment with real or mocked dependencies, ComponentFixture for rendered component access, detectChanges for explicit change detection triggering, HttpClientTestingModule for intercepting and verifying HTTP calls, RouterTestingModule for navigation testing, fakeAsync/tick for synchronous time manipulation, jasmine.createSpyObj/vi.fn for service mocking — and plain TypeScript instantiation for pure service unit testing — with Cypress or Playwright for E2E browser testing."
+
+## BUILD
+
+### 🏗️ Mini Project: Full Test Suite — Component, Service, HTTP, and E2E Tests
+
+**What you will build:** Tests for a UserListComponent (shallow + deep), UserApiService (HTTP mocking with HttpTestingController), an auth guard, and async form submission — the complete Angular testing toolkit.
+**Why this project:** Forces every testing pattern: TestBed, detectChanges, async, HTTP mock, spy.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new testing-demo --standalone --routing
+cd testing-demo
+ng generate component user-list --standalone
+ng generate service user-api
+```
+
+#### Step 2 — Component Test (shallow)
+```typescript
+// user-list.component.spec.ts
+import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
+import { By } from '@angular/platform-browser';
+import { UserListComponent } from './user-list.component';
+import { UserApiService } from '../user-api.service';
+import { of, delay } from 'rxjs';
+import { RouterTestingModule } from '@angular/router/testing';
+
+describe('UserListComponent', () => {
+  let component: UserListComponent;
+  let fixture: ComponentFixture<UserListComponent>;
+  let mockApiService: jasmine.SpyObj<UserApiService>;
+
+  const mockUsers = [
+    { id: 1, name: 'Ana', email: 'ana@dev.io' },
+    { id: 2, name: 'Ben', email: 'ben@dev.io' },
+  ];
+
+  beforeEach(async () => {
+    mockApiService = jasmine.createSpyObj('UserApiService', ['getUsers']);
+    mockApiService.getUsers.and.returnValue(of(mockUsers));
+
+    await TestBed.configureTestingModule({
+      imports: [UserListComponent, RouterTestingModule],
+      providers: [{ provide: UserApiService, useValue: mockApiService }],
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(UserListComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+  });
+
+  it('renders user list', () => {
+    const items = fixture.debugElement.queryAll(By.css('li'));
+    expect(items.length).toBe(2);
+    expect(items[0].nativeElement.textContent).toContain('Ana');
+  });
+
+  it('calls getUsers on init', () => {
+    expect(mockApiService.getUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows loading then users', fakeAsync(() => {
+    mockApiService.getUsers.and.returnValue(of(mockUsers).pipe(delay(500)));
+    fixture = TestBed.createComponent(UserListComponent);
+    fixture.detectChanges();
+    // Before delay resolves
+    expect(fixture.nativeElement.textContent).toContain('Loading');
+    tick(500);
+    fixture.detectChanges();
+    expect(fixture.nativeElement.textContent).toContain('Ana');
+  }));
+});
+```
+
+#### Step 3 — Service Test With HTTP Mocking
+```typescript
+// user-api.service.spec.ts
+import { TestBed } from '@angular/core/testing';
+import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
+import { UserApiService } from './user-api.service';
+
+describe('UserApiService', () => {
+  let service: UserApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({ imports: [HttpClientTestingModule] });
+    service = TestBed.inject(UserApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+  afterEach(() => httpMock.verify());
+
+  it('getUsers returns typed array', () => {
+    let result: any;
+    service.getUsers().subscribe(r => result = r);
+    const req = httpMock.expectOne('/api/users');
+    expect(req.request.method).toBe('GET');
+    req.flush([{ id: 1, name: 'Ana', email: 'a@b.com' }]);
+    expect(result[0].name).toBe('Ana');
+  });
+
+  it('handles 500 error', () => {
+    let error: any;
+    service.getUsers().subscribe({ error: e => error = e });
+    httpMock.expectOne('/api/users').flush('Server Error', { status: 500, statusText: 'Error' });
+    expect(error.type).toBe('server');
+  });
+});
+```
+
+#### Step 4 — Guard Test
+```typescript
+// auth.guard.spec.ts
+describe('authGuard', () => {
+  it('allows when logged in', () => {
+    TestBed.configureTestingModule({ providers: [
+      { provide: AuthService, useValue: { isLoggedIn: () => true } },
+      { provide: Router, useValue: { createUrlTree: () => null } },
+    ]});
+    expect(TestBed.runInInjectionContext(() => authGuard())).toBe(true);
+  });
+});
+```
+
+#### Step 5 — Tests Summary
+```typescript
+// Component: detectChanges, By.css, mock service, fakeAsync
+// Service: HttpTestingController, expectOne, flush
+// Guard: TestBed.runInInjectionContext for functional guards
+// Pipe: plain instantiation, no TestBed: const pipe = new MyPipe(); pipe.transform(...)
+
+// Expected test run:
+// ng test --watch=false --coverage
+// 8 specs, 0 failures
+// Coverage: Statements: 85%+
+```
+
+**Expected Output:**
+```
+UserListComponent: renders users, calls API, shows loading state
+UserApiService: GET request verified, error handling tested
+authGuard: allows/blocks navigation based on auth state
+ng test: all specs pass
+```
+
+**Stretch Challenges:**
+- [ ] Add component harness tests using Angular CDK testing harnesses
+- [ ] Add Cypress E2E test for the user list flow
+- [ ] Achieve 100% branch coverage on the API service
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When should you use TestBed vs plain instantiation for services?
+**Q2:** What does detectChanges() do in a test?
+**Q3:** Write a basic component test with a mocked service. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between fakeAsync + tick and async + whenStable?
+**Q5:** A junior is testing an HTTP service with jasmine.createSpy instead of HttpTestingController — what's wrong?
+**Q6:** How do you test an @Output event emitter?
+
+### Day 7 — Application
+**Q7:** Build tests for a form component with validation — test each validator rule.
+**Q8:** How do you test an Effect in NgRx?
+**Q9:** What is a TestBed teardown and why does it matter for test isolation?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Describe your Angular testing strategy — unit, integration, and E2E tests."
+**Q11:** Draw: Angular testing pyramid — what goes in unit, integration, and E2E layers.
+**Q12:** ★ System design: "Design a testing strategy for a 200-component Angular app — what to test at each layer, coverage targets, CI integration."

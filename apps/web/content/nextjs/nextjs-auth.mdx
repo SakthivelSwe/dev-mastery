@@ -180,3 +180,342 @@ A: NextAuth.js supports two session strategies:
 **When to use each:**
 - JWT: Simple apps, read-heavy, horizontal scaling, when DB latency is a concern
 - Database: Apps requiring immediate logout (banking, healthcare), fine-grained session control, when you need to see active sessions in an admin dashboard
+
+## FEYNMAN CHECK
+
+### Explain Next.js Authentication Like I'm 10 Years Old
+> Next.js authentication works by storing a SESSION TOKEN in an HTTP-only cookie that the browser automatically sends with every request. When the user logs in, your server verifies their password, creates a signed JWT (or session ID), and sets it as an httpOnly cookie. On subsequent requests, middleware or Server Components read this cookie, verify it, and either allow the request or redirect to /login. The non-obvious depth: never store auth tokens in localStorage — XSS attacks can read localStorage but CANNOT read httpOnly cookies. Also: ALWAYS verify auth on the SERVER (in middleware or Server Components), never trust client-side checks alone — a malicious user can disable JS or modify client code, but cannot bypass server-side checks. NextAuth.js (now Auth.js v5) is the standard library — handles OAuth providers, sessions, JWT, and CSRF for you.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between JWT and session-based auth in Next.js?**
+> **A:** JWT (JSON Web Token): self-contained signed token with user claims (id, role, expiry) — verify by checking signature, no DB lookup needed (stateless, scalable). Drawback: can't revoke before expiry (logged-out users can keep using their token until it expires). SESSION: opaque session ID stored in DB/Redis with user data lookup on each request (stateful) — instant revocation possible (delete the session row), but adds DB roundtrip per request. Hybrid pattern: JWT with short expiry (15 min) + refresh token in DB (revocable) — best of both.
+
+**Q2: Mental model for the auth flow in App Router?**
+> **A:** (1) User submits login form → Server Action verifies credentials → creates JWT → sets httpOnly cookie. (2) User navigates to /dashboard → middleware reads session cookie → verifies JWT → either passes through (set x-user-id header) or redirects to /login. (3) Server Component reads x-user-id from headers() OR re-verifies the cookie directly via cookies(). (4) Logout: Server Action clears the cookie, optionally invalidates the refresh token in DB. The whole flow stays server-side — no client-side token management needed.
+
+**Q3: Most dangerous misconception about Next.js auth?**
+> **A:** Client-side route guards are sufficient:
+> ```typescript
+> // WRONG: useEffect-based client auth — easy to bypass
+> 'use client';
+> export function ProtectedPage() {
+>   const [user, setUser] = useState(null);
+>   useEffect(() => {
+>     fetch('/api/me').then(r => r.json()).then(setUser);
+>   }, []);
+>   if (!user) return <p>Loading...</p>;
+>   return <div>Secret content</div>;  // BUT: secret content is in client bundle!
+> }
+> // Attacker disables JS → sees blank page (no Loading message blocks them)
+> // Attacker views React DevTools → sees secret content rendered briefly
+> // Attacker downloads bundle → reads secret data from JS source
+>
+> // CORRECT: Server Component check + middleware redirect
+> import { redirect } from 'next/navigation';
+> import { getSession } from '@/lib/auth';
+> export default async function ProtectedPage() {
+>   const session = await getSession();
+>   if (!session) redirect('/login');  // server-side, before HTML sent
+>   const secret = await fetchSecret(session.userId);
+>   return <div>{secret}</div>;
+> }
+> ```
+
+**Q4: How does CSRF protection work with Server Actions?**
+> **A:** Server Actions are automatically CSRF-protected because: (1) They use POST to a unique action ID URL (attacker can't guess). (2) They require the action ID which is embedded in YOUR HTML — cross-origin attacker can't access your HTML to extract it. (3) The Origin/Referer headers are checked by Next.js. Additional protection: SameSite=Strict cookies prevent the browser from sending session cookies on cross-origin requests entirely. For external API routes (used by mobile clients), use Authorization Bearer tokens instead of cookies — Bearer tokens require explicit attacker action to obtain, unlike cookies which the browser sends automatically.
+
+**Q5: FAANG-grade definition of Next.js authentication patterns.**
+> **A:** "Next.js authentication uses server-side session verification — JWTs (stateless, scalable) or session IDs (stateful, revocable) stored in httpOnly+secure+SameSite cookies — verified in middleware for route protection (redirect to /login) and in Server Components for data authorisation (preventing leakage in HTML) — combined with Auth.js (NextAuth) for OAuth provider integration, JWT signing/verification, CSRF protection, and database adapter abstraction — Server Actions providing automatic CSRF protection via action ID obfuscation — with refresh token rotation for long-lived sessions, role-based access control via JWT claims, and middleware-based tenant isolation for multi-tenant SaaS — and never relying on client-side route guards which are bypassable."
+
+## BUILD
+
+### 🏗️ Mini Project: Full Auth System — Login, Session, RBAC, Logout (No External Library)
+
+**What you will build:** A complete auth system from scratch: registration with bcrypt, login Server Action, JWT session cookie, middleware route protection, role-based UI, and logout — no Auth.js, all manual to understand internals.
+**Why this project:** Forces every auth concept — hashing, JWT, cookies, middleware, RBAC.
+**Time estimate:** 50 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest auth-demo --typescript --tailwind --app
+npm install bcryptjs jose better-sqlite3 @types/bcryptjs @types/better-sqlite3
+```
+
+#### Step 2 — Auth Utilities
+```typescript
+// src/lib/auth.ts
+import { cookies } from 'next/headers';
+import { SignJWT, jwtVerify } from 'jose';
+import bcrypt from 'bcryptjs';
+import Database from 'better-sqlite3';
+
+const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET ?? 'change-in-production');
+const COOKIE_NAME = 'session';
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 7;  // 7 days
+
+const db = new Database('auth.db');
+db.exec(`CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`);
+
+export interface SessionPayload { userId: number; email: string; role: 'user' | 'admin'; }
+
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, 12);  // 12 rounds — safe for 2025
+}
+
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
+}
+
+export async function createSession(payload: SessionPayload): Promise<string> {
+  return new SignJWT(payload as any)
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('7d')
+    .sign(JWT_SECRET);
+}
+
+export async function verifySession(token: string): Promise<SessionPayload | null> {
+  try {
+    const { payload } = await jwtVerify(token, JWT_SECRET);
+    return payload as unknown as SessionPayload;
+  } catch {
+    return null;  // expired or invalid signature
+  }
+}
+
+export async function getSession(): Promise<SessionPayload | null> {
+  const token = cookies().get(COOKIE_NAME)?.value;
+  if (!token) return null;
+  return verifySession(token);
+}
+
+export async function setSessionCookie(token: string): Promise<void> {
+  cookies().set(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: COOKIE_MAX_AGE,
+    path: '/',
+  });
+}
+
+export async function clearSession(): Promise<void> {
+  cookies().delete(COOKIE_NAME);
+}
+
+export function findUserByEmail(email: string) {
+  return db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+}
+
+export function createUser(email: string, passwordHash: string, role: 'user' | 'admin' = 'user') {
+  return db.prepare('INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)')
+    .run(email, passwordHash, role);
+}
+```
+
+#### Step 3 — Login & Register Server Actions
+```typescript
+// src/app/(auth)/actions.ts
+'use server';
+import { redirect } from 'next/navigation';
+import { z } from 'zod';
+import {
+  hashPassword, verifyPassword, createSession, setSessionCookie,
+  clearSession, findUserByEmail, createUser,
+} from '@/lib/auth';
+
+const LoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+
+const RegisterSchema = LoginSchema.extend({
+  name: z.string().min(2),
+});
+
+export async function loginAction(prevState: any, formData: FormData) {
+  const result = LoginSchema.safeParse({
+    email: formData.get('email'),
+    password: formData.get('password'),
+  });
+
+  if (!result.success) return { error: 'Invalid email or password format' };
+
+  const user = findUserByEmail(result.data.email);
+  if (!user) return { error: 'Invalid credentials' };  // don't reveal which field is wrong
+
+  const valid = await verifyPassword(result.data.password, user.password_hash);
+  if (!valid) return { error: 'Invalid credentials' };
+
+  const token = await createSession({ userId: user.id, email: user.email, role: user.role });
+  await setSessionCookie(token);
+  redirect('/dashboard');
+}
+
+export async function registerAction(prevState: any, formData: FormData) {
+  const result = RegisterSchema.safeParse({
+    email: formData.get('email'),
+    password: formData.get('password'),
+    name: formData.get('name'),
+  });
+
+  if (!result.success) return { error: 'Invalid input' };
+
+  if (findUserByEmail(result.data.email)) {
+    return { error: 'Email already registered' };
+  }
+
+  const hash = await hashPassword(result.data.password);
+  const created = createUser(result.data.email, hash);
+
+  const token = await createSession({
+    userId: Number(created.lastInsertRowid),
+    email: result.data.email,
+    role: 'user',
+  });
+  await setSessionCookie(token);
+  redirect('/dashboard');
+}
+
+export async function logoutAction() {
+  await clearSession();
+  redirect('/login');
+}
+```
+
+#### Step 4 — Middleware Protection + Protected Pages
+```typescript
+// src/middleware.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { verifySession } from '@/lib/auth';
+
+const PROTECTED_ROUTES = ['/dashboard', '/admin', '/profile'];
+const ADMIN_ROUTES = ['/admin'];
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/auth).*)'],
+};
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  const needsAuth = PROTECTED_ROUTES.some(r => pathname.startsWith(r));
+  if (!needsAuth) return NextResponse.next();
+
+  const token = request.cookies.get('session')?.value;
+  if (!token) {
+    const url = new URL('/login', request.url);
+    url.searchParams.set('returnTo', pathname);
+    return NextResponse.redirect(url);
+  }
+
+  const session = await verifySession(token);
+  if (!session) {
+    const response = NextResponse.redirect(new URL('/login?expired=1', request.url));
+    response.cookies.delete('session');
+    return response;
+  }
+
+  // RBAC: admin routes
+  if (ADMIN_ROUTES.some(r => pathname.startsWith(r)) && session.role !== 'admin') {
+    return NextResponse.redirect(new URL('/403', request.url));
+  }
+
+  return NextResponse.next();
+}
+
+// src/app/dashboard/page.tsx
+import { getSession } from '@/lib/auth';
+import { logoutAction } from '@/app/(auth)/actions';
+import { redirect } from 'next/navigation';
+
+export default async function DashboardPage() {
+  const session = await getSession();
+  if (!session) redirect('/login');  // belt-and-suspenders: middleware + page check
+
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-bold">Dashboard</h1>
+      <p>Welcome, {session.email}!</p>
+      <p>Role: {session.role}</p>
+      <form action={logoutAction}>
+        <button className="mt-4 px-4 py-2 bg-red-500 text-white rounded">Logout</button>
+      </form>
+    </main>
+  );
+}
+```
+
+#### Step 5 — Tests
+```typescript
+import { hashPassword, verifyPassword, createSession, verifySession } from '@/lib/auth';
+
+describe('Auth', () => {
+  it('hashes and verifies password', async () => {
+    const hash = await hashPassword('secret123');
+    expect(await verifyPassword('secret123', hash)).toBe(true);
+    expect(await verifyPassword('wrong', hash)).toBe(false);
+  });
+
+  it('creates and verifies JWT session', async () => {
+    const token = await createSession({ userId: 1, email: 'a@b.com', role: 'user' });
+    const session = await verifySession(token);
+    expect(session?.userId).toBe(1);
+    expect(session?.email).toBe('a@b.com');
+  });
+
+  it('rejects invalid token', async () => {
+    const result = await verifySession('invalid.token.here');
+    expect(result).toBeNull();
+  });
+});
+```
+
+**Expected Output:**
+```
+POST register -> creates user, sets cookie, redirects /dashboard
+POST login -> verifies password, sets cookie, redirects /dashboard
+GET /dashboard (no cookie) -> redirected to /login?returnTo=/dashboard
+GET /dashboard (with cookie) -> "Welcome a@b.com"
+GET /admin (with role=user) -> redirected to /403
+POST logout -> clears cookie, redirects /login
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add OAuth (GitHub) via @auth/core
+- [ ] Add refresh token rotation with 15-min access tokens
+- [ ] Add rate limiting on /login (5 attempts per IP per minute)
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Why must auth tokens never be in localStorage?
+**Q2:** Difference between JWT and session-based auth?
+**Q3:** Write a Server Action that creates a session cookie. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why are Server Actions automatically CSRF-protected?
+**Q5:** A junior protects routes only client-side — explain the vulnerability.
+**Q6:** What cookie attributes prevent XSS and CSRF?
+
+### Day 7 — Application
+**Q7:** Build a refresh token rotation system with short-lived JWTs.
+**Q8:** A PR uses session.role from a JWT without re-verifying — explain stale-data risk.
+**Q9:** When should you use Auth.js vs build auth yourself?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through implementing authentication in Next.js — what runs where, security considerations."
+**Q11:** Draw: auth lifecycle — register → hash → store → login → JWT → cookie → middleware verify → page access.
+**Q12:** ★ System design: "Design auth for a multi-tenant SaaS — SSO, per-tenant roles, API tokens for service accounts, session management at scale."

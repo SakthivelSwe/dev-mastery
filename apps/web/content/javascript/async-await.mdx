@@ -171,3 +171,223 @@ useEffect(() => {
   fetchData();
 }, []);
 ```
+
+## FEYNMAN CHECK
+
+### Explain async/await Like I'm 10 Years Old
+> async/await is SYNTACTIC SUGAR for Promises. `async function f()` always returns a Promise. `await p` PAUSES the function until p settles, then resumes with p's value (or throws if rejected). Inside an async function, you write code that LOOKS synchronous but ISN'T — it can use try/catch for errors and for-loops for sequencing. The non-obvious detail: `await` ONLY pauses the CURRENT async function — the caller keeps running. `fn()` where fn is async returns the promise IMMEDIATELY; you have to await fn() or chain .then. A common bug: forgetting to await — `async function() { saveToDb(user); }` is fire-and-forget; errors vanish silently. ESLint's no-floating-promises catches this.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does async/await fundamentally solve over raw Promises?**
+> **A:** Readability and control flow. With raw Promises, branching/looping/error-handling around async ops required nested .then chains: `p.then(a => { if (a) return q.then(b => ...) else return ...; }).catch(...)`. With async/await, the same code is: `try { const a = await p; if (a) { const b = await q; ... } } catch (e) { ... }` — flat, debuggable, supports loops naturally.
+
+**Q2: Mental model for async/await?**
+> **A:** "Every await is a SUSPEND POINT — the engine puts your function aside, runs other things, and resumes when the awaited value is ready." The function's local variables are preserved on the heap (a Continuation). The caller never blocks. await DOES NOT make the program single-threaded blocking — the event loop runs other tasks while you're paused.
+
+**Q3: Most dangerous misconception?**
+> **A:** Sequential awaits in a loop when parallel would do:
+> ```js
+> // ❌ Slow — each fetch awaits the previous to complete
+> for (const url of urls) {
+>   const data = await fetch(url).then(r => r.json());
+>   results.push(data);
+> }
+> // 10 URLs × 200ms each = 2000ms total
+>
+> // ✅ Parallel with Promise.all
+> const results = await Promise.all(urls.map(url => fetch(url).then(r => r.json())));
+> // All 10 in flight at once = ~200ms total
+> ```
+
+**Q4: How does async/await compile under the hood?**
+> **A:** The compiler converts each async function into a STATE MACHINE. Every `await` becomes a state transition: save current state, return the awaited promise's continuation, schedule resume callback. When the promise settles, the runtime jumps back into the function at the saved state. Modern V8 has dedicated bytecode for async — making it nearly as fast as raw .then chains, with extra overhead only for try/catch around await.
+
+**Q5: FAANG-grade definition?**
+> **A:** "async/await is JavaScript syntactic sugar over Promises — async functions always return a Promise, await expressions suspend the function at compile-time-generated state-machine resume points, throwing rejected-promise reasons as synchronous errors catchable by try/catch — enabling synchronous-looking code over asynchronous operations with full support for loops, branches, try/finally, and structured error handling."
+
+## BUILD
+
+### 🏗️ Mini Project: Sequential vs Parallel Image Loader With Progress
+
+**What you will build:** Two implementations of "load 20 images and report progress" — one with sequential await (slow, simple), one with parallel Promise.all + progress callback (fast, complex) — and a benchmark comparing them.
+**Why this project:** Forces you to SEE the cost of sequential awaits and how to parallelise correctly.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-async && cd js-async
+npm init -y && npm install -D vitest
+ni loader.js, loader.test.js -ItemType File
+```
+
+#### Step 2 — Sequential vs Parallel
+```js
+// loader.js
+
+// Simulate image load with variable delay
+function loadImage(url) {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve({ url, bytes: Math.floor(Math.random() * 50000) }), 50 + Math.random() * 150);
+  });
+}
+
+// SEQUENTIAL — slow, simple
+export async function loadAllSeq(urls, onProgress) {
+  const results = [];
+  for (const url of urls) {
+    const img = await loadImage(url);     // ❌ each waits for previous
+    results.push(img);
+    onProgress?.(results.length, urls.length);
+  }
+  return results;
+}
+
+// PARALLEL — fast, but progress callback is trickier
+export async function loadAllPar(urls, onProgress) {
+  let done = 0;
+  return Promise.all(urls.map(async (url) => {
+    const img = await loadImage(url);
+    done++;
+    onProgress?.(done, urls.length);
+    return img;
+  }));
+}
+
+// CONCURRENT WITH LIMIT — best of both worlds
+export async function loadAllLimit(urls, { concurrency = 4, onProgress } = {}) {
+  let done = 0;
+  const results = new Array(urls.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < urls.length) {
+      const i = idx++;
+      results[i] = await loadImage(urls[i]);
+      done++;
+      onProgress?.(done, urls.length);
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return results;
+}
+```
+
+#### Step 3 — Benchmark Them
+```js
+// demo.js
+import { loadAllSeq, loadAllPar, loadAllLimit } from './loader.js';
+
+const urls = Array.from({ length: 20 }, (_, i) => `/img/${i}.png`);
+
+console.time('sequential');
+await loadAllSeq(urls, (done, total) => process.stdout.write(`\r[seq] ${done}/${total}`));
+console.timeEnd('sequential');
+
+console.time('parallel');
+await loadAllPar(urls, (done, total) => process.stdout.write(`\r[par] ${done}/${total}`));
+console.timeEnd('parallel');
+
+console.time('limit=4');
+await loadAllLimit(urls, { concurrency: 4, onProgress: (d, t) => process.stdout.write(`\r[lim] ${d}/${t}`) });
+console.timeEnd('limit=4');
+```
+
+#### Step 4 — Error Handling: try/catch With await
+```js
+// Robust version with error per task
+export async function loadAllSafe(urls) {
+  const settled = await Promise.allSettled(urls.map(loadImage));
+  const ok    = settled.filter(s => s.status === 'fulfilled').map(s => s.value);
+  const errors = settled.filter(s => s.status === 'rejected').map(s => s.reason);
+  return { ok, errors };
+}
+
+// Top-level await (ES2022, modules only)
+const { ok, errors } = await loadAllSafe(['/good', '/bad', '/ugly']);
+console.log(`Loaded: ${ok.length}, Failed: ${errors.length}`);
+```
+
+#### Step 5 — Tests
+```js
+// loader.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { loadAllSeq, loadAllPar, loadAllLimit } from './loader.js';
+
+describe('async/await loaders', () => {
+  it('sequential is slower than parallel for same workload', async () => {
+    const urls = ['a', 'b', 'c', 'd', 'e'];
+    const startSeq = Date.now();
+    await loadAllSeq(urls);
+    const seqTime = Date.now() - startSeq;
+
+    const startPar = Date.now();
+    await loadAllPar(urls);
+    const parTime = Date.now() - startPar;
+
+    expect(parTime).toBeLessThan(seqTime);
+  });
+  it('progress callback fires for each completion', async () => {
+    const onProgress = vi.fn();
+    await loadAllPar(['a', 'b', 'c'], onProgress);
+    expect(onProgress).toHaveBeenCalledTimes(3);
+    expect(onProgress).toHaveBeenLastCalledWith(3, 3);
+  });
+  it('limit caps concurrency', async () => {
+    let active = 0, peak = 0;
+    const urls = Array.from({ length: 10 }, (_, i) => 'u' + i);
+    // Wrap loadImage to track concurrency — not directly testable without injection
+    // Instead, just verify timing isn't fully parallel
+    const start = Date.now();
+    await loadAllLimit(urls, { concurrency: 2 });
+    const time = Date.now() - start;
+    expect(time).toBeGreaterThan(200);   // 2-at-a-time can't finish in <200ms
+  });
+});
+```
+
+**Expected Output:**
+```
+[seq] 20/20  sequential: 2400ms
+[par] 20/20  parallel: 200ms
+[lim] 20/20  limit=4: 600ms
+
+Loaded: 3, Failed: 0
+
+# All tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add an AbortController so users can cancel
+- [ ] Add backpressure — pause new loads when downstream is slow
+- [ ] Compare with for-await-of over a generator
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does an async function return?
+**Q2:** What does `await` actually do?
+**Q3:** Write an async function that fetches two URLs in parallel and returns both. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is `for (const u of urls) { await fetch(u) }` slow?
+**Q5:** A junior writes `async function save() { db.write(user); }` — no await. Show the bug.
+**Q6:** Refactor to await + try/catch:
+```js
+function loadUser(id) {
+  return fetch('/u/'+id).then(r => r.json()).catch(e => null);
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a generator that yields async results one at a time (for-await-of).
+**Q8:** A PR awaits inside a forEach — explain why it doesn't actually wait.
+**Q9:** What's the overhead of async/await vs raw .then chains?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how async/await compiles to a state machine."
+**Q11:** Draw: call stack and microtask queue across 3 await points in one async function.
+**Q12:** ★ System design: "Build a pipeline that fetches → transforms → uploads 1M records with backpressure and retry."

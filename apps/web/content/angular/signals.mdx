@@ -156,3 +156,248 @@ A: **No, they are incorrect! Computed Signals are heavily cached and lazily eval
 This is the magic of Signals over standard getter functions (`get fullName() { ... }`).
 When Angular evaluates the `computed` signal the first time, it performs the string concatenation and *caches the result*. The next 49 times the template asks for `fullName()`, Angular instantly returns the cached string without executing the math function again.
 The cached value is only ever discarded (marked as "stale") if `firstName` or `lastName` specifically changes. Furthermore, the math isn't even recalculated immediately when the dependencies change; it is evaluated *lazily*, meaning it only recalculates when the template actually asks for the value again! This guarantees mathematically optimal performance.
+
+## FEYNMAN CHECK
+
+### Explain Angular Signals Like I'm 10 Years Old
+> Signals are Angular's reactive primitive — a container that holds a value AND tracks who reads it. When you read a signal (signal()), Angular registers that component or computed as a DEPENDENT. When the signal's value changes via .set() or .update(), Angular AUTOMATICALLY re-renders all dependents — no Zone.js needed, no markForCheck(), no manual subscription. Think of a signal as a spreadsheet cell: when you change cell A1, all cells that reference it (B1, C1) automatically recalculate. The non-obvious depth: computed() creates a DERIVED signal — its value is recalculated lazily only when a dependency changes and the computed is READ. effect() runs a SIDE EFFECT whenever its signal dependencies change — use for logging, syncing to localStorage, triggering animations.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the three signal primitives?**
+> **A:** (1) signal(initialValue) — a writable container. Read with signal(); write with signal.set(val), signal.update(fn), signal.mutate(fn) (for objects). (2) computed(() => expr) — a read-only derived signal; lazily evaluated when read after dependencies change; memoised. (3) effect(() => { /* runs when deps change */ }) — a side effect tied to signal reads; runs after render; auto-cleans up when the owning context is destroyed. All three are SYNCHRONOUS — no Promises or Observables involved.
+
+**Q2: Mental model for computed() memoisation?**
+> **A:** computed() is LAZY + MEMOISED. If userCount and productCount haven't changed since the last read of totalCount = computed(() => userCount() + productCount()), Angular returns the CACHED value without recalculating. This makes computed() safe to use in templates — even if the template reads a computed 100 times per render cycle, the function runs at most ONCE per dependency change. This contrasts sharply with template method calls (doCalculation()) which run on EVERY change detection cycle.
+
+**Q3: Most dangerous misconception about signals?**
+> **A:** You can use effect() for component state updates:
+> ```typescript
+> // WRONG: setting another signal inside effect() causes infinite loops
+> const a = signal(0);
+> const b = signal(0);
+>
+> effect(() => {
+>   b.set(a() * 2);  // reading a() makes effect depend on a
+>   // Setting b in effect triggers the effect again if b is also read here
+> });
+>
+> // CORRECT: use computed() for derived state
+> const b = computed(() => a() * 2);
+>
+> // Use effect() only for SIDE EFFECTS: localStorage, logging, DOM libraries
+> effect(() => {
+>   localStorage.setItem('lastValue', JSON.stringify(a()));  // OK
+> });
+> ```
+
+**Q4: How do signals interact with OnPush change detection?**
+> **A:** With signals, Angular marks a component as dirty specifically when a signal it reads changes — this is MORE granular than OnPush (which marks dirty on any @Input reference change). A component reading 10 signals but only 1 changing gets a targeted dirty mark for just that component. Angular 17+ uses a "reactive graph" — the dependency graph built from signal reads — to determine the minimal set of components to re-render. This is the foundation for zoneless Angular: no Zone.js patching needed when all async state flows through signals.
+
+**Q5: FAANG-grade definition of Angular signals.**
+> **A:** "Angular signals (Angular 16+) are reactive primitives implementing the observer pattern at the framework level — signal() for writable state containers, computed() for memoised derived values (lazily recalculated when dependencies change and the value is read), and effect() for side effects tied to signal-dependency changes — enabling fine-grained, synchronous reactivity without Zone.js, compatible with OnPush change detection, and forming the foundation of zoneless Angular applications via a reactive dependency graph that marks only signal-reading components as dirty on state change."
+
+## BUILD
+
+### 🏗️ Mini Project: Signal-Based Shopping Cart — Full State Management With Computed, Effect
+
+**What you will build:** A complete shopping cart using only Angular signals — signal() for items, computed() for totals and filtered views, effect() for localStorage persistence — no NgRx, no RxJS BehaviorSubject.
+**Why this project:** Forces all three signal primitives in a realistic stateful app.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new signals-cart --standalone --routing false
+cd signals-cart
+ng generate service cart-store
+ng generate component cart --standalone
+```
+
+#### Step 2 — Cart Store Service
+```typescript
+// cart-store.service.ts
+import { Injectable, signal, computed, effect } from '@angular/core';
+
+export interface CartItem { id: string; name: string; price: number; qty: number; }
+
+@Injectable({ providedIn: 'root' })
+export class CartStoreService {
+  private _items = signal<CartItem[]>(this.loadFromStorage());
+
+  // Public read-only view
+  items = this._items.asReadonly();
+
+  // Derived signals — computed lazily, memoised
+  itemCount = computed(() => this._items().reduce((s, i) => s + i.qty, 0));
+  subtotal  = computed(() => this._items().reduce((s, i) => s + i.price * i.qty, 0));
+  tax       = computed(() => Math.round(this.subtotal() * 0.10 * 100) / 100);
+  total     = computed(() => this.subtotal() + this.tax());
+  isEmpty   = computed(() => this._items().length === 0);
+
+  constructor() {
+    // Side effect: persist to localStorage whenever items change
+    effect(() => {
+      localStorage.setItem('cart', JSON.stringify(this._items()));
+    });
+  }
+
+  addItem(item: Omit<CartItem, 'qty'>) {
+    this._items.update(items => {
+      const existing = items.find(i => i.id === item.id);
+      if (existing) return items.map(i => i.id === item.id ? { ...i, qty: i.qty + 1 } : i);
+      return [...items, { ...item, qty: 1 }];
+    });
+  }
+
+  updateQty(id: string, qty: number) {
+    if (qty <= 0) { this.removeItem(id); return; }
+    this._items.update(items => items.map(i => i.id === id ? { ...i, qty } : i));
+  }
+
+  removeItem(id: string) {
+    this._items.update(items => items.filter(i => i.id !== id));
+  }
+
+  clear() { this._items.set([]); }
+
+  private loadFromStorage(): CartItem[] {
+    try {
+      const saved = localStorage.getItem('cart');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  }
+}
+```
+
+#### Step 3 — Cart Component
+```typescript
+// cart.component.ts
+import { Component, inject } from '@angular/core';
+import { NgFor, NgIf, CurrencyPipe } from '@angular/common';
+import { CartStoreService } from '../cart-store.service';
+
+const PRODUCTS = [
+  { id: 'p1', name: 'Angular T-Shirt', price: 29.99 },
+  { id: 'p2', name: 'RxJS Hoodie', price: 49.99 },
+  { id: 'p3', name: 'Signal Mug', price: 14.99 },
+];
+
+@Component({
+  standalone: true,
+  selector: 'app-cart',
+  imports: [NgFor, NgIf, CurrencyPipe],
+  template: `
+    <section>
+      <h2>Products</h2>
+      <div *ngFor="let p of products">
+        {{ p.name }} — {{ p.price | currency }}
+        <button (click)="cart.addItem(p)">Add to Cart</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Cart ({{ cart.itemCount() }} items)</h2>
+      <p *ngIf="cart.isEmpty()">Cart is empty</p>
+      <div *ngFor="let item of cart.items()">
+        {{ item.name }} x
+        <input type="number" [value]="item.qty"
+               (change)="cart.updateQty(item.id, +$any($event.target).value)"
+               min="0" style="width:50px">
+        = {{ item.price * item.qty | currency }}
+        <button (click)="cart.removeItem(item.id)">×</button>
+      </div>
+      <hr>
+      <p>Subtotal: {{ cart.subtotal() | currency }}</p>
+      <p>Tax (10%): {{ cart.tax() | currency }}</p>
+      <strong>Total: {{ cart.total() | currency }}</strong>
+      <button (click)="cart.clear()">Clear Cart</button>
+    </section>
+  `,
+})
+export class CartComponent {
+  cart = inject(CartStoreService);
+  products = PRODUCTS;
+}
+```
+
+#### Step 4 — Error Handling: Immutable Signal Updates
+```typescript
+// Always use update() with immutable transformations
+// WRONG: direct mutation — signals won't detect this
+cart._items().push({ id: 'x', name: 'X', price: 1, qty: 1 });
+
+// CORRECT: update() creates new reference
+cart._items.update(items => [...items, { id: 'x', name: 'X', price: 1, qty: 1 }]);
+```
+
+#### Step 5 — Tests
+```typescript
+describe('CartStoreService', () => {
+  let service: CartStoreService;
+  beforeEach(() => { TestBed.configureTestingModule({}); service = TestBed.inject(CartStoreService); service.clear(); });
+
+  it('adds items and merges duplicates', () => {
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    expect(service.items()[0].qty).toBe(2);
+  });
+
+  it('computes total correctly', () => {
+    service.addItem({ id: '1', name: 'A', price: 100 });
+    expect(service.subtotal()).toBe(100);
+    expect(service.tax()).toBe(10);
+    expect(service.total()).toBe(110);
+  });
+
+  it('isEmpty is true after clear', () => {
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    service.clear();
+    expect(service.isEmpty()).toBe(true);
+  });
+});
+```
+
+**Expected Output:**
+```
+Add Angular T-Shirt -> itemCount: 1, subtotal: 29.99, total: 32.99
+Add Angular T-Shirt again -> qty: 2, total: 65.98
+Clear -> cart empty
+Refresh page -> cart restored from localStorage (effect persisted)
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a coupon code signal with computed discount
+- [ ] Add toObservable(cartService.items) and pipe it through RxJS for analytics
+- [ ] Enable zoneless change detection and measure load time improvement
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three signal primitives in Angular.
+**Q2:** When should you use effect() vs computed()?
+**Q3:** Write a signal with update(). From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why should you not set another signal inside effect()?
+**Q5:** How is computed() different from a template method call?
+**Q6:** Refactor to signals:
+```typescript
+count = 0;
+increment() { this.count++; }
+double() { return this.count * 2; }
+```
+
+### Day 7 — Application
+**Q7:** Build a form with signal-based validation — required fields, error messages, disabled submit.
+**Q8:** A PR uses ngOnInit + subscribe to populate component state — refactor to signals.
+**Q9:** How do signals relate to OnPush change detection?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Angular signals — how computed() works, when to use effect(), and how they enable zoneless apps."
+**Q11:** Draw: reactive graph — signal reads, computed dependencies, component dirty marking.
+**Q12:** ★ System design: "Migrate an NgRx-based app to signals state management — when is NgRx still better, when can you use signals?"

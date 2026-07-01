@@ -175,3 +175,236 @@ A: A Validator is simply a TypeScript function that takes an `AbstractControl` a
 
 **Q: What is an Async Validator?**
 A: Standard validators execute instantly in memory (e.g., checking length). But what if you need to check if a username is already taken in the database? An Async Validator returns an Observable or a Promise. Angular will pause the form's status as `PENDING`, fire the HTTP request, and then automatically update the form to `VALID` or `INVALID` when the server responds!
+
+## FEYNMAN CHECK
+
+### Explain Angular Reactive Forms Like I'm 10 Years Old
+> Reactive forms build the form structure in TypeScript, not HTML — you create a FormGroup with FormControls in the component class, then bind them to template inputs via formControlName. The HTML just RENDERS the form; all validation, grouping, and state logic lives in TypeScript. The non-obvious power: because the form is a JavaScript object, you can dynamically add/remove controls at runtime, subscribe to value and status changes as Observables, reset the form programmatically, and unit-test validation logic without a DOM. Reactive forms are "model-driven" — you define the shape of your data and its validation rules up front, then Angular handles two-way sync automatically.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the reactive forms data model?**
+> **A:** FormControl is a single field (tracks value, validation status, touched/dirty/pristine state). FormGroup is a collection of FormControls keyed by name (tracks the aggregate validity of its children). FormArray is an indexed collection of FormControls or FormGroups (for dynamic lists of fields). FormBuilder is a helper that simplifies creation syntax. AbstractControl is the base class — all three extend it. The entire form is a TREE of AbstractControls whose values compose automatically into a plain JavaScript object via formGroup.value.
+
+**Q2: Mental model for validation in reactive forms?**
+> **A:** Validators are functions that take an AbstractControl and return null (valid) or a ValidationErrors object (invalid — the keys become error codes you check in templates). Validators.required, Validators.email, Validators.min(n), Validators.pattern(re) are built-in. Async validators (like checking username availability) return Observable<ValidationErrors | null> and run after sync validators pass. Cross-field validators live on a FormGroup — they receive the entire group and can check multiple fields together (e.g., password === confirmPassword).
+
+**Q3: Most dangerous misconception about reactive forms?**
+> **A:** formGroup.value gives the complete form data:
+> ```typescript
+> // WRONG: .value excludes DISABLED controls
+> const form = this.fb.group({ name: 'Ana', role: [{ value: 'admin', disabled: true }] });
+> console.log(form.value);  // { name: 'Ana' } — role is missing!
+>
+> // CORRECT: .getRawValue() includes disabled controls
+> console.log(form.getRawValue());  // { name: 'Ana', role: 'admin' }
+>
+> // Practical scenario: disabling a field during submission
+> // but still needing its value to send to the server
+> ```
+
+**Q4: How do FormArrays work for dynamic form fields?**
+> **A:** FormArray holds AbstractControls at numeric indices. Push adds a new control, removeAt removes by index, at(i) accesses by index. The formArrayName directive in the template binds to the array, and formGroupName/formControlName bind to individual array items. Pattern: for a dynamic phone numbers list, each phone is a FormGroup with number and type controls. push(this.fb.group({ number: '', type: 'mobile' })) adds a new row; removeAt(i) deletes it. The form value automatically reflects the array contents.
+
+**Q5: FAANG-grade definition of Angular reactive forms.**
+> **A:** "Angular reactive forms are a model-driven approach where form structure (FormControl, FormGroup, FormArray) and validation (sync and async Validators) are defined in TypeScript, with formControlName/formGroupName/formArrayName directives binding the model to template inputs — exposing form state (value, status, touched, dirty, errors) as Observables for reactive transformations — and FormBuilder providing ergonomic factory methods — making forms fully unit-testable, dynamically composable, and RxJS-composable without touching the DOM."
+
+## BUILD
+
+### 🏗️ Mini Project: Multi-Step Registration Form With Dynamic Fields and Cross-Field Validation
+
+**What you will build:** A 3-step registration form: (1) account info with async username-availability check, (2) profile with a dynamic phone-numbers FormArray, (3) confirmation with password + confirmPassword cross-field validator.
+**Why this project:** Forces async validators, FormArrays, cross-field validation, and multi-step form patterns.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new reactive-forms-demo --standalone --routing false
+cd reactive-forms-demo
+ng generate component registration --standalone
+```
+
+#### Step 2 — Validators
+```typescript
+// validators.ts
+import { AbstractControl, ValidationErrors, AsyncValidatorFn } from '@angular/forms';
+import { Observable, of, delay, map } from 'rxjs';
+
+// Cross-field: passwords must match
+export function passwordsMatch(control: AbstractControl): ValidationErrors | null {
+  const pass = control.get('password');
+  const confirm = control.get('confirmPassword');
+  if (!pass || !confirm) return null;
+  return pass.value === confirm.value ? null : { passwordsMismatch: true };
+}
+
+// Async: simulate username availability check
+export function usernameAvailable(): AsyncValidatorFn {
+  const taken = new Set(['admin', 'user', 'test', 'angular']);
+  return (control: AbstractControl): Observable<ValidationErrors | null> => {
+    return of(control.value).pipe(
+      delay(500),  // simulate network delay
+      map(username => taken.has(username.toLowerCase()) ? { usernameTaken: true } : null)
+    );
+  };
+}
+```
+
+#### Step 3 — Registration Component
+```typescript
+// registration.component.ts
+import { Component, inject } from '@angular/core';
+import { FormBuilder, FormArray, Validators, ReactiveFormsModule } from '@angular/forms';
+import { NgFor, NgIf } from '@angular/common';
+import { passwordsMatch, usernameAvailable } from '../validators';
+
+@Component({
+  standalone: true,
+  imports: [ReactiveFormsModule, NgFor, NgIf],
+  template: `
+    <form [formGroup]="form" (ngSubmit)="submit()">
+      <!-- Step 1: Account -->
+      <section>
+        <h3>Account Info</h3>
+        <input formControlName="username" placeholder="Username">
+        <span *ngIf="form.get('username')?.pending">Checking...</span>
+        <span *ngIf="form.get('username')?.errors?.['usernameTaken']">Username taken!</span>
+        <span *ngIf="form.get('username')?.errors?.['required']">Required</span>
+        <input formControlName="email" type="email" placeholder="Email">
+      </section>
+
+      <!-- Step 2: Phone Numbers (FormArray) -->
+      <section formArrayName="phones">
+        <h3>Phone Numbers</h3>
+        <div *ngFor="let phone of phones.controls; let i = index" [formGroupName]="i">
+          <input formControlName="number" placeholder="Number">
+          <select formControlName="type">
+            <option value="mobile">Mobile</option>
+            <option value="home">Home</option>
+            <option value="work">Work</option>
+          </select>
+          <button type="button" (click)="removePhone(i)">Remove</button>
+        </div>
+        <button type="button" (click)="addPhone()">+ Add Phone</button>
+      </section>
+
+      <!-- Step 3: Password -->
+      <section formGroupName="passwords">
+        <h3>Set Password</h3>
+        <input formControlName="password" type="password" placeholder="Password">
+        <input formControlName="confirmPassword" type="password" placeholder="Confirm">
+        <span *ngIf="form.get('passwords')?.errors?.['passwordsMismatch']">Passwords do not match</span>
+      </section>
+
+      <button type="submit" [disabled]="form.invalid || form.pending">Register</button>
+    </form>
+    <pre>{{ form.getRawValue() | json }}</pre>
+  `,
+})
+export class RegistrationComponent {
+  private fb = inject(FormBuilder);
+
+  form = this.fb.group({
+    username: ['', [Validators.required, Validators.minLength(3)], [usernameAvailable()]],
+    email: ['', [Validators.required, Validators.email]],
+    phones: this.fb.array([this.createPhone()]),
+    passwords: this.fb.group({
+      password: ['', [Validators.required, Validators.minLength(8)]],
+      confirmPassword: ['', Validators.required],
+    }, { validators: passwordsMatch }),
+  });
+
+  get phones(): FormArray { return this.form.get('phones') as FormArray; }
+
+  createPhone() {
+    return this.fb.group({ number: ['', Validators.required], type: ['mobile'] });
+  }
+  addPhone()      { this.phones.push(this.createPhone()); }
+  removePhone(i: number) { this.phones.removeAt(i); }
+
+  submit() {
+    if (this.form.valid) console.log('Submitted:', this.form.getRawValue());
+  }
+}
+```
+
+#### Step 4 — Error Handling: Status and Touch Tracking
+```typescript
+// Show error only after the user has touched the field
+getError(path: string, error: string): boolean {
+  const control = this.form.get(path);
+  return !!(control?.touched && control?.errors?.[error]);
+}
+
+// Reset form on success
+onSuccess() {
+  this.form.reset();
+  // OR reset to initial values:
+  this.form.patchValue({ username: '', email: '' });
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('passwordsMatch validator', () => {
+  it('returns null when passwords match', () => {
+    const group = new FormGroup({
+      password: new FormControl('abc123'),
+      confirmPassword: new FormControl('abc123'),
+    });
+    expect(passwordsMatch(group)).toBeNull();
+  });
+  it('returns error when passwords differ', () => {
+    const group = new FormGroup({
+      password: new FormControl('abc123'),
+      confirmPassword: new FormControl('different'),
+    });
+    expect(passwordsMatch(group)).toEqual({ passwordsMismatch: true });
+  });
+});
+```
+
+**Expected Output:**
+```
+username 'admin' -> "Username taken!" after 500ms delay
+Add Phone -> new row in FormArray
+Remove Phone -> row removed
+Passwords mismatch -> "Passwords do not match"
+Submit -> logs getRawValue() including disabled fields
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a step-by-step wizard with separate FormGroups per step
+- [ ] Add debounceTime(300) to the username async validator
+- [ ] Build a reusable form-error component that reads AbstractControl errors
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between FormControl, FormGroup, and FormArray?
+**Q2:** What does formGroup.value exclude that getRawValue() includes?
+**Q3:** Write a required + minLength validator on a FormControl. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do async validators differ from sync validators?
+**Q5:** A junior adds a cross-field validator on a FormControl — it never runs for both fields. Fix.
+**Q6:** Refactor to reactive form:
+```typescript
+// Template-driven: <input [(ngModel)]="name" required>
+// Needs to become reactive
+```
+
+### Day 7 — Application
+**Q7:** Build a FormArray of addresses with add/remove — each address has street, city, postcode.
+**Q8:** A PR shows validation errors before the user touches fields — fix.
+**Q9:** How do you reset a reactive form to its initial values?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare reactive forms and template-driven forms — when would you use each in a production app?"
+**Q11:** Draw: FormGroup value tree for a nested multi-section registration form.
+**Q12:** ★ System design: "Design a dynamic form builder that renders forms from a JSON schema — Angular reactive forms approach."

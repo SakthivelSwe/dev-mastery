@@ -183,3 +183,317 @@ Without this, `images: ['/og-image.jpg']` becomes an invalid relative URL in the
 3. **`generateMetadata` returning undefined for some reason:** Check if the slug lookup is actually finding the post and returning real data (not hitting the `if (!post)` fallback).
 
 4. **Twitter is scraping the page before `generateMetadata` finishes:** If the page is rendered dynamically on first request and Twitter's bot is faster than your server's response, it might get an incomplete page. Use SSG or ISR for blog posts so the page is pre-rendered and instantly available.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Metadata Like I'm 10 Years Old
+> Metadata is the data ABOUT your page that search engines (Google), social platforms (Twitter, Facebook), and browsers use to understand your content. Next.js generates the <head> tags from JavaScript objects exported from your page or layout files. Static metadata: export const metadata = { title: 'My Page', description: '...' }. Dynamic metadata (based on route params, DB data): export async function generateMetadata({ params }) { const post = await fetchPost(params.id); return { title: post.title, openGraph: { ... } } }. The non-obvious depth: metadata cascades and merges through layouts — a root layout sets default title template ('%s | DevApp'), each page provides just the title ('Settings'), and the final rendered title is 'Settings | DevApp'. This DRY pattern prevents repeating the brand name in every page's metadata.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the metadata title template and how does it cascade?**
+> **A:** export const metadata = { title: { template: '%s | DevApp', default: 'DevApp - Build Faster' } }. Child pages export const metadata = { title: 'Pricing' } — the rendered <title> is 'Pricing | DevApp'. If a child page has no title, the layout's default ('DevApp - Build Faster') is used. Templates apply at every layout level: root layout has '%s | DevApp', dashboard layout overrides with '%s | Dashboard | DevApp', settings page provides 'Account' → final is 'Account | Dashboard | DevApp'. This DRY pattern keeps brand consistent without duplication.
+
+**Q2: Mental model for OpenGraph vs Twitter cards?**
+> **A:** OpenGraph (Facebook's standard, used by most platforms): openGraph: { title, description, images, type, locale, siteName }. Twitter cards (Twitter-specific): twitter: { card: 'summary_large_image', title, description, images }. Most platforms fall back to OG if no Twitter card, so OG alone covers 80% of social sharing. For best results, provide both: OG for general use, Twitter overrides for Twitter-specific formatting. Image dimensions matter: 1200×630 for OG (1.91:1 ratio), 1200×630 or 1200×600 for Twitter — wrong ratios get cropped poorly.
+
+**Q3: Most dangerous misconception about metadata?**
+> **A:** Client-side metadata changes work for SEO:
+> ```typescript
+> // WRONG: useEffect to set document.title after page load
+> 'use client';
+> import { useEffect } from 'react';
+> export default function Page() {
+>   useEffect(() => { document.title = 'Dynamic Title'; }, []);
+>   return <div>...</div>;
+> }
+> // Google's crawler sees the initial server-rendered <title> — your dynamic title is invisible
+> // Social media scrapers (Facebook, Twitter) don't execute JavaScript at all
+> // Result: posts shared show the wrong title and no preview image
+>
+> // CORRECT: use generateMetadata in Server Components
+> export async function generateMetadata({ params }) {
+>   const product = await fetchProduct(params.id);
+>   return { title: product.name, description: product.description };
+> }
+> // Rendered server-side — visible to crawlers and scrapers
+> ```
+
+**Q4: How do you implement a dynamic OG image?**
+> **A:** Create app/og/route.tsx using ImageResponse from next/og:
+> import { ImageResponse } from 'next/og';
+> export async function GET(request) {
+>   const { searchParams } = new URL(request.url);
+>   const title = searchParams.get('title') ?? 'DevApp';
+>   return new ImageResponse(
+>     <div style={{ background: 'linear-gradient(...)', width: 1200, height: 630 }}>
+>       <h1 style={{ fontSize: 60 }}>{title}</h1>
+>     </div>,
+>     { width: 1200, height: 630 }
+>   );
+> }
+> Then in page metadata: openGraph: { images: ['/og?title=My Post'] }. Each shared link gets a custom-generated image with the post title rendered onto a branded background — automated and dynamic.
+
+**Q5: FAANG-grade definition of Next.js metadata.**
+> **A:** "Next.js metadata API is a file-system-aware <head> generator — exporting either static metadata (constant object) or generateMetadata (async function receiving params and parent metadata) from layout.tsx or page.tsx — supporting title templates with %s placeholder for DRY layered branding — full OpenGraph, Twitter cards, Robots, alternates (canonical/hreflang), and JSON-LD structured data — dynamic OG image generation via next/og's ImageResponse using JSX with edge-runtime Satori for sub-second image rendering — automatic merging across nested layouts (child overrides parent, templates cascade) — and server-side rendering ensuring SEO crawlers and social scrapers receive the correct tags without JavaScript execution."
+
+## BUILD
+
+### 🏗️ Mini Project: SEO-Optimised Blog — Static + Dynamic Metadata + Dynamic OG Images + Sitemap
+
+**What you will build:** A blog with: root metadata template, per-post generateMetadata with OG/Twitter, dynamic OG image generation, automatic sitemap.xml, robots.txt, and JSON-LD structured data.
+**Why this project:** Forces every SEO and metadata pattern.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest seo-demo --typescript --tailwind --app
+```
+
+#### Step 2 — Root Layout With Metadata Template
+```typescript
+// src/app/layout.tsx
+import { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  metadataBase: new URL('https://devapp.example.com'),  // resolves relative URLs
+  title: {
+    template: '%s | DevApp Blog',
+    default: 'DevApp Blog - Engineering Insights',
+  },
+  description: 'Production engineering articles for senior developers.',
+  authors: [{ name: 'DevApp Team' }],
+  keywords: ['Next.js', 'React', 'TypeScript', 'engineering'],
+  openGraph: {
+    type: 'website',
+    siteName: 'DevApp Blog',
+    locale: 'en_US',
+    images: [{ url: '/og-default.png', width: 1200, height: 630 }],
+  },
+  twitter: {
+    card: 'summary_large_image',
+    site: '@devapp',
+    creator: '@devapp',
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: { index: true, follow: true, 'max-image-preview': 'large' },
+  },
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return <html lang="en"><body>{children}</body></html>;
+}
+```
+
+#### Step 3 — Dynamic Post Metadata
+```typescript
+// src/app/blog/[slug]/page.tsx
+import { Metadata } from 'next';
+import { notFound } from 'next/navigation';
+
+interface Post { slug: string; title: string; excerpt: string; author: string; date: string; tags: string[]; }
+
+async function getPost(slug: string): Promise<Post | null> {
+  // Fetch from CMS/DB
+  return {
+    slug, title: 'How Server Components Changed Everything',
+    excerpt: 'A deep dive into React Server Components in production.',
+    author: 'Ana Dev', date: '2025-03-15',
+    tags: ['react', 'server-components', 'next.js'],
+  };
+}
+
+interface Props { params: { slug: string }; }
+
+// Dynamic metadata based on the post
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const post = await getPost(params.slug);
+  if (!post) return { title: 'Not Found' };
+
+  return {
+    title: post.title,                          // -> 'How Server Components... | DevApp Blog'
+    description: post.excerpt,
+    authors: [{ name: post.author }],
+    keywords: post.tags,
+    alternates: {
+      canonical: `/blog/${post.slug}`,
+    },
+    openGraph: {
+      title: post.title,
+      description: post.excerpt,
+      type: 'article',
+      publishedTime: post.date,
+      authors: [post.author],
+      tags: post.tags,
+      images: [{
+        url: `/api/og?title=${encodeURIComponent(post.title)}&author=${encodeURIComponent(post.author)}`,
+        width: 1200, height: 630,
+        alt: post.title,
+      }],
+    },
+    twitter: {
+      card: 'summary_large_image',
+      title: post.title,
+      description: post.excerpt,
+      images: [`/api/og?title=${encodeURIComponent(post.title)}`],
+    },
+  };
+}
+
+export default async function PostPage({ params }: Props) {
+  const post = await getPost(params.slug);
+  if (!post) notFound();
+
+  // JSON-LD structured data for Google's rich results
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'BlogPosting',
+    headline: post.title,
+    author: { '@type': 'Person', name: post.author },
+    datePublished: post.date,
+    keywords: post.tags.join(', '),
+  };
+
+  return (
+    <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
+      <article className="max-w-2xl mx-auto p-8">
+        <h1 className="text-3xl font-bold">{post.title}</h1>
+        <p className="text-gray-500 mt-2">By {post.author} on {post.date}</p>
+        <p className="mt-4">{post.excerpt}</p>
+      </article>
+    </>
+  );
+}
+```
+
+#### Step 4 — Dynamic OG Image Generator
+```typescript
+// src/app/api/og/route.tsx
+import { ImageResponse } from 'next/og';
+import { NextRequest } from 'next/server';
+
+export const runtime = 'edge';  // fast, global
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const title = searchParams.get('title') ?? 'DevApp Blog';
+  const author = searchParams.get('author') ?? '';
+
+  return new ImageResponse(
+    (
+      <div
+        style={{
+          width: '100%', height: '100%',
+          background: 'linear-gradient(135deg, #1e3a8a 0%, #6366f1 100%)',
+          display: 'flex', flexDirection: 'column',
+          justifyContent: 'center', alignItems: 'center',
+          padding: 80, color: 'white',
+        }}
+      >
+        <div style={{ fontSize: 64, fontWeight: 700, textAlign: 'center', lineHeight: 1.2 }}>
+          {title}
+        </div>
+        {author && (
+          <div style={{ fontSize: 32, marginTop: 30, opacity: 0.8 }}>
+            by {author}
+          </div>
+        )}
+        <div style={{ position: 'absolute', bottom: 40, right: 40, fontSize: 28 }}>
+          devapp.example.com
+        </div>
+      </div>
+    ),
+    { width: 1200, height: 630 },
+  );
+}
+```
+
+#### Step 5 — Sitemap + Robots + Tests
+```typescript
+// src/app/sitemap.ts
+import { MetadataRoute } from 'next';
+
+export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
+  const posts = [{ slug: 'rsc' }, { slug: 'streaming' }];  // fetch from DB
+
+  return [
+    { url: 'https://devapp.example.com', lastModified: new Date(), priority: 1.0 },
+    { url: 'https://devapp.example.com/blog', lastModified: new Date(), priority: 0.8 },
+    ...posts.map(p => ({
+      url: `https://devapp.example.com/blog/${p.slug}`,
+      lastModified: new Date(),
+      changeFrequency: 'weekly' as const,
+      priority: 0.6,
+    })),
+  ];
+}
+
+// src/app/robots.ts
+import { MetadataRoute } from 'next';
+export default function robots(): MetadataRoute.Robots {
+  return {
+    rules: [
+      { userAgent: '*', allow: '/', disallow: ['/admin', '/api'] },
+    ],
+    sitemap: 'https://devapp.example.com/sitemap.xml',
+  };
+}
+
+// Tests
+import { generateMetadata } from '@/app/blog/[slug]/page';
+it('generates correct OG metadata', async () => {
+  const meta = await generateMetadata({ params: { slug: 'rsc' } });
+  expect(meta.title).toContain('Server Components');
+  expect(meta.openGraph?.type).toBe('article');
+});
+```
+
+**Expected Output:**
+```
+View source /blog/rsc:
+  <title>How Server Components Changed Everything | DevApp Blog</title>
+  <meta property="og:image" content="/api/og?title=...">
+  <script type="application/ld+json">{...}</script>
+GET /api/og?title=Test -> 1200x630 PNG image (dynamic)
+GET /sitemap.xml -> XML sitemap with all URLs
+GET /robots.txt -> robots rules
+Share URL on Twitter -> beautiful card with title and image
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add hreflang alternates for i18n SEO
+- [ ] Generate sitemap dynamically from DB at request time
+- [ ] Add breadcrumb JSON-LD structured data
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between static metadata and generateMetadata?
+**Q2:** What is the %s template syntax?
+**Q3:** Write generateMetadata for a blog post page. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why doesn't client-side document.title work for SEO?
+**Q5:** A PR uses useEffect to set OG tags — diagnose why social previews are broken.
+**Q6:** What does metadataBase enable?
+
+### Day 7 — Application
+**Q7:** Build a dynamic OG image generator with branded design.
+**Q8:** A PR sets robots: { index: false } in root metadata — explain the SEO catastrophe.
+**Q9:** How does JSON-LD structured data improve search results?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Next.js metadata API — cascading, dynamic generation, and SEO best practices."
+**Q11:** Draw: metadata cascade from root → layout → page with title template merging.
+**Q12:** ★ System design: "Design SEO architecture for a multi-language news site — hreflang, sitemaps, structured data, dynamic OG images."

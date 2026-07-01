@@ -129,3 +129,242 @@ A: By default, any `<button>` inside a `<form>` is implicitly treated as `type="
 To fix this, you have two options:
 1. Explicitly mark the cancel button as `type="button"`. This tells the browser, "This is just a dumb, clickable box; do not submit or validate the form."
 2. Add the `formnovalidate` attribute directly to the submit button. This tells the browser to proceed with the form submission, but skip all validation checks!
+
+## FEYNMAN CHECK
+
+### Explain HTML5 Form Validation Like I'm 10 Years Old
+> Before you call the server, the browser plays bouncer at the door: it checks every input against built-in rules (`required`, `type="email"`, `pattern`, `min/max`, `minlength/maxlength`) AND any custom rule you set via `setCustomValidity('...')`. If anything fails, the browser blocks the submission and pops up the FIRST invalid field's error — without ONE line of JS. This is why "use the platform" exists: native validation gives you keyboard nav, screen-reader announcements, mobile-friendly UI, and built-in localised error text for free.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does native form validation fundamentally solve?**
+> **A:** It eliminates the round-trip cost of submitting an obviously-invalid form, while ALSO giving the user instant feedback in a UX consistent with their OS and locale. A custom JS validator can do the same but you re-invent: focus management, ARIA live-region announcements, mobile native error styling, localised error strings, and the screen-reader form mode.
+
+**Q2: What is the ONE mental model that makes form validation click?**
+> **A:** Every form control has a live `validity` object whose 8 boolean flags (`valueMissing`, `typeMismatch`, `patternMismatch`, `tooLong`, `tooShort`, `rangeUnderflow`, `rangeOverflow`, `stepMismatch`, plus catch-all `customError`) summarise WHY the field is invalid. The browser uses these flags to block submission and show the tooltip. Custom validation is just `element.setCustomValidity(message)` — empty string means valid.
+
+**Q3: What is the most dangerous misconception? Show it with code.**
+> **A:** That client-side validation is enough. It's purely a UX layer, NEVER security:
+> ```javascript
+> // ❌ DANGEROUS — attacker bypasses the form with curl
+> // Server: app.post('/transfer', (req, res) => bank.transfer(req.body.amount));
+>
+> // ✅ Server MUST re-validate every constraint the HTML claimed
+> app.post('/transfer', (req, res) => {
+>   const amt = Number(req.body.amount);
+>   if (!Number.isFinite(amt) || amt <= 0 || amt > 10000) return res.sendStatus(400);
+>   bank.transfer(amt);
+> });
+> ```
+
+**Q4: How does `:invalid` CSS interact with the validation engine?**
+> **A:** The browser keeps `validity.valid` in sync on every `input` event. `:invalid` matches whenever `validity.valid === false`. The pitfall: `:invalid` fires IMMEDIATELY on page load — a required-but-empty input is already `:invalid` before the user touched it, producing ugly red borders on a fresh form. Fix: apply error styles via `:invalid:not(:placeholder-shown)` or gate them behind a JS-toggled `data-touched` attribute.
+
+**Q5: Write a one-sentence FAANG-precise definition.**
+> **A:** "HTML5 form validation is a declarative constraint API exposed via element attributes (`required`, `pattern`, `min`, `type`...) and a programmatic counterpart (`element.validity`, `setCustomValidity`, `reportValidity`) that the browser uses to block submission and surface localised error UI — providing zero-JS UX that must always be re-checked on the server because it is purely a client-side hint, not a security boundary."
+
+## BUILD
+
+### 🏗️ Mini Project: Sign-Up Form With Full Native + Async Custom Validation
+
+**What you will build:** A registration form using every relevant native validation attribute, custom `setCustomValidity` for password-confirm matching, async validation that checks username availability via fetch, and properly-timed error display (no premature red borders).
+**Why this project:** Wires together every layer of the Constraint Validation API correctly — most production forms get only 1 or 2 layers right.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir validation-demo && cd validation-demo
+ni signup.html, validate.js -ItemType File
+```
+
+#### Step 2 — Form With Native Constraints
+```html
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Sign up</title>
+<style>
+  /* Show errors ONLY after first blur — avoids ugly red on page load */
+  [data-touched]:invalid { border-color: crimson; }
+  [data-touched]:valid   { border-color: green;   }
+  .err { color: crimson; font-size: 0.9em; min-height: 1.2em; }
+</style></head>
+<body>
+<form id="signup" action="/signup" method="POST" novalidate>
+  <label for="u">Username</label>
+  <input id="u" name="username" type="text" required
+         minlength="3" maxlength="20"
+         pattern="[a-z0-9_]+"
+         title="Lowercase letters, digits, underscore only"
+         aria-describedby="u-err">
+  <div id="u-err" class="err" aria-live="polite"></div>
+
+  <label for="e">Email</label>
+  <input id="e" name="email" type="email" required maxlength="254"
+         aria-describedby="e-err">
+  <div id="e-err" class="err" aria-live="polite"></div>
+
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" required
+         minlength="12" pattern=".*[A-Z].*[0-9].*"
+         title="≥12 chars, 1 uppercase, 1 digit"
+         aria-describedby="p-err">
+  <div id="p-err" class="err" aria-live="polite"></div>
+
+  <label for="p2">Confirm password</label>
+  <input id="p2" name="passwordConfirm" type="password" required
+         aria-describedby="p2-err">
+  <div id="p2-err" class="err" aria-live="polite"></div>
+
+  <button type="submit">Create account</button>
+</form>
+<script type="module" src="./validate.js"></script>
+</body></html>
+```
+
+#### Step 3 — Custom + Async Validation (`validate.js`)
+```javascript
+const form = document.getElementById('signup');
+const u    = form.username;
+const p    = form.password;
+const p2   = form.passwordConfirm;
+
+// (1) Mark fields as "touched" on first blur — :invalid styling only shows then
+for (const field of form.elements) {
+  if (!field.name) continue;
+  field.addEventListener('blur', () => field.dataset.touched = 'true', { once: true });
+  field.addEventListener('input', () => showError(field));
+}
+
+// (2) Password-confirm custom validity — runs on EITHER field changing
+function syncConfirm() {
+  const msg = p.value && p2.value && p.value !== p2.value
+    ? 'Passwords do not match'
+    : '';
+  p2.setCustomValidity(msg);
+  showError(p2);
+}
+p.addEventListener('input', syncConfirm);
+p2.addEventListener('input', syncConfirm);
+
+// (3) Async username availability — debounced, AbortController-cancelled
+let abort;
+u.addEventListener('input', async () => {
+  if (abort) abort.abort();
+  abort = new AbortController();
+  if (!u.checkValidity()) return;           // skip if native rules already fail
+  await new Promise(r => setTimeout(r, 300));  // debounce
+  try {
+    const r = await fetch('/api/check?u=' + encodeURIComponent(u.value),
+                          { signal: abort.signal });
+    const { available } = await r.json();
+    u.setCustomValidity(available ? '' : 'Username already taken');
+  } catch (e) {
+    if (e.name !== 'AbortError') u.setCustomValidity('');
+  }
+  showError(u);
+});
+
+// (4) Render validation message into the live region
+function showError(field) {
+  const slot = document.getElementById(field.id + '-err');
+  slot.textContent = field.validity.valid ? '' : field.validationMessage;
+  field.setAttribute('aria-invalid', String(!field.validity.valid));
+}
+
+// (5) On submit, re-check ALL and let browser show its UI
+form.addEventListener('submit', (e) => {
+  if (!form.checkValidity()) {
+    e.preventDefault();
+    form.reportValidity();                  // browser focuses first invalid field
+  }
+});
+```
+
+#### Step 4 — Edge Cases
+```javascript
+// Disable submit while any field is invalid (optional UX)
+form.addEventListener('input', () => {
+  form.querySelector('button[type=submit]').disabled = !form.checkValidity();
+});
+
+// Reset clears custom validity too (otherwise stays "taken" after reset)
+form.addEventListener('reset', () => {
+  for (const el of form.elements) el.setCustomValidity?.('');
+});
+```
+
+#### Step 5 — Tests
+```javascript
+// Smoke test via the DOM API
+console.assert(form.username.validity.valueMissing, 'username should be required');
+form.username.value = 'ab';
+console.assert(form.username.validity.tooShort, 'minlength=3 should trigger tooShort');
+form.username.value = 'AB!';
+console.assert(form.username.validity.patternMismatch, 'pattern should reject uppercase/!');
+form.username.value = 'ok_name';
+console.assert(form.username.validity.valid, 'valid username should pass');
+```
+
+**Expected Output:**
+```
+- Empty submission: browser tooltip on first invalid field, no network call
+- "AB!" in username: red border after blur, "Lowercase letters, digits, underscore only"
+- Password "abc" + confirm "xyz": confirm field shows "Passwords do not match"
+- Available username: green border. Taken: red border + "Username already taken"
+- All console.assert calls pass with no warning
+```
+
+**Stretch Challenges:**
+- [ ] Add a strength meter that turns the password border yellow → green based on entropy
+- [ ] Add a "Show password" toggle without breaking validation
+- [ ] Replace inline error divs with a single `<output>` summary at form top
+
+## SPACED REVIEW
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name the 8 `ValidityState` boolean flags. Give one HTML attribute that triggers each.
+
+**Q2:** What is the ONE method you call to set a custom error message on a form control? What argument means "no error"?
+
+**Q3:** Write a 6-line HTML form with a username field that requires 3-20 lowercase letters or digits, no spaces.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** Why does `:invalid` create poor UX on a freshly loaded form? Give two different fixes.
+
+**Q5:** Describe a production bug where the team relied on `pattern` for security. Show the exploit and the server-side fix.
+
+**Q6:** Refactor so the password-confirm check is properly hooked into the Constraint Validation API:
+```html
+<input id="pw" type="password">
+<input id="pw2" type="password">
+<button onclick="if(pw.value!==pw2.value){alert('mismatch');return false;}submit();">Go</button>
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build an async "is this email already registered" validator with 300ms debounce, AbortController cancellation, and aria-live error display. No libraries.
+
+**Q8:** A form validates entirely in JS with custom HTML errors. List 4 things the browser would give you for free if you migrated to the Constraint Validation API.
+
+**Q9:** What is `form.reportValidity()` vs `form.checkValidity()`? When do you call each and what does each do to the UI?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Interview: "Walk me through how you would build a sign-up form's validation using only browser APIs."
+
+**Q11:** Draw the dependency graph: form-validation ↔ forms-html ↔ html-attributes ↔ accessibility-html.
+
+**Q12:** ★ System design: "Design validation for a multi-region SaaS where: client validates instantly, server enforces business rules, async checks must work offline, error messages localised in 14 languages. Where does each rule live?"

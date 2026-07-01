@@ -149,3 +149,203 @@ A: **The Serialization Boundary.**
 When a Server Component passes data as a prop to a Client Component, that data crosses the network boundary (from the Server to the Browser). React must serialize that data into JSON, embed it in the HTML payload, and send it over the internet.
 If you query `SELECT * FROM users` (fetching 10,000 rows with 50 columns) and pass that massive array to a Client Component, you are forcing the server to send a 10MB JSON string over the network!
 *The Fix:* Server Components should filter and transform data on the server, passing down *only* the absolute minimum specific data the Client Component needs to render.
+
+## FEYNMAN CHECK
+
+### Explain React Server Components Like I'm 10 Years Old
+> Server Components run ON THE SERVER — they can directly access databases, read files, and fetch data without sending JavaScript to the browser. Only their HTML output is sent. Client Components (`'use client'` directive) run in the browser and can use useState, useEffect, events. The non-obvious depth: Server Components have zero client-side JavaScript by default — they don't contribute to the JS bundle. A page can mix both: layout (Server Component, zero JS) wrapping an interactive counter (Client Component, small JS). This is the biggest shift in React since hooks — the component tree now spans TWO environments.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the key differences between Server and Client Components?**
+> **A:** SERVER: renders on server, can use async/await directly, accesses databases/file system/secrets, contributes 0 bytes to JS bundle, no useState/useEffect/events/browser APIs. CLIENT (`'use client'`): renders in browser, can use hooks, event handlers, browser APIs, localStorage. The decision rule: is this component interactive? Yes → Client. No → keep Server (default). Server Components can import Client Components; Client Components CANNOT import Server Components directly (but can render them via children prop).
+
+**Q2: How does data fetching change with Server Components?**
+> **A:** In Client Components, data fetch = useEffect + loading state + error state + race condition + cache. In Server Components: `const data = await db.query('SELECT ...')` — directly in the component function. No loading state needed (component doesn't render until data is ready). No API route needed for the data (direct DB access). React caches Server Component renders and deduplicates concurrent requests (React's fetch() wrapper in Next.js). This eliminates the client-server waterfall: no roundtrip from browser to API to database.
+
+**Q3: Most dangerous misconception?**
+> **A:** All components should be Server Components:
+> ```tsx
+> // ❌ WRONG: Server Component with useState
+> // async-server-component.tsx (no 'use client')
+> import { useState } from 'react'; // ERROR: hooks don't work in Server Components
+> export async function Counter() {
+>   const [count, setCount] = useState(0);  // throws at build time
+>   return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
+> }
+>
+> // ✅ CORRECT: split at the interactivity boundary
+> // page.tsx — Server Component (can fetch DB directly)
+> import { Counter } from './Counter';  // Client Component
+> import { db } from '@/lib/db';
+> export default async function Page() {
+>   const initialCount = await db.getCount();  // direct DB access
+>   return <Counter initialCount={initialCount} />;  // passes data as props
+> }
+>
+> // Counter.tsx — MUST have 'use client' for interactivity
+> 'use client';
+> import { useState } from 'react';
+> export function Counter({ initialCount }: { initialCount: number }) {
+>   const [count, setCount] = useState(initialCount);
+>   return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
+> }
+> ```
+
+**Q4: What is streaming and Suspense in Server Components?**
+> **A:** Without streaming: browser waits for the entire page to render on server before receiving any HTML. With streaming + Suspense: React sends the shell (layout, nav) immediately, then streams each Suspense boundary's resolved content as it completes. A slow database query for a blog post sidebar doesn't block the main article content from rendering. Next.js implements this via the App Router: wrap slow sections in `<Suspense fallback={<Skeleton />}>` and they stream in after the fast parts. Result: faster Time-to-First-Byte and better perceived performance.
+
+**Q5: FAANG-grade definition.**
+> **A:** "React Server Components are a React architecture (implemented in Next.js App Router) splitting components into two environments: Server Components (default, render on server, async/await data fetching with direct DB/file access, zero client JavaScript) and Client Components ('use client' directive, browser-side, hooks/events/browser APIs) — composable with Server Components passing serialisable props and children to Client Components — enabling elimination of API routes for data fetching (direct DB access in component), JS bundle reduction (Server Components contribute 0 bytes), and streaming via Suspense boundaries (shell renders immediately, slow components stream in) — with the constraint that Client Components cannot import Server Components (only render them as children), and Server Component props must be serialisable (no functions, class instances, or circular refs)."
+
+## BUILD
+
+### 🏗️ Mini Project: Next.js App Router Page — Server + Client Components
+
+**What you will build:** A Next.js page with Server Component (DB fetch, 0 JS), a streaming Suspense boundary, and an interactive Client Component — showing the complete server/client split.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1
+```bash
+npx create-next-app@latest sc-demo --typescript --tailwind --app && cd sc-demo
+```
+
+#### Step 2 — Server Component Page (Direct DB-like Fetch)
+```tsx
+// app/users/page.tsx — Server Component (no 'use client')
+import { Suspense } from 'react';
+import { UserList } from './UserList';
+import { UserListSkeleton } from './UserListSkeleton';
+import { LikeButton } from './LikeButton';  // Client Component
+
+// This function runs on the SERVER — could be db.query() in real app
+async function getUsers() {
+  const res = await fetch('https://jsonplaceholder.typicode.com/users', {
+    next: { revalidate: 60 }  // ISR: revalidate every 60 seconds
+  });
+  return res.json() as Promise<Array<{ id: number; name: string; email: string }>>;
+}
+
+// Server Component: async, direct data access, 0 client JS
+export default async function UsersPage() {
+  // Data fetched on server — no loading state, no useEffect
+  const users = await getUsers();
+
+  return (
+    <main className="max-w-2xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-4">Users (Server Component)</h1>
+      <p className="text-sm text-gray-500 mb-4">
+        This page has 0 client-side JS from the page itself.
+        Only LikeButton contributes to the bundle.
+      </p>
+
+      {/* Static server-rendered user list */}
+      <ul className="border rounded mb-6">
+        {users.map(user => (
+          <li key={user.id} className="p-3 border-b flex justify-between items-center">
+            <div>
+              <p className="font-medium">{user.name}</p>
+              <p className="text-sm text-gray-500">{user.email}</p>
+            </div>
+            {/* Client Component embedded in Server Component */}
+            <LikeButton userId={user.id} />
+          </li>
+        ))}
+      </ul>
+
+      {/* Streaming: slow component doesn't block above content */}
+      <Suspense fallback={<UserListSkeleton />}>
+        <SlowSection />
+      </Suspense>
+    </main>
+  );
+}
+
+// Simulates a slow database query
+async function SlowSection() {
+  await new Promise(r => setTimeout(r, 2000));  // 2s delay
+  return (
+    <div className="p-4 bg-green-50 rounded">
+      <p>This section streamed in after 2 seconds — page was usable immediately!</p>
+    </div>
+  );
+}
+```
+
+#### Step 3 — Client Component (Interactivity)
+```tsx
+// app/users/LikeButton.tsx
+'use client';  // REQUIRED for useState, event handlers
+import { useState } from 'react';
+
+export function LikeButton({ userId }: { userId: number }) {
+  const [liked, setLiked] = useState(false);
+  const [count, setCount] = useState(0);
+
+  const toggle = () => {
+    setLiked(l => !l);
+    setCount(c => liked ? c - 1 : c + 1);
+  };
+
+  return (
+    <button onClick={toggle}
+      className={`px-3 py-1 rounded text-sm ${liked ? 'bg-red-100 text-red-600' : 'bg-gray-100'}`}>
+      {liked ? '❤️' : '🤍'} {count > 0 ? count : ''}
+    </button>
+  );
+}
+
+// app/users/UserListSkeleton.tsx — Server Component (no 'use client')
+export function UserListSkeleton() {
+  return (
+    <div className="animate-pulse space-y-2">
+      {[1,2,3].map(i => (
+        <div key={i} className="h-16 bg-gray-200 rounded" />
+      ))}
+    </div>
+  );
+}
+```
+
+#### Step 4 — Demonstrate Bundle Size Difference
+```bash
+# Build and check bundle
+npm run build
+# Look at .next/server/ (Server Component output) vs .next/static/ (Client JS)
+# LikeButton.js in static/ — small interactive bundle
+# UsersPage is NOT in static/ — it's in server/ — contributes 0 bytes to browser
+```
+
+**Expected Output:**
+```
+Page loads: user list renders instantly (server HTML)
+Like buttons are interactive (Client Component JS loaded)
+After 2 seconds: streaming Suspense resolves, green box appears
+Network tab: no getUsers API call from browser (server fetched it)
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What can Server Components do that Client Components cannot?
+**Q2:** What does 'use client' do?
+**Q3:** Write a Server Component that fetches data directly. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Can Client Components import Server Components?
+**Q5:** A PR adds useState to a Server Component — what happens?
+**Q6:** How does streaming work with Suspense in Server Components?
+
+### Day 7 — Application
+**Q7:** Split a dashboard page: server-rendered stats + client interactive chart.
+**Q8:** A PR has a useEffect fetch in every page component — migrate to Server Components.
+**Q9:** How do you pass non-serialisable data from Server to Client?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain React Server Components — what problem do they solve?"
+**Q11:** Draw: RSC architecture — server renders → HTML stream → client hydrates Client Components only.
+**Q12:** ★ System design: "Design a Next.js app for 1M users — which pages are RSC vs Client, where does data fetch?"

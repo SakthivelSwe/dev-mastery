@@ -201,3 +201,246 @@ A: Yes! You can use `firstValueFrom(this.http.get(...))`. This is very common in
 
 **Q: What is a "Cold" Observable?**
 A: A cold observable is a stream that does not execute its underlying logic until a consumer explicitly subscribes. All `HttpClient` methods return cold observables. If you write `this.http.post()`, it builds the network request in memory, but absolutely nothing hits the network card until `.subscribe()` is called.
+
+## FEYNMAN CHECK
+
+### Explain Angular HttpClient Like I'm 10 Years Old
+> HttpClient is Angular's built-in HTTP service — a typed wrapper around the browser's XMLHttpRequest/fetch. You inject it, call this.http.get<User[]>('/api/users'), and get back an Observable (not a Promise). The Observable does nothing until you subscribe (lazy) — this is important: calling http.get() doesn't trigger the network request until a subscribe() or async pipe subscribes to it. The non-obvious depth: HttpClient automatically serialises request bodies to JSON and parses JSON responses. It also integrates with Angular's interceptor pipeline — every request/response flows through registered interceptors, enabling cross-cutting concerns like auth token injection, logging, error handling, and retry without touching individual service methods.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does HttpClient return Observables instead of Promises?**
+> **A:** Observables add: (1) CANCELLATION — you can unsubscribe from a request, aborting it if the component is destroyed (unlike Promises which always run to completion). (2) RETRY — operators like retry(3) or retryWhen(strategy) can resubscribe on error. (3) COMPOSITION — you can pipe HTTP responses through map/switchMap/catchError/shareReplay chains. (4) PROGRESS events — downloadProgress can track upload/download bytes. For most simple one-shot GET/POST, you could convert with firstValueFrom() to a Promise, but losing retry/cancel/compose benefits.
+
+**Q2: Mental model for typed HTTP requests?**
+> **A:** this.http.get<User[]>('/api/users') tells TypeScript what shape the response JSON will be, enabling type checking on .pipe(map(users => users[0].email)). But this is a COMPILE-TIME-ONLY type assertion — HttpClient trusts that the server returns what you declared. At runtime, if the server returns unexpected data, the TypeScript type doesn't protect you. Use Zod or a validator in the pipe to actually VALIDATE the response shape: .pipe(map(data => UserSchema.parse(data))).
+
+**Q3: Most dangerous misconception about HttpClient?**
+> **A:** HTTP observables auto-cancel and clean up:
+> ```typescript
+> // WRONG: if component is destroyed before response arrives,
+> // the subscription stays active and callback tries to update destroyed component
+> export class SearchComponent implements OnInit {
+>   ngOnInit() {
+>     this.http.get('/api/results').subscribe(data => {
+>       this.results = data;  // component may already be destroyed!
+>     });
+>   }
+> }
+>
+> // CORRECT: auto-cancel with takeUntilDestroyed
+> private destroyRef = inject(DestroyRef);
+> ngOnInit() {
+>   this.http.get('/api/results')
+>     .pipe(takeUntilDestroyed(this.destroyRef))
+>     .subscribe(data => this.results = data);
+> }
+> // Or better: use async pipe — it cancels automatically
+> results$ = this.http.get('/api/results');
+> // template: {{ results$ | async }}
+> ```
+
+**Q4: How does withCredentials and CORS work with HttpClient?**
+> **A:** By default, HttpClient requests don't include cookies for cross-origin requests. Pass { withCredentials: true } to include cookies and auth headers. The server must respond with Access-Control-Allow-Credentials: true AND Access-Control-Allow-Origin: https://your-app.com (not wildcard *). For JSON content, Angular automatically sets Content-Type: application/json. Custom headers are added via HttpHeaders object: new HttpHeaders({ Authorization: 'Bearer ' + token }).
+
+**Q5: FAANG-grade definition of Angular HttpClient.**
+> **A:** "Angular HttpClient is a typed HTTP client wrapping XMLHttpRequest — returning cold Observables (lazy, cancellable) for GET/POST/PUT/DELETE/PATCH requests with automatic JSON serialisation/deserialisation, typed response generics, HTTP interceptor pipeline for cross-cutting concerns (auth, logging, retry, error handling), progress event support, and XSRF/CSRF token handling — with provideHttpClient(withInterceptors([...])) for functional interceptor registration and withFetch() for a fetch-based backend."
+
+## BUILD
+
+### 🏗️ Mini Project: Typed API Service With Loading State, Error Handling, and Retry
+
+**What you will build:** A UserApiService wrapping HttpClient with: typed responses, global loading state, error handling that categorises network vs server vs validation errors, and automatic retry with exponential backoff.
+**Why this project:** Forces every production HttpClient pattern into one testable, reusable service.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new http-demo --standalone --routing false
+cd http-demo
+ng generate service user-api
+```
+
+#### Step 2 — Typed API Service
+```typescript
+// user-api.service.ts
+import { Injectable, inject, signal } from '@angular/core';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+import { Observable, throwError, timer } from 'rxjs';
+import { retry, catchError, mergeMap, finalize } from 'rxjs/operators';
+
+export interface User { id: number; name: string; email: string; }
+export interface ApiError { type: 'network' | 'server' | 'validation' | 'unknown'; message: string; status?: number; }
+
+@Injectable({ providedIn: 'root' })
+export class UserApiService {
+  private http = inject(HttpClient);
+  private BASE = 'https://jsonplaceholder.typicode.com';
+
+  isLoading = signal(false);
+
+  private handleError(err: HttpErrorResponse): Observable<never> {
+    let apiError: ApiError;
+    if (err.status === 0) {
+      apiError = { type: 'network', message: 'No internet connection or server unreachable' };
+    } else if (err.status >= 400 && err.status < 500) {
+      apiError = { type: 'validation', message: err.error?.message ?? 'Invalid request', status: err.status };
+    } else if (err.status >= 500) {
+      apiError = { type: 'server', message: 'Server error, please try again', status: err.status };
+    } else {
+      apiError = { type: 'unknown', message: 'An unexpected error occurred' };
+    }
+    return throwError(() => apiError);
+  }
+
+  private withRetry<T>(obs: Observable<T>): Observable<T> {
+    return obs.pipe(
+      retry({
+        count: 3,
+        delay: (err, attempt) => {
+          if ((err as ApiError).type === 'validation') return throwError(() => err);
+          return timer(Math.pow(2, attempt) * 500);  // 0.5s, 1s, 2s
+        },
+      }),
+    );
+  }
+
+  getUsers(): Observable<User[]> {
+    this.isLoading.set(true);
+    return this.withRetry(this.http.get<User[]>(`${this.BASE}/users`)).pipe(
+      catchError(this.handleError),
+      finalize(() => this.isLoading.set(false)),
+    );
+  }
+
+  getUser(id: number): Observable<User> {
+    return this.withRetry(this.http.get<User>(`${this.BASE}/users/${id}`)).pipe(
+      catchError(this.handleError),
+    );
+  }
+
+  createUser(user: Omit<User, 'id'>): Observable<User> {
+    return this.http.post<User>(`${this.BASE}/users`, user).pipe(
+      catchError(this.handleError),
+    );
+  }
+
+  updateUser(id: number, changes: Partial<User>): Observable<User> {
+    return this.http.patch<User>(`${this.BASE}/users/${id}`, changes).pipe(
+      catchError(this.handleError),
+    );
+  }
+}
+```
+
+#### Step 3 — Component Integration
+```typescript
+// app.component.ts
+import { Component, inject, OnInit } from '@angular/core';
+import { UserApiService, ApiError } from './user-api.service';
+import { AsyncPipe, NgIf, NgFor } from '@angular/common';
+
+@Component({
+  standalone: true, imports: [AsyncPipe, NgIf, NgFor],
+  template: `
+    <h1>Users</h1>
+    <p *ngIf="apiService.isLoading()">Loading...</p>
+    <p *ngIf="error">Error ({{ error.type }}): {{ error.message }}</p>
+    <ul><li *ngFor="let user of users">{{ user.name }} — {{ user.email }}</li></ul>
+  `,
+})
+export class AppComponent implements OnInit {
+  apiService = inject(UserApiService);
+  users: any[] = [];
+  error: ApiError | null = null;
+
+  ngOnInit() {
+    this.apiService.getUsers().subscribe({
+      next: users => this.users = users,
+      error: (err: ApiError) => this.error = err,
+    });
+  }
+}
+```
+
+#### Step 4 — Error Handling: HttpClientTestingModule
+```typescript
+// Test the retry logic
+it('retries 3 times on server error', () => {
+  const httpTesting = TestBed.inject(HttpTestingController);
+  const service = TestBed.inject(UserApiService);
+  let errorReceived: ApiError | null = null;
+  service.getUsers().subscribe({ error: e => errorReceived = e });
+
+  for (let i = 0; i < 4; i++) {
+    const req = httpTesting.expectOne('/api/users');
+    req.flush('Server Error', { status: 500, statusText: 'Internal Server Error' });
+  }
+  expect(errorReceived?.type).toBe('server');
+});
+```
+
+#### Step 5 — Tests
+```typescript
+describe('UserApiService', () => {
+  let service: UserApiService;
+  let httpMock: HttpTestingController;
+  beforeEach(() => {
+    TestBed.configureTestingModule({ imports: [HttpClientTestingModule] });
+    service = TestBed.inject(UserApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+  afterEach(() => httpMock.verify());
+
+  it('getUsers returns typed user array', () => {
+    let result: any;
+    service.getUsers().subscribe(users => result = users);
+    httpMock.expectOne('https://jsonplaceholder.typicode.com/users')
+      .flush([{ id: 1, name: 'Ana', email: 'ana@test.com' }]);
+    expect(result[0].name).toBe('Ana');
+  });
+});
+```
+
+**Expected Output:**
+```
+isLoading becomes true, then false after response
+Users list renders
+Server error -> ApiError type 'server', message shown
+Network error -> ApiError type 'network'
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add request deduplication for concurrent identical GET calls
+- [ ] Add a caching interceptor with TTL
+- [ ] Add Zod schema validation of the HTTP response
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Why does HttpClient return Observables instead of Promises?
+**Q2:** What happens if the server returns HTTP 404 — does the Observable error?
+**Q3:** Write an HTTP GET that returns typed User[]. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do you cancel an in-flight HTTP request in Angular?
+**Q5:** A junior calls http.get() in a constructor — the request fires twice. Why?
+**Q6:** Refactor to auto-cancel when component destroys:
+```typescript
+ngOnInit() { this.http.get('/api/data').subscribe(d => this.data = d); }
+```
+
+### Day 7 — Application
+**Q7:** Build an HTTP service with a loading state signal and error categorisation.
+**Q8:** A PR retries a 401 Unauthorized error — explain why this is wrong.
+**Q9:** How does withFetch() differ from the default XHR backend?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through what happens when you call http.get() — from Observable creation to DOM update."
+**Q11:** Draw: HttpClient interceptor pipeline for an authenticated request.
+**Q12:** ★ System design: "Design the HTTP layer for an Angular SPA — auth, caching, retry, error handling, offline."

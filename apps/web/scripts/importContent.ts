@@ -7,7 +7,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const CONTENT_DIR = path.join(__dirname, '../content');
-const API_BASE = 'http://localhost:8082/admin';
+const API_BASE = 'http://localhost:8080/v1/admin';
 
 async function importAllContent() {
   if (!fs.existsSync(CONTENT_DIR)) {
@@ -70,8 +70,11 @@ async function importAllContent() {
 
 async function sendBatch(topics: any[]) {
   console.log(`Sending batch of ${topics.length} topics...`);
-  const adminJwt = jwt.sign({ sub: 'admin-user', roles: ['ADMIN'] }, 'devmastery_dev_jwt_secret_change_in_prod_min_32_chars');
-  
+  const adminJwt = jwt.sign(
+    { sub: '00000000-0000-0000-0000-000000000001', roles: ['ADMIN'] },
+    'devmastery_dev_jwt_secret_change_in_prod_min_32_chars'
+  );
+
   try {
     const response = await fetch(`${API_BASE}/topics/layers/batch`, {
       method: 'POST',

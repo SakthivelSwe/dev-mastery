@@ -101,3 +101,115 @@ A: **No! Never store passwords using two-way encryption!**
 If you use two-way encryption, the server must store the decryption key. If a hacker breaches the database, they will also steal the decryption key, allowing them to decrypt every single password instantly!
 Passwords MUST be stored using **One-Way Hashing** (specifically slow hashing algorithms like `Bcrypt` or `Argon2`).
 A hash is a mathematical meat-grinder. It turns `"password123"` into a chaotic string of characters, but it is mathematically impossible to reverse the process! The server *never* knows the user's actual password. When the user logs in, the server hashes their input, and simply checks if the resulting hashes match! If they forget their password, they cannot recover it; you must send them a secure email link to generate a brand new one.
+
+## FEYNMAN CHECK
+
+### Explain API Security Like I'm 10 Years Old
+> API security is the locks, alarms, and bouncer for your back-end. Common threats: unauthorised access (no auth), broken authz (logged-in user sees other users' data), injection (SQL/NoSQL/command), excessive data exposure, rate-limit absence (brute-force, DDoS), and insecure deserialisation. The non-obvious part: most breaches are NOT zero-days — they're missing controls (no rate-limit on login, missing authz check on /admin route, default credentials). This is why OWASP Top 10 has stayed remarkably stable for 10+ years.
+
+---
+
+### 5 Deep Questions
+**Q1: What is BOLA (Broken Object-Level Authorisation) and why is it #1?**
+> **A:** API returns object by ID but doesn't verify the caller owns it. `GET /orders/123` returns order 123 even if it belongs to another user — because authn (logged in) was checked but authz (owns this order) was not. Fix: every object endpoint must verify ownership.
+
+**Q2: ONE model.**
+> **A:** "Auth = identity. Authz per object = ownership. Validation = input shape. Sanitisation = output. Rate-limit = abuse. Logging = forensics. Each is a separate layer; skipping any creates exploitable gaps."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Authenticated but not authorised
+> app.get('/orders/:id', authn, async (req, res) => {
+>   res.json(await db.orders.findById(req.params.id));  // Any logged-in user reads any order
+> });
+> // ✅ Verify ownership
+> app.get('/orders/:id', authn, async (req, res) => {
+>   const order = await db.orders.findById(req.params.id);
+>   if (!order || order.userId !== req.user.sub) return res.sendStatus(404);
+>   res.json(order);
+> });
+> ```
+
+**Q4: How do you prevent SQL injection?**
+> **A:** ALWAYS use parameterised queries (prepared statements). Never string-concatenate user input into SQL. ORMs do this by default. Even with ORM, raw escape hatches (`pool.query(`SELECT * FROM users WHERE name = '${name}'`)`) reintroduce the vulnerability.
+
+**Q5: Senior one-liner.**
+> **A:** "API security is layered defence — authn + per-object authz + input validation + output sanitisation + rate-limit + audit — and 95% of breaches come from a missing layer, not a zero-day, which is why OWASP Top 10 has remained stable for a decade."
+
+## BUILD
+
+### 🏗️ Mini Project: Hardened API Endpoint
+**Time:** 35 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir api-sec && cd api-sec
+npm init -y && npm i express express-rate-limit helmet jsonwebtoken zod
+touch server.js
+```
+
+#### Step 2 — Core (defence in depth)
+```js
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+const { z } = require('zod');
+
+const app = express();
+app.use(helmet());                          // 1. security headers
+app.use(express.json({ limit: '10kb' }));   // 2. body size cap
+app.use('/api/', rateLimit({ windowMs: 60_000, max: 60 })); // 3. rate-limit
+
+function authn(req, res, next) { /* JWT verify, set req.user */ next(); }
+
+const QuerySchema = z.object({ page: z.coerce.number().int().min(1).max(1000).default(1) });
+
+app.get('/api/orders/:id', authn, async (req, res) => {
+  // 4. input validation
+  const id = z.coerce.number().int().positive().parse(req.params.id);
+  // 5. per-object authz
+  const order = await db.orders.findById(id);
+  if (!order || order.userId !== req.user.sub) return res.sendStatus(404);
+  // 6. output filtering — never leak internal fields
+  const { internalNotes, ...safe } = order;
+  res.json(safe);
+});
+
+app.use((err, req, res, next) => {
+  console.error(err);   // 7. logging
+  res.status(500).json({ error: 'internal' });  // 8. no stack trace leak
+});
+
+app.listen(3000);
+```
+
+#### Step 5 — Test
+```bash
+# Should rate-limit after 60 requests/min
+for i in $(seq 1 100); do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/api/orders/1; done | sort | uniq -c
+```
+
+**Expected Output:** Mix of 200 and 429 (rate-limited).
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Name 5 of OWASP API Top 10.
+**Q2:** BOLA — what is it and why #1?
+**Q3:** Write a per-object authz check.
+
+### Day 3
+**Q4:** SQL injection — show the bug and fix.
+**Q5:** Show the authn-but-no-authz bug.
+**Q6:** What does helmet middleware do?
+
+### Day 7
+**Q7:** Add rate-limiting + body-size cap + input validation to an endpoint.
+**Q8:** PR exposes `/api/users` listing all users. Describe the data-exposure incident.
+**Q9:** How do you log securely without leaking PII?
+
+### Day 14
+**Q10:** ★ "Audit an API for OWASP Top 10 — what's your checklist?"
+**Q11:** Link API security → authn → authz → input-validation → rate-limit.
+**Q12:** ★ "Your endpoint is being scraped at 10k req/s from rotating IPs. Mitigation?"

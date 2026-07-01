@@ -149,3 +149,236 @@ export async function POST(request: Request) {
 ```
 
 Now the product page updates within seconds of a price change — not 5 minutes, not days.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Data Fetching Like I'm 10 Years Old
+> Next.js's App Router lets you fetch data DIRECTLY inside your components using async/await — no useEffect, no loading state library, no API layer. Just const data = await fetch('...') at the top of a Server Component. Next.js handles caching, deduplication, and revalidation automatically based on options you pass to fetch(). For client-side data that needs to stay fresh (live updates, polling), use SWR or TanStack Query inside 'use client' components. The non-obvious depth: Next.js EXTENDS the native fetch function with caching options — fetch in a Server Component is NOT the standard browser fetch, it's Next.js's enhanced version that integrates with the page's rendering strategy. Multiple identical fetches in the same render are AUTOMATICALLY DEDUPLICATED — calling getUser(1) in 5 components only hits the server once.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the four Next.js fetch caching modes?**
+> **A:** (1) Default (force-cache): cached indefinitely, page becomes SSG. (2) no-store: never cached, page becomes SSR. (3) revalidate: N: cached for N seconds, then ISR. (4) tags: ['x']: cached and tagged for on-demand invalidation via revalidateTag('x'). These are passed via the second argument: fetch(url, { cache: 'force-cache' }) or fetch(url, { next: { revalidate: 60, tags: ['posts'] } }). Next.js infers the page's rendering strategy from the most dynamic fetch — if any fetch is no-store, the entire page is SSR.
+
+**Q2: Mental model for parallel vs sequential data fetching?**
+> **A:** SEQUENTIAL: const user = await getUser(id); const posts = await getPosts(user.id); — second fetch waits for first to complete. Use when the second depends on the first. PARALLEL: const [user, posts] = await Promise.all([getUser(id), getPosts(id)]); — both fetches run simultaneously. Use when fetches are independent. STREAMING: wrap slow components in Suspense — they render independently. Pattern: parent Server Component starts fast queries (PARALLEL), each Suspense child runs its own slow query (STREAMING) — gives instant FCP plus progressive content.
+
+**Q3: Most dangerous misconception about data fetching?**
+> **A:** Fetching the same data in multiple components multiplies requests:
+> ```typescript
+> // CORRECT: Next.js deduplicates identical fetches in the same render
+> // src/lib/data.ts
+> import { cache } from 'react';
+> export const getUser = cache(async (id: string) => {
+>   const res = await fetch(`https://api.example.com/users/${id}`);
+>   return res.json();
+> });
+>
+> // Components A, B, and C all call getUser('1') in the same render:
+> // -> Only ONE network request happens
+> // -> React's cache() memoizes the result for the request lifetime
+>
+> // For fetch() specifically, Next.js dedupes automatically
+> // For non-fetch data sources (DB, ORM), use React's cache() wrapper
+> ```
+
+**Q4: When should you use SWR/TanStack Query vs Server Component data fetching?**
+> **A:** Use Server Component fetching when: data is fetched on initial page load, data doesn't need to update in the browser without navigation, you want zero client bundle for data fetching. Use SWR/TanStack Query when: data must stay fresh in the browser (polling, real-time), the user can update data via mutations (cache invalidation), you need optimistic UI updates, the page has many interactive widgets that fetch independently. Hybrid pattern: Server Component fetches initial data, passes it to a 'use client' component that hydrates SWR with the initial data, then handles client-side refetches.
+
+**Q5: FAANG-grade definition of Next.js data fetching.**
+> **A:** "Next.js App Router data fetching enables direct async/await in Server Components — with the framework-extended fetch() supporting four caching modes (default cache, no-store for SSR, revalidate for ISR, tags for on-demand invalidation) — automatic request deduplication for identical fetches within the same render — React's cache() function for memoising non-fetch data sources — parallel fetching via Promise.all for independent queries — Suspense boundaries for streaming slow fetches — and client-side libraries (SWR, TanStack Query) for hydrated client state with mutations and polling — eliminating the API layer for initial data while maintaining client-side interactivity."
+
+## BUILD
+
+### 🏗️ Mini Project: Hybrid Data Fetching — Server Initial + Client Refresh + Mutations
+
+**What you will build:** A todos app where Server Component fetches initial todos (instant load), Client Component uses SWR with the initial data, mutations call Server Actions, and the cache invalidates correctly — the production data fetching pattern.
+**Why this project:** Forces server fetching, deduplication, SWR hydration, and Server Action mutations together.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest data-demo --typescript --tailwind --app
+npm install swr better-sqlite3 @types/better-sqlite3
+```
+
+#### Step 2 — Server Data Layer With cache()
+```typescript
+// src/lib/todos.ts
+import { cache } from 'react';
+import Database from 'better-sqlite3';
+const db = new Database('todos.db');
+db.exec(`CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, done INTEGER DEFAULT 0)`);
+
+export interface Todo { id: number; text: string; done: number; }
+
+// React's cache() memoises within the same request — multiple components calling
+// getTodos() in the same page render hit the DB only once
+export const getTodos = cache(async (): Promise<Todo[]> => {
+  console.log('[DB] fetching todos');  // observe deduplication
+  return db.prepare('SELECT * FROM todos ORDER BY id DESC').all() as Todo[];
+});
+
+export const getTodoCount = cache(async (): Promise<number> => {
+  return (db.prepare('SELECT COUNT(*) as c FROM todos').get() as any).c;
+});
+```
+
+#### Step 3 — Server Component Page With Parallel + Streaming
+```typescript
+// src/app/todos/page.tsx
+import { Suspense } from 'react';
+import { getTodos, getTodoCount } from '@/lib/todos';
+import { TodoListClient } from '@/components/TodoListClient';
+import { AddTodoForm } from '@/components/AddTodoForm';
+
+async function StatsSection() {
+  // Slow stat aggregation — streams independently
+  await new Promise(r => setTimeout(r, 800));
+  const count = await getTodoCount();
+  return <p className="text-sm text-gray-500">Total: {count} todos</p>;
+}
+
+export default async function TodosPage() {
+  // Parallel: kick off both fetches simultaneously
+  const todosPromise = getTodos();
+  // Stats is wrapped in Suspense — doesn't block the page
+
+  const todos = await todosPromise;
+
+  return (
+    <main className="max-w-xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-4">My Todos</h1>
+      <Suspense fallback={<p className="text-sm text-gray-300">Loading stats...</p>}>
+        <StatsSection />
+      </Suspense>
+      <AddTodoForm />
+      {/* Client hydration: pass server-fetched data as initial value to SWR */}
+      <TodoListClient initialTodos={todos} />
+    </main>
+  );
+}
+```
+
+#### Step 4 — Client Component With SWR Hydration
+```typescript
+// src/components/TodoListClient.tsx
+'use client';
+import useSWR from 'swr';
+import { Todo } from '@/lib/todos';
+import { toggleTodoAction, deleteTodoAction } from '@/app/todos/actions';
+
+const fetcher = (url: string) => fetch(url).then(r => r.json());
+
+interface Props { initialTodos: Todo[]; }
+
+export function TodoListClient({ initialTodos }: Props) {
+  // SWR hydrates with server data, refetches client-side as needed
+  const { data: todos, mutate } = useSWR<Todo[]>('/api/todos', fetcher, {
+    fallbackData: initialTodos,  // server-rendered HTML uses this immediately
+    revalidateOnFocus: true,
+    refreshInterval: 30_000,  // poll every 30s
+  });
+
+  const handleToggle = async (id: number) => {
+    // Optimistic update — UI changes instantly
+    mutate(
+      todos?.map(t => t.id === id ? { ...t, done: t.done ? 0 : 1 } : t),
+      { revalidate: false },
+    );
+    await toggleTodoAction(id);
+    mutate();  // refetch to confirm server state
+  };
+
+  const handleDelete = async (id: number) => {
+    mutate(todos?.filter(t => t.id !== id), { revalidate: false });
+    await deleteTodoAction(id);
+    mutate();
+  };
+
+  return (
+    <ul className="space-y-2 mt-4">
+      {todos?.map(todo => (
+        <li key={todo.id} className="flex items-center gap-2 p-3 border rounded">
+          <input type="checkbox" checked={!!todo.done} onChange={() => handleToggle(todo.id)} />
+          <span className={todo.done ? 'line-through text-gray-400' : ''}>{todo.text}</span>
+          <button onClick={() => handleDelete(todo.id)} className="ml-auto text-red-500">×</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+#### Step 5 — Server Actions + API Route
+```typescript
+// src/app/todos/actions.ts
+'use server';
+import { revalidatePath } from 'next/cache';
+import Database from 'better-sqlite3';
+const db = new Database('todos.db');
+
+export async function addTodoAction(formData: FormData) {
+  const text = formData.get('text') as string;
+  if (!text?.trim()) return;
+  db.prepare('INSERT INTO todos (text) VALUES (?)').run(text);
+  revalidatePath('/todos');
+}
+
+export async function toggleTodoAction(id: number) {
+  db.prepare('UPDATE todos SET done = 1 - done WHERE id = ?').run(id);
+  revalidatePath('/todos');
+}
+
+export async function deleteTodoAction(id: number) {
+  db.prepare('DELETE FROM todos WHERE id = ?').run(id);
+  revalidatePath('/todos');
+}
+
+// src/app/api/todos/route.ts -- for SWR client refresh
+import { NextResponse } from 'next/server';
+import { getTodos } from '@/lib/todos';
+export const dynamic = 'force-dynamic';  // always fresh for client polling
+export async function GET() { return NextResponse.json(await getTodos()); }
+```
+
+**Expected Output:**
+```
+/todos -> initial todos rendered instantly (server)
+Console logs: "[DB] fetching todos" only ONCE per page render (cache() dedupe)
+Add todo -> Server Action runs -> revalidatePath -> UI updates
+Toggle checkbox -> optimistic UI updates, then server confirms
+Stats section streams in after 800ms (Suspense)
+SWR polls /api/todos every 30s for fresh data
+```
+
+**Stretch Challenges:**
+- [ ] Replace SWR with TanStack Query and observe similar patterns
+- [ ] Add error boundaries for failed mutations
+- [ ] Add a useTransition() pending state for the optimistic mutations
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Four fetch caching modes in Next.js?
+**Q2:** What does React's cache() do?
+**Q3:** Write a Server Component fetching data with revalidate: 60. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between parallel and sequential data fetching — give an example of each.
+**Q5:** A junior calls getUser() 5 times in different components — how many DB hits?
+**Q6:** When should you use SWR/TanStack Query alongside Server Component fetching?
+
+### Day 7 — Application
+**Q7:** Build a hybrid Server + SWR pattern that hydrates client cache from server data.
+**Q8:** A PR uses cache: 'no-store' on every fetch — explain the performance cost.
+**Q9:** How do Server Actions integrate with SWR cache invalidation?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare data fetching in Server Components vs client-side SWR — when do you use each?"
+**Q11:** Draw: data flow — Server Component fetch → cache → HTML → hydration → SWR → mutations.
+**Q12:** ★ System design: "Design the data layer for a real-time analytics dashboard — initial load, live polling, mutations, optimistic UI."

@@ -121,3 +121,187 @@ declare global {
     const API_URL: string;
 }
 ```
+
+## FEYNMAN CHECK
+
+### Explain Declaration Files Like I'm 10 Years Old
+> A declaration file (`.d.ts`) is a TYPES-ONLY blueprint — no implementation, just the SHAPES. When you write TS source, the compiler can EMIT matching .d.ts files alongside .js — this is how libraries ship type information. When you use a JS-only library, you can WRITE a .d.ts file describing its shape so TS knows what's there. `@types/foo` packages on npm are community-maintained .d.ts for popular JS libraries (lodash, express, react-dom). Ambient declarations (`declare module 'foo' { ... }`) let you type a library inline. Triple-slash directives (`/// <reference path="..." />`) are legacy but still appear. The non-obvious power: declaration merging lets you AUGMENT existing types (extend Express's Request, add custom Window properties).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When do you need to write a .d.ts file?**
+> **A:** Three cases: (1) Your TS library publishing — `declaration: true` emits them automatically. (2) Using a JS-only library with no @types/* package — write your own .d.ts. (3) Augmenting global types — adding to `window.myFoo`, extending Express `Request.user`, adding custom CSS in JSX. For modern projects most libraries ship types; you usually only write .d.ts for project-specific augmentation.
+
+**Q2: Mental model for declaration files?**
+> **A:** Think of .d.ts as the "header file" of TypeScript (C analog). It describes WHAT exists without HOW. Pure types are erased at runtime; declaration files preserve them across compilation boundaries. They're how TS bridges to JS-only code, how IDE intellisense works for installed packages, and how libraries express their public API without forcing consumers to compile from source.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Putting `import` in an ambient declaration accidentally makes it a module:
+> ```ts
+> // ❌ The import makes this file a MODULE — globals don't apply globally
+> import { type Foo } from './foo';
+> declare global {
+>   interface Window { myApp: { foo: Foo } }   // works only when imported, not globally
+> }
+>
+> // ✅ Wrap in declare global { } and avoid top-level non-type imports
+> // For augmentation, use 'export {}' to make it explicitly a module
+> declare global {
+>   interface Window { myApp: { foo: string } }
+> }
+> export {};   // makes the file a module
+> ```
+
+**Q4: How does declaration merging work for libraries like Express?**
+> **A:** Express ships `@types/express` with `interface Request { ... }`. In your app, you write `declare module 'express-serve-static-core' { interface Request { user?: User } }` — TS MERGES this with the original interface, adding your custom `user` property. Now every `req.user` is typed across your codebase. This is the canonical pattern for typing middleware-added properties.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Declaration files (.d.ts) are TypeScript's type-only header files describing the public shape of modules without implementation — emitted automatically by tsc with `declaration: true`, hand-written for type augmentation (declare global, declare module), distributed via @types/* packages for JavaScript libraries, and combined through declaration merging to extend third-party types in application code."
+
+## BUILD
+
+### 🏗️ Mini Project: Augment Express Request With Custom Properties + Type a JS-Only Library
+
+**What you will build:** Extend Express's `Request` to include `user` and `requestId`, plus write a .d.ts for a hypothetical JS-only library — both in one project.
+**Why this project:** Forces declaration merging and manual .d.ts writing — the two most common production .d.ts tasks.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-dts && cd ts-dts
+npm init -y
+npm install express
+npm install -D typescript @types/express @types/node
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/types/express.d.ts, src/types/legacy-lib.d.ts, src/server.ts, lib/legacy.js -ItemType File
+```
+
+#### Step 2 — Augment Express
+```ts
+// src/types/express.d.ts
+import 'express-serve-static-core';
+
+declare module 'express-serve-static-core' {
+  interface Request {
+    user?: { id: number; email: string; role: 'admin' | 'user' };
+    requestId: string;
+  }
+}
+```
+
+#### Step 3 — Type a JS-Only Library
+```javascript
+// lib/legacy.js (no types provided)
+exports.computeChecksum = function(data) {
+  return data.split('').reduce((a, c) => (a + c.charCodeAt(0)) % 256, 0);
+};
+exports.VERSION = '0.4.1';
+```
+```ts
+// src/types/legacy-lib.d.ts
+declare module 'legacy-lib' {
+  export function computeChecksum(data: string): number;
+  export const VERSION: string;
+}
+```
+```json
+// package.json (add "imports" for the local JS)
+{ "imports": { "legacy-lib": "./lib/legacy.js" } }
+```
+
+#### Step 4 — Use Both Augmentations
+```ts
+// src/server.ts
+import express, { type Request, type Response, type NextFunction } from 'express';
+// @ts-ignore — local alias
+import * as legacy from 'legacy-lib';
+
+const app = express();
+
+// Middleware: assign requestId + (fake) user
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  req.requestId = Math.random().toString(36).slice(2);
+  req.user = { id: 1, email: 'demo@example.com', role: 'admin' };
+  next();
+});
+
+app.get('/profile', (req, res) => {
+  // req.user is now typed — autocomplete works
+  if (!req.user) return res.status(401).end();
+  res.json({
+    user: req.user,
+    requestId: req.requestId,
+    checksum: legacy.computeChecksum(req.user.email),
+    libVersion: legacy.VERSION,
+  });
+});
+
+app.listen(3000, () => console.log('Listening on 3000'));
+```
+
+#### Step 5 — Tests + tsc Check
+```bash
+npx tsc --noEmit   # must pass with strict mode
+
+# Verify in src/server.ts:
+#  - req.user.email autocompletes
+#  - legacy.computeChecksum has type (string) => number, not any
+```
+```ts
+// src/server.test.ts
+import { describe, it, expectTypeOf } from 'vitest';
+import type { Request } from 'express';
+
+describe('declaration merging', () => {
+  it('Request has user and requestId', () => {
+    expectTypeOf<Request>().toHaveProperty('user');
+    expectTypeOf<Request>().toHaveProperty('requestId');
+  });
+});
+```
+
+**Expected Output:**
+```
+$ npx tsc --noEmit
+[no errors]
+
+$ node dist/server.js
+Listening on 3000
+
+# req.user is fully typed — TS knows about email, role
+# legacy.computeChecksum is typed (string) => number
+```
+
+**Stretch Challenges:**
+- [ ] Add custom CSS-in-JSX intrinsic attributes via `declare namespace JSX`
+- [ ] Type a hypothetical `window.myAnalytics` global from a script tag
+- [ ] Migrate the JS library to TS and remove the .d.ts file
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is a .d.ts file? Does it ship code?
+**Q2:** What does `declare module 'foo' { ... }` do?
+**Q3:** Write a declaration that adds `window.myApp: { id: number }`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does adding a top-level `import` to a .d.ts break global augmentation?
+**Q5:** A junior types Express middleware additions but `req.user` is still `any` — diagnose.
+**Q6:** Write a .d.ts for a CommonJS library exporting:
+```js
+module.exports = { connect: (url) => Promise.resolve({ close: () => {} }) };
+```
+
+### Day 7 — Application
+**Q7:** Add full TS typing to a vanilla JS library by writing only .d.ts files (no source changes).
+**Q8:** A PR ships a library without `declaration: true` — explain the consumer experience.
+**Q9:** What is the cost of `skipLibCheck: false` on a project with 200 deps that ship .d.ts?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how to add types to a popular JS library that doesn't ship its own."
+**Q11:** Draw: relationship between source .ts, emitted .js, emitted .d.ts, and consumer projects.
+**Q12:** ★ System design: "Plan the .d.ts strategy for a polyglot codebase mixing JS and TS, with internal libraries and external SDKs."

@@ -155,3 +155,257 @@ In simple objects, `target[prop] = value` works perfectly.
 However, imagine the target object uses standard ES6 getters and setters (e.g., `get fullName() { return this.firstName + this.lastName; }`).
 If you intercept a property and simply do `return target[prop]`, the `this` keyword inside the target's getter will point to the raw target object, bypassing the Proxy completely! If `firstName` is accessed internally by the getter, the Proxy won't trap the access to `firstName`!
 By using `Reflect.get(target, prop, receiver)`, the `receiver` argument (which is the Proxy object itself) forces the internal `this` context to point *back* to the Proxy! This guarantees that any subsequent internal property accesses are routed back through the Proxy traps, ensuring 100% flawless interception.
+
+## FEYNMAN CHECK
+
+### Explain Proxy & Reflect Like I'm 10 Years Old
+> Proxy lets you INTERCEPT operations on an object — `get`, `set`, `has`, `delete`, `call` (for functions), `apply`, `construct`, even `Object.keys`. You create `new Proxy(target, handler)` where handler defines TRAP functions for each operation. Reflect provides the DEFAULT IMPLEMENTATIONS of every trap as methods (`Reflect.get(target, prop)`, `Reflect.set(target, prop, value)`) — so handlers can selectively customise and pass through. Together they enable: reactive frameworks (Vue 3, MobX 6), property validation, lazy loading, access logging, virtual objects, mocking libraries. The non-obvious detail: a Proxy is OBSERVATIONALLY INDISTINGUISHABLE from the target for most uses — but `===` compares Proxy and target as different references. Some operations (e.g. internal-slot access on Date or Map) bypass Proxy traps.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do Proxy & Reflect fundamentally solve?**
+> **A:** Programmatic metaprogramming — customising the FUNDAMENTAL behavior of objects at the language level. Before Proxy (pre-ES6), you could only customize via getters/setters per-property (Object.defineProperty) — slow, verbose, no support for dynamic property lookup. Proxy intercepts ALL operations uniformly, enabling clean implementations of: Vue 3's reactivity (auto-subscribe to property reads, auto-notify on writes), validation wrappers (reject invalid values at set time), data binding, sandboxing for plugin systems.
+
+**Q2: Mental model for traps?**
+> **A:** Think of Proxy as a TRANSLATOR sitting between the caller and the target. Every operation the caller performs goes through your handler first. If you don't define a trap, the operation forwards to the target (default behavior). Inside a trap, `Reflect.get(target, prop)` (or `.set`, etc.) gives you the default — call it to "let the operation through", or replace it entirely. This is decorator-pattern at the language level.
+
+**Q3: Most dangerous misconception?**
+> **A:** Proxy can intercept built-in object internals:
+> ```js
+> // ❌ Proxy CANNOT intercept Map/Set internal slots
+> const mapProxy = new Proxy(new Map(), {
+>   set(t, p, v) { console.log('set'); return Reflect.set(t, p, v); }
+> });
+> mapProxy.set('k', 'v');   // No log — Map.set uses internal slots, bypassing the proxy
+> console.log(mapProxy.get('k'));   // undefined!
+>
+> // ✅ For Map/Set, wrap each method explicitly
+> const mapProxy = new Proxy(new Map(), {
+>   get(t, p) {
+>     const value = Reflect.get(t, p);
+>     return typeof value === 'function' ? value.bind(t) : value;
+>   }
+> });
+> ```
+
+**Q4: How does Vue 3's reactivity use Proxy?**
+> **A:** Vue 3 wraps every reactive object in a Proxy. The `get` trap registers the CURRENT EFFECT (the rendering function being executed) as a subscriber to that property. The `set` trap notifies all subscribers, re-running effects (re-rendering components that read that property). This achieves "automatic dependency tracking" — no manual subscriptions needed. The replacement for Vue 2's Object.defineProperty approach (which couldn't detect new property additions, array index sets, etc.).
+
+**Q5: FAANG-grade definition?**
+> **A:** "Proxy is JavaScript's metaprogramming primitive — wrapping a target object with a handler whose traps intercept fundamental operations (property access, assignment, deletion, function invocation, construction, prototype access, descriptor queries) — paired with Reflect, which provides the default implementations of every trap as static methods enabling clean trap composition — collectively powering reactive frameworks, validation layers, mocking libraries, and virtual-object patterns, with limitations around built-in internal-slot operations on Date, Map, Set, WeakMap, and Promise."
+
+## BUILD
+
+### 🏗️ Mini Project: Mini Reactive System (Vue-Style) Using Proxy
+
+**What you will build:** A reactive() factory that wraps objects so writes auto-notify reads — a tiny clone of Vue 3's reactivity using Proxy + Reflect — and an effect(fn) helper that re-runs when its dependencies change.
+**Why this project:** Forces the exact pattern that powers Vue, MobX, Valtio, and Solid.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-proxy && cd js-proxy
+npm init -y && npm install -D vitest
+ni reactive.js, reactive.test.js -ItemType File
+```
+
+#### Step 2 — Reactive Core
+```js
+// reactive.js
+let currentEffect = null;
+const targetMap = new WeakMap();   // target -> (key -> Set<effect>)
+
+function track(target, key) {
+  if (!currentEffect) return;
+  let depsMap = targetMap.get(target);
+  if (!depsMap) targetMap.set(target, (depsMap = new Map()));
+  let dep = depsMap.get(key);
+  if (!dep) depsMap.set(key, (dep = new Set()));
+  dep.add(currentEffect);
+}
+
+function trigger(target, key) {
+  const depsMap = targetMap.get(target);
+  const dep = depsMap?.get(key);
+  if (!dep) return;
+  for (const effect of [...dep]) effect();
+}
+
+export function reactive(target) {
+  return new Proxy(target, {
+    get(t, key, receiver) {
+      const result = Reflect.get(t, key, receiver);
+      track(t, key);
+      return typeof result === 'object' && result !== null ? reactive(result) : result;
+    },
+    set(t, key, value, receiver) {
+      const oldValue = t[key];
+      const result = Reflect.set(t, key, value, receiver);
+      if (oldValue !== value) trigger(t, key);
+      return result;
+    },
+    deleteProperty(t, key) {
+      const result = Reflect.deleteProperty(t, key);
+      trigger(t, key);
+      return result;
+    },
+  });
+}
+
+export function effect(fn) {
+  const run = () => {
+    currentEffect = run;
+    try { fn(); }
+    finally { currentEffect = null; }
+  };
+  run();
+  return run;
+}
+```
+
+#### Step 3 — Use It
+```js
+// demo.js
+import { reactive, effect } from './reactive.js';
+
+const state = reactive({ count: 0, user: { name: 'Ana' }, items: [] });
+
+// Effect re-runs whenever any property IT READS changes
+effect(() => {
+  console.log(`count is ${state.count}, user is ${state.user.name}`);
+});
+
+state.count = 1;             // logs: count is 1, user is Ana
+state.count = 2;             // logs: count is 2, user is Ana
+state.user.name = 'Bob';     // logs: count is 2, user is Bob  (deep reactivity!)
+state.unused = 'foo';        // no log — effect didn't read 'unused'
+
+// Computed via effect + reactive
+const computed = reactive({ doubled: 0 });
+effect(() => { computed.doubled = state.count * 2; });
+state.count = 5;
+console.log(computed.doubled);   // 10
+```
+
+#### Step 4 — Error Handling: Validation Proxy
+```js
+// validate.js
+export function validated(target, schema) {
+  return new Proxy(target, {
+    set(t, key, value) {
+      const validator = schema[key];
+      if (validator && !validator(value)) {
+        throw new TypeError(`Invalid value for "${key}": ${value}`);
+      }
+      return Reflect.set(t, key, value);
+    },
+  });
+}
+
+const user = validated({ age: 0, name: '' }, {
+  age:  v => Number.isInteger(v) && v >= 0 && v <= 120,
+  name: v => typeof v === 'string' && v.length > 0,
+});
+
+user.age  = 30;       // ok
+user.name = 'Ana';    // ok
+try { user.age = -1; }     catch (e) { console.log('caught:', e.message); }
+try { user.name = ''; }    catch (e) { console.log('caught:', e.message); }
+```
+
+#### Step 5 — Tests
+```js
+// reactive.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { reactive, effect } from './reactive.js';
+import { validated } from './validate.js';
+
+describe('reactive', () => {
+  it('re-runs effect on property change', () => {
+    const s = reactive({ x: 0 });
+    const spy = vi.fn();
+    effect(() => { spy(s.x); });
+    expect(spy).toHaveBeenCalledTimes(1);
+    s.x = 1;
+    expect(spy).toHaveBeenCalledTimes(2);
+    s.x = 1;   // same value
+    expect(spy).toHaveBeenCalledTimes(2);   // no re-run
+  });
+
+  it('tracks only read properties', () => {
+    const s = reactive({ a: 0, b: 0 });
+    const spy = vi.fn();
+    effect(() => { spy(s.a); });
+    s.b = 99;
+    expect(spy).toHaveBeenCalledTimes(1);   // unaffected
+  });
+
+  it('deep reactivity for nested objects', () => {
+    const s = reactive({ user: { name: 'Ana' } });
+    const spy = vi.fn();
+    effect(() => { spy(s.user.name); });
+    s.user.name = 'Bob';
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('validated proxy', () => {
+  it('allows valid sets', () => {
+    const u = validated({ n: 0 }, { n: v => v > 0 });
+    u.n = 5;
+    expect(u.n).toBe(5);
+  });
+  it('throws on invalid sets', () => {
+    const u = validated({ n: 0 }, { n: v => v > 0 });
+    expect(() => { u.n = -1; }).toThrow(TypeError);
+  });
+});
+```
+
+**Expected Output:**
+```
+count is 0, user is Ana
+count is 1, user is Ana
+count is 2, user is Ana
+count is 2, user is Bob
+10
+caught: Invalid value for "age": -1
+caught: Invalid value for "name":
+
+# All tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add computed(getter) — like Vue's computed properties, lazy + cached
+- [ ] Add a Map/Set handler so reactive(new Map()) works
+- [ ] Build a snapshot/restore feature using Proxy + structuredClone
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between Proxy and Object.defineProperty?
+**Q2:** What does Reflect provide?
+**Q3:** Write a Proxy that logs every property access. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does Proxy fail to intercept Map.set/get without special handling?
+**Q5:** A junior uses Proxy on a Date — methods throw. Diagnose.
+**Q6:** Add validation to this setter:
+```js
+const config = { timeout: 5000 };
+config.timeout = -1;   // should throw
+```
+
+### Day 7 — Application
+**Q7:** Build a Proxy that warns on use of deprecated property names with rename hints.
+**Q8:** A PR wraps every API response in a Proxy for lazy loading — explain the trade-offs.
+**Q9:** What's the perf cost of Proxy property access vs direct access?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how Vue 3's reactivity works using Proxy + WeakMap."
+**Q11:** Draw: every trap Proxy supports and the operation it intercepts.
+**Q12:** ★ System design: "Architect a security sandbox for third-party JS using Proxy — what traps, what limits?"

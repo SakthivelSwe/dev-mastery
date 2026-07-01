@@ -173,3 +173,246 @@ A: Absolutely not. `const { age, name } = user;` is identical to `const { name, 
 
 **Q: What happens if you try to destructure a property from `null` or `undefined`?**
 A: It will trigger a fatal `TypeError` and crash your application (`Cannot destructure property 'name' of 'undefined' as it is undefined`). You must always ensure the object you are destructuring actually exists. If it might be null, you can use a fallback empty object: `const { name } = user || {};`.
+
+## FEYNMAN CHECK
+
+### Explain Destructuring Like I'm 10 Years Old
+> Destructuring is SYNTAX SUGAR for pulling values out of arrays/objects into named variables in ONE line. `const {name, age} = user` is equivalent to `const name = user.name; const age = user.age`. `const [first, second] = arr` pulls the first two array elements. With defaults: `const {timeout = 5000} = config`. With renaming: `const {n: name} = obj`. With nested: `const {addr: {city}} = user`. With rest: `const [head, ...tail] = arr`. The non-obvious detail: destructuring on `undefined` or `null` THROWS — `const {x} = null` is TypeError. Always provide a default: `const {x} = config ?? {}`. Object destructuring in function PARAMS is the modern way to express named arguments without losing IDE help.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When is destructuring worth it vs plain property access?**
+> **A:** Use destructuring when you're pulling MORE THAN ONE value, OR you want defaults, OR you want renaming. For a single value, `config.url` is clearer than `const {url} = config`. For function parameters with 3+ options, destructuring is far better than a positional argument list — call sites are self-documenting (`fetch(url, { method: 'POST', headers })`).
+
+**Q2: Mental model for destructuring?**
+> **A:** Read destructuring as "describe the SHAPE on the left, JS will try to MATCH it on the right." `const {a, b: {c}} = obj` says: obj must have a property a (extract it), and a property b (which itself must have a c — extract that). It's pattern-matching-lite. Defaults apply when the value is undefined (not null, not 0, not ''). Renaming reverses syntax intuition: `const {a: x} = {a: 5}` means "extract a, call it x" — x = 5.
+
+**Q3: Most dangerous misconception?**
+> **A:** Destructuring null:
+> ```js
+> // ❌ Throws TypeError
+> const { x } = null;          // TypeError: Cannot destructure property 'x' of 'null'
+> const { x } = undefined;     // Same
+>
+> // ❌ Also: defaults only fire on undefined, not null
+> const { count = 0 } = { count: null };
+> console.log(count);           // null — default did NOT apply
+>
+> // ✅ Defend against null AND missing
+> const { count = 0 } = obj ?? {};
+> // Or normalise: const count = obj?.count ?? 0;
+> ```
+
+**Q4: How does parameter destructuring interact with arity?**
+> **A:** `function f({a, b})` declares ONE parameter (an object). `f.length` is 1. The default arity-zero case: `function f({a, b} = {})` lets you call f() without args. Without the `= {}`, calling f() throws because you can't destructure undefined. The pattern `function f({a = 1, b = 2} = {})` is the canonical "named args with defaults" — every modern lib uses it.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Destructuring assignment is JavaScript syntax that extracts values from arrays (positional) or objects (by key) into individual bindings — supporting defaults (for undefined), renaming via `prop: localName`, nested patterns, rest collection, and use in function parameters as the idiomatic named-arguments pattern — throwing TypeError when destructuring null or undefined without a fallback."
+
+## BUILD
+
+### 🏗️ Mini Project: Robust Options Parser With Defaults, Renaming, Nested Destructuring
+
+**What you will build:** A reusable `parseOptions` factory that accepts schemas and produces fully-typed options resolvers with defaults — like the pattern in Express, axios, and webpack configs.
+**Why this project:** Forces every destructuring pattern in one realistic API design.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-destructure && cd js-destructure
+npm init -y && npm install -D vitest
+ni options.js, options.test.js -ItemType File
+```
+
+#### Step 2 — Real Function With Full Destructuring
+```js
+// options.js
+
+// HTTP fetch wrapper — every option destructured, defaulted, validated
+export async function request(url, {
+  method = 'GET',
+  headers = {},
+  body,
+  timeout = 5000,
+  retries: { count: retryCount = 3, delay: retryDelay = 1000 } = {},
+  signal,
+} = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  // Combine external signal with our timeout
+  signal?.addEventListener('abort', () => controller.abort());
+
+  let lastErr;
+  for (let attempt = 1; attempt <= retryCount; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method, headers, body, signal: controller.signal,
+      });
+      clearTimeout(timer);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retryCount) await new Promise(r => setTimeout(r, retryDelay));
+    }
+  }
+  clearTimeout(timer);
+  throw lastErr;
+}
+
+// Demo: every form of destructuring in call sites
+const cfg = {
+  url: 'https://api.example.com',
+  retries: { count: 5, delay: 2000 },
+};
+
+// 1. Destructure from object literal
+const { url, retries: { count } = {} } = cfg;
+console.log('URL:', url, 'retries:', count);
+
+// 2. With rename + default
+const { url: endpoint = '/fallback' } = cfg;
+
+// 3. From function return
+function getCoords() { return [37.7749, -122.4194]; }
+const [lat, lng] = getCoords();
+console.log({ lat, lng });
+
+// 4. Swap variables
+let a = 1, b = 2;
+[a, b] = [b, a];
+console.log(a, b);   // 2 1
+```
+
+#### Step 3 — Schema-Driven Options
+```js
+// schema.js
+export function defineOptions(schema) {
+  return (input = {}) => {
+    const out = {};
+    for (const [key, { default: def, required, validate }] of Object.entries(schema)) {
+      const value = input[key] !== undefined ? input[key] : def;
+      if (required && value === undefined) {
+        throw new Error(`Missing required option: ${key}`);
+      }
+      if (validate && !validate(value)) {
+        throw new Error(`Invalid option: ${key}`);
+      }
+      out[key] = value;
+    }
+    return out;
+  };
+}
+
+const parseDbConfig = defineOptions({
+  host: { default: 'localhost' },
+  port: { default: 5432, validate: (n) => Number.isInteger(n) && n > 0 },
+  user: { required: true },
+  pool: { default: 10 },
+});
+
+console.log(parseDbConfig({ user: 'admin' }));
+```
+
+#### Step 4 — Error Handling: Destructure From Maybe-Null
+```js
+// safe.js — defensive destructuring
+function getProfile(user) {
+  // ❌ Throws if user is null/undefined:
+  // const { name, email } = user;
+
+  // ✅ Default to empty object to allow destructuring
+  const { name = '<unknown>', email = '<none>' } = user ?? {};
+
+  // ✅ For deeper nesting, combine optional chaining + ??
+  const street = user?.address?.street ?? '<no street>';
+  return { name, email, street };
+}
+
+console.log(getProfile(null));
+console.log(getProfile({ name: 'Ana' }));
+console.log(getProfile({ name: 'Ana', address: { street: 'Main St' } }));
+```
+
+#### Step 5 — Tests
+```js
+// options.test.js
+import { describe, it, expect } from 'vitest';
+import { defineOptions } from './schema.js';
+
+describe('defineOptions', () => {
+  const parse = defineOptions({
+    a: { default: 1 },
+    b: { required: true },
+    c: { default: 'x', validate: (s) => typeof s === 'string' },
+  });
+
+  it('applies defaults', () => {
+    expect(parse({ b: 'x' })).toEqual({ a: 1, b: 'x', c: 'x' });
+  });
+  it('throws on missing required', () => {
+    expect(() => parse({})).toThrow(/Missing required option: b/);
+  });
+  it('throws on validation failure', () => {
+    expect(() => parse({ b: 'x', c: 99 })).toThrow(/Invalid option: c/);
+  });
+});
+
+describe('destructuring edge cases', () => {
+  it('defaults only fire on undefined, not null', () => {
+    const { x = 10 } = { x: null };
+    expect(x).toBeNull();
+  });
+  it('destructuring null throws', () => {
+    expect(() => { const { x } = null; }).toThrow(TypeError);
+  });
+});
+```
+
+**Expected Output:**
+```
+URL: https://api.example.com retries: 5
+{ lat: 37.7749, lng: -122.4194 }
+2 1
+{ host: 'localhost', port: 5432, user: 'admin', pool: 10 }
+{ name: '<unknown>', email: '<none>', street: '<no street>' }
+{ name: 'Ana', email: '<none>', street: '<no street>' }
+{ name: 'Ana', email: '<none>', street: 'Main St' }
+
+# 5/5 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add nested-schema support (recursive defineOptions)
+- [ ] Add a type-driven version that emits TS types from the schema
+- [ ] Compare with zod for the same use case
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Syntax for renaming during destructuring?
+**Q2:** When does a destructuring default fire?
+**Q3:** Write a function signature with default named options. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `const {x = 1} = {x: null}` give `null`, not `1`?
+**Q5:** A junior writes `function f({a, b})` and calls `f()` — TypeError. Fix.
+**Q6:** Refactor for named args:
+```js
+function search(query, page, perPage, sort, filters) { /* ... */ }
+search('js', 1, 20, 'date', { tag: 'tutorial' });
+```
+
+### Day 7 — Application
+**Q7:** Build a swap utility for any two variables using one line.
+**Q8:** A PR uses positional args for a 7-option API — refactor to destructured options.
+**Q9:** Is destructuring slower than direct property access? When does it matter?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every destructuring pattern with concrete examples."
+**Q11:** Draw: how destructuring compiles to property-access + temporary-binding code.
+**Q12:** ★ System design: "Design a public API where every method accepts options with safe defaults and clear validation — patterns and pitfalls."

@@ -1,274 +1,611 @@
 ---
-title: dependency-injection
-slug: dependency-injection
+slug: "dependency-injection"
+title: "Dependency Injection"
+level: 2
 ---
 
-# Dependency Injection — Constructor vs Field vs Setter | Level: 2
+## WHY
 
----
-
-## 1. Architectural Deep Dive & Internal Mechanics
-
-Dependency Injection (DI) is the concrete implementation of Inversion of Control. Spring supports three primary injection styles: **Constructor Injection**, **Field Injection**, and **Setter Injection**.
-
-```
-[ Constructor Injection ]
-   │
-   ├── Instantiation & Injection occur simultaneously
-   └── Guarantees final fields, prevents circular dependencies at startup
-
-[ Field Injection ]
-   │
-   ├── Class instantiated with empty constructor
-   └── ReflectionUtils.setField() modifies private fields (Requires running Context)
-
-[ Setter Injection ]
-   │
-   ├── Class instantiated with empty constructor
-   └── Mutators invoked post-instantiation (Allows optional/mutable dependencies)
-```
-
-### Constructor Injection
-Constructor injection is the industry standard. The container instantiates the bean by invoking its constructor, passing all dependencies as arguments. This guarantees:
-* **Immutability**: Fields can be declared `final`, preventing post-initialization modification.
-* **Fail-Fast Startup**: Missing dependencies are detected at compilation or application startup rather than runtime.
-* **No Reflection Required**: Dependencies can be injected programmatically in unit tests without starting an application context.
-
-At runtime, Spring uses reflection via `Constructor.newInstance()` to instantiate the bean, passing resolved arguments from the `BeanFactory`.
-
-### Field Injection
-Field injection uses the `@Autowired` annotation directly on private fields. Under the hood, Spring uses `ReflectionUtils.makeAccessible(Field field)` to bypass Java access controls and invokes `field.set(bean, dependency)`. 
-
-* **The Problem**: Field injection decouples the class from its dependency declaration. The class cannot be instantiated cleanly in standard unit tests without using mock frameworks or Spring's internal testing utilities (like `ReflectionTestUtils`). It also hides class coupling issues, making it easy to violate the Single Responsibility Principle.
-
-### Setter Injection
-Setter injection instantiates the bean using its default constructor, then calls setter methods annotated with `@Autowired`. This style is suitable for optional dependencies that can be reconfigured or changed at runtime. However, it exposes the bean to mutability and can lead to partially initialized objects if not carefully managed.
-
-### Circular Dependencies
-A circular dependency occurs when `BeanA` requires `BeanB`, and `BeanB` requires `BeanA`.
-
-* **Constructor Injection**: Spring detects circular dependencies during the instantiation phase. Because both beans require the other to be constructed first, the container throws a `BeanCurrentlyInCreationException` immediately at startup.
-* **Field/Setter Injection**: Spring can occasionally resolve circular dependencies by instantiating the beans using empty constructors, registering them in its "singleton objects currently in creation" cache, and injecting the field dependencies later. However, this relies on internal bean lifecycle caching and can fail or lead to null references if the circular path is executed during initialization.
-* **The `@Lazy` Escape Hatch**: The `@Lazy` annotation resolves circular dependencies by injecting a dynamic proxy instead of the actual bean. The proxy implements the target interface and defers loading the real bean until a method is first called on the proxy.
-
----
-
-## 2. Blueprint & Production-Ready Code
-
-The following code demonstrates constructor injection, setter injection, and how to resolve circular dependencies using `@Lazy`.
+Dependency Injection (DI) is the foundation of every modern Java framework. Without it, you'd write code like this:
 
 ```java
-package com.devmastery.di;
+// WITHOUT DI — tightly coupled nightmare
+class OrderService {
+    private PaymentProcessor processor = new StripePaymentProcessor();  // HARD-CODED!
+    private EmailService email = new GmailEmailService();               // HARD-CODED!
+}
+// Problems: Can't test without real Stripe/Gmail. Can't swap to PayPal. Can't mock.
+```
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.stereotype.Component;
-import org.springframework.stereotype.Service;
+With DI, the **container** creates and wires dependencies:
 
-@SpringBootApplication
-public class DependencyInjectionApplication {
-    public static void main(String[] args) {
-        SpringApplication.run(DependencyInjectionApplication.class, args);
+```java
+// WITH DI — loose coupling
+class OrderService {
+    private final PaymentProcessor processor;  // Interface, not implementation
+    private final EmailService email;
+
+    OrderService(PaymentProcessor processor, EmailService email) {
+        this.processor = processor;  // Spring injects the actual implementation
+        this.email = email;
     }
 }
+// Benefits: swap Stripe to PayPal without touching OrderService. Test with mocks.
+```
 
-// ==========================================
-// 1. RECOMMENDED: Constructor Injection (Immutable)
-// ==========================================
+Five concrete reasons DI matters:
+
+1. **Testability**: Constructor injection lets you write `new OrderService(mockProcessor, mockEmail)` — no Spring context needed for unit tests.
+2. **Loose coupling**: `OrderService` depends on `PaymentProcessor` interface. It doesn't know or care if it's Stripe, PayPal, or a test stub.
+3. **Open-Closed Principle**: Add new payment processors by implementing the interface. Zero changes to `OrderService`.
+4. **Immutability**: Constructor injection enables `final` fields — thread-safe by default.
+5. **Explicit dependencies**: Constructor parameters document what a class needs. `@Autowired` private fields hide it.
+
+Spring Boot's IoC container manages the entire DI lifecycle. Understanding how it works internally — bean creation order, circular dependency resolution, proxy injection — is essential for debugging complex startup failures.
+
+## THEORY
+
+### Inversion of Control vs Dependency Injection
+
+| Concept | Definition |
+|---------|------------|
+| **Inversion of Control (IoC)** | Design principle: you don't create dependencies, the framework creates them for you |
+| **Dependency Injection (DI)** | Concrete technique for IoC: dependencies are "injected" through constructor, field, or setter |
+| **IoC Container** | Spring's `ApplicationContext` — manages object creation, wiring, lifecycle |
+
+### Three Injection Styles Compared
+
+| | Constructor Injection | Field Injection | Setter Injection |
+|--|---|---|---|
+| **Syntax** | `OrderService(PaymentProcessor p)` | `@Autowired private PaymentProcessor p;` | `@Autowired void setProcessor(P p)` |
+| **Immutability** | ✅ Fields can be `final` | ❌ Can't be `final` | ❌ Can't be `final` |
+| **Test without Spring** | ✅ `new OrderService(mock)` | ❌ Need `ReflectionTestUtils` | ✅ `service.setProcessor(mock)` |
+| **Circular dependency** | ❌ Fails fast (startup) | ⚠️ May work (Spring caching) | ⚠️ May work |
+| **Null safety** | ✅ Never null if started | ❌ NPE if Spring missed it | ⚠️ Optional but mutable |
+| **Spring recommendation** | ✅ RECOMMENDED | ❌ Not recommended | ⚠️ For optional deps only |
+
+### How Spring Resolves Dependencies: The Bean Lifecycle
+
+```
+1. Component Scanning
+   Scan @Component, @Service, @Repository, @Controller annotated classes
+   → Build BeanDefinition objects (metadata: class, scope, constructor args)
+
+2. Bean Instantiation Order
+   Spring topologically sorts beans by dependency graph
+   OrderService needs PaymentProcessor → create PaymentProcessor FIRST
+   → Call Constructor.newInstance(paymentProcessor) → OrderService created
+
+3. Dependency Resolution
+   For each constructor parameter:
+     a. Find by type (most common)
+     b. If multiple candidates → find by @Qualifier name
+     c. If still ambiguous → BeanException at startup
+
+4. Post-Processing
+   BeanPostProcessor runs (e.g., AOP proxy wrapping for @Transactional)
+   @PostConstruct methods run
+
+5. Ready to Serve
+   All beans in ApplicationContext — ready to handle requests
+```
+
+### Circular Dependencies: Causes and Solutions
+
+A circular dependency occurs when Bean A needs Bean B, and Bean B needs Bean A. With constructor injection, this causes `BeanCurrentlyInCreationException` at startup — which is the **desired behavior** (fail fast, not fail mysteriously at runtime).
+
+```
+A requires B (constructor)
+B requires A (constructor)
+→ Spring can't create either — throws BeanCurrentlyInCreationException ✅
+
+A requires B (field/setter)
+B requires A (constructor)
+→ Spring creates A with empty constructor, registers in "early exposure" cache
+→ Spring creates B, injects the partial A from cache
+→ Spring completes A's field injection
+→ A and B exist, but A was partially initialized during B's construction ⚠️
+```
+
+**Solutions** (in order of preference):
+
+1. **Refactor**: Extract shared logic into a third bean (C) that A and B both depend on — no cycle.
+2. **`@Lazy` on one side**: Spring injects a proxy instead of the real bean. Proxy activates on first method call.
+3. **`@PostConstruct` + setter**: Use setter injection for one side, set it in `@PostConstruct`.
+4. **`ApplicationContext.getBean()`**: Manual lookup — avoid, this is Service Locator anti-pattern.
+
+### `@Qualifier` and Primary Beans
+
+```java
+// Multiple implementations of same interface:
+@Component("stripeProcessor")
+class StripePaymentProcessor implements PaymentProcessor { ... }
+
+@Component("paypalProcessor")
+class PayPalPaymentProcessor implements PaymentProcessor { ... }
+
 @Service
 class OrderService {
-    private final PaymentProcessor paymentProcessor;
+    // Without qualifier: NoUniqueBeanDefinitionException!
+    // With qualifier: unambiguous
+    OrderService(@Qualifier("stripeProcessor") PaymentProcessor processor) { ... }
+}
 
-    // Single constructor: @Autowired is implicit in Spring 4.3+
-    public OrderService(PaymentProcessor paymentProcessor) {
-        if (paymentProcessor == null) {
-            throw new IllegalArgumentException("PaymentProcessor must not be null");
-        }
-        this.paymentProcessor = paymentProcessor;
-    }
+// Alternatively: mark one as @Primary (default choice)
+@Component @Primary
+class StripePaymentProcessor implements PaymentProcessor { ... }
+// Now OrderService without @Qualifier gets Stripe by default
+```
 
-    public void processOrder(double amount) {
-        paymentProcessor.pay(amount);
+### Bean Scopes
+
+| Scope | Lifetime | When to Use |
+|-------|----------|-------------|
+| `singleton` (default) | Application lifetime | Stateless services, repositories |
+| `prototype` | New instance per `getBean()` | Stateful objects, not thread-safe components |
+| `request` | Per HTTP request | Web MVC request-scoped data |
+| `session` | Per HTTP session | User session state |
+| `application` | Per `ServletContext` | Shared web app state |
+
+## VISUALIZATION_CONFIG
+```json
+{ "type": "none" }
+```
+
+## CODE
+
+### Level 1 — Beginner
+```java
+import org.springframework.stereotype.*;
+import org.springframework.boot.*;
+import org.springframework.boot.autoconfigure.*;
+
+// CONSTRUCTOR INJECTION: Spring's recommended approach
+@SpringBootApplication
+public class DiBasicsApp {
+    public static void main(String[] args) {
+        SpringApplication.run(DiBasicsApp.class, args);
     }
 }
 
-@Component
-class PaymentProcessor {
-    private static final Logger log = LoggerFactory.getLogger(PaymentProcessor.class);
+// Interface — decoupled from implementation
+interface NotificationService {
+    void notify(String message);
+}
 
-    public void pay(double amount) {
-        log.info("Processing payment of ${}", amount);
+// Implementation — Spring will create and inject this
+@Service("emailNotification")
+class EmailNotificationService implements NotificationService {
+    public void notify(String message) {
+        System.out.println("EMAIL: " + message);
     }
 }
 
-// ==========================================
-// 2. Setter Injection (Optional/Mutable)
-// ==========================================
+// Consumer — depends on interface, not implementation
+@Service
+class AlertService {
+    private final NotificationService notificationService;
+
+    // Single constructor → @Autowired is implicit (Spring 4.3+)
+    // Spring looks for a bean of type NotificationService → finds EmailNotificationService
+    public AlertService(NotificationService notificationService) {
+        this.notificationService = notificationService;  // Can be final!
+    }
+
+    public void sendAlert(String event) {
+        notificationService.notify("ALERT: " + event);
+    }
+}
+```
+
+### Level 2 — Building Blocks
+```java
+import org.springframework.beans.factory.annotation.*;
+import org.springframework.stereotype.*;
+import jakarta.annotation.PostConstruct;
+
+// THREE INJECTION STYLES: Pros and Cons
+
+// STYLE 1: CONSTRUCTOR (RECOMMENDED)
+@Service
+class OrderService {
+    private final PaymentProcessor processor;
+    private final InventoryService inventory;
+
+    // BENEFITS:
+    // - Both deps are final (immutable, thread-safe)
+    // - Test: new OrderService(mockProcessor, mockInventory) — no Spring needed
+    // - NPE impossible — Spring validates deps at startup
+    public OrderService(PaymentProcessor processor, InventoryService inventory) {
+        this.processor = processor;
+        this.inventory = inventory;
+    }
+}
+
+// STYLE 2: FIELD (NOT RECOMMENDED)
+@Service
+class BadOrderService {
+    @Autowired
+    private PaymentProcessor processor;  // NOT final — could be null!
+    @Autowired
+    private InventoryService inventory;  // Hidden dependency — not visible in constructor
+
+    // PROBLEMS:
+    // - Can't write: new BadOrderService(mockProcessor, mockInventory) — won't work
+    // - Must use: ReflectionTestUtils.setField(service, "processor", mock)  ← ugly
+    // - Adding more @Autowired fields hides how bloated this class is (SRP violation)
+}
+
+// STYLE 3: SETTER (FOR OPTIONAL DEPENDENCIES)
 @Service
 class NotificationService {
-    private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
-    private SmsGateway smsGateway;
+    private SmsGateway smsGateway;  // Optional — may not be configured
 
-    // Setter injection allows this dependency to be optional or swapped
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    // required=false: Spring skips this if no SmsGateway bean exists
+    @Autowired(required = false)
     public void setSmsGateway(SmsGateway smsGateway) {
         this.smsGateway = smsGateway;
     }
 
-    public void notifyUser(String message) {
+    public void sendAlert(String msg) {
         if (smsGateway != null) {
-            smsGateway.send(message);
+            smsGateway.send(msg);
         } else {
-            log.warn("SmsGateway not available. Notification logged: {}", message);
+            System.out.println("No SMS gateway — logged: " + msg);
         }
     }
 }
 
-@Component
-class SmsGateway {
-    private static final Logger log = LoggerFactory.getLogger(SmsGateway.class);
-    public void send(String msg) {
-        log.info("SMS Sent: {}", msg);
-    }
-}
-
-// ==========================================
-// 3. Circular Dependency Mitigation with @Lazy
-// ==========================================
-@Component
-class CircularServiceA {
-    private static final Logger log = LoggerFactory.getLogger(CircularServiceA.class);
-    private final CircularServiceB serviceB;
-
-    // Use @Lazy to inject a proxy of ServiceB, breaking the constructor loop
-    public CircularServiceA(@Lazy CircularServiceB serviceB) {
-        this.serviceB = serviceB;
-    }
-
-    public void doWork() {
-        log.info("ServiceA working...");
-        serviceB.doSubWork();
-    }
-}
-
-@Component
-class CircularServiceB {
-    private static final Logger log = LoggerFactory.getLogger(CircularServiceB.class);
-    private final CircularServiceA serviceA;
-
-    public CircularServiceB(CircularServiceA serviceA) {
-        this.serviceA = serviceA;
-    }
-
-    public void doSubWork() {
-        log.info("ServiceB working...");
-    }
-
-    public void triggerCascade() {
-        serviceA.doWork();
-    }
-}
-```
-
----
-
-## 3. Configuration & Properties
-
-```yaml
-spring:
-  application:
-    name: spring-di-deepdive
-  main:
-    # Set to false to ensure Spring fails fast on circular dependencies
-    allow-circular-references: false
-```
-
-### Property Explanations
-* `spring.main.allow-circular-references`: Setting this to `false` (the default since Spring Boot 2.6) ensures that Spring throws a `BeanCurrentlyInCreationException` during startup if a circular reference is detected, unless it is explicitly mitigated using `@Lazy`.
-
----
-
-## 4. Advanced Patterns & Pitfalls (SonarQube Compliant)
-
-### Common Pitfall: Field Injection in Production Code
-Using `@Autowired` on private fields makes unit testing difficult and hides dependency bloat.
-
-```java
-// INSECURE / UNTESTABLE ANTI-PATTERN
+// LIFECYCLE: @PostConstruct runs after all injection is complete
 @Service
-public class BadService {
-    @Autowired
-    private DependencyA depA;
-    @Autowired
-    private DependencyB depB;
-    // No constructor or setter. Testing requires ReflectionTestUtils.
+class CacheService {
+    private final UserRepository userRepository;
+
+    CacheService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @PostConstruct  // Called AFTER constructor + all dependency injection
+    void warmUpCache() {
+        System.out.println("Warming up cache...");
+        // userRepository is guaranteed to be injected here
+    }
 }
 ```
 
-*Correction*: Use constructor injection. It allows you to instantiate the class in a plain JUnit test using `new BadService(mockA, mockB)`.
-
-### SonarQube Compliance: S3749 (Members of Spring components should be injected)
-Ensure all fields in a Spring component are either injected via constructor, initialized with default values, or marked as transient if they do not represent state.
-
-### Performance Consideration: Heavy Lazy Initialization Proxying
-Using `@Lazy` introduces a small runtime overhead because every method call must pass through a dynamic proxy. Avoid using `@Lazy` as a broad solution for poor design. Instead, resolve circular dependencies by refactoring the shared logic into a third, independent bean.
-
----
-
-## 5. Verification & Testing
-
-This test verifies that constructor injection works without starting a Spring Context, and that circular dependency resolution using `@Lazy` functions as expected.
-
+### Level 3 — Intermediate
 ```java
-package com.devmastery.di;
+import org.springframework.beans.factory.annotation.*;
+import org.springframework.context.annotation.*;
+import org.springframework.stereotype.*;
 
-import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+// QUALIFIER, PRIMARY, and MULTIPLE IMPLEMENTATIONS
 
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.mockito.Mockito.verify;
+interface PaymentProcessor { void pay(double amount); }
 
-@SpringBootTest(classes = DependencyInjectionApplication.class)
-class DependencyInjectionTest {
+@Component("stripe")
+class StripeProcessor implements PaymentProcessor {
+    public void pay(double amount) { System.out.println("Stripe: $" + amount); }
+}
 
-    @Autowired
-    private CircularServiceB circularServiceB;
+@Component("paypal")
+@Primary  // Default choice when no @Qualifier specified
+class PayPalProcessor implements PaymentProcessor {
+    public void pay(double amount) { System.out.println("PayPal: $" + amount); }
+}
 
-    @Test
-    void testConstructorInjectionWithoutSpring() {
-        // Verify we can test OrderService without loading any Spring Context
-        PaymentProcessor mockProcessor = Mockito.mock(PaymentProcessor.class);
-        OrderService orderService = new OrderService(mockProcessor);
+@Component("crypto")
+class CryptoProcessor implements PaymentProcessor {
+    public void pay(double amount) { System.out.println("Crypto: $" + amount); }
+}
 
-        orderService.processOrder(100.0);
+@Service
+class CheckoutService {
+    private final PaymentProcessor defaultProcessor;    // Gets PayPal (@Primary)
+    private final PaymentProcessor premiumProcessor;    // Gets Stripe (@Qualifier)
+    private final Map<String, PaymentProcessor> allProcessors;  // ALL processors
 
-        verify(mockProcessor).pay(100.0);
+    CheckoutService(
+        PaymentProcessor defaultProcessor,              // @Primary → PayPal
+        @Qualifier("stripe") PaymentProcessor premiumProcessor,  // Explicit → Stripe
+        Map<String, PaymentProcessor> allProcessors    // Spring injects bean-name:bean map
+    ) {
+        this.defaultProcessor = defaultProcessor;
+        this.premiumProcessor = premiumProcessor;
+        this.allProcessors = allProcessors;
     }
 
-    @Test
-    void testCircularDependencyResolution() {
-        // Verify that the context starts successfully and the proxy resolves calls
-        assertNotNull(circularServiceB);
-        circularServiceB.triggerCascade();
+    public void checkout(String paymentMethod, double amount) {
+        PaymentProcessor processor = allProcessors.getOrDefault(paymentMethod, defaultProcessor);
+        processor.pay(amount);
+    }
+}
+
+// CONDITIONAL BEANS: only create in specific environments
+@Configuration
+public class PaymentConfig {
+    @Bean
+    @Profile("production")  // Only in production profile
+    public PaymentProcessor realStripeProcessor() {
+        return new StripeProcessor();
+    }
+
+    @Bean
+    @Profile("test")  // Only in test profile
+    public PaymentProcessor mockPaymentProcessor() {
+        return amount -> System.out.println("MOCK payment: $" + amount);
     }
 }
 ```
 
+### Level 4 — Advanced
+```java
+import org.springframework.context.annotation.*;
+import org.springframework.stereotype.*;
+import org.springframework.beans.factory.config.*;
+
+// CIRCULAR DEPENDENCIES: Problem and solutions
+@SpringBootApplication
+public class CircularDepsApp {
+
+    // CIRCULAR DEPENDENCY PROBLEM:
+    // ServiceA → ServiceB → ServiceA (cycle!)
+    // With constructor injection: BeanCurrentlyInCreationException at startup ← GOOD, fail fast!
+
+    // SOLUTION 1: Break the cycle — extract shared logic into ServiceC
+    @Service
+    static class ServiceA {
+        private final SharedLogicService shared;  // Depends on neutral C, not B
+
+        ServiceA(SharedLogicService shared) { this.shared = shared; }
+    }
+
+    @Service
+    static class ServiceB {
+        private final SharedLogicService shared;  // Depends on neutral C, not A
+
+        ServiceB(SharedLogicService shared) { this.shared = shared; }
+    }
+
+    @Service
+    static class SharedLogicService {
+        // No circular dependency — A and B both inject C, not each other
+        String doSharedWork() { return "shared result"; }
+    }
+
+    // SOLUTION 2: @Lazy — inject a proxy, defer instantiation
+    @Service
+    static class ReportService {
+        private final AnalysisService analysis;
+
+        // @Lazy: Spring injects a CGLIB proxy, not the real bean
+        // Real AnalysisService created on first method call, not at startup
+        ReportService(@Lazy AnalysisService analysis) {
+            this.analysis = analysis;
+        }
+    }
+
+    @Service
+    static class AnalysisService {
+        private final ReportService report;  // Constructor dep on ReportService
+
+        AnalysisService(ReportService report) {
+            this.report = report;  // @Lazy in ReportService breaks the cycle
+        }
+    }
+
+    // SCOPED BEANS: prototype scope — new instance per injection
+    @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+    @Component
+    static class CartItem {
+        private double price;
+        private int quantity;
+        // New instance every time Spring injects CartItem
+        // Useful for stateful objects that shouldn't be shared
+    }
+
+    public static void main(String[] args) {
+        var ctx = SpringApplication.run(CircularDepsApp.class, args);
+
+        // Verify SharedLogicService works
+        SharedLogicService shared = ctx.getBean(SharedLogicService.class);
+        System.out.println(shared.doSharedWork());
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+import org.springframework.beans.factory.*;
+import org.springframework.beans.factory.config.*;
+import org.springframework.context.*;
+
+// EXPERT: BeanFactory, ObjectProvider, programmatic DI
+@Service
+public class AdvancedDIPatterns implements ApplicationContextAware {
+
+    private ApplicationContext context;
+
+    @Override
+    public void setApplicationContext(ApplicationContext ctx) {
+        this.context = ctx;
+    }
+
+    // ObjectProvider: type-safe, lazy, optional dependency injection
+    // Better than @Autowired(required=false) — no NPE risk
+    private final ObjectProvider<SmsGateway> smsGatewayProvider;
+    private final ObjectProvider<List<EventHandler>> eventHandlerProvider;
+
+    AdvancedDIPatterns(
+        ObjectProvider<SmsGateway> smsGatewayProvider,
+        ObjectProvider<List<EventHandler>> eventHandlerProvider
+    ) {
+        this.smsGatewayProvider = smsGatewayProvider;
+        this.eventHandlerProvider = eventHandlerProvider;
+    }
+
+    public void sendSmsIfAvailable(String msg) {
+        // getIfAvailable: returns null if no bean, doesn't throw NoSuchBeanDefinitionException
+        SmsGateway gateway = smsGatewayProvider.getIfAvailable();
+        if (gateway != null) gateway.send(msg);
+    }
+
+    public void notifyAllHandlers(String event) {
+        // orderedStream: returns all EventHandler beans sorted by @Order / Ordered
+        eventHandlerProvider.orderedStream()
+            .forEach(handler -> handler.handle(event));
+    }
+
+    // FACTORY BEANS: when bean creation needs complex logic
+    @Configuration
+    static class DataSourceConfig {
+        @Bean
+        public DataSource dataSource(@Value("${spring.datasource.url}") String url,
+                                     @Value("${spring.datasource.username}") String user) {
+            // Complex factory logic — too complex for a constructor
+            HikariConfig config = new HikariConfig();
+            config.setJdbcUrl(url);
+            config.setUsername(user);
+            config.setMaximumPoolSize(20);
+            config.setConnectionTimeout(3_000);
+            return new HikariDataSource(config);
+        }
+    }
+
+    // PROGRAMMATIC DI: when you need to create beans dynamically at runtime
+    public <T> T createDynamicBean(Class<T> type, String beanName) {
+        // Check if bean already exists
+        if (context.containsBean(beanName)) {
+            return context.getBean(beanName, type);
+        }
+        // Register programmatically (advanced — usually not needed)
+        ConfigurableApplicationContext configurableCtx = (ConfigurableApplicationContext) context;
+        configurableCtx.getBeanFactory().registerSingleton(beanName, type);
+        return context.getBean(beanName, type);
+    }
+
+    interface SmsGateway { void send(String msg); }
+    interface EventHandler { void handle(String event); }
+    interface DataSource {}
+    static class HikariConfig { void setJdbcUrl(String url) {} void setUsername(String u) {} void setMaximumPoolSize(int n) {} void setConnectionTimeout(long ms) {} }
+    static class HikariDataSource implements DataSource { HikariDataSource(HikariConfig c) {} }
+}
+```
+
+## REAL_WORLD
+
+### Spring Boot Testing: Why Constructor Injection Wins
+```java
+// WITH FIELD INJECTION — test requires Spring context or reflection hacks
+@Service
+public class OrderServiceFieldInjected {
+    @Autowired private PaymentGateway gateway;  // Hidden dependency
+    @Autowired private AuditLogger auditLogger;
+
+    public void process(Order order) { gateway.charge(order.total()); }
+}
+
+// Test must use @SpringBootTest or ReflectionTestUtils.setField — SLOW and FRAGILE
+@SpringBootTest
+class OrderServiceFieldTest {
+    @Autowired OrderServiceFieldInjected service;  // Full Spring context = 5+ second startup
+    @MockBean PaymentGateway mockGateway;
+    @MockBean AuditLogger mockLogger;
+
+    @Test void test() { service.process(new Order(100.0)); }
+}
+
+// WITH CONSTRUCTOR INJECTION — instant, no Spring needed
+@Service
+public class OrderServiceConstructorInjected {
+    private final PaymentGateway gateway;
+    private final AuditLogger auditLogger;
+
+    public OrderServiceConstructorInjected(PaymentGateway gateway, AuditLogger auditLogger) {
+        this.gateway = gateway;
+        this.auditLogger = auditLogger;
+    }
+
+    public void process(Order order) { gateway.charge(order.total()); }
+}
+
+// Test is a plain JUnit test — runs in milliseconds, no Spring context
+class OrderServiceConstructorTest {
+    @Test void test() {
+        PaymentGateway mockGateway = Mockito.mock(PaymentGateway.class);
+        AuditLogger mockLogger = Mockito.mock(AuditLogger.class);
+
+        // Instantiate directly — no Spring, no annotations, no context
+        OrderServiceConstructorInjected service =
+            new OrderServiceConstructorInjected(mockGateway, mockLogger);
+
+        service.process(new Order(100.0));
+        Mockito.verify(mockGateway).charge(100.0);  // Verify interaction
+    }
+}
+```
+
+## INTERVIEW
+
+### Q1: What is the difference between IoC and Dependency Injection?
+**Difficulty:** Easy | **Companies:** All Spring shops
+
+❌ **Weak:** "They're basically the same thing."
+
+✅ **Strong:** "IoC (Inversion of Control) is a design principle: instead of your code controlling the creation of dependencies, you invert control to a framework. Dependency Injection is one specific technique implementing IoC — the framework 'injects' required objects into your class via constructors, fields, or setters. Other IoC patterns include the Service Locator pattern (where code asks the container for dependencies). Spring's `ApplicationContext` is an IoC container; `@Autowired` is the DI mechanism. All DI is IoC, but not all IoC is DI."
+
 ---
 
-## 6. Reference & Core Classes
+### Q2: Why is constructor injection preferred over field injection?
+**Difficulty:** Medium | **Companies:** All Spring shops
 
-| Class/Interface | Source Package | Core Responsibility |
-| :--- | :--- | :--- |
-| `AutowiredAnnotationBeanPostProcessor` | `org.springframework.beans.factory.annotation` | Processes `@Autowired` annotations on fields, setters, and constructors. |
-| `ReflectionUtils` | `org.springframework.util` | Internal Spring utility used to manipulate class fields during field injection. |
-| `BeanCurrentlyInCreationException` | `org.springframework.beans.factory` | Thrown when a circular dependency cannot be resolved during instantiation. |
-| `Lazy` | `org.springframework.context.annotation` | Instructs the container to inject a lazy-resolution proxy instead of a direct reference. |
+❌ **Weak:** "Constructor injection is better practice."
+
+✅ **Strong:** "Three concrete reasons: (1) **Testability** — constructor injection lets you instantiate the class with `new Service(mock1, mock2)` in a plain JUnit test without loading Spring. Field injection requires `ReflectionTestUtils.setField()` or `@SpringBootTest` (5+ second startup penalty). (2) **Immutability** — constructor params can be `final`, making the class thread-safe. Field injection prevents `final`. (3) **Dependency transparency** — the constructor signature explicitly documents what the class needs. Adding a new `@Autowired` field is invisible to callers, making it easy to violate SRP silently. SonarQube rule S3749 flags field injection in Spring components."
 
 ---
+
+### Q3: How does Spring resolve circular dependencies?
+**Difficulty:** Hard | **Companies:** Netflix, large Spring shops
+
+❌ **Weak:** "Spring uses @Lazy to break cycles."
+
+✅ **Strong:** "Spring Boot 2.6+ throws `BeanCurrentlyInCreationException` for constructor circular dependencies by default (correct behavior — fail fast). For field/setter injection, Spring uses a three-level cache: when Bean A is being created, it's immediately registered in the 'early singleton objects' cache. When Bean B (which needs A) is being created and Spring tries to inject A, it finds A in the early cache and injects the partially initialized A. This works only when A's circular dependency on B is a field/setter (not constructor), so A can be registered before B is needed. Solutions in order of preference: (1) Refactor to eliminate the cycle — usually the right answer. (2) Extract shared logic to a third bean. (3) `@Lazy` on one side — injects a proxy, defers real instantiation."
+
 ---
+
+### Q4: What is `@Qualifier` and when would you use it?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak:** "It selects which bean to inject when there are multiple of the same type."
+
+✅ **Strong:** "`@Qualifier` disambiguates between multiple beans of the same type. When Spring finds more than one candidate for an `@Autowired` parameter (e.g., two `PaymentProcessor` implementations), it throws `NoUniqueBeanDefinitionException` unless told which one to use. `@Qualifier('stripe')` tells Spring to use the bean named 'stripe'. Alternative: `@Primary` marks the default choice when no `@Qualifier` is specified. For dynamic selection at runtime (choosing processor based on config/request), inject a `Map<String, PaymentProcessor>` — Spring populates it with bean-name → bean mappings for all implementations."
+
+---
+
+### Q5: What is `ObjectProvider<T>` and when should you use it instead of `@Autowired`?
+**Difficulty:** Hard | **Companies:** Pivotal, large Spring shops
+
+❌ **Weak:** "It's a lazy injection wrapper."
+
+✅ **Strong:** "`ObjectProvider<T>` is a Spring 4.3+ injection-aware supplier that provides lazy, optional, and multiple bean access. Key methods: `getIfAvailable()` returns the bean or null (never throws), `getIfUnique()` returns the bean if exactly one exists, `orderedStream()` returns all matching beans sorted by `@Order`. Use cases: (1) Optional dependencies (cleaner than `@Autowired(required=false)` + null check). (2) Avoiding `NoSuchBeanDefinitionException` for beans that may not be configured in all environments. (3) Injecting all beans of a type in priority order. (4) Avoiding circular dependency issues — ObjectProvider doesn't trigger bean creation at injection time."
+
+## FEYNMAN CHECK
+
+Dependency Injection is like room service at a hotel. Without it, you (the chef) must go find all your ingredients yourself: drive to the grocery store, pick the milk, find the eggs. With DI, the hotel sends everything to your room — you just tell the front desk what you need in the morning. You don't care WHERE the milk comes from (Stripe or PayPal). You just use whatever arrives. Testing becomes easy: the tester sends fake ingredients. Swapping suppliers is easy: change what the hotel orders, not the recipe.
+
+## BUILD
+
+**Challenge 1:** Implement an `OrderService` with constructor injection of `PaymentProcessor` and `EmailService`. Write a plain JUnit test (no Spring) using Mockito mocks. Verify that `processor.charge()` is called with the correct amount.
+
+**Challenge 2:** Create 3 implementations of a `NotificationService` interface (Email, SMS, Slack). Use `@Qualifier` to inject a specific one. Then inject all three via `Map<String, NotificationService>` and route based on user preferences.
+
+**Challenge 3:** Create a deliberate circular dependency (A → B → A), observe the startup error, then fix it using the "extract third bean" approach and verify both approaches work.
+
+## SPACED REVIEW
+
+- **Day 1:** What are the 3 injection styles? Which is recommended and why?
+- **Day 3:** Write an OrderService with constructor injection and test it without Spring
+- **Day 7:** What causes a circular dependency? How does Spring detect it? What's the fix?
+- **Day 14:** When would you use @Qualifier vs @Primary? What happens if you don't use either?
+- **Day 30:** What is ObjectProvider<T>? How does it differ from @Autowired(required=false)?

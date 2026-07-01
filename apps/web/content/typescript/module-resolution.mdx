@@ -136,3 +136,202 @@ Then, you use Conditional Exports in your `package.json` to tell the consumer's 
   }
 }
 ```
+
+## FEYNMAN CHECK
+
+### Explain Module Resolution Like I'm 10 Years Old
+> Module resolution is HOW TypeScript figures out what `import { foo } from 'bar'` actually points to on disk. There are several strategies: `Node` (CommonJS — the old way), `NodeNext` (modern Node ESM + CJS interop with file-extension rules), `Bundler` (mimics how Vite/webpack/esbuild resolve — no extension required, supports package.json "exports"), and `Classic` (deprecated). The non-obvious complexity: package.json's `"exports"` field controls what consumers can import, with conditional exports for ESM vs CJS, browser vs node, types vs runtime. A single missing "types" condition makes your library invisible to consumers' TypeScript.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why are there multiple module resolution strategies?**
+> **A:** History. Node started CJS-only (Node strategy). Then ESM arrived with strict file-extension rules and a different resolution algorithm (NodeNext). Bundlers ignored both and invented their own conventions (omit extensions, support .ts directly, alias resolution). Bundler resolution (TS 5.0+) is the spec for the bundler world. Pick based on RUNTIME — Node app? NodeNext. Vite/Next.js? Bundler. Browser-only? Bundler. Legacy CJS? Node.
+
+**Q2: Mental model for package.json "exports"?**
+> **A:** `exports` is the PUBLIC API of a package. It maps subpath to file. Conditions (`import`, `require`, `types`, `browser`, `node`) let you provide different files based on consumer environment. `"./foo": { "import": "./foo.mjs", "require": "./foo.cjs", "types": "./foo.d.ts" }`. If a path is NOT in exports, consumers can't import it — even if the file exists. This replaces the older "main" + "module" + "browser" fields.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Forgetting the "types" condition in exports:
+> ```json
+> // ❌ Library works at runtime but consumers' TS shows "any" for everything
+> { "exports": {
+>     ".": { "import": "./dist/index.js" }     // no types condition!
+> } }
+>
+> // ✅ Always include types — and it MUST be FIRST in the conditions object
+> { "exports": {
+>     ".": {
+>       "types":  "./dist/index.d.ts",
+>       "import": "./dist/index.js"
+>     }
+> } }
+> ```
+
+**Q4: How does TS find `@types/*` packages?**
+> **A:** TS walks node_modules looking for `@types/<package>` declarations, then `<package>/package.json` "types" field, then `<package>/index.d.ts` by convention. Restrict with `typeRoots` (replaces all) or `types` (allowlist what to load). Crucial for monorepo perf: `"types": []` in test packages prevents accidentally pulling in node, jest, mocha types globally.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript module resolution is the algorithm mapping import specifiers to file paths — selectable via the moduleResolution compilerOption (Node for legacy CommonJS, NodeNext for ESM-aware Node, Bundler for bundler-conventions, Classic deprecated) — interacting with package.json's exports field for public API definition (with the types condition mandatory and ordering-significant), and tsconfig paths/baseUrl for compile-time alias resolution."
+
+## BUILD
+
+### 🏗️ Mini Project: Publish a Dual ESM/CJS Library With Proper Types
+
+**What you will build:** A small TypeScript library that publishes both ESM and CJS builds with type declarations, working correctly in Node 18+ (ESM), Node CJS, and bundlers.
+**Why this project:** Forces real package.json exports configuration — the #1 source of "cannot find module" errors in 2026.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-dual-pkg && cd ts-dual-pkg
+npm init -y
+npm install -D typescript
+ni src/index.ts, tsconfig.esm.json, tsconfig.cjs.json -ItemType File
+```
+
+#### Step 2 — Source Code
+```ts
+// src/index.ts
+export function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+
+export const VERSION = '1.0.0';
+```
+
+#### Step 3 — Two Build Configs
+```json
+// tsconfig.esm.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "outDir": "./dist/esm",
+    "declaration": true,
+    "declarationDir": "./dist/esm",
+    "strict": true
+  },
+  "include": ["src/**/*"]
+}
+
+// tsconfig.cjs.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "outDir": "./dist/cjs",
+    "declaration": true,
+    "declarationDir": "./dist/cjs",
+    "strict": true
+  },
+  "include": ["src/**/*"]
+}
+```
+
+#### Step 4 — Package.json Exports
+```json
+// package.json
+{
+  "name": "my-greet-lib",
+  "version": "1.0.0",
+  "type": "module",
+  "main":    "./dist/cjs/index.js",
+  "module":  "./dist/esm/index.js",
+  "types":   "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types":   "./dist/esm/index.d.ts",
+      "import":  "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json',JSON.stringify({type:'commonjs'}))\"",
+    "build": "npm run build:esm && npm run build:cjs"
+  }
+}
+```
+
+#### Step 5 — Test Both Worlds
+```bash
+npm run build
+
+# Test ESM consumer
+ni test-esm/index.mjs -ItemType File
+@"
+import { greet, VERSION } from 'my-greet-lib';
+console.log(greet('ESM'), VERSION);
+"@ | Out-File test-esm/index.mjs
+
+# Test CJS consumer
+ni test-cjs/index.cjs -ItemType File
+@"
+const { greet, VERSION } = require('my-greet-lib');
+console.log(greet('CJS'), VERSION);
+"@ | Out-File test-cjs/index.cjs
+
+# (After npm link or local install)
+node test-esm/index.mjs
+node test-cjs/index.cjs
+```
+```bash
+# Verify with publint
+npx publint
+# Verify with arethetypeswrong
+npx @arethetypeswrong/cli .
+```
+
+**Expected Output:**
+```
+Hello, ESM! 1.0.0
+Hello, CJS! 1.0.0
+
+$ npx publint
+✔ All exports point to valid files
+✔ types condition is first
+✔ ESM and CJS subpaths match
+
+$ npx @arethetypeswrong/cli .
+✔ Node 16+ (ESM):       ok
+✔ Node 16+ (CJS):       ok
+✔ Bundler:              ok
+```
+
+**Stretch Challenges:**
+- [ ] Add a "browser" condition that excludes Node-only APIs
+- [ ] Add subpath exports: `my-greet-lib/utils`
+- [ ] Run `publint --strict` and fix every warning
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name the four moduleResolution values and when to use each.
+**Q2:** Why must `types` be the FIRST condition in exports?
+**Q3:** Write a minimal package.json exports for a dual ESM/CJS library. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does omitting "types" from exports cause consumers' TS to show "any"?
+**Q5:** A package import fails with "cannot find module" but the file exists — diagnose using the exports field.
+**Q6:** Convert this CJS-only library to dual format:
+```json
+{ "main": "./dist/index.js", "types": "./dist/index.d.ts" }
+```
+
+### Day 7 — Application
+**Q7:** Set up a TypeScript library that works in both Webpack 5 and Vite, Node 18 ESM, and Node 18 CJS.
+**Q8:** A PR adds a new subpath but forgets to add it to exports. What breaks for consumers?
+**Q9:** What is the cost of dual-publishing vs ESM-only in 2026?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through everything that can go wrong when publishing a TypeScript library to npm."
+**Q11:** Draw: how does Node's ESM resolution differ from CJS — for example same import path.
+**Q12:** ★ System design: "Architect a monorepo's publish pipeline where 20 packages depend on each other and must support React Native, Node, and the browser."

@@ -103,3 +103,115 @@ A: **No, not by default. The logs will likely be lost!**
 When a Node.js process encounters an `uncaughtException` or `unhandledRejection`, the V8 engine immediately begins tearing down the process. 
 Logging over a network (or even to a file stream) is an asynchronous I/O operation. The Node.js process will brutally terminate *before* the asynchronous network request to DataDog or Elasticsearch can finish sending the JSON payload, leaving you completely blind as to why the server crashed in production!
 *The Fix:* You must explicitly register listeners for `process.on('uncaughtException')`. Inside that listener, you synchronously log the fatal error, forcefully flush the Winston logger buffers, and ONLY THEN gracefully execute `process.exit(1)` to kill the server!
+
+## FEYNMAN CHECK
+
+### Explain Monitoring & Logging Like I'm 10 Years Old
+> Monitoring = your system's heart-rate monitor (request rate, error rate, latency, CPU). Logging = the diary (what happened, when, with what data). Together = observability. The non-obvious part: structured logs (JSON with consistent fields) are queryable; plain-text logs (`console.log('user did thing')`) are useless at scale. This is why every modern logger emits JSON and ships to a central aggregator (Datadog, New Relic, ELK).
+
+---
+
+### 5 Deep Questions
+**Q1: Metrics vs logs vs traces?**
+> **A:** Metrics: time-series numbers (cpu, rps, p99). Aggregated, cheap. Logs: discrete events with context. Searchable, expensive. Traces: end-to-end request path across services. Best for diagnosing distributed latency. Modern systems use all three (the "three pillars of observability").
+
+**Q2: ONE model.**
+> **A:** "Metrics tell you THAT something is wrong (alert). Logs tell you WHAT happened (context). Traces tell you WHERE the time went (root cause). Pick the right tool per phase of incident."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Unstructured log — can't filter or aggregate
+> console.log('User logged in: ' + user.id);
+> // ✅ Structured JSON — queryable in Datadog/Splunk
+> logger.info({ event: 'login', userId: user.id, ip: req.ip, durationMs: t });
+> ```
+
+**Q4: What is a SLO/SLI/SLA?**
+> **A:** SLI = indicator (p99 latency, error rate). SLO = objective (99.9% of requests < 200ms). SLA = contract with consequences (refund if SLO breached). SRE practice: alert on SLO burn rate, not raw metrics — fewer false positives.
+
+**Q5: Senior one-liner.**
+> **A:** "Monitoring + logging + tracing form the three pillars of observability, each answering a different question (what's wrong vs what happened vs where the time went) — and structured, sampled, correlated telemetry is the difference between a 5-minute root cause and a 5-hour war room."
+
+## BUILD
+
+### 🏗️ Mini Project: Structured Logging + Metrics for Express
+**Time:** 35 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir obs && cd obs
+npm init -y && npm i express pino pino-http prom-client
+touch server.js
+```
+
+#### Step 2 — Logger
+```js
+const pino = require('pino');
+const logger = pino({ level: 'info' });   // JSON output
+const httpLogger = require('pino-http')({ logger });
+```
+
+#### Step 3 — Metrics
+```js
+const { Registry, Counter, Histogram } = require('prom-client');
+const registry = new Registry();
+const httpRequests = new Counter({ name: 'http_requests_total', help: 'Total', labelNames: ['method','route','status'], registers: [registry] });
+const httpDuration = new Histogram({ name: 'http_request_duration_seconds', help: 'Latency', labelNames: ['route'], registers: [registry] });
+```
+
+#### Step 4 — Server
+```js
+const express = require('express');
+const app = express();
+app.use(httpLogger);
+app.use((req, res, next) => {
+  const end = httpDuration.startTimer({ route: req.path });
+  res.on('finish', () => {
+    httpRequests.inc({ method: req.method, route: req.path, status: res.statusCode });
+    end();
+  });
+  next();
+});
+
+app.get('/api/users/:id', (req, res) => {
+  req.log.info({ userId: req.params.id }, 'fetching user');
+  res.json({ id: req.params.id, name: 'Alice' });
+});
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', registry.contentType);
+  res.end(await registry.metrics());
+});
+
+app.listen(3000);
+```
+
+#### Step 5 — Verify
+```bash
+curl http://localhost:3000/api/users/42       # JSON log
+curl http://localhost:3000/metrics            # Prometheus metrics
+```
+
+**Expected Output:** JSON logs in stdout; Prometheus metrics at /metrics.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Metrics vs logs vs traces — purpose of each.
+**Q2:** Why structured JSON logs?
+**Q3:** Write a pino logger and emit a structured event.
+
+### Day 3
+**Q4:** SLO vs SLA vs SLI.
+**Q5:** Show unstructured-log bug.
+**Q6:** What is correlation ID and why does it matter?
+
+### Day 7
+**Q7:** Add distributed tracing with OpenTelemetry to a Node app.
+**Q8:** PR logs PII (email, password) to stdout. Compliance + cost impact?
+**Q9:** What is log sampling and when do you need it?
+
+### Day 14
+**Q10:** ★ "Design observability for a 50-service architecture."
+**Q11:** Link logs → metrics → traces → alerts.
+**Q12:** ★ "Your alert fires every 10 min with no real issue. Diagnose."

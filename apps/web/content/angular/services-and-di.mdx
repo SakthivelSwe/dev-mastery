@@ -177,3 +177,202 @@ A: No. Components are tied to the DOM and have a specific lifecycle (`ngOnInit`,
 
 **Q: What is an InjectionToken?**
 A: Usually, you inject classes (`UserService`). But what if you want to inject an Interface, a primitive string (like an API URL), or a configuration object? Interfaces disappear after TypeScript compilation, so Angular can't find them at runtime! You create an `InjectionToken<string>('API_URL')` to give Angular a physical object it can register in the DI container and inject into constructors.
+
+## FEYNMAN CHECK
+
+### Explain Angular Services and DI Like I'm 10 Years Old
+> A service is just a TypeScript class decorated with @Injectable — it holds business logic or shared state that multiple components need (UserService, AuthService, CartService). Dependency injection (DI) is how Angular automatically creates and provides services to components that need them — you declare what you need in the constructor or via inject(), Angular figures out how to create it. The key non-obvious insight: Angular's DI is HIERARCHICAL. There is a root injector (app-level singleton), module injectors (scoped singletons), and component injectors (instance per component). If you provide a service in a component's providers array, each component instance gets its OWN service instance — not a singleton. This is why "share state between components" using a service only works if both components share the same injector level.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the injector hierarchy and why does it matter?**
+> **A:** Angular builds a tree of injectors mirroring the component tree. When a component requests a dependency, Angular walks UP the injector tree to find the first provider. providedIn: 'root' registers the service in the ROOT injector — one instance for the entire app. Providing in a component: { providers: [MyService] } creates a new injector for that component's subtree. This enables: per-route scoped state (provide in a route's providers), component-level isolation (provide in a feature component), and lazy module separation (provide in a lazy-loaded route for a separate instance).
+
+**Q2: Mental model for inject() vs constructor injection?**
+> **A:** inject() is the modern function-based injection API available in injection context (constructor, field initialiser, factory functions). It replaces constructor parameter injection syntactically — both resolve through the same injector hierarchy. inject() is preferred for: functional guards, resolvers, interceptors (where there is no class), and for reducing constructor boilerplate. Constructor injection is still valid and required for libraries that inspect constructor metadata for DI.
+
+**Q3: Most dangerous misconception about services?**
+> **A:** providedIn: 'root' services are always singletons:
+> ```typescript
+> // WRONG assumption: this service is always a singleton
+> @Injectable({ providedIn: 'root' })
+> export class CartService { items: CartItem[] = []; }
+>
+> // If a component ALSO provides it:
+> @Component({ providers: [CartService] })
+> export class CheckoutComponent { /* gets its OWN CartService instance */ }
+>
+> // Now CheckoutComponent's CartService is separate from the root one
+> // State changes in root CartService are invisible to CheckoutComponent
+> ```
+
+**Q4: How does Angular handle circular dependencies in DI?**
+> **A:** Angular detects circular dependencies at bootstrap and throws a CircularDependencyError. Example: ServiceA injects ServiceB which injects ServiceA. Fix: use forwardRef(() => ServiceA) to break the cycle, or restructure to extract the shared logic into a third service that neither depends on the other. In practice, circular service dependencies indicate an architectural problem — the services are too tightly coupled and should be refactored.
+
+**Q5: FAANG-grade definition of Angular DI.**
+> **A:** "Angular's Dependency Injection is a hierarchical injector system where each component, directive, and module can register providers — Angular resolves dependencies by walking up the injector tree from the requesting component to the root, instantiating services lazily and caching them per injector scope — enabling singleton app-level services (providedIn: 'root'), scoped per-feature services (provided in lazy routes), and per-component instances (provided in component providers array) — with tree-shaking removing unused services from the bundle when provided in root."
+
+## BUILD
+
+### 🏗️ Mini Project: Scoped Shopping Cart Service — Root vs Component Provider Comparison
+
+**What you will build:** A shopping cart app where one cart service is root-level (shared across app) and another is component-level (each cart instance is independent) — demonstrating DI scope visually.
+**Why this project:** Forces you to observe the practical consequence of DI scope — the most common source of state bugs in Angular.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new di-demo --standalone --routing false
+ng generate service cart
+ng generate component cart-widget --standalone
+```
+
+#### Step 2 — Cart Service
+```typescript
+// cart.service.ts
+import { Injectable, signal, computed } from '@angular/core';
+
+export interface CartItem { id: string; name: string; price: number; qty: number; }
+
+@Injectable()   // No providedIn — must be explicitly provided
+export class CartService {
+  private _items = signal<CartItem[]>([]);
+  items = this._items.asReadonly();
+  total = computed(() => this._items().reduce((s, i) => s + i.price * i.qty, 0));
+
+  addItem(item: Omit<CartItem, 'qty'>) {
+    this._items.update(items => {
+      const existing = items.find(i => i.id === item.id);
+      if (existing) return items.map(i => i.id === item.id ? { ...i, qty: i.qty + 1 } : i);
+      return [...items, { ...item, qty: 1 }];
+    });
+  }
+  removeItem(id: string) { this._items.update(items => items.filter(i => i.id !== id)); }
+  clear() { this._items.set([]); }
+}
+```
+
+#### Step 3 — Cart Widget Component
+```typescript
+// cart-widget.component.ts
+import { Component, inject, Input } from '@angular/core';
+import { NgFor, CurrencyPipe } from '@angular/common';
+import { CartService } from '../cart.service';
+
+@Component({
+  standalone: true,
+  selector: 'app-cart-widget',
+  imports: [NgFor, CurrencyPipe],
+  providers: [CartService],   // NEW instance per component!
+  template: `
+    <div style="border: 1px solid #ccc; padding: 8px; margin: 8px">
+      <strong>{{ label }} Cart</strong>
+      <button (click)="addSample()">+ Add Item</button>
+      <p>Items: {{ cartService.items().length }} | Total: {{ cartService.total() | currency }}</p>
+      <ul>
+        <li *ngFor="let item of cartService.items()">
+          {{ item.name }} x{{ item.qty }}
+          <button (click)="cartService.removeItem(item.id)">X</button>
+        </li>
+      </ul>
+    </div>
+  `,
+})
+export class CartWidgetComponent {
+  @Input() label = 'Widget';
+  cartService = inject(CartService);
+  private n = 0;
+  addSample() {
+    const id = 'item-' + (this.n % 3);
+    this.cartService.addItem({ id, name: 'Product ' + (this.n++ % 3 + 1), price: 9.99 + this.n });
+  }
+}
+```
+
+#### Step 4 — Root vs Component Scope Demo
+```typescript
+// app.component.ts — root CartService is shared, widget CartService is per-instance
+@Component({
+  standalone: true,
+  imports: [CartWidgetComponent, NgFor, CurrencyPipe],
+  providers: [CartService],   // ROOT scope for the app-level cart
+  template: `
+    <h1>DI Scope Demo</h1>
+    <h2>Root-level cart (shared across the app)</h2>
+    <button (click)="rootCart.addItem({ id: 'A', name: 'Shared Item', price: 5 })">Add to Root Cart</button>
+    <p>Root cart items: {{ rootCart.items().length }}</p>
+
+    <h2>Component-level carts (each widget has its OWN cart)</h2>
+    <p>Adding to Widget A does NOT affect Widget B</p>
+    <app-cart-widget label="Widget A"/>
+    <app-cart-widget label="Widget B"/>
+  `,
+})
+export class AppComponent {
+  rootCart = inject(CartService);
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('CartService', () => {
+  let service: CartService;
+  beforeEach(() => { TestBed.configureTestingModule({ providers: [CartService] }); service = TestBed.inject(CartService); });
+
+  it('adds items and merges duplicates', () => {
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    expect(service.items().length).toBe(1);
+    expect(service.items()[0].qty).toBe(2);
+  });
+  it('computes total correctly', () => {
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    service.addItem({ id: '2', name: 'B', price: 5 });
+    expect(service.total()).toBe(15);
+  });
+  it('removes item by id', () => {
+    service.addItem({ id: '1', name: 'A', price: 10 });
+    service.removeItem('1');
+    expect(service.items().length).toBe(0);
+  });
+});
+```
+
+**Expected Output:**
+```
+Root cart: adding items affects the shared root cart
+Widget A cart: independent from Widget B
+Widget B cart: independent from Widget A
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add InjectionToken for a cart config (max items, currency)
+- [ ] Build a CartFacade that uses multiple services internally
+- [ ] Add an effect() to save cart to localStorage on every change
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does providedIn: 'root' do?
+**Q2:** What is the difference between constructor injection and inject()?
+**Q3:** Write a service with one method and inject it into a component. From memory.
+
+### Day 3 — Comprehension
+**Q4:** If you provide a service in a component's providers array, how many instances exist?
+**Q5:** A junior provides UserService in two places and state changes don't sync — diagnose.
+**Q6:** When would you provide a service at route level vs root level?
+
+### Day 7 — Application
+**Q7:** Build a NotificationService with a stack of messages — root-level singleton.
+**Q8:** A PR injects a service in a component that is destroyed and recreated — does state reset?
+**Q9:** How does tree-shaking interact with providedIn: 'root'?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Angular's hierarchical DI system — how does Angular resolve a service dependency?"
+**Q11:** Draw: injector tree for an app with root + lazy module + component-level providers.
+**Q12:** ★ System design: "Design a multi-tenant Angular app where each tenant has isolated state — DI strategy."

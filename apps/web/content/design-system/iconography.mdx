@@ -114,3 +114,373 @@ To solve this, implement an **Icon Build Pipeline**:
 3. The pipeline runs `SVGO` to compress and strip out hardcoded `fill` properties.
 4. The pipeline uses `SVGR` to compile them into individual React components (`HomeIcon.tsx`, `BellIcon.tsx`).
 5. The pipeline generates an `index.ts` file that exports them all, allowing consumers to tree-shake imports: `import { HomeIcon } from '@my-system/icons'`.
+
+
+## CODE
+
+### Level 1 — Beginner: SVG Icon Component
+```tsx
+// Single icon component with consistent sizing and accessibility
+interface IconProps {
+  name: string;
+  size?: 16 | 20 | 24 | 32;
+  color?: string;
+  ariaLabel?: string;  // Set when icon conveys meaning; omit for decorative icons
+  className?: string;
+}
+
+// SVG sprite approach — all icons in one file, referenced by <use>
+export function Icon({ name, size = 20, color = 'currentColor', ariaLabel, className }: IconProps) {
+  const isDecorative = !ariaLabel;
+  return (
+    <svg
+      width={size}
+      height={size}
+      fill={color}
+      aria-hidden={isDecorative ? 'true' : undefined} // Hides from screen readers if decorative
+      aria-label={ariaLabel}                            // Screen reader reads this for meaningful icons
+      role={ariaLabel ? 'img' : undefined}
+      focusable="false"  // Prevents IE11 from making SVG focusable
+      className={className}
+    >
+      <use href={`/icons/sprite.svg#${name}`} /> {/* References SVG sprite */}
+    </svg>
+  );
+}
+```
+
+### Level 2 — Intermediate: Icon Registry with Tree-Shaking
+```tsx
+// Inline SVG approach — no sprite file, fully tree-shakeable
+// Each icon is a React component; unused icons are removed by bundler
+
+const iconPaths = {
+  check: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+  x:     'M6 18L18 6M6 6l12 12',
+  plus:  'M12 4v16m8-8H4',
+  arrow: 'M9 5l7 7-7 7',
+  search:'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z',
+} as const;
+
+type IconName = keyof typeof iconPaths;
+
+interface SvgIconProps {
+  name: IconName;
+  size?: number;
+  strokeWidth?: number;
+  ariaLabel?: string;
+}
+
+export function SvgIcon({ name, size = 20, strokeWidth = 2, ariaLabel }: SvgIconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"  // Inherits text color — no need to pass color prop
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden={!ariaLabel}
+      aria-label={ariaLabel}
+      role={ariaLabel ? 'img' : undefined}
+    >
+      <path d={iconPaths[name]} />
+    </svg>
+  );
+}
+```
+
+### Level 3 — Advanced: Animated Icon with Transitions
+```tsx
+import { motion, AnimatePresence } from 'framer-motion';
+
+// Animated icon — handles state transitions (e.g., menu ↔ close, play ↔ pause)
+interface AnimatedIconProps {
+  isActive: boolean;
+  activeIcon: IconName;
+  inactiveIcon: IconName;
+  size?: number;
+  ariaLabel: string; // Meaningful — icon conveys state
+}
+
+export function AnimatedToggleIcon({ isActive, activeIcon, inactiveIcon, size = 24, ariaLabel }: AnimatedIconProps) {
+  return (
+    <span
+      aria-label={ariaLabel}
+      aria-live="polite"  // Announces state change to screen readers
+      role="img"
+      style={{ display: 'inline-flex', position: 'relative', width: size, height: size }}
+    >
+      <AnimatePresence mode="wait">
+        <motion.span
+          key={isActive ? 'active' : 'inactive'} // Key change triggers exit/enter animation
+          initial={{ opacity: 0, scale: 0.5, rotate: -90 }}
+          animate={{ opacity: 1, scale: 1,   rotate: 0 }}
+          exit={{    opacity: 0, scale: 0.5,  rotate: 90 }}
+          transition={{ duration: 0.15 }}
+          style={{ position: 'absolute', inset: 0 }}
+          aria-hidden="true"
+        >
+          <SvgIcon name={isActive ? activeIcon : inactiveIcon} size={size} />
+        </motion.span>
+      </AnimatePresence>
+    </span>
+  );
+}
+```
+
+### Level 4 — Expert / Production: Icon Build Pipeline
+```javascript
+// scripts/build-icons.js — generates React components from SVG files
+// Input: src/icons/*.svg → Output: src/components/icons/index.tsx
+const fs = require('fs');
+const path = require('path');
+const { optimize } = require('svgo');    // npm install svgo
+const { transform } = require('@svgr/core'); // npm install @svgr/core
+
+const SVG_DIR = path.join(__dirname, '../src/icons');
+const OUT_DIR = path.join(__dirname, '../src/components/icons');
+
+const SVGR_CONFIG = {
+  plugins: ['@svgr/plugin-svgo', '@svgr/plugin-jsx'],
+  svgoConfig: {
+    plugins: [
+      'removeTitle',
+      'removeDesc',
+      'removeUselessDefs',
+      { name: 'convertColors', params: { currentColor: true } }, // All fills → currentColor
+    ],
+  },
+  typescript: true,
+  dimensions: false,       // Remove width/height from SVG — controlled via props
+  expandProps: 'start',    // Spread props at the start of SVG attributes
+  svgProps: {
+    'aria-hidden': '{!ariaLabel}',
+    'aria-label': '{ariaLabel}',
+    role: "{ariaLabel ? 'img' : undefined}",
+  },
+  template: (variables, { tpl }) => tpl`
+    import { SVGProps } from 'react';
+    interface Props extends SVGProps<SVGSVGElement> {
+      size?: number;
+      ariaLabel?: string;
+    }
+    const ${variables.componentName} = ({ size = 24, ariaLabel, ...props }: Props) => (
+      ${variables.jsx}
+    );
+    export default ${variables.componentName};
+  `,
+};
+
+async function buildIcons() {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const svgFiles = fs.readdirSync(SVG_DIR).filter(f => f.endsWith('.svg'));
+  const exports = [];
+
+  for (const file of svgFiles) {
+    const svgContent = fs.readFileSync(path.join(SVG_DIR, file), 'utf8');
+    const componentName = file.replace('.svg', '').replace(/-(w)/g, (_, c) => c.toUpperCase()).replace(/^w/, c => c.toUpperCase()) + 'Icon';
+    const jsxCode = await transform(svgContent, SVGR_CONFIG, { componentName });
+    fs.writeFileSync(path.join(OUT_DIR, `${componentName}.tsx`), jsxCode);
+    exports.push(`export { default as ${componentName} } from './${componentName}';`);
+    console.log(`✅ Generated ${componentName}`);
+  }
+
+  fs.writeFileSync(path.join(OUT_DIR, 'index.ts'), exports.join('
+') + '
+');
+  console.log(`
+✅ Barrel file written: ${exports.length} icons`);
+}
+
+buildIcons().catch(console.error);
+```
+## REAL_WORLD
+
+### How Material Design Manages 2000+ Icons
+
+Google's Material Design icon library ships 2000+ SVG icons used across Google Workspace, Android, and thousands of third-party apps. Their system enforces: consistent 24×24 artboard, 2px stroke for regular weight, optical sizing (smaller icons get thicker strokes automatically), and a named semantic set where every icon has a `label` that drives alt text. The system prevents icon proliferation (different teams creating near-identical icons) via a centralised icon review process.
+
+```tsx
+// Production pattern — Icon system with accessibility contract
+// Context: Every icon is either decorative OR communicative — never ambiguous
+
+interface IconProps {
+  name: keyof typeof iconMap;    // Typed icon name — TS error on typo
+  size?: 16 | 20 | 24 | 32;     // Restricted to design grid sizes
+  color?: string;                // Defaults to currentColor for CSS inheritance
+  label?: string;                // If provided: aria-label + role="img". If absent: aria-hidden
+  className?: string;
+}
+
+export function Icon({ name, size = 24, color = 'currentColor', label, className }: IconProps) {
+  const SvgIcon = iconMap[name];  // Tree-shaken SVG component per icon
+
+  if (label) {
+    // Communicative icon — has semantic meaning
+    return (
+      <SvgIcon
+        role="img"
+        aria-label={label}
+        width={size}
+        height={size}
+        fill={color}
+        className={className}
+      />
+    );
+  }
+
+  // Decorative icon — hidden from screen readers
+  return (
+    <SvgIcon
+      aria-hidden="true"
+      focusable="false"    // IE/Edge fix — SVGs were focusable by default
+      width={size}
+      height={size}
+      fill={color}
+      className={className}
+    />
+  );
+}
+```
+
+### Production Gotcha: SVG Focusable in Legacy Browsers
+```tsx
+// ❌ IE/Edge — SVG receives keyboard focus, screen reader reads SVG source code
+<svg width="24" height="24"><path d="..." /></svg>
+
+// ✅ Explicitly exclude from tab order and ARIA tree
+<svg width="24" height="24" aria-hidden="true" focusable="false"><path d="..." /></svg>
+```
+**Why it happens:** Internet Explorer and older Edge made SVG elements focusable by default. Even in 2025 some enterprise clients run legacy browsers, and the fix (`focusable="false"`) costs nothing.
+
+| Icon Use | aria-hidden | role | label |
+|----------|------------|------|-------|
+| Decorative (next to text) | true | — | — |
+| Standalone meaning | — | img | required |
+| Button icon | true | — | button has label |
+
+## INTERVIEW
+
+**Q1 (Junior): What is the difference between a decorative and a semantic icon?**
+A: A decorative icon adds visual flavour alongside text that already communicates the message (e.g. a calendar icon next to the word "Schedule") — it should be hidden from screen readers via `aria-hidden="true"`. A semantic icon communicates meaning independently (a standalone delete icon with no text label) — it needs `role="img"` and an `aria-label`. Confusing the two either floods screen readers with redundant "calendar calendar" announcements or leaves icon-only buttons completely silent to AT users.
+
+**Q2 (Junior): Why should icons use `currentColor` as their default fill?**
+A: `currentColor` inherits the CSS `color` property of the parent element, so icon colour automatically follows text colour. This means icons inside a disabled button automatically grey out when the button is disabled (`color: gray`), icons inside a dark-mode context automatically invert without any additional props, and interactive states (hover, focus) change icon colour by just changing the parent's `color`. Hardcoding a fill colour breaks all three.
+
+**Q3 (Mid): How do you set up tree-shaking for an icon library with 500 icons?**
+A: Export each icon as a separate named export from its own file: `export { DeleteIcon } from './DeleteIcon'`. A barrel `index.ts` re-exports all icons but bundlers (webpack, Rollup, Vite with ES modules) will tree-shake unused exports. Alternatively, use a code-split icon map where `import('icons/DeleteIcon')` loads only that SVG's chunk. Never bundle all 500 icons into one file — at ~1KB per SVG, that's 500KB of unused icon data in every bundle.
+
+**Q4 (Mid): What is optical sizing and why does it matter for icon systems?**
+A: Optical sizing adjusts stroke weight based on the rendered size — a 16px icon with the same 2px stroke as a 24px icon looks visually heavier at small size. Material Symbols ships variable fonts where the `OPSZ` axis automatically adjusts weight for the current size. In SVG icon systems without variable fonts, maintain separate 16px and 24px artboards with different stroke widths.
+
+**Q5 (Senior): How do you govern icon proliferation across a large organisation?**
+A: Establish three controls: (1) a centralised icon review board that reviews requests before any new icon is added; (2) a search-first policy requiring teams to prove no existing icon meets the need; (3) a semantic naming convention (action-add, navigation-back, status-warning) that groups icons by purpose and makes duplicates obvious. Without governance, organisations accumulate 40 slightly different "add" icons by different teams.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "ConceptMap", "state": "design-system-iconography" }
+```
+
+## FEYNMAN CHECK
+
+### Explain Iconography Systems Like I'm 10 Years Old
+> Icons are tiny pictograms that take the place of words. A good icon system is like a library of stamps: every stamp is the same size (24×24), the same line thickness, and clearly labelled so you know which one to use. The hard part: some icons are decoration (the calendar next to "Monday") and some are meaning (the only thing telling you a button deletes something). If you treat them the same, blind users either hear "calendar calendar" twice or hear nothing when they need information. This is why every design system has two modes for icons: aria-hidden for decoration, aria-label for meaning.
+
+---
+
+### 5 Deep Questions
+**Q1: Why does icon size need to snap to a fixed scale?**
+> **A:** Icons are drawn on fixed artboards (16, 20, 24, 32px). At sizes between these, pixel rounding creates blurry or uneven edges. The fixed scale also ensures icons align to the 4/8px spacing grid, preventing fractional pixel offsets that cause inconsistent layouts across browsers.
+
+**Q2: ONE model.**
+> **A:** "Every icon is either decoration (aria-hidden) or communication (role=img + aria-label). No icon is both. No icon is neither."
+
+**Q3: Misconception with code.**
+> **A:** Icon-only button with no accessible name:
+> ```tsx
+> // ❌ SR says "button" — user has no idea what it does
+> <button><TrashIcon /></button>
+> // ✅ aria-label names the action, icon is decorative
+> <button aria-label="Delete item"><TrashIcon aria-hidden="true" focusable="false" /></button>
+> ```
+
+**Q4: How does currentColor enable theming?**
+> **A:** `fill="currentColor"` cascades from the parent CSS color. Dark mode flips body text to white — icons automatically become white. Disabled state sets parent color to gray — icons automatically gray. Zero icon-specific theme code needed.
+
+**Q5: Senior one-liner.**
+> **A:** "An iconography system is a governed catalogue of decorative/communicative SVGs with consistent artboards, currentColor fills, and a binary accessibility contract — decorative = aria-hidden, semantic = role/img + label."
+
+## BUILD
+
+### 🏗️ Mini Project: Icon Component + Accessibility Audit
+
+**What you will build:** A typed Icon component with automatic decoration/communication mode switching, tested with axe-core.
+**Time estimate:** 30 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir icon-system && cd icon-system
+npx create-next-app@latest . --typescript --tailwind --no-src-dir --app
+touch components/Icon.tsx components/Icon.test.tsx
+```
+
+#### Step 2 — Core
+```tsx
+// components/Icon.tsx
+const icons = {
+  trash: () => <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>,
+  check: () => <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/></svg>,
+};
+type IconName = keyof typeof icons;
+interface IconProps { name: IconName; label?: string; size?: 16|20|24|32; className?: string; }
+export function Icon({ name, label, size=24, className }: IconProps) {
+  const SvgIcon = icons[name];
+  if (label) return <span role="img" aria-label={label} className={className}><SvgIcon /></span>;
+  return <span aria-hidden="true" focusable="false" className={className}><SvgIcon /></span>;
+}
+```
+
+#### Step 5 — Tests
+```tsx
+test('decorative icon is hidden from SR', () => {
+  render(<Icon name="trash" />);
+  expect(document.querySelector('[aria-hidden]')).toBeInTheDocument();
+});
+test('semantic icon has accessible name', () => {
+  render(<Icon name="check" label="Success" />);
+  expect(screen.getByRole('img', { name: 'Success' })).toBeInTheDocument();
+});
+```
+
+**Expected Output:**
+```
+✓ decorative icon is hidden from SR
+✓ semantic icon has accessible name
+```
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Decorative vs semantic icon — what makes each? How do you implement each in JSX?
+**Q2:** Why must standalone icon buttons have an aria-label? What does SR say without one?
+**Q3:** Write a 15-line Icon component that handles both modes.
+
+### Day 3
+**Q4:** Why use `currentColor` not hardcoded fill? Give 3 scenarios it saves work.
+**Q5:** Show the SVG focusable bug in IE/Edge and the fix.
+**Q6:** Add icon size snapping (16/20/24/32 only) with TypeScript.
+
+### Day 7
+**Q7:** Set up tree-shaking for 100 SVG icons. Verify bundle impact with source-map-explorer.
+**Q8:** PR adds 15 icon-only buttons — none have aria-labels. Describe the SR experience.
+**Q9:** What is optical sizing? Does your icon system need separate artboards per size?
+
+### Day 14
+**Q10:** ★ "Design an icon governance process for a company with 50 product teams, preventing icon proliferation."
+**Q11:** Link icons → accessibility → design-tokens (currentColor) → component-api.
+**Q12:** ★ "Your icon library has 800 icons. Average app bundle includes all 800 even when using 20. How do you fix this?"

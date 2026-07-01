@@ -84,3 +84,137 @@ This is the most misunderstood concept in web security.
 When the React app fired the `POST` request, the browser sent the network packet across the internet. The Express server received the payload, perfectly executed the database logic, created the user, and replied with a `201 Created` response.
 However, because the Express server did *not* include the CORS whitelist headers in its response, the **Browser** intercepted the response the millisecond it arrived at the laptop, triggered the massive red error in the console, and physically prevented the React JavaScript code from reading the response!
 CORS does not stop servers from executing code; it stops client-side JavaScript from seeing the results! (Note: If the request was considered "Complex" and required an OPTIONS Preflight, the browser *would* have blocked the POST entirely, saving the database!).
+
+## FEYNMAN CHECK
+
+### Explain Advanced Web Security Like I'm 10 Years Old
+> Advanced web security = defending against the actual attacks running daily: XSS (inject JS into pages), CSRF (trick browsers into actions), clickjacking (overlay invisible buttons), SQL injection (sneak SQL into inputs), SSRF (trick servers into fetching internal URLs), supply-chain (poison your dependencies). The non-obvious part: defence-in-depth is the only winning strategy — CSP + sanitisation + cookies-with-flags + HTTPS + audit logs. One layer is never enough. This is why "we use HTTPS" is not a security plan.
+
+---
+
+### 5 Deep Questions
+**Q1: What is XSS and how do you prevent it?**
+> **A:** XSS = attacker injects `<script>` into your page that runs in users' browsers, stealing cookies/data. Prevent: escape all user content on output (frameworks do this by default), set CSP header (`Content-Security-Policy: default-src 'self'`), set HttpOnly on cookies. Never use `innerHTML` with user input.
+
+**Q2: ONE model.**
+> **A:** "Threats: input (injection), output (XSS), state (CSRF), transport (MITM), supply chain (deps). Defences: validate input, sanitise output, signed/SameSite cookies, HTTPS+HSTS, dep audit. Defence-in-depth — every layer adds friction for attackers."
+
+**Q3: Misconception with code.**
+> **A:** ```tsx
+> // ❌ XSS — user comment renders as HTML
+> <div dangerouslySetInnerHTML={{ __html: comment }} />
+> // ✅ Framework auto-escapes — text only
+> <div>{comment}</div>
+> // If HTML must render, sanitise first with DOMPurify
+> import DOMPurify from 'dompurify';
+> <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(comment) }} />
+> ```
+
+**Q4: What is CSRF and what defences work?**
+> **A:** CSRF = attacker tricks user's browser into submitting a request with the user's cookies. Defences: SameSite=Strict cookies (modern browsers default), CSRF token in form/header (server validates), check Origin/Referer headers. Modern frameworks handle this automatically when configured.
+
+**Q5: Senior one-liner.**
+> **A:** "Web security is defence-in-depth against a stable OWASP Top 10 of attacks — CSP, parameterised queries, SameSite cookies, HTTPS+HSTS, dependency audits, and audit logging together close the gaps no single mitigation can — and the breach reports of failed companies are the curriculum."
+
+## BUILD
+
+### 🏗️ Mini Project: Harden an Express App
+**Time:** 40 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir secure-app && cd secure-app
+npm init -y && npm i express helmet csurf cookie-parser express-rate-limit
+touch server.js
+```
+
+#### Step 2 — Defence Layers
+```js
+const express = require('express');
+const helmet = require('helmet');
+const cookieParser = require('cookie-parser');
+const csurf = require('csurf');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+
+// 1. Security headers (CSP, HSTS, X-Frame-Options, etc.)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+    },
+  },
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+}));
+
+// 2. Body parsing with size cap
+app.use(express.json({ limit: '10kb' }));
+app.use(cookieParser());
+
+// 3. CSRF protection — issue token on GET, verify on POST/PUT/DELETE
+app.use(csurf({ cookie: { httpOnly: true, sameSite: 'strict', secure: true } }));
+
+// 4. Rate-limit auth endpoints heavily
+app.use('/api/auth/', rateLimit({ windowMs: 60_000, max: 5 }));
+app.use('/api/',      rateLimit({ windowMs: 60_000, max: 100 }));
+
+// 5. Secure cookies
+function setSession(res, value) {
+  res.cookie('session', value, {
+    httpOnly: true,     // XSS can't read
+    secure: true,       // HTTPS only
+    sameSite: 'strict', // CSRF protection
+    maxAge: 15 * 60 * 1000,
+  });
+}
+
+app.get('/form', (req, res) => {
+  res.send(`<form method="POST" action="/api/comment">
+    <input name="_csrf" value="${req.csrfToken()}" type="hidden">
+    <textarea name="text"></textarea>
+    <button>Post</button>
+  </form>`);
+});
+
+app.post('/api/comment', (req, res) => {
+  // CSRF middleware already verified the token
+  res.json({ ok: true, text: req.body.text });  // Express escapes by default
+});
+
+app.listen(3000);
+```
+
+#### Step 5 — Verify
+```bash
+curl -I http://localhost:3000/   # Inspect security headers (helmet)
+# Try a POST without CSRF token — should 403
+curl -X POST http://localhost:3000/api/comment -d "text=hi"
+```
+
+**Expected Output:** Headers present, CSRF blocks token-less POSTs, rate-limit triggers on bursts.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Name 5 of OWASP Top 10.
+**Q2:** XSS — how does it work and how do you stop it?
+**Q3:** Write a CSP header allowing only self-origin scripts.
+
+### Day 3
+**Q4:** CSRF defences — name three layers.
+**Q5:** Show dangerouslySetInnerHTML bug + DOMPurify fix.
+**Q6:** What does SameSite=Strict cookie do?
+
+### Day 7
+**Q7:** Add HSTS + CSP + secure cookies to a real app.
+**Q8:** PR loads inline scripts violating CSP. Risk + fix.
+**Q9:** What is SSRF and how do you prevent it?
+
+### Day 14
+**Q10:** ★ "Pen-test your app — what's your 10-item attack checklist?"
+**Q11:** Link XSS → CSP → cookies → CSRF.
+**Q12:** ★ "A supply-chain compromise injects malicious npm. Detection + response plan."

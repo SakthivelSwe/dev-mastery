@@ -151,3 +151,208 @@ A: **The Third-Party Library is Mutating State.**
 The React Compiler relies entirely on reference equality (`===`) to know if a cache should be invalidated. If an object is deeply mutated instead of re-created immutably (e.g., `data.push(newItem)` instead of `data = [...data, newItem]`), the reference remains identical. 
 Without the compiler, React often re-renders enough of the tree that the mutation accidentally slips through and updates the UI anyway. 
 WITH the compiler, the caching is mathematically flawless. Because the object reference didn't change, the compiler will serve the cached, outdated UI forever, refusing to re-render. The bug was always there (the library broke the rules of React), but the Compiler finally exposed it!
+
+## FEYNMAN CHECK
+
+### Explain React Compiler Like I'm 10 Years Old
+> React Compiler (released 2024, stable 2025) is a BUILD-TIME tool that automatically adds optimal memoisation to your React code. It reads your components and hooks, figures out which values are stable vs which change, and inserts `useMemo` / `useCallback` / `React.memo` in the compiled output — so you don't have to. Your source code stays clean; the compiled output is fully optimised. The non-obvious depth: the Compiler can only optimise code that follows the Rules of React (no mutation of props/state, no reading stale closures). It will SKIP (bail out from optimising) components that violate the rules — and tell you why in compiler output.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What does React Compiler actually do to your code?**
+> **A:** The Compiler analyses your component's dataflow — which values depend on which other values. It inserts `c()` calls (compiler's internal caching primitive, similar to useMemo but more granular) wrapping every expression that can be cached. Example: `const greeting = `Hello, ${name}`` becomes `const greeting = c(name, () => `Hello, ${name}`)`. Outputs: compiled .js files with caching primitives, source maps preserved. No runtime library changes — just optimised compiled output.
+
+**Q2: How does the Compiler interact with existing useMemo/useCallback?**
+> **A:** The Compiler ignores existing manual useMemo/useCallback — it doesn't double-wrap. But with Compiler enabled, manual memoisation is redundant. Migration: enable Compiler → run your test suite → if all passes, remove manual useMemo/useCallback (they become noise). The `eslint-plugin-react-compiler` will report components the Compiler bailed out on — fix those violations, then manual memoisation is fully removable.
+
+**Q3: Most dangerous misconception?**
+> **A:** React Compiler fixes all performance problems:
+> ```tsx
+> // ❌ Compiler CANNOT optimise: mutating props or state
+> function BadComponent({ items }: { items: string[] }) {
+>   items.push('extra');  // ← MUTATION — Compiler bails out, no optimisation
+>   return <ul>{items.map(i => <li key={i}>{i}</li>)}</ul>;
+> }
+>
+> // ❌ Compiler CANNOT optimise: impure render (side effect in render)
+> function BadComponent() {
+>   document.title = 'Page loaded';  // ← side effect in render body — bail out
+>   return <div>Hello</div>;
+> }
+>
+> // ✅ Compiler optimises: pure, Rules-of-React-compliant code
+> function GoodComponent({ items }: { items: string[] }) {
+>   const enriched = [...items, 'extra'];  // new array — pure
+>   return <ul>{enriched.map(i => <li key={i}>{i}</li>)}</ul>;
+>   // Compiler: caches enriched when items reference stable, skips re-render
+> }
+> ```
+
+**Q4: What is the migration path for existing codebases?**
+> **A:** (1) Enable `eslint-plugin-react-compiler` — see violations without touching code. (2) Fix violations (mutations, side effects in render). (3) Enable the Babel/SWC plugin for the compiler. (4) Run test suite — most apps pass without changes if they follow Rules of React. (5) Incrementally remove manual useMemo/useCallback (Compiler makes them redundant). (6) Validate with React DevTools Profiler — components should show 0 extra re-renders. The Compiler is opt-in per directory or component via `'use no memo'` to exclude specific components.
+
+**Q5: FAANG-grade definition.**
+> **A:** "React Compiler is a build-time optimisation tool that statically analyses component dataflow to automatically insert optimal caching primitives (equivalent to useMemo/useCallback/React.memo) in compiled output — eliminating manual memoisation boilerplate while preserving source code clarity — operating on Rules-of-React-compliant code (pure renders, no prop/state mutation, no side effects in render body) and bailing out gracefully on violations (reporting via eslint-plugin-react-compiler) — outputting cached React code with fine-grained invalidation (more granular than manual useMemo) — requiring no runtime changes (works with React 17+) — making manual useMemo/useCallback/React.memo an anti-pattern in Compiler-enabled codebases — and representing the React team's long-term solution to the memoisation burden that motivated Zustand, Jotai, and other libraries to advertise performance as a selling point."
+
+## BUILD
+
+### 🏗️ Mini Project: Before/After React Compiler Demo
+
+**What you will build:** A component tree with manual memoisation (before), then the Compiler-optimised version (after) — showing the cleanup and validation.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup With Compiler
+```bash
+npm create vite@latest compiler-demo -- --template react-ts
+cd compiler-demo
+npm install babel-plugin-react-compiler@beta eslint-plugin-react-compiler@beta
+```
+
+#### Step 2 — Configure Compiler (Vite + Babel)
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        plugins: [
+          ['babel-plugin-react-compiler', {}],
+        ],
+      },
+    }),
+  ],
+});
+```
+
+#### Step 3 — Before: Manual Memoisation (Verbose)
+```tsx
+// src/BeforeCompiler.tsx — manual memoisation everywhere
+import { useState, useMemo, useCallback, memo } from 'react';
+
+const ITEMS = Array.from({ length: 100 }, (_, i) => ({ id: i, name: 'Item '+i, price: i * 1.5 }));
+
+const ExpensiveItem = memo(function Item({ name, price, onSelect }: { name: string; price: number; onSelect: (n: string) => void }) {
+  return <li className="p-2 border-b"><button onClick={() => onSelect(name)}>{name} — ${price.toFixed(2)}</button></li>;
+});
+
+export function BeforeCompiler() {
+  const [query, setQuery] = useState('');
+  const [selected, setSelected] = useState('');
+  const [counter, setCounter] = useState(0);
+
+  // Manual memoisation — required without Compiler
+  const filtered = useMemo(() => ITEMS.filter(i => i.name.toLowerCase().includes(query.toLowerCase())), [query]);
+  const handleSelect = useCallback((name: string) => setSelected(name), []);
+
+  return (
+    <div className="p-4 border rounded">
+      <h2 className="font-bold mb-2">Before Compiler (manual memo)</h2>
+      <button onClick={() => setCounter(c => c + 1)} className="mb-2 px-2 py-1 bg-gray-100 rounded">Counter: {counter}</button>
+      <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Filter..." className="w-full border px-2 py-1 rounded mb-2" />
+      <p className="text-sm mb-1">Selected: {selected || '(none)'}</p>
+      <ul className="max-h-40 overflow-auto border rounded">
+        {filtered.slice(0, 20).map(i => <ExpensiveItem key={i.id} name={i.name} price={i.price} onSelect={handleSelect} />)}
+      </ul>
+    </div>
+  );
+}
+```
+
+#### Step 4 — After: Compiler-Optimised (Clean)
+```tsx
+// src/AfterCompiler.tsx — no manual memoisation needed
+import { useState } from 'react';
+
+const ITEMS = Array.from({ length: 100 }, (_, i) => ({ id: i, name: 'Item '+i, price: i * 1.5 }));
+
+// No React.memo needed — Compiler handles it
+function Item({ name, price, onSelect }: { name: string; price: number; onSelect: (n: string) => void }) {
+  return <li className="p-2 border-b"><button onClick={() => onSelect(name)}>{name} — ${price.toFixed(2)}</button></li>;
+}
+
+export function AfterCompiler() {
+  const [query, setQuery] = useState('');
+  const [selected, setSelected] = useState('');
+  const [counter, setCounter] = useState(0);
+
+  // No useMemo needed — Compiler caches this automatically
+  const filtered = ITEMS.filter(i => i.name.toLowerCase().includes(query.toLowerCase()));
+
+  // No useCallback needed — Compiler generates stable ref automatically
+  const handleSelect = (name: string) => setSelected(name);
+
+  return (
+    <div className="p-4 border rounded">
+      <h2 className="font-bold mb-2">After Compiler (clean code)</h2>
+      <button onClick={() => setCounter(c => c + 1)} className="mb-2 px-2 py-1 bg-gray-100 rounded">Counter: {counter}</button>
+      <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Filter..." className="w-full border px-2 py-1 rounded mb-2" />
+      <p className="text-sm mb-1">Selected: {selected || '(none)'}</p>
+      <ul className="max-h-40 overflow-auto border rounded">
+        {filtered.slice(0, 20).map(i => <Item key={i.id} name={i.name} price={i.price} onSelect={handleSelect} />)}
+      </ul>
+    </div>
+  );
+}
+```
+
+#### Step 5 — Side-by-Side + Violation Test
+```tsx
+// src/App.tsx
+import { BeforeCompiler } from './BeforeCompiler';
+import { AfterCompiler } from './AfterCompiler';
+
+export default function App() {
+  return (
+    <main className="max-w-4xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">React Compiler Demo</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Open React DevTools Profiler. Click Counter in each panel and compare renders.
+        After Compiler: same performance as Before, but ZERO manual memoisation in source.
+      </p>
+      <div className="grid grid-cols-2 gap-4">
+        <BeforeCompiler />
+        <AfterCompiler />
+      </div>
+    </main>
+  );
+}
+// To test Compiler violation detection:
+// Add items.push('x') to AfterCompiler — Compiler bails, eslint-plugin warns
+```
+
+**Expected Output:**
+```
+Both panels behave identically — same performance
+AfterCompiler source: no useMemo, useCallback, or memo calls
+React DevTools: compiled output shows _c() caching primitives in AfterCompiler
+Click Counter: 0 Item re-renders in both (Compiler memoised automatically)
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does React Compiler do?
+**Q2:** What code does the Compiler bail out on?
+**Q3:** Write a component that benefits from Compiler optimisation. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do you migrate from manual useMemo to Compiler?
+**Q5:** A component mutates a prop — show why Compiler skips it.
+**Q6:** What is 'use no memo' directive?
+
+### Day 7 — Application
+**Q7:** Enable Compiler on an existing app, fix violations.
+**Q8:** Identify 3 patterns in your codebase where Compiler would skip.
+**Q9:** How do you verify Compiler is working via DevTools?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "How does React Compiler work and what does it change about performance optimisation?"
+**Q11:** Draw: Compiler pipeline — JSX source → dataflow analysis → caching primitives → compiled output.
+**Q12:** ★ System design: "Plan migration of a 500-component codebase to React Compiler — tooling, testing, phased rollout."

@@ -132,3 +132,216 @@ A: **The `act` Warning.**
 When a React state update occurs, React batches the updates and schedules a re-render. In a test environment, if your test finishes checking assertions *before* React has finished flushing those state updates to the DOM, React throws this warning because the test environment is leaking active operations.
 `act()` is a React helper function that guarantees all state updates and DOM renders are fully flushed and settled before the next line of code executes.
 *The Fix:* Fortunately, you almost never need to write `act()` manually anymore! Every single method in React Testing Library (`fireEvent`, `userEvent`, `findBy`) automatically wraps its operations in `act()` under the hood. If you are seeing this warning today, it usually means your component is executing an asynchronous state update (like a `setTimeout` or an un-mocked Promise) that RTL doesn't know about, and you need to `await` a `findBy` query to ensure the test waits for the async operation to complete!
+
+## FEYNMAN CHECK
+
+### Explain React Testing Library Like I'm 10 Years Old
+> RTL says: test what users SEE and DO, not implementation. Render a component, query DOM as a user would (`getByRole('button', { name: 'Submit' })`), interact (`await user.click(button)`), assert (`expect(screen.getByText('Saved')).toBeInTheDocument()`). RTL makes testing implementation details HARD on purpose — because those change on refactor. Tests that test behaviour survive refactors.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Testing trophy — where do component tests sit?**
+> **A:** Static (TypeScript/ESLint) → Unit (pure functions, hooks) → Integration (components + dependencies = RTL sweet spot) → E2E (Playwright/Cypress). RTL tests are INTEGRATION — render component with real children/hooks/context, test combined behaviour. Unit tests that mock everything test implementation, not behaviour.
+
+**Q2: Query hierarchy?**
+> **A:** getByRole → getByLabelText → getByPlaceholderText → getByText → getByDisplayValue → getByAltText → getByTestId (last resort). Priority mirrors how users find elements. findBy = async (waits), queryBy = no-throw (use for absence), getAllBy/findAllBy for multiples.
+
+**Q3: Most dangerous misconception?**
+> **A:** Testing state/implementation details:
+> ```tsx
+> // ❌ Implementation — breaks on refactor
+> test('increments', () => {
+>   const { container } = render(<Counter />);
+>   expect(container.querySelector('.state')).toHaveTextContent('0');
+>   // Breaks when you rename the class
+> });
+>
+> // ✅ Behaviour — survives useState→useReducer refactor
+> test('displays count and increments on click', async () => {
+>   const user = userEvent.setup();
+>   render(<Counter />);
+>   expect(screen.getByRole('heading', { name: /count: 0/i })).toBeInTheDocument();
+>   await user.click(screen.getByRole('button', { name: /increment/i }));
+>   expect(screen.getByRole('heading', { name: /count: 1/i })).toBeInTheDocument();
+> });
+> ```
+
+**Q4: How do you test async + custom hooks?**
+> **A:** Async: `await screen.findByText('Result')` (waits automatically) or `await waitFor(() => expect(...))`. Mock fetch with `vi.fn().mockResolvedValue(...)`. Custom hooks: `renderHook` from RTL. Context: wrap in Provider. React Query: fresh QueryClient per test with `{ retry: false }`.
+
+**Q5: FAANG-grade definition.**
+> **A:** "RTL: behaviour-over-implementation testing — semantic queries (getByRole > labelText > text > testId), @testing-library/user-event for realistic interactions, Arrange-Act-Assert structure — components tested with real dependencies (integration layer) — async via findBy/waitFor — custom hooks via renderHook — mocking only external I/O — tests survive refactors because they test observable output, not internal state."
+
+## BUILD
+
+### 🏗️ Mini Project: Full Test Suite for Search Component
+
+**What you will build:** Complete RTL test suite — rendering, async, error, filter, callbacks, accessibility queries.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1
+```bash
+npm create vite@latest rtl-demo -- --template react-ts
+cd rtl-demo && npm install -D @testing-library/react @testing-library/user-event @testing-library/jest-dom vitest jsdom
+```
+
+#### Step 2 — Component Under Test
+```tsx
+// src/UserSearch.tsx
+import { useState, useEffect, useId } from 'react';
+export interface User { id: number; name: string; active: boolean; }
+
+export function UserSearch({ onSelect }: { onSelect?: (u: User) => void }) {
+  const [q, setQ] = useState('');
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string|null>(null);
+  const [filter, setFilter] = useState<'all'|'active'>('all');
+  const id = useId();
+
+  useEffect(() => {
+    if (!q.trim()) { setUsers([]); return; }
+    const ctrl = new AbortController();
+    setLoading(true); setError(null);
+    fetch('/api/users?q='+encodeURIComponent(q), { signal: ctrl.signal })
+      .then(r => { if (!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then((d: User[]) => { setUsers(d); setLoading(false); })
+      .catch(e => { if (e.name !== 'AbortError') { setError(e.message); setLoading(false); } });
+    return () => ctrl.abort();
+  }, [q]);
+
+  const visible = filter === 'active' ? users.filter(u => u.active) : users;
+
+  return (
+    <section aria-label="User search">
+      <label htmlFor={id}>Search users</label>
+      <input id={id} value={q} onChange={e => setQ(e.target.value)} placeholder="Type to search..." />
+      <div role="group" aria-label="Filter">
+        {(['all','active'] as const).map(f => (
+          <label key={f}><input type="radio" name="filter" value={f} checked={filter===f} onChange={() => setFilter(f)} /> {f}</label>
+        ))}
+      </div>
+      {error && <p role="alert">{error}</p>}
+      {loading && <p aria-live="polite">Searching...</p>}
+      {!loading && visible.length === 0 && q && <p role="status">No users found for "{q}"</p>}
+      <ul aria-label="Search results">
+        {visible.map(u => (
+          <li key={u.id}><button onClick={() => onSelect?.(u)}>{u.name}{!u.active && ' (inactive)'}</button></li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+```
+
+#### Step 3 — Complete Test Suite
+```tsx
+// src/UserSearch.test.tsx
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, within, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { UserSearch, User } from './UserSearch';
+
+const mockUsers: User[] = [
+  { id: 1, name: 'Ana', active: true },
+  { id: 2, name: 'Ben', active: true },
+  { id: 3, name: 'Carla', active: false },
+];
+
+const setup = (props = {}) => ({ user: userEvent.setup(), ...render(<UserSearch {...props} />) });
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('UserSearch', () => {
+  it('renders accessible label', () => {
+    setup();
+    expect(screen.getByLabelText('Search users')).toBeInTheDocument();
+  });
+
+  it('shows loading while fetching', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+    const { user } = setup();
+    await user.type(screen.getByLabelText('Search users'), 'a');
+    expect(await screen.findByText('Searching...')).toBeInTheDocument();
+  });
+
+  it('shows results after fetch', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(mockUsers) }));
+    const { user } = setup();
+    await user.type(screen.getByLabelText('Search users'), 'a');
+    const list = await screen.findByRole('list', { name: 'Search results' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(3);
+  });
+
+  it('shows error on failed fetch', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 }));
+    const { user } = setup();
+    await user.type(screen.getByLabelText('Search users'), 'x');
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 500');
+  });
+
+  it('shows empty state', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve([]) }));
+    const { user } = setup();
+    await user.type(screen.getByLabelText('Search users'), 'xyz');
+    expect(await screen.findByRole('status')).toHaveTextContent(/no users/i);
+  });
+
+  it('filters active only', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(mockUsers) }));
+    const { user } = setup();
+    await user.type(screen.getByLabelText('Search users'), 'a');
+    await screen.findByText('Ana');
+    await user.click(screen.getByLabelText('active'));
+    expect(screen.queryByText(/Carla/)).not.toBeInTheDocument();
+    expect(screen.getByText('Ana')).toBeInTheDocument();
+  });
+
+  it('calls onSelect with correct user', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(mockUsers) }));
+    const onSelect = vi.fn();
+    const { user } = setup({ onSelect });
+    await user.type(screen.getByLabelText('Search users'), 'a');
+    await screen.findByText('Ana');
+    await user.click(screen.getByRole('button', { name: /Ana/i }));
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ name: 'Ana' }));
+  });
+});
+```
+
+**Expected Output:**
+```
+Tests: 7 passed
+
+getByLabelText — not by ID
+findByRole — async wait
+role="alert" / role="status" — semantic
+getByRole button with name — user-centric
+queryBy — absence assertions
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** RTL query hierarchy?
+**Q2:** getBy vs queryBy vs findBy?
+**Q3:** Write a button increment test. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does RTL discourage testing implementation?
+**Q5:** PR uses getByTestId everywhere — propose better queries.
+**Q6:** How do you test a component using React Query?
+
+### Day 7 — Application
+**Q7:** Write test suite for a form: render, fill, invalid submit, valid submit.
+**Q8:** Test uses fireEvent instead of userEvent — diagnose.
+**Q9:** How do you test a custom hook?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Testing trophy — where do React component tests fit?"
+**Q11:** Draw: test types — unit/hook → integration/component → E2E; cost vs confidence.
+**Q12:** ★ System design: "Testing strategy for a 200-component design system — unit, integration, visual regression, accessibility."

@@ -116,3 +116,202 @@ A: `id` must be absolutely unique within a single HTML document; you cannot have
 
 **Q: If a boolean attribute like `disabled` is set to `disabled="false"`, is it disabled?**
 A: **YES!** This is a common trap. For boolean attributes in HTML, their mere presence on the element makes them true, regardless of what value you assign to them. `<input disabled="false">` will be disabled. To enable the input, you must completely remove the `disabled` attribute from the tag.
+
+## FEYNMAN CHECK
+
+### Explain HTML Attributes Like I'm 10 Years Old
+> Attributes are the configuration knobs of an HTML tag. `<input type="email" required maxlength="100">` is one tag with three knobs. Boolean attributes are special — their PRESENCE alone means true; the value is irrelevant. `<input disabled>`, `<input disabled="disabled">`, and `<input disabled="false">` are ALL disabled, which trips up almost every junior dev once. `data-*` attributes are an officially-blessed namespace for your own metadata — JavaScript reads them as `element.dataset.userId` (camelCased).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do HTML attributes fundamentally solve?**
+> **A:** They let one tag handle many variations without inventing 50 new tags. There's one `<input>` with 25 attribute combinations instead of `<text-input>`, `<email-input>`, etc. Cost: parsing rules are tag-specific (boolean attributes, enumerated attributes, IDL vs content attributes), which makes the HTML spec longer than most programming languages.
+
+**Q2: What is the ONE mental model that makes attributes click?**
+> **A:** There are TWO parallel attribute spaces: the CONTENT attribute (string in markup, accessed via `getAttribute`) and the IDL attribute (JS property, e.g. `input.value`). They start in sync but can drift. `<input value="hi">` initialises both; typing changes IDL but NOT content. This is why `form.reset()` works — it copies the original content attribute back to IDL.
+
+**Q3: What is the most dangerous misconception? Show it with code.**
+> **A:** That `<button disabled="false">` enables the button. Boolean attributes are presence-only:
+> ```html
+> <!-- ❌ All THREE are disabled. The value is completely ignored. -->
+> <button disabled>Save</button>
+> <button disabled="">Save</button>
+> <button disabled="false">Save</button>
+>
+> <!-- ✅ The ONLY way to enable is to omit the attribute entirely -->
+> <button>Save</button>
+> <!-- Or in JS: button.removeAttribute('disabled') / button.disabled = false -->
+> ```
+
+**Q4: How do `data-*` attributes interact with JavaScript at the runtime level?**
+> **A:** Every `data-*` is exposed on `element.dataset` with hyphenated→camelCase conversion: `data-user-id="42"` → `el.dataset.userId === "42"`. Crucially, dataset values are ALWAYS strings — `data-count="5"` gives `"5"` not `5`. The DOM stores both representations in sync, so `el.dataset.userId = '99'` immediately updates the HTML attribute.
+
+**Q5: Write a one-sentence FAANG-precise definition.**
+> **A:** "HTML attributes are key-value pairs the browser parses into a NamedNodeMap on each element, separated into content attributes (string values living in markup) and IDL attributes (typed values living on the DOM node prototype) — which is why `input.checked = true` updates the live state without altering the original `checked` content attribute the form-reset algorithm reads from."
+
+## BUILD
+
+### 🏗️ Mini Project: Declarative Web-Component Loader Built on `data-*`
+
+**What you will build:** A 60-line vanilla-JS module that scans the page for `<div data-component="...">`, automatically instantiates the right widget, and observes the DOM for dynamically added ones. The pattern Angular's selector engine, htmx, and Alpine.js use under the hood.
+**Why this project:** Forces you to understand `dataset`, type coercion, attribute mutation, and `MutationObserver` in one tight piece of code.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir data-loader && cd data-loader
+ni index.html, loader.js -ItemType File
+```
+
+#### Step 2 — Markup That Drives the System
+```html
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Data-driven widgets</title></head>
+<body>
+  <div data-component="counter" data-start="10" data-step="2"></div>
+  <div data-component="clock" data-format="24h"></div>
+  <button id="add">Add another counter dynamically</button>
+  <script type="module" src="./loader.js"></script>
+</body></html>
+```
+
+#### Step 3 — The Loader (dataset + MutationObserver)
+```javascript
+// loader.js — component registry keyed by data-component
+const registry = {
+  counter(host) {
+    let value = Number(host.dataset.start ?? 0);  // dataset is ALWAYS string
+    const step = Number(host.dataset.step ?? 1);
+    host.innerHTML = '<output>' + value + '</output> <button>+</button>';
+    const out = host.querySelector('output');
+    host.querySelector('button').addEventListener('click', () => {
+      value += step;
+      out.textContent = value;
+    });
+  },
+  clock(host) {
+    const fmt = host.dataset.format === '24h' ? 'en-GB' : 'en-US';
+    const tick = () => host.textContent = new Date().toLocaleTimeString(fmt);
+    tick();
+    setInterval(tick, 1000);
+  },
+};
+
+function hydrate(root) {
+  const nodes = root.querySelectorAll('[data-component]:not([data-hydrated])');
+  for (const host of nodes) {
+    const init = registry[host.dataset.component];
+    if (!init) { console.warn('Unknown:', host.dataset.component); continue; }
+    init(host);
+    host.dataset.hydrated = 'true';
+  }
+}
+
+hydrate(document);
+
+// Auto-hydrate future insertions
+new MutationObserver((records) => {
+  for (const r of records)
+    for (const node of r.addedNodes)
+      if (node.nodeType === 1) hydrate(node);
+}).observe(document.body, { childList: true, subtree: true });
+
+// Demo: add a counter at runtime — MutationObserver hydrates it
+document.getElementById('add').addEventListener('click', () => {
+  const div = document.createElement('div');
+  div.dataset.component = 'counter';
+  div.dataset.start = '100';
+  div.dataset.step = '5';
+  document.body.appendChild(div);
+});
+```
+
+#### Step 4 — Error Handling
+```javascript
+// Wrap init in try/catch so one broken widget can't break the page
+function hydrate(root) {
+  const nodes = root.querySelectorAll('[data-component]:not([data-hydrated])');
+  for (const host of nodes) {
+    const init = registry[host.dataset.component];
+    if (!init) continue;
+    try {
+      init(host);
+      host.dataset.hydrated = 'true';
+    } catch (err) {
+      host.dataset.hydrated = 'error';
+      host.setAttribute('aria-invalid', 'true');
+      console.error('[' + host.dataset.component + ']', err);
+    }
+  }
+}
+```
+
+#### Step 5 — Tests
+```javascript
+console.assert(document.querySelector('[data-hydrated]'),
+  'at least one widget should be hydrated');
+console.assert(document.querySelector('output').textContent === '10',
+  'counter should start at 10');
+```
+
+**Expected Output:**
+```
+- Counter shows 10, clicking increments by 2
+- Clock shows current time in 24h format
+- "Add another counter" inserts a new widget that hydrates automatically (starts at 100, steps by 5)
+```
+
+**Stretch Challenges:**
+- [ ] Add `data-lazy="viewport"` flag deferring init until element scrolls into view (IntersectionObserver)
+- [ ] Support nested JSON config: `data-config='{"theme":"dark"}'` parsed once
+- [ ] Add teardown path: when host is removed, run the component's cleanup
+
+## SPACED REVIEW
+
+---
+
+### Day 1 — Recall
+
+**Q1:** What is a boolean attribute? Write the THREE syntactically valid ways to mark an input as disabled.
+
+**Q2:** What is the difference between `element.getAttribute('value')` and `element.value` on an `<input>`? When do they diverge?
+
+**Q3:** Convert `data-user-profile-id="42"` to the JS expression that reads it. Then write the expression that updates it to 99.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** Name 6 global attributes valid on every HTML element. For each, give a one-line use case.
+
+**Q5:** Describe the production bug caused by writing `<input disabled={isDisabled}>` in a non-JSX templating engine. Show buggy vs fixed.
+
+**Q6:** Refactor this for security and accessibility:
+```html
+<a href="javascript:void(0)" onclick="open(${url})">Open</a>
+<input type="text" placeholder="Email" required="false" />
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build a `data-track="event-name"` analytics system that captures clicks across the entire page using ONE delegated listener on `document`.
+
+**Q8:** Every form uses `<input type="text" name="email">` with JS validation. List 3 attribute changes that would eliminate the JS validation entirely.
+
+**Q9:** What is `contenteditable`? Build a 20-line in-browser markdown preview where typing in a `contenteditable` div instantly renders to HTML.
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Interview: "Explain the difference between an HTML content attribute and a DOM IDL attribute. Give one case where they intentionally diverge."
+
+**Q11:** Draw the dependency graph: html-attributes ↔ forms-html ↔ form-validation ↔ accessibility-html.
+
+**Q12:** ★ System design: "Design attribute conventions for a server-rendered framework that's progressively enhanced. How do you encode component state, hydration boundaries, and analytics without inventing non-standard names?"

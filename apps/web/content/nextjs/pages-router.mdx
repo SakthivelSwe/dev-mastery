@@ -139,3 +139,215 @@ In the Pages Router, `_app.tsx` is the only global layout file. If you wanted a 
 Furthermore, when navigating between pages in the Pages Router, the entire page component tree is unmounted and remounted. You couldn't easily have a persistent navigation sidebar that maintained its scroll position or React state while the main content area changed.
 
 The App Router solves this natively with `layout.tsx` files that can be nested at any folder level, and these layouts purposefully persist their state and DOM across child navigations.
+
+## FEYNMAN CHECK
+
+### Explain the Next.js Pages Router Like I'm 10 Years Old
+> The Pages Router is Next.js's original routing system — every file in pages/ becomes a URL. pages/index.tsx = /, pages/about.tsx = /about, pages/products/[id].tsx = /products/1. Data fetching happens through special exported functions: getStaticProps (fetches at BUILD time for SSG), getServerSideProps (fetches on every REQUEST for SSR), getStaticPaths (tells Next.js which dynamic pages to pre-generate). The non-obvious limitation: in the Pages Router, EVERY page gets a complete new React tree — there are no persistent layouts between navigations. This is why Next.js built the App Router — to enable layout persistence and Server Components. For new projects use App Router; for existing codebases Pages Router is still fully supported.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When does getStaticProps run vs getServerSideProps?**
+> **A:** getStaticProps runs at BUILD TIME on the Node.js server — during next build, not when users visit the page. The result becomes a pre-rendered HTML file. It also runs during revalidation (ISR). getServerSideProps runs on EVERY REQUEST at RUNTIME — for each user visit, Next.js calls your function, fetches fresh data, and renders the page. Use getStaticProps when data doesn't change per user (blog posts, product catalogue). Use getServerSideProps when data is user-specific or must be real-time (dashboards, cart, profile).
+
+**Q2: Mental model for getStaticPaths?**
+> **A:** getStaticPaths answers "which dynamic URLs should I pre-generate at build time?" For a blog with [slug] routes, getStaticPaths returns [{ params: { slug: 'hello-world' } }, { params: { slug: 'nextjs-guide' } }] — Next.js pre-renders those specific pages. fallback: false means any unknown slug returns 404. fallback: true means unknown slugs trigger a fallback page while data is fetched (on-demand ISR). fallback: 'blocking' renders server-side for unknown slugs, then caches the result — no loading state.
+
+**Q3: Most dangerous misconception about Pages Router?**
+> **A:** getStaticProps can access browser APIs:
+> ```typescript
+> // WRONG: getStaticProps runs at BUILD TIME in Node.js, not in browser
+> export async function getStaticProps() {
+>   const user = localStorage.getItem('user');  // ReferenceError: localStorage not defined!
+>   const token = document.cookie;               // ReferenceError: document not defined!
+>   return { props: { user } };
+> }
+>
+> // CORRECT: getStaticProps can only use Node.js APIs and server-side code
+> export async function getStaticProps() {
+>   const products = await fetch('https://api.example.com/products').then(r => r.json());
+>   return { props: { products }, revalidate: 60 };
+> }
+> ```
+
+**Q4: How does _app.tsx and _document.tsx work?**
+> **A:** _app.tsx wraps EVERY page — it receives the Component (the page) and pageProps (from getStaticProps/getServerSideProps) and renders them. Use _app.tsx for: global CSS imports, layout wrappers, context providers (Redux, Auth), analytics initialisation. _document.tsx wraps the HTML document — use it to add custom html/body attributes, Google Fonts script tags, and viewport meta tags. _document.tsx renders ONLY on the server — browser APIs are unavailable. Changes to _document.tsx require a full server restart.
+
+**Q5: FAANG-grade definition of the Pages Router.**
+> **A:** "Next.js Pages Router is a file-system router where pages/ folder files map to URL routes — with getStaticProps for build-time static data fetching (SSG), getServerSideProps for per-request server-side data fetching (SSR), getStaticPaths for dynamic route pre-generation with fallback strategies, API routes at pages/api/, custom _app.tsx for global page wrappers and _document.tsx for HTML customisation — fully supported for existing apps but superseded by App Router for new projects due to lack of persistent layouts, React Server Component support, and streaming."
+
+## BUILD
+
+### 🏗️ Mini Project: Blog With getStaticProps, getStaticPaths, and ISR
+
+**What you will build:** A blog using Pages Router: index page with getStaticProps (post list), dynamic [slug] page with getStaticPaths + getStaticPaths, ISR with revalidate, and an API route for post creation.
+**Why this project:** Forces all three Pages Router data-fetching patterns in a realistic blog.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest pages-router-blog --typescript --tailwind --no-app
+cd pages-router-blog
+npm install gray-matter remark remark-html
+mkdir -p content/posts
+```
+
+#### Step 2 — Markdown Post Data
+```bash
+# content/posts/hello-world.md
+cat > content/posts/hello-world.md << 'EOF'
+---
+title: "Hello World"
+date: "2024-01-15"
+excerpt: "My first post"
+---
+# Hello World
+Welcome to my blog built with Next.js Pages Router.
+EOF
+```
+
+#### Step 3 — Data Layer
+```typescript
+// lib/posts.ts
+import fs from 'fs';
+import path from 'path';
+import matter from 'gray-matter';
+
+const postsDir = path.join(process.cwd(), 'content/posts');
+
+export interface Post { slug: string; title: string; date: string; excerpt: string; content: string; }
+
+export function getAllPosts(): Omit<Post, 'content'>[] {
+  return fs.readdirSync(postsDir)
+    .filter(f => f.endsWith('.md'))
+    .map(filename => {
+      const slug = filename.replace('.md', '');
+      const raw = fs.readFileSync(path.join(postsDir, filename), 'utf-8');
+      const { data } = matter(raw);
+      return { slug, title: data.title, date: data.date, excerpt: data.excerpt };
+    })
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+}
+
+export function getPostBySlug(slug: string): Post {
+  const raw = fs.readFileSync(path.join(postsDir, slug + '.md'), 'utf-8');
+  const { data, content } = matter(raw);
+  return { slug, title: data.title, date: data.date, excerpt: data.excerpt, content };
+}
+```
+
+#### Step 4 — Pages
+```typescript
+// pages/index.tsx — SSG with ISR
+import { GetStaticProps } from 'next';
+import Link from 'next/link';
+import { getAllPosts } from '@/lib/posts';
+
+export default function BlogIndex({ posts }: { posts: any[] }) {
+  return (
+    <main className="max-w-2xl mx-auto p-8">
+      <h1 className="text-3xl font-bold mb-6">Blog</h1>
+      {posts.map(post => (
+        <article key={post.slug} className="mb-8 p-4 border rounded">
+          <h2><Link href={`/posts/${post.slug}`} className="text-blue-600 hover:underline">{post.title}</Link></h2>
+          <p className="text-gray-500">{post.date}</p>
+          <p>{post.excerpt}</p>
+        </article>
+      ))}
+    </main>
+  );
+}
+
+export const getStaticProps: GetStaticProps = async () => {
+  const posts = getAllPosts();
+  return { props: { posts }, revalidate: 60 };  // ISR: refresh every 60s
+};
+
+// pages/posts/[slug].tsx — SSG with getStaticPaths
+import { GetStaticPaths, GetStaticProps } from 'next';
+import { getAllPosts, getPostBySlug } from '@/lib/posts';
+
+export default function PostPage({ post }: { post: any }) {
+  return (
+    <article className="max-w-2xl mx-auto p-8">
+      <h1 className="text-3xl font-bold">{post.title}</h1>
+      <time className="text-gray-500">{post.date}</time>
+      <div className="prose mt-4" dangerouslySetInnerHTML={{ __html: post.content }} />
+    </article>
+  );
+}
+
+export const getStaticPaths: GetStaticPaths = async () => {
+  const posts = getAllPosts();
+  return {
+    paths: posts.map(p => ({ params: { slug: p.slug } })),
+    fallback: 'blocking',  // on-demand generation for new slugs
+  };
+};
+
+export const getStaticProps: GetStaticProps = async ({ params }) => {
+  const post = getPostBySlug(params!.slug as string);
+  return { props: { post }, revalidate: 60 };
+};
+```
+
+#### Step 5 — Tests
+```typescript
+// __tests__/posts.test.ts
+import { getAllPosts, getPostBySlug } from '@/lib/posts';
+
+describe('posts data layer', () => {
+  it('getAllPosts returns array', () => {
+    const posts = getAllPosts();
+    expect(Array.isArray(posts)).toBe(true);
+  });
+  it('getPostBySlug returns correct fields', () => {
+    const posts = getAllPosts();
+    if (posts.length > 0) {
+      const post = getPostBySlug(posts[0].slug);
+      expect(post.slug).toBeTruthy();
+      expect(post.title).toBeTruthy();
+    }
+  });
+});
+```
+
+**Expected Output:**
+```
+npm run build -> pre-generates index + post pages
+npm start -> blog served from static HTML
+/posts/hello-world -> pre-rendered post page
+New post file + revalidate -> page updates within 60s
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add getServerSideProps to a user-specific dashboard page
+- [ ] Migrate the blog to App Router and compare the code size
+- [ ] Add a search API route using getServerSideProps with query params
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between getStaticProps and getServerSideProps?
+**Q2:** When does getStaticProps run?
+**Q3:** Write getStaticPaths for a [slug] blog route. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the difference between fallback: false, true, and 'blocking'?
+**Q5:** A junior calls localStorage in getStaticProps — what error and why?
+**Q6:** What is the purpose of _app.tsx and what goes in it?
+
+### Day 7 — Application
+**Q7:** Add ISR to an existing getStaticProps page with a 5-minute revalidation.
+**Q8:** When would you choose getServerSideProps over getStaticProps for a product page?
+**Q9:** How do you pass data from _app.tsx's getInitialProps to a page?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain the difference between getStaticProps, getServerSideProps, and getStaticPaths — give a real-world use case for each."
+**Q11:** Draw: Pages Router data flow — getStaticProps at build time vs getServerSideProps at request time.
+**Q12:** ★ System design: "Migrate a 200-page Pages Router app to App Router — which pages use SSG, SSR, ISR, and which become Server Components?"

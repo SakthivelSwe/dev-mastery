@@ -1,216 +1,845 @@
 ---
-title: closures
-slug: closures
+slug: "closures"
+title: "Java Closures: Lambda Capture and Functional Scope"
+level: 2
 ---
 
-# Closures — Lexical Scope and Variable Capture
+## WHY
 
-A closure is the combination of a function bundled together with references to its surrounding state (the lexical environment). Closures allow an inner function to access variables from an outer scope even after the outer function has finished executing.
+Java didn't have closures until Java 8 (2014), and the delay was intentional: the Java designers wrestled with a fundamental tension between closures and Java's concurrency model. In languages with mutable closures (like JavaScript's early `var` declarations), a closure captures a *mutable reference*, and changing the variable outside the lambda changes what the lambda sees — a source of countless bugs. Java made a deliberate choice: lambdas capture values, not mutable references. The "effectively final" rule is the enforcement mechanism.
 
----
+The specific pain that Java closures solve is **boilerplate in single-method patterns**. Before lambdas, implementing `Comparator` required an anonymous inner class with 5 lines of ceremony for what is logically one expression: `(a, b) -> a.getName().compareTo(b.getName())`. Implementing a strategy, a callback, or a predicate all required the same ceremony. Lambda expressions let you express "a computation that can be passed around as data" without the class infrastructure.
 
-## 1. Lexical Scope vs. Dynamic Scope
+The production failure mode is subtle: **captured variable mutation via shared mutable state**. Even though you cannot *reassign* a captured local variable, you can absolutely *mutate the object it points to* — and this is legal. A lambda that captures a `List<String>` can call `list.add()` — and when the same list is modified by another thread while the lambda is executing, you have a data race. The "effectively final" rule only prevents you from reassigning the reference; it offers zero protection against concurrent mutation of the referenced object.
 
-JavaScript uses **Lexical Scope** (also known as Static Scope). This means that the scope of an identifier is determined entirely at **write time** (during the compilation phase) based on its physical location within the source code, rather than at **call time** (runtime invocation).
+Understanding Java closures at the bytecode level — how `javac` generates synthetic classes, which variables are captured by value vs. reference, and why the JVM's treatment of `final` fields makes published lambdas thread-safe — is essential for writing correct concurrent Java code using streams, `CompletableFuture`, and reactive pipelines.
 
-```javascript
-const x = 10;
+## THEORY
 
-function foo() {
-  console.log(x); // Lexical scope look-up resolves to the outer x (10)
-}
+### What a Java Closure Actually Is
 
-function bar() {
-  const x = 20;
-  foo(); // Invocation site does not change foo's lexical scope
-}
-
-bar(); // Prints 10, not 20
-```
-
----
-
-## 2. V8 Internals: Contexts and Heap Allocation
-
-To understand closures at a low level, we must look at how V8 manages scope allocation.
-
-### The Stack vs. Heap Allocation Problem
-Normally, local variables in a function are allocated on the **Call Stack** within the function's stack frame. When the function returns, its stack frame is popped, and that memory is reclaimed.
-
-However, if an inner function references a variable from an outer function, and the inner function escapes (is returned or passed elsewhere), the outer function's stack frame is popped, but its variables must survive.
+A Java lambda expression is syntactic sugar for an anonymous class that implements a functional interface. The JVM uses `invokedynamic` and `LambdaMetafactory` to generate the implementation at runtime, but the semantic model is:
 
 ```
-STRICT STACK ALLOCATION (No Closure):
-[Call Stack] -> [outer() Frame (allocates x)] -> [Returns] -> [Frame Popped (x is deleted)]
+Lambda: () -> prefix + name
 
-V8 CLOSURE ALLOCATION:
-[Heap Memory]
-  |
-  +--> [Context Object (Scope of outer)]
-         |-- x: 10  <-- Retained because inner() has a [[Scope]] pointer here
-```
+Generated (conceptually):
+class Lambda$1 implements Runnable {
+    private final String prefix;  // captured value — final field
+    private final String name;    // captured value — final field
 
-### V8 Context Allocation
-To solve this, the V8 parser performs **Scope Analysis** (located in `src/ast/scopes.cc` in the V8 codebase) before compiling the code. 
-* If the parser detects that a variable in an outer function is captured by an inner function, that variable is **not** allocated on the stack.
-* Instead, V8 allocates a **`Context` object** (specifically, a `FunctionContext`) on the **Heap**.
-* The outer function’s local variables that are captured are stored as properties of this Heap-allocated `Context`.
-* When the inner function is instantiated, V8 creates a `JSFunction` object representing it. This object contains an internal field called `context` (accessible via the `[[Scope]]` internal slot), which points directly to the Heap-allocated `Context` of its parent.
-
-Because the inner function holds a reference to this heap `Context`, the garbage collector (V8’s Orinoco GC engine) cannot reclaim the memory containing the captured variables, even after the outer function's execution frame is removed from the stack.
-
----
-
-## 3. The Classic Loop Bug and Scoping Solutions
-
-### The Bug
-```javascript
-for (var i = 0; i < 3; i++) {
-  setTimeout(() => {
-    console.log(i);
-  }, 100);
-}
-// Outputs: 3, 3, 3
-```
-
-#### Why this happens:
-1. `var` is function-scoped (or globally scoped). It is not block-scoped.
-2. In this loop, only **one** binding is created for `i` in the parent execution context.
-3. The three arrow functions capture the *same* `i` variable by reference from the parent context.
-4. By the time the `setTimeout` callbacks execute (after at least 100ms, when the synchronous loop has long finished), the value of `i` has been incremented to `3`. All three closures read this shared mutable variable.
-
----
-
-### Fix 1: Block Scope (`let`)
-```javascript
-for (let i = 0; i < 3; i++) {
-  setTimeout(() => {
-    console.log(i);
-  }, 100);
-}
-// Outputs: 0, 1, 2
-```
-* **Under the hood**: The `let` keyword is block-scoped. For every iteration of the loop, V8 creates a new lexical scope block. 
-* Each iteration gets its own unique binding of `i` initialized with the value from the previous iteration. 
-* Consequently, three separate `Context` objects are created on the heap, each storing a different, immutable value of `i` ($0$, $1$, and $2$).
-
----
-
-### Fix 2: Immediately Invoked Function Expressions (IIFE)
-```javascript
-for (var i = 0; i < 3; i++) {
-  (function(capturedI) {
-    setTimeout(() => {
-      console.log(capturedI);
-    }, 100);
-  })(i);
-}
-// Outputs: 0, 1, 2
-```
-* **Under the hood**: An IIFE is executed immediately on each iteration. 
-* By passing `i` as an argument to the IIFE, it is mapped to a new parameter `capturedI`. 
-* Since function parameters are local variables scoped to that function invocation, a new execution context (and a corresponding Heap `Context` for the closure) is created for each iteration, capturing the value of `i` at that exact moment in time.
-
----
-
-### Fix 3: Function Factory
-```javascript
-function createLogCallback(value) {
-  return () => {
-    console.log(value);
-  };
-}
-
-for (var i = 0; i < 3; i++) {
-  setTimeout(createLogCallback(i), 100);
-}
-// Outputs: 0, 1, 2
-```
-* **Under the hood**: The factory function `createLogCallback` returns a new closure. 
-* The argument `i` is bound to the parameter `value` inside the unique execution context of that specific call. This decouples the execution from the mutable loop variable `i`.
-
----
-
-## 4. Memory Implications and Closures
-
-Because closures retain references to their outer environments, they can lead to memory retention issues if not managed carefully.
-
-### Shared Context Memory Leak (The Meteor Leak Pattern)
-When multiple inner functions are defined within the same outer function, they **share the same Context object**. This can cause unexpected memory retention.
-
-```javascript
-let globalHolder = null;
-
-function replaceThing() {
-  const priorThing = globalHolder;
-  
-  // Unused closure that references 'priorThing'
-  const unusedClosure = function() {
-    if (priorThing) {
-      console.log("hi");
+    Lambda$1(String prefix, String name) {  // values copied in at capture time
+        this.prefix = prefix;
+        this.name = name;
     }
-  };
-  
-  // Active closure that is assigned globally
-  globalHolder = {
-    longStr: new Array(1000000).join('*'),
-    someMethod: function() {
-      // This closure DOES NOT reference priorThing
+
+    public void run() {
+        System.out.println(this.prefix + this.name);  // uses copies
     }
-  };
+}
+```
+
+### The Effectively Final Rule — Why It Exists
+
+```
+Stack frame:        Lambda heap object:
+┌───────────────┐   ┌─────────────────────────┐
+│ method frame  │   │ Lambda$1 instance       │
+│               │   │  prefix = "Hello"       │
+│ prefix="Hello"│──►│  (copy made at λ-create)│
+│               │   │                         │
+│ AFTER method  │   │  Lambda still lives here│
+│ RETURNS:      │   │  with its own copy      │
+│ prefix is     │   │  — not the stack var!   │
+│ GONE (stack   │   └─────────────────────────┘
+│ frame popped) │
+└───────────────┘
+```
+
+If `prefix` could change after capture, the lambda would hold a stale copy — Java prevents this by requiring effectively final. The copy semantics are safe only when the value is immutable.
+
+### Types of Variable Capture
+
+| What is captured | Can be captured? | Mutation visible to lambda? |
+|---|---|---|
+| Local primitive (`int x = 5`) | ✅ if effectively final | N/A — copied by value |
+| Local reference (`String s = "hi"`) | ✅ if effectively final | N/A — reference copied, String immutable |
+| Local mutable object (`List<String> list`) | ✅ if ref not reassigned | ✅ YES — object is shared! |
+| Instance field (`this.count`) | ✅ always | ✅ YES — shares the object's field |
+| Static field | ✅ always | ✅ YES — shared globally |
+
+### Lambda vs. Anonymous Inner Class: Key Differences
+
+| Feature | Lambda | Anonymous Inner Class |
+|---|---|---|
+| `this` refers to | **enclosing class** | the anonymous class itself |
+| New scope for variables | No (shares enclosing scope) | Yes (separate scope) |
+| Can shadow enclosing fields | No | Yes |
+| JVM implementation | `invokedynamic` + LambdaMetafactory | `new` + separate .class file |
+| Can have state | No (only captured effectively-finals) | Yes (fields) |
+| Can implement multiple methods | No (functional interface only) | Yes |
+
+### Closure Over `this` — The Hidden Capture
+
+When a lambda accesses an instance field or calls an instance method, it implicitly captures `this`:
+
+```java
+class Counter {
+    private int count = 0;  // instance field
+
+    public Runnable increment() {
+        // Lambda implicitly captures 'this' — Counter.this
+        return () -> count++;  // equivalent to: this.count++
+        // If this Counter is shared across threads, count++ is a data race!
+    }
+}
+```
+
+### Common Misconception
+
+> "Effectively final means the lambda sees a snapshot — changes to the variable are invisible."
+
+**Reality:** Effectively final prevents *reassignment* of the local variable. If the variable holds a reference to a mutable object (`List`, `Map`, `StringBuilder`, custom class), mutations to that object ARE visible through the lambda — because both the outside code and the lambda hold references to the same heap object. Only when the captured object is itself immutable (String, Integer, records) are changes truly invisible.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "MemoryDiagram", "state": "java-mastery-closures" }
+```
+
+## CODE
+
+### Level 1 — Beginner: Basic Lambda Capture
+
+```java
+import java.util.function.*;
+import java.util.*;
+
+public class LambdaCapture {
+    public static void main(String[] args) {
+        // Capturing a primitive (effectively final)
+        int multiplier = 3;  // effectively final — never reassigned
+        IntUnaryOperator tripler = x -> x * multiplier;  // captures multiplier value
+        System.out.println(tripler.applyAsInt(5));  // 15
+
+        // Capturing a String (effectively final, String is immutable)
+        String greeting = "Hello";
+        Supplier<String> greeter = () -> greeting + " World";
+        System.out.println(greeter.get());  // Hello World
+
+        // ❌ This would NOT compile — prefix is mutated
+        // String prefix = "Hi";
+        // Runnable r = () -> System.out.println(prefix);
+        // prefix = "Hey";  // makes prefix NOT effectively final → compile error on lambda
+
+        // Capturing a mutable object reference — legal BUT the object can be mutated
+        List<String> names = new ArrayList<>();
+        names.add("Alice");
+        Runnable adder = () -> names.add("Bob");  // captures reference to names List
+        adder.run();
+        System.out.println(names);  // [Alice, Bob] — List was mutated through the closure!
+
+        // Functional interface as parameter
+        greetAll(List.of("Alice", "Bob"), name -> System.out.println("Hi, " + name));
+    }
+
+    static void greetAll(List<String> names, Consumer<String> greeter) {
+        names.forEach(greeter);  // lambda is just a Consumer<String>
+    }
+}
+```
+
+### Level 2 — Intermediate: Closure Factories, Memoization, and Currying
+
+```java
+import java.util.*;
+import java.util.function.*;
+
+public class ClosureFactories {
+
+    /**
+     * Closure factory: returns a function that closes over 'base'
+     * Each call returns a NEW lambda with its OWN captured 'base'
+     */
+    static IntUnaryOperator adder(int base) {
+        return x -> x + base;  // closes over 'base' — each call has its own base
+    }
+
+    /**
+     * Memoize: wrap any function with caching via closure over a Map
+     * The Map is shared across all calls — closure enables stateful caching
+     */
+    static <T, R> Function<T, R> memoize(Function<T, R> fn) {
+        Map<T, R> cache = new HashMap<>();  // captured by the closure — shared across calls
+        return key -> cache.computeIfAbsent(key, fn);
+    }
+
+    /**
+     * Currying: transform f(a, b) into f(a)(b) via closures
+     */
+    static <A, B, R> Function<A, Function<B, R>> curry(BiFunction<A, B, R> fn) {
+        return a -> b -> fn.apply(a, b);  // outer lambda captures fn, inner captures a
+    }
+
+    public static void main(String[] args) {
+        // Closure factory — each adder has its own captured 'base'
+        IntUnaryOperator add5 = adder(5);
+        IntUnaryOperator add10 = adder(10);
+        System.out.println(add5.applyAsInt(3));   // 8
+        System.out.println(add10.applyAsInt(3));  // 13
+
+        // Memoization — shared cache via closure
+        Function<Integer, Long> slowFib = memoize(n -> {
+            // Simulate expensive calculation
+            return (long) n * n;
+        });
+        System.out.println(slowFib.apply(5));  // 25 — computed
+        System.out.println(slowFib.apply(5));  // 25 — from cache (closure's map)
+
+        // Currying
+        BiFunction<String, String, String> concat = (a, b) -> a + b;
+        Function<String, Function<String, String>> curriedConcat = curry(concat);
+        Function<String, String> prependHello = curriedConcat.apply("Hello, ");
+        System.out.println(prependHello.apply("World"));  // Hello, World
+        System.out.println(prependHello.apply("Java"));   // Hello, Java
+    }
+}
+```
+
+### Level 3 — Advanced: Thread-Safety with Closures, CompletableFuture Pipelines
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+public class AdvancedClosures {
+
+    /**
+     * ❌ DANGEROUS: closure captures mutable shared state
+     * count++ in a lambda is a data race when run in parallel stream
+     */
+    static long countWordsUnsafe(List<String> words) {
+        int[] count = {0};  // array trick to "mutate" captured value — but NOT thread-safe!
+        words.parallelStream().forEach(w -> count[0]++);  // DATA RACE!
+        return count[0];  // result is non-deterministic
+    }
+
+    /**
+     * ✅ SAFE: use reduce/collect — closures don't share mutable state
+     */
+    static long countWordsSafe(List<String> words) {
+        return words.parallelStream()
+            .filter(w -> !w.isBlank())
+            .count();  // count() is an intrinsic parallel reduction — no shared state
+    }
+
+    /**
+     * Closure pipeline with CompletableFuture — each lambda in the chain
+     * captures state from the closure, enabling clean async pipelines
+     */
+    static CompletableFuture<String> processUserPipeline(String userId, String baseUrl) {
+        // Each lambda in the chain captures baseUrl from the enclosing scope
+        return CompletableFuture
+            .supplyAsync(() -> fetchUser(userId, baseUrl))         // captures baseUrl
+            .thenApply(user -> enrichWithProfile(user, baseUrl))   // captures baseUrl
+            .thenApply(user -> formatForDisplay(user))
+            .exceptionally(ex -> "Error processing user: " + ex.getMessage());
+    }
+
+    /**
+     * Partial application via closure — pre-bind some arguments
+     * Used extensively in functional pipelines
+     */
+    static <T> Predicate<T> not(Predicate<T> predicate) {
+        return t -> !predicate.test(t);  // captures predicate in closure
+    }
+
+    static <T, K> Function<T, K> cached(Function<T, K> fn, Map<T, K> cache) {
+        return t -> cache.computeIfAbsent(t, fn);  // captures both fn and cache
+    }
+
+    // Simplified stubs for pipeline
+    record User(String id, String name, String email) {}
+    static User fetchUser(String id, String baseUrl) { return new User(id, "Alice", "alice@example.com"); }
+    static User enrichWithProfile(User u, String baseUrl) { return u; }
+    static String formatForDisplay(User u) { return "User: " + u.name(); }
+
+    public static void main(String[] args) throws Exception {
+        var words = List.of("hello", "world", "", "java", "closures");
+        System.out.println("Count: " + countWordsSafe(words));  // 4
+
+        // Partial application
+        Predicate<String> isBlank = String::isBlank;
+        Predicate<String> isNotBlank = not(isBlank);
+        System.out.println(isNotBlank.test("hello"));  // true
+        System.out.println(isNotBlank.test(""));       // false
+
+        // Async pipeline
+        var result = processUserPipeline("u001", "https://api.example.com").get(5, TimeUnit.SECONDS);
+        System.out.println(result);
+    }
+}
+```
+
+### Level 4 — Expert / Production: Closure-Based DSL and Reactive Operator Pipeline
+
+```java
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+/**
+ * Production closure patterns:
+ * 1. Closure-based validation DSL
+ * 2. Function composition pipeline
+ * 3. Resource-safe closures with try-with-resources analogue
+ */
+public class ProductionClosures {
+
+    /**
+     * Validation DSL using closures — each rule is a Function<T, Optional<String>>
+     * (returns empty if valid, or error message if invalid)
+     */
+    static class Validator<T> {
+        private final List<Function<T, Optional<String>>> rules = new ArrayList<>();
+
+        public Validator<T> rule(Predicate<T> predicate, String errorMessage) {
+            // Closure captures predicate and errorMessage
+            rules.add(value -> predicate.test(value)
+                ? Optional.empty()
+                : Optional.of(errorMessage));
+            return this;
+        }
+
+        public Validator<T> rule(Predicate<T> predicate, Function<T, String> errorSupplier) {
+            // Error message can reference the value — closure over errorSupplier
+            rules.add(value -> predicate.test(value)
+                ? Optional.empty()
+                : Optional.of(errorSupplier.apply(value)));
+            return this;
+        }
+
+        public List<String> validate(T value) {
+            return rules.stream()
+                .map(rule -> rule.apply(value))
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .toList();
+        }
+    }
+
+    record UserRegistration(String email, String password, int age) {}
+
+    static Validator<UserRegistration> buildUserValidator() {
+        return new Validator<UserRegistration>()
+            .rule(u -> u.email() != null && u.email().contains("@"),
+                  "Email must contain @")
+            .rule(u -> u.password() != null && u.password().length() >= 8,
+                  "Password must be at least 8 characters")
+            .rule(u -> u.age() >= 18,
+                  u -> "Must be 18+, got: " + u.age())  // closure over value
+            .rule(u -> u.age() <= 120,
+                  "Age seems unrealistic");
+    }
+
+    /**
+     * Pipeline builder using closures — compose transformation steps
+     * Used in data processing, ETL pipelines, middleware chains
+     */
+    static class Pipeline<T> {
+        private final List<Function<T, T>> steps = new ArrayList<>();
+
+        public Pipeline<T> then(Function<T, T> step) {
+            steps.add(step);  // captures step in list
+            return this;
+        }
+
+        public T process(T input) {
+            T current = input;
+            for (Function<T, T> step : steps) {
+                current = step.apply(current);
+            }
+            return current;
+        }
+    }
+
+    /**
+     * Resource-safe operation via closure — ensures cleanup even on exception
+     * Analogue to Python's context manager, Kotlin's use{}
+     */
+    static <R> R withResource(AutoCloseable resource, Callable<R> operation) throws Exception {
+        try {
+            return operation.call();  // closure over resource available if needed
+        } finally {
+            resource.close();
+        }
+    }
+
+    interface Callable<R> { R call() throws Exception; }
+
+    public static void main(String[] args) {
+        // Validation DSL
+        var validator = buildUserValidator();
+        var user = new UserRegistration("alice@example.com", "short", 16);
+        var errors = validator.validate(user);
+        errors.forEach(e -> System.out.println("Error: " + e));
+        // Error: Password must be at least 8 characters
+        // Error: Must be 18+, got: 16
+
+        // Pipeline
+        var emailNormalizer = new Pipeline<String>()
+            .then(String::trim)
+            .then(String::toLowerCase)
+            .then(s -> s.replace("..", "."))  // fix double dots
+            .then(s -> s.startsWith("@") ? s.substring(1) : s); // fix leading @
+
+        System.out.println(emailNormalizer.process("  Alice@Example.COM  "));  // alice@example.com
+
+        // Compose functions
+        Function<Integer, Integer> doubleIt = x -> x * 2;
+        Function<Integer, Integer> addTen = x -> x + 10;
+        Function<Integer, Integer> squared = x -> x * x;
+
+        Function<Integer, Integer> pipeline = doubleIt.andThen(addTen).andThen(squared);
+        System.out.println(pipeline.apply(5));  // (5*2+10)^2 = 400
+    }
+}
+```
+
+## REAL_WORLD
+
+### How Java Streams Use Closures Internally
+
+Java's Stream API (Java 8+) is built entirely on closures. Every `filter()`, `map()`, `flatMap()`, `sorted()` call receives a lambda — a closure — and assembles them into a lazy pipeline. The stream doesn't execute any lambdas until a terminal operation (`collect()`, `count()`, `findFirst()`) triggers the pipeline. Each intermediate operation wraps the previous stage and its lambda in a new stream stage — a chain of closures that executes top-to-bottom when the terminal fires.
+
+The key insight: stream operations are closures over the previous stage and the provided function. `stream.filter(predicate).map(transformer)` creates a data structure like `MapStage(predicate=..., source=FilterStage(predicate=predicate, source=originalStream))` — each stage closes over its predecessor.
+
+```java
+import java.util.*;
+import java.util.stream.*;
+import java.util.function.*;
+
+public class StreamClosurePatterns {
+
+    // Production pattern: closure-parameterized stream operations
+    public static <T> Predicate<T> fieldEquals(Function<T, String> getter, String value) {
+        // Returns a Predicate that closes over getter and value
+        // Used to build queries dynamically from user input
+        return item -> value.equals(getter.apply(item));
+    }
+
+    record User(String name, String department, double salary) {}
+
+    public static void main(String[] args) {
+        var users = List.of(
+            new User("Alice", "Engineering", 120_000),
+            new User("Bob", "Marketing", 90_000),
+            new User("Carol", "Engineering", 130_000)
+        );
+
+        // Closure-based filter construction — predicate captures 'getter' and 'value'
+        var engineeringFilter = fieldEquals(User::department, "Engineering");
+        var marketingFilter = fieldEquals(User::department, "Marketing");
+
+        double engineeringAvg = users.stream()
+            .filter(engineeringFilter)
+            .mapToDouble(User::salary)
+            .average()
+            .orElse(0);
+        System.out.printf("Engineering avg: $%.0f%n", engineeringAvg);  // $125,000
+
+        // Closure composition: combine predicates
+        Predicate<User> highEarningEngineer = engineeringFilter
+            .and(u -> u.salary() > 125_000);  // closure over salary threshold
+        users.stream()
+            .filter(highEarningEngineer)
+            .forEach(u -> System.out.println("High earner: " + u.name())); // Carol
+    }
+}
+```
+
+### Production Gotcha: Closure Capturing Mutable Loop Variable
+
+```java
+// ❌ DANGEROUS — classic closure-in-loop bug
+// Java prevents the most obvious form (won't compile with non-final i)
+// But the object mutation form is allowed and causes data races
+
+List<Runnable> tasks = new ArrayList<>();
+List<String> messages = new ArrayList<>();
+
+for (int i = 0; i < 5; i++) {
+    final int index = i;  // must be final — Java prevents direct loop var capture
+    messages.add("message-" + i);  // Adding to shared list
+    tasks.add(() -> System.out.println(messages.get(index)));
+    // ❌ But if messages is modified BETWEEN task creation and execution,
+    // all lambdas see the CURRENT state of messages, not a snapshot!
 }
 
-setInterval(replaceThing, 1000);
+// Simulate async execution — messages might be cleared before tasks run
+messages.clear();  // Now all tasks will throw IndexOutOfBoundsException!
+
+// ✅ PRODUCTION-SAFE: capture immutable values, not mutable references
+List<Runnable> safeTasks = new ArrayList<>();
+for (int i = 0; i < 5; i++) {
+    final String message = "message-" + i;  // capture immutable String, not the list index
+    safeTasks.add(() -> System.out.println(message));
+    // ✅ message is an immutable String — captured by value, never changes
+}
 ```
 
-#### Why this leaks memory:
-1. `unusedClosure` captures `priorThing`.
-2. `someMethod` is a closure created in the same execution of `replaceThing`.
-3. Because they are created in the same scope, `unusedClosure` and `someMethod` **share the same Heap Context object**.
-4. The shared `Context` object contains a reference to `priorThing`.
-5. Even though `someMethod` does not reference `priorThing` directly, it holds a reference to the shared `Context` object.
-6. Since `globalHolder` persists on the global scope, the `someMethod` closure remains alive, keeping the shared `Context` alive, which keeps `priorThing` alive.
-7. Each interval execution creates a chain of retained objects, causing a severe memory leak.
+**Why it happens:** The effectively-final rule only protects against re-assignment of the captured variable. The mutable object pointed to by that variable can change freely — and closures share that object, not a copy of it.
+
+### Performance Characteristics
+
+| Operation | Cost | Notes |
+|-----------|------|-------|
+| Lambda object creation (non-capturing) | ~0 (singleton) | JVM reuses the same instance |
+| Lambda object creation (capturing) | ~1 heap allocation | New instance per capture site per call |
+| Lambda invocation via functional interface | 3-5ns (virtual dispatch) | Same as interface method call |
+| Lambda invocation via `invokedynamic` | 1-3ns (first call higher) | JVM specializes at warmup |
+| Closure over `this` (instance method reference) | 0 extra cost | `this` is always available |
+| Closure over primitive (int) | 0 boxing if lambda not generic | Stored directly, no boxing |
+| Closure over boxed type (Integer) | 1 allocation if escaped | JIT may scalar-replace in hot path |
+
+## INTERVIEW
+
+**Q1 (Junior): What is a lambda expression in Java and how does it differ from an anonymous inner class?**
+A: A lambda expression is a concise way to represent a functional interface implementation — a single-method abstraction expressed as an expression rather than a class definition. `(x, y) -> x + y` is a lambda; the equivalent anonymous inner class is five lines. The key semantic difference is `this`: inside a lambda, `this` refers to the enclosing class; inside an anonymous inner class, `this` refers to the anonymous class itself. Lambdas also cannot shadow variables from the enclosing scope (no new variable scope), while anonymous inner classes create a new scope and can shadow variables. At the JVM level, lambdas are more efficient because they don't generate separate `.class` files and use `invokedynamic` for deferred binding.
+
+**Q2 (Junior): What does "effectively final" mean and why does Java require it for lambda capture?**
+A: "Effectively final" means a local variable is never reassigned after its initial assignment — it would compile as `final` even if you didn't write the keyword. Java requires captured variables to be effectively final because when a lambda captures a local variable, the JVM copies the variable's value into a hidden field of the lambda object. If the variable could change after capture, the lambda would hold a stale copy with no way to see the update — a silent data inconsistency. The effectively-final rule makes this copy semantics safe: if the value never changes, the copy is always correct. Note this only prevents re-assignment; if the captured variable holds a reference to a mutable object, mutations to that object ARE visible through the closure.
+
+**Q3 (Mid): Can a Java lambda capture and mutate state? Show both a data race example and a safe alternative.**
+A: Yes — a lambda can mutate state through a captured mutable object reference, even though it can't reassign the captured variable. This creates data races in parallel execution.
+```java
+// ❌ DATA RACE — int[] is mutable, lambda mutates it in parallel
+int[] count = {0};
+list.parallelStream().forEach(item -> count[0]++);  // non-atomic ++ in parallel!
+
+// ✅ SAFE — use atomic types for concurrent mutation
+AtomicInteger count = new AtomicInteger(0);
+list.parallelStream().forEach(item -> count.incrementAndGet());  // atomic, thread-safe
+
+// ✅ EVEN BETTER — use stream reduction, no shared state at all
+long count = list.parallelStream().filter(Objects::nonNull).count();
+```
+
+**Q4 (Mid): What is the difference between a closure and a partial application in Java?**
+A: A closure is any function (lambda) that captures variables from its enclosing scope. Partial application creates a new function by pre-binding some arguments of an existing function. In Java, you implement partial application via closure: `Function<String, String> prependHello = s -> "Hello " + s` is a partial application of string concatenation with "Hello " pre-bound. The closure captures the pre-bound value in a hidden field. Java's `Function.andThen()` and `Function.compose()` are built on closures to chain partial applications. The distinction: closures describe the *mechanism* (capturing variables from outer scope); partial application describes the *pattern* (fixing arguments of a multi-argument function).
+
+**Q5 (Senior): How does Java's treatment of closures compare to JavaScript's? What problems does Java's design prevent?**
+A: JavaScript closures capture *live references* to variables in the enclosing scope — when the variable changes, all closures that captured it see the new value. This enables the classic "loop closure bug": `for (var i = 0; i < 3; i++) { setTimeout(() => console.log(i), 0); }` prints `3, 3, 3` because all lambdas share the same live `i` variable which is 3 by the time they execute. Java's effectively-final rule prevents this by refusing to compile code where a captured variable could change — you must use `final int index = i` inside the loop. Java's design trades expressiveness (you can't create mutable shared state easily) for safety (no silent stale-variable bugs). The trade-off is intentional: Java targets enterprise code where correctness matters more than flexibility.
+
+**Q6 (Senior): Why is capturing `this` in a lambda potentially dangerous in concurrent contexts?**
+A: When a lambda in an instance method captures an instance field (`this.count`) or calls an instance method, it implicitly captures `this` — the entire object. If this lambda is submitted to an `ExecutorService` or stored in a shared data structure, any thread that invokes the lambda can access and mutate the object's state. This is equivalent to publishing a reference to the enclosing object across thread boundaries. If the object is not thread-safe (no `synchronized`, no `volatile`, no immutability), you have a data race. The safe patterns are: (1) capture copies of the relevant values at lambda creation time (`final String name = this.name`), (2) make the enclosing object immutable, or (3) ensure all field accesses use proper synchronization.
+
+**Q7 (Senior+): How does the JVM's `invokedynamic` and `LambdaMetafactory` optimize lambda creation performance?**
+A: Before Java 8, anonymous inner classes required generating separate `.class` files, loading them via the classloader, and creating a new instance on every lambda call-site evaluation. `invokedynamic` defers the lambda binding to runtime: on the first execution of a lambda-creating expression, the JVM calls `LambdaMetafactory.metafactory()` which generates a `CallSite` that creates optimized lambda instances. Non-capturing lambdas get a special optimization: because they capture nothing, all invocations of the same lambda expression return the *same instance* — effectively a singleton. Capturing lambdas create a new instance per invocation (since captured values differ), but use a generated class with `final` fields, enabling JMM final-field publication safety. This makes lambda-heavy code in Java 8+ significantly faster than equivalent pre-Java-8 anonymous class code.
+
+## FEYNMAN CHECK
+
+### Explain Java Closures Like I'm 10 Years Old
+
+> Imagine you're sending a robot on a mission. Before the robot leaves, you stuff a backpack with everything it might need — a copy of your phone number, a map of the area, a list of tasks. **That's a closure** — the robot (lambda) carries its own copy of values from your environment. The trick: if you gave the robot a copy of your phone number, it has YOUR number forever — even if you change your phone later, the robot's backpack still has the old number. This is why Java says the number has to be "final" (unchangeable) when you put it in the backpack — otherwise the robot would have a stale number and might call the wrong person. But here's the sneaky part: if you gave the robot a *copy of a physical book*, the robot can still write in the book — because the book is mutable, even though the robot's backpack holds it. This is the closure mutation trap: you can't change WHICH book the robot carries, but you can write in the same book the robot and you both hold.
 
 ---
 
-## 5. The Module Pattern
+### 5 Deep Conceptual Questions
 
-Closures enable encapsulation by mimicking private class members. This is the foundation of the classic Module Pattern.
+**Q1: Why does the JVM need to copy captured values instead of sharing the original variable?**
+> **A:** Local variables live on the stack frame of the method that declared them. When a method returns, its stack frame is popped — all local variables are destroyed. But a lambda object lives on the heap and may be stored in collections, returned from methods, or passed to other threads that outlive the original method call. If the lambda held a direct reference to the stack slot, that slot would point into garbage memory after the method returned. The JVM avoids this by copying the variable's value into a final field of the lambda object at creation time. The lambda then references its own field — which lives on the heap with the lambda itself — not the original stack variable. This is why captured values must be effectively final: the copy is made once, and any subsequent change to the original would not be reflected in the lambda's copy.
 
-```javascript
-const BankAccount = (function() {
-  // Private variable stored in the IIFE's closure context
-  let balance = 0;
+**Q2: What is the one mental model that makes closure capture semantics click?**
+> **A:** "A lambda is a data structure that carries a snapshot of its environment." When you write `String prefix = "Hello"; return () -> prefix + name`, the lambda is equivalent to `new LambdaStruct(prefix="Hello", name=name)` — an object with fields. The fields are `final`, so the snapshot is immutable. But if the snapshot contains a reference to a mutable object (a `List`), the `final` field means "I will always refer to THIS list" — not "the list will never change." The mental model: the backpack (lambda) is sealed after you pack it, but if you packed a notebook (mutable object), anyone with a reference to that notebook can still write in it.
 
-  function validateAmount(amount) {
-    return typeof amount === 'number' && amount > 0;
-  }
+**Q3: What is the most dangerous closure pattern in Java? Show it with code.**
+> **A:** Capturing `this` implicitly and submitting to an executor — the lambda holds a live reference to the enclosing object, enabling unsynchronized cross-thread mutation.
+> ```java
+> // ❌ DANGEROUS — lambda captures 'this' implicitly via instance field
+> class OrderProcessor {
+>     private List<Order> pendingOrders = new ArrayList<>();
+>
+>     public void startProcessing() {
+>         executor.submit(() -> {
+>             pendingOrders.removeIf(Order::isExpired);  // captures 'this' implicitly!
+>             // pendingOrders could be modified by the main thread simultaneously
+>         });
+>     }
+> }
+>
+> // ✅ SAFE — take a snapshot; capture only what you need
+> public void startProcessing() {
+>     List<Order> snapshot = List.copyOf(pendingOrders);  // immutable copy
+>     executor.submit(() -> {
+>         snapshot.stream()
+>             .filter(o -> !o.isExpired())
+>             .forEach(orderRepository::save);
+>         // snapshot is immutable — no shared mutable state
+>     });
+> }
+> ```
 
-  return {
-    deposit(amount) {
-      if (validateAmount(amount)) {
-        balance += amount;
-        return true;
-      }
-      return false;
-    },
-    withdraw(amount) {
-      if (validateAmount(amount) && amount <= balance) {
-        balance -= amount;
-        return true;
-      }
-      return false;
-    },
-    getBalance() {
-      return balance;
+**Q4: How do closures and streams interact at the JVM level?**
+> **A:** When you write `stream.filter(p).map(f).collect(c)`, the JVM creates a linked list of stream stage objects at compile time via `invokedynamic`. Each stage holds a reference to the previous stage (source) and the lambda (the closure). When the terminal `collect` executes, it requests elements from its predecessor stage, which requests from its predecessor, all the way to the source. Each lambda in the chain is invoked in sequence as elements flow through. Non-capturing lambdas (like `String::trim`) are singleton objects shared across all invocations. Capturing lambdas (like `s -> prefix + s` where `prefix` is a local variable) create new instances per call site — but because the effectively-final rule guarantees the captured value is stable, each instance is created once per `stream.filter(...)` call and reused for all elements.
+
+**Q5: Write a one-sentence definition of Java closures for a senior FAANG engineer.**
+> **A:** "A Java closure is a lambda expression that captures variables from its lexically enclosing scope into final fields of a JVM-generated synthetic class (produced via `invokedynamic` and `LambdaMetafactory`), where the effectively-final constraint ensures copy semantics are consistent, and where the distinction between capturing a value (immutable copy of a primitive or reference) versus mutating through a captured reference (shared mutable heap object) is the precise boundary between closure-based functional idioms and data races in concurrent Java code."
+
+## BUILD
+
+### 🏗️ Mini Project: Closure-Based Query Builder
+
+**What you will build:** A type-safe, closure-based query builder that composes filtering, sorting, and limiting predicates for in-memory collections — demonstrating closure factories, composition, and effective use of captured state.
+**Why this project:** Forces you to build real closure chains, understand captured immutable vs. mutable references, and apply functional composition patterns used in Stream API internals.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+
+```bash
+mkdir query-builder && cd query-builder
+mkdir -p src/main/java/com/query
+touch src/main/java/com/query/QueryBuilder.java
+touch src/main/java/com/query/QueryBuilderTest.java
+```
+
+#### Step 2 — Core Implementation
+
+```java
+package com.query;
+
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+/**
+ * Closure-based query builder — each method returns 'this' for chaining,
+ * and captures the provided lambda in an internal list of predicates.
+ */
+public class QueryBuilder<T> {
+
+    private final List<Predicate<T>> filters = new ArrayList<>();  // captured closures
+    private Comparator<T> orderBy = null;  // captured comparator closure
+    private int limit = Integer.MAX_VALUE;  // captured limit value
+
+    /** Add a filter — captures the predicate closure */
+    public QueryBuilder<T> where(Predicate<T> predicate) {
+        filters.add(predicate);  // closure stored in list
+        return this;
     }
-  };
-})();
 
-BankAccount.deposit(100);
-console.log(BankAccount.getBalance()); // 100
-console.log(BankAccount.balance); // undefined (completely private)
+    /** Field-equals shortcut — closure factory: creates predicate from getter + value */
+    public <F> QueryBuilder<T> whereEquals(Function<T, F> getter, F value) {
+        // Closure captures both 'getter' and 'value'
+        filters.add(item -> Objects.equals(getter.apply(item), value));
+        return this;
+    }
+
+    /** Range filter — closure captures min and max */
+    public <F extends Comparable<F>> QueryBuilder<T> whereBetween(
+            Function<T, F> getter, F min, F max) {
+        filters.add(item -> {
+            F val = getter.apply(item);
+            return val.compareTo(min) >= 0 && val.compareTo(max) <= 0;
+        });
+        return this;
+    }
+
+    public QueryBuilder<T> orderBy(Comparator<T> comparator) {
+        this.orderBy = comparator;  // capture the comparator closure
+        return this;
+    }
+
+    public QueryBuilder<T> limit(int n) {
+        this.limit = n;  // capture limit value
+        return this;
+    }
+
+    public List<T> execute(List<T> data) {
+        Stream<T> stream = data.stream();
+
+        // Apply all captured filter closures
+        for (Predicate<T> filter : filters) {
+            stream = stream.filter(filter);  // each filter is a closure
+        }
+
+        if (orderBy != null) {
+            stream = stream.sorted(orderBy);  // apply captured comparator
+        }
+
+        return stream.limit(limit).collect(Collectors.toList());
+    }
+}
+```
+
+#### Step 3 — Usage
+
+```java
+package com.query;
+
+import java.util.*;
+
+public class Main {
+    record Employee(String name, String dept, int salary, int yearsExp) {}
+
+    public static void main(String[] args) {
+        var employees = List.of(
+            new Employee("Alice", "Engineering", 120_000, 5),
+            new Employee("Bob",   "Marketing",   80_000, 3),
+            new Employee("Carol", "Engineering", 150_000, 10),
+            new Employee("Dave",  "HR",          70_000, 2),
+            new Employee("Eve",   "Engineering", 95_000, 4)
+        );
+
+        // Closure-based query — each condition is a captured lambda
+        var results = new QueryBuilder<Employee>()
+            .whereEquals(Employee::dept, "Engineering")      // closure: dept == "Engineering"
+            .whereBetween(Employee::salary, 90_000, 160_000) // closure: 90k <= salary <= 160k
+            .orderBy(Comparator.comparingInt(Employee::salary).reversed()) // closure: sort by salary
+            .limit(2)
+            .execute(employees);
+
+        results.forEach(e -> System.out.printf("%s: $%,d%n", e.name(), e.salary()));
+        // Carol: $150,000
+        // Alice: $120,000
+    }
+}
+```
+
+#### Step 4 — Error Handling
+
+```java
+// Add to QueryBuilder
+public QueryBuilder<T> whereNotNull(Function<T, ?> getter) {
+    filters.add(item -> getter.apply(item) != null);
+    return this;
+}
+
+public QueryBuilder<T> whereMatches(Function<T, String> getter, String pattern) {
+    Objects.requireNonNull(pattern, "pattern must not be null");
+    filters.add(item -> {
+        String value = getter.apply(item);
+        return value != null && value.matches(pattern);
+    });
+    return this;
+}
+```
+
+#### Step 5 — Tests
+
+```java
+package com.query;
+
+import org.junit.jupiter.api.Test;
+import java.util.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+class QueryBuilderTest {
+    record Item(String name, int value) {}
+
+    private List<Item> items() {
+        return List.of(
+            new Item("apple", 10), new Item("banana", 20),
+            new Item("cherry", 30), new Item("date", 15)
+        );
+    }
+
+    @Test
+    void whereFiltersByPredicate() {
+        var result = new QueryBuilder<Item>()
+            .where(i -> i.value() > 15)
+            .execute(items());
+        assertEquals(2, result.size());
+        assertTrue(result.stream().allMatch(i -> i.value() > 15));
+    }
+
+    @Test
+    void whereEqualsFiltersExactMatch() {
+        var result = new QueryBuilder<Item>()
+            .whereEquals(Item::name, "banana")
+            .execute(items());
+        assertEquals(1, result.size());
+        assertEquals("banana", result.get(0).name());
+    }
+
+    @Test
+    void limitReducesResults() {
+        var result = new QueryBuilder<Item>().limit(2).execute(items());
+        assertEquals(2, result.size());
+    }
+
+    @Test
+    void chainedFiltersAreAndCombined() {
+        var result = new QueryBuilder<Item>()
+            .where(i -> i.value() >= 15)
+            .where(i -> i.value() <= 20)
+            .execute(items());
+        assertEquals(2, result.size());  // banana(20) and date(15)
+        assertTrue(result.stream().allMatch(i -> i.value() >= 15 && i.value() <= 20));
+    }
+}
+```
+
+**Expected Output:**
+```
+Carol: $150,000
+Alice: $120,000
+```
+
+**Stretch Challenges:**
+- [ ] Add `orWhere()` support (combining predicates with OR instead of AND)
+- [ ] Add `groupBy(Function<T,K>)` returning `Map<K, List<T>>`
+- [ ] Add thread-safe execution using parallel streams with a configurable threshold
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before reading ahead.
+
+---
+
+### Day 1 — Recall
+
+**Q1:** What is "effectively final"? Write one example of a variable that IS effectively final and one that is NOT. Why does Java require this for lambda capture?
+
+**Q2:** Can a Java lambda mutate state? Show the case where it CAN (mutable object via captured reference) and the case where it CANNOT (primitive reassignment).
+
+**Q3:** Write a closure factory: `static Predicate<String> longerThan(int n)` that returns a predicate closing over `n`.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the difference between `this` inside a lambda vs. `this` inside an anonymous inner class? When does this difference matter in production code?
+
+**Q5:** Explain why capturing a `List<String>` in a lambda and then calling `list.clear()` from another thread is a data race, even though the capture was "effectively final."
+
+**Q6:** Convert this anonymous inner class to a lambda + explain what changed:
+```java
+Comparator<User> comp = new Comparator<User>() {
+    public int compare(User a, User b) { return a.getName().compareTo(b.getName()); }
+};
 ```
 
 ---
+
+### Day 7 — Application
+
+**Q7:** Implement a `memoize(Function<T,R>)` method that uses closure to cache results. The cache should be local to each memoized function instance (not global). Write 3 tests.
+
+**Q8:** You have a lambda `() -> service.processOrder(order)` submitted to an `ExecutorService`. Identify 2 potential threading issues and fix both.
+
+**Q9:** What is the performance difference between a non-capturing lambda and a capturing lambda at the JVM level? When would the JIT eliminate the allocation?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Classic interview: *"Explain Java closures. What is 'effectively final' and why does it exist? How does Java prevent the JavaScript loop closure bug?"*
+
+**Q11:** Draw the memory diagram showing: a lambda `() -> prefix + name` where `prefix = "Hello"` and `name = "Alice"` — show the stack, heap, and the lambda object's fields.
+
+**Q12:** ★ System design: *"You're building a rule engine for fraud detection that evaluates 50 different rules per transaction at 1 million transactions/second. How would you use closures and functional composition in Java to make the rules composable, testable, and performant?"*

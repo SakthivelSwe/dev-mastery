@@ -139,3 +139,181 @@ const userStatus = Status.Active;
 const userStatus = 1;
 ```
 However, `const enum` causes massive problems with modern build tools (like Babel, SWC, and esbuild) because these tools compile files one at a time and don't perform whole-program type analysis. Because of this, the official TypeScript team recommends avoiding `const enum` entirely in modern projects.
+
+## FEYNMAN CHECK
+
+### Explain Enums Like I'm 10 Years Old
+> Enums are NAMED CONSTANTS grouped together. `enum Status { Active, Inactive, Banned }` creates Status.Active = 0, Status.Inactive = 1, Status.Banned = 2 by default (numeric). `enum Status { Active = 'active' }` gives string values you control. Enums ARE one of the few TS features that emit RUNTIME code (a JS object) — unlike pure types which vanish. This makes them controversial: bigger bundles, harder to tree-shake, weird semantics. The modern alternative is `const Status = { Active: 'active' } as const` plus `type Status = typeof Status[keyof typeof Status]` — zero runtime cost, better type narrowing, easier to refactor. The TypeScript team now recommends literal unions over enums for most cases.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why do most modern TS codebases avoid enums?**
+> **A:** Three reasons: (1) Runtime cost — enums emit a JS object that bundlers struggle to tree-shake. (2) Numeric enums allow assigning arbitrary numbers (`status = 99` is allowed even though no member equals 99) — broken type safety. (3) String literal unions (`type Status = 'active' | 'banned'`) give you the same compile-time safety with zero runtime, full tree-shaking, and better autocomplete. Const enums are a third option (inlined at compile time) but break isolatedModules.
+
+**Q2: Mental model: enum vs const object vs literal union?**
+> **A:** Literal unions (`'a' | 'b'`) are the purest types — zero runtime, no namespace. Const objects (`as const`) give you both the type and a runtime lookup. Enums give you a runtime two-way mapping (numeric reverse-lookup) but cost bundle size. Pick literal union by default; const object when you need a runtime values collection; enum only for backward compat or numeric flag enums.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing numeric enums are type-safe:
+> ```ts
+> // ❌ Any number is assignable to a numeric enum
+> enum Status { Active = 0, Banned = 1 }
+> const s: Status = 99;   // 💀 no error — silent corruption
+>
+> // ✅ String enum or literal union
+> enum Status2 { Active = 'active', Banned = 'banned' }
+> const s2: Status2 = 'unknown';   // ❌ now TS rejects
+>
+> type StatusU = 'active' | 'banned';
+> const s3: StatusU = 'unknown';   // ❌ rejected
+> ```
+
+**Q4: How does `const enum` differ from regular enum at compile time?**
+> **A:** A `const enum` is INLINED — calls to `MyEnum.Active` are replaced with the literal value during compilation, and no runtime object is emitted. Zero runtime cost. The downside: it breaks under `isolatedModules: true` (required by esbuild, swc, ts-loader's transpileOnly) because each file is compiled independently and can't see the enum's values. Modern build tooling forces you off const enums into literal unions or as-const objects.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript enums are runtime-emitted named-constant collections with numeric reverse-mapping for numeric variants — providing both compile-time type-safety and runtime lookup, but at the cost of bundle size, broken tree-shaking, and unsafe numeric assignability — for which modern codebases substitute either literal-union types (compile-time only, zero runtime) or as-const objects (typed runtime values with full type safety)."
+
+## BUILD
+
+### 🏗️ Mini Project: Migrate an Enum to `as const` And Compare Outputs
+
+**What you will build:** Define the same Status concept three ways (numeric enum, string enum, as-const object), compile each, and inspect the JS output to see bundle-size and tree-shaking differences.
+**Why this project:** Forces you to SEE why enums lose to literal unions in modern bundlers.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-enums && cd ts-enums
+npm init -y && npm install -D typescript
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/numeric.ts, src/string-enum.ts, src/as-const.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Three Versions of the Same Idea
+```ts
+// src/numeric.ts
+export enum StatusNumeric { Active, Inactive, Banned }
+
+// src/string-enum.ts
+export enum StatusString {
+  Active   = 'active',
+  Inactive = 'inactive',
+  Banned   = 'banned',
+}
+
+// src/as-const.ts
+export const Status = {
+  Active:   'active',
+  Inactive: 'inactive',
+  Banned:   'banned',
+} as const;
+export type Status = typeof Status[keyof typeof Status];   // 'active'|'inactive'|'banned'
+```
+
+#### Step 3 — Usage Comparison
+```ts
+// src/main.ts
+import { StatusNumeric } from './numeric.js';
+import { StatusString }  from './string-enum.js';
+import { Status }        from './as-const.js';
+
+// Numeric enum (DANGEROUS):
+const a: StatusNumeric = 999;       // ❌❌❌ NO type error!
+console.log(StatusNumeric.Active);  // 0
+console.log(StatusNumeric[0]);      // 'Active' — reverse mapping (bundle cost)
+
+// String enum (better):
+const b: StatusString = 'active';
+// const c: StatusString = 'unknown';   // ❌ TS error
+
+// as-const literal union (best):
+const d: Status = 'active';
+// const e: Status = 'unknown';         // ❌ TS error
+```
+
+#### Step 4 — Error Handling: Exhaustive Switch
+```ts
+function describe(s: Status): string {
+  switch (s) {
+    case 'active':   return 'User is active';
+    case 'inactive': return 'User is dormant';
+    case 'banned':   return 'User is banned';
+    default: {
+      const _: never = s;
+      return _;
+    }
+  }
+}
+console.log(describe(Status.Active));
+```
+
+#### Step 5 — Tests + Bundle Size Inspection
+```bash
+npx tsc
+# Inspect outputs:
+cat dist/numeric.js      # ~200 bytes — emits a full Status object with reverse mapping
+cat dist/string-enum.js  # ~150 bytes — Status object without reverse mapping
+cat dist/as-const.js     # ~100 bytes — just a frozen-ish object
+```
+```ts
+import { describe, it, expect } from 'vitest';
+import { Status } from './as-const.js';
+
+describe('Status as const', () => {
+  it('values are literal strings', () => {
+    expect(Status.Active).toBe('active');
+  });
+  it('type narrows correctly', () => {
+    const s: Status = 'banned';
+    expect(s).toBe('banned');
+  });
+});
+```
+
+**Expected Output:**
+```
+0
+Active
+User is active
+
+# bundle sizes (gzip):
+numeric.js:     ~80 B  (has reverse mapping table)
+string-enum.js: ~60 B
+as-const.js:    ~40 B  (best, fully tree-shakable)
+```
+
+**Stretch Challenges:**
+- [ ] Try `const enum Status` and observe the inlined output — then enable isolatedModules and watch it break
+- [ ] Build a numeric flag enum (bitwise — e.g. permissions) and compare to a Set<Permission>
+- [ ] Migrate a real project's enums to as-const and measure bundle delta
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What's the default starting value of a numeric enum?
+**Q2:** Why are enums controversial in modern TS codebases?
+**Q3:** Write a Status using `as const` + literal-union type. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `const x: NumericEnum = 999` not error?
+**Q5:** What does `const enum` do, and why is it incompatible with isolatedModules?
+**Q6:** Refactor this numeric enum to a typed literal-union:
+```ts
+enum LogLevel { Debug, Info, Warn, Error }
+function log(level: LogLevel, msg: string) { /* */ }
+```
+
+### Day 7 — Application
+**Q7:** Build a permissions system using a bitwise number enum (read=1, write=2, admin=4) and compare with a Set<Permission>.
+**Q8:** A PR adds a string enum to a library. Explain what consumers must do to use it (tree-shaking risk).
+**Q9:** What is the file-size cost per enum member at scale (1000 enums)?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "When would you choose enum vs literal union vs as-const object?"
+**Q11:** Draw: bundle output diff for each of the three Status forms.
+**Q12:** ★ System design: "Audit a 100k-line TS app for enum usage and plan migration to literal unions. What tooling, what risks?"

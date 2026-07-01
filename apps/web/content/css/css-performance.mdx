@@ -125,3 +125,175 @@ Today, performant parallax is achieved entirely without JavaScript by utilizing 
 A: **No, you cannot animate the `display` property.** 
 `display: none` completely removes the element from the Render Tree, which instantly triggers a massive Layout recalculation for the rest of the page. There is no mathematical "in-between" state between existing and not existing. 
 If you want to fade an element out, you must animate `opacity: 1` to `opacity: 0` (Hardware accelerated). Once the opacity transition finishes, *then* you can use JavaScript (or an animation `animation-fill-mode`) to safely set `display: none` or remove it from the DOM.
+
+## FEYNMAN CHECK
+
+### Explain CSS Performance Like I'm 10 Years Old
+> CSS performance is about MINIMISING the work the browser does per frame. Three big costs: (1) BYTES — every kb of CSS delays first paint because CSS is render-blocking; (2) PARSE+MATCH — complex selectors and deep DOMs cost CPU; (3) LAYOUT+PAINT+COMPOSITE — changing certain properties triggers expensive recalculation. The golden rules: animate only `transform` and `opacity` (compositor-only), use `will-change` sparingly (it costs memory), add `content-visibility: auto` to offscreen sections (browser skips rendering until needed), and avoid huge selectors like `* { box-sizing: border-box; }` on enormous DOMs.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the three stages of CSS performance cost?**
+> **A:** (1) DELIVERY — bytes over the wire, render-blocking until parsed. (2) STYLE COMPUTATION — for each element, find matching rules, resolve cascade, compute used values. Cost is O(elements × rules). (3) LAYOUT/PAINT/COMPOSITE — applying styles to pixels. Layout is recursive (changing one width can cascade), paint rasterises layers, composite assembles them on the GPU. Each later stage is usually MORE expensive than the previous, so optimising the right one matters.
+
+**Q2: Mental model for "what triggers what"?**
+> **A:** Memorise the three categories:
+> - **LAYOUT** properties (width, height, top, padding, margin, border, font-size, display) → re-layout + paint + composite
+> - **PAINT** properties (color, background, box-shadow, border-radius) → paint + composite
+> - **COMPOSITE** properties (transform, opacity, filter) → composite only
+> Animate ONLY the third category for 60fps. The site csstriggers.com is the cheat sheet.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing `will-change` is free:
+> ```css
+> /* ❌ Promoting every card to its own GPU layer — VRAM explosion */
+> .card { will-change: transform; }
+>
+> /* ✅ Promote only what is ACTIVELY animating, and remove after */
+> .card.is-animating { will-change: transform; }
+> // JS: el.classList.add('is-animating');
+> //     animation.onfinish = () => el.classList.remove('is-animating');
+> ```
+
+**Q4: How does `content-visibility: auto` work at runtime?**
+> **A:** `content-visibility: auto` tells the browser "if this element is offscreen, skip layout/paint for its subtree until it nears the viewport." The browser uses a hint called `contain-intrinsic-size` to reserve placeholder space. For a 10,000-row table, this can turn a 4-second initial render into 200ms by skipping rendering of all rows beyond the viewport. Cost: the browser must do extra work on scroll to enter/exit content-visibility on each section.
+
+**Q5: FAANG-grade definition?**
+> **A:** "CSS performance is the joint optimisation of stylesheet delivery (file size, render-blocking, critical CSS extraction), style invalidation cost (selector complexity, descendant invalidation triggered by mutations), and rendering pipeline stage costs (composite-only animations, will-change-driven layer promotion, contain/content-visibility-driven rendering skip) — measured via Core Web Vitals (LCP, CLS, INP) and Chrome DevTools Performance traces."
+
+## BUILD
+
+### 🏗️ Mini Project: Optimise a 10,000-Row Table to 60fps Scroll With CSS Only
+
+**What you will build:** A table with 10,000 rows that scrolls smoothly using `content-visibility: auto`, `contain: layout style paint`, and avoiding common CSS performance traps.
+**Why this project:** Forces every modern CSS performance feature: containment, content-visibility, GPU acceleration, will-change.
+**Time estimate:** 30 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir css-perf && cd css-perf
+ni index.html, style.css -ItemType File
+```
+
+#### Step 2 — HTML (10,000 rows generated client-side)
+```html
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><link rel="stylesheet" href="style.css"></head>
+<body>
+  <h1>10,000-Row Table</h1>
+  <div class="scroll">
+    <table id="tbl">
+      <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>City</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <script>
+    const tbody = document.querySelector('#tbl tbody');
+    const frag = document.createDocumentFragment();
+    for (let i=1;i<=10000;i++) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i}</td><td>User ${i}</td><td>user${i}@dev.io</td><td>NYC</td>`;
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+  </script>
+</body></html>
+```
+
+#### Step 3 — Performance CSS
+```css
+body { font: 14px system-ui; margin: 0; padding: 1rem; }
+h1 { margin-bottom: 1rem; }
+.scroll { height: 80vh; overflow: auto; border: 1px solid #ddd; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 12px; border-bottom: 1px solid #eee; text-align: left; }
+thead th { position: sticky; top: 0; background: #f5f5f7; z-index: 1; }
+
+/* The killer optimisation: */
+tbody tr {
+  content-visibility: auto;             /* skip render when offscreen */
+  contain-intrinsic-size: 0 36px;       /* reserve space for unrendered rows */
+  contain: layout style paint;          /* isolate row from siblings */
+}
+
+/* GPU-friendly hover */
+tbody tr:hover { background: #f0f8ff; }
+```
+
+#### Step 4 — Error Handling: Measure & Compare
+```javascript
+// Toggle the optimisation off to see the difference
+const styleEl = document.createElement('style');
+document.head.appendChild(styleEl);
+
+document.body.insertAdjacentHTML('beforeend',
+  '<button id="toggle">Toggle content-visibility</button>');
+let optimised = true;
+document.getElementById('toggle').onclick = () => {
+  optimised = !optimised;
+  styleEl.textContent = optimised ? '' :
+    `tbody tr { content-visibility: visible !important; contain: none !important; }`;
+  console.log('Optimised:', optimised);
+};
+```
+
+#### Step 5 — Tests
+```javascript
+// Measure scroll FPS
+let frames = 0, last = performance.now();
+function tick(now) {
+  frames++;
+  if (now - last > 1000) {
+    console.log('FPS:', frames);
+    frames = 0; last = now;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// Measure initial render time
+console.time('initial render');
+window.addEventListener('load', () => console.timeEnd('initial render'));
+```
+
+**Expected Output:**
+```
+- With optimisations: initial render <300ms, scroll FPS 60
+- Without (toggle off):   initial render >3s,   scroll FPS 20-30 on mid-range device
+- Memory: optimised version uses ~10MB less because offscreen DOM isn't fully laid out
+- DevTools Performance: optimised version shows almost no "Recalculate Style" cost on scroll
+```
+
+**Stretch:**
+- [ ] Add `will-change: scroll-position` to the scroller and measure the effect
+- [ ] Profile in Chrome DevTools → Performance, compare layout cost before/after
+- [ ] Build a virtualised version with JS and compare to pure CSS content-visibility
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name properties that trigger LAYOUT vs PAINT vs COMPOSITE only.
+**Q2:** What does `content-visibility: auto` do?
+**Q3:** Write the CSS to isolate a card so its changes don't invalidate siblings. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is animating `width` more expensive than animating `transform: scaleX()`?
+**Q5:** A junior adds `will-change: transform` to every card. Diagnose the problem.
+**Q6:** Optimise:
+```css
+@keyframes slide { from { left: 0; } to { left: 200px; } }
+.box { position: relative; animation: slide 0.3s; }
+```
+
+### Day 7 — Application
+**Q7:** Build a long-form blog page with `content-visibility: auto` on each section.
+**Q8:** A PR adds a complex `box-shadow` on every list item and scrolling jank appears. Diagnose.
+**Q9:** What does `contain: strict` do? When is it safe to use?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every step from a CSS file in the network tab to pixels on the screen, naming each performance cost."
+**Q11:** Draw: how do containment, content-visibility, and will-change interact with the rendering pipeline?
+**Q12:** ★ System design: "Optimise CSS for an enterprise dashboard with 200 widgets, real-time data updates, and a goal of < 100ms INP."

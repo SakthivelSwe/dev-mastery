@@ -147,3 +147,269 @@ A: A memory leak occurs when an object is no longer needed by the application's 
 
 **Q: Why does the V8 Garbage Collector cause UI stuttering?**
 A: The Mark-and-Sweep algorithm is a "Stop-The-World" event. Because V8 must map the entire memory graph, it must forcefully PAUSE your JavaScript execution to ensure the graph doesn't change while it's looking at it. If your Heap is massive (1GB of data), the GC might take 50 milliseconds to sweep it. Since the browser requires 16ms to render a 60FPS frame, a 50ms pause results in 3 dropped frames, appearing as a visible "stutter" or "jank" on the user's screen.
+
+## FEYNMAN CHECK
+
+### Explain Memory Management Like I'm 10 Years Old
+> JavaScript uses GARBAGE COLLECTION — you never call free() like in C. The garbage collector (GC) finds objects that are no longer REACHABLE from "roots" (global object, stack, registers) and frees their memory. The algorithm: MARK-AND-SWEEP — start from roots, mark everything reachable, sweep (free) the rest. V8 uses GENERATIONAL GC: new-space (short-lived objects — young gen, collected often, cheap), old-space (long-lived objects — old gen, collected infrequently, more expensive). Most objects die young — creating and discarding them is cheap. The non-obvious leaks: event listeners not removed on component unmount, closures capturing large objects, detached DOM nodes, global caches without WeakMap.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When is an object eligible for GC?**
+> **A:** When NO reachable reference points to it. "Reachable" means: you can reach it from global, the current call stack, or another reachable object. Circular references are NOT a problem for modern mark-and-sweep (they're treated correctly — if neither is reachable from roots, both are GC'd). The old reference-counting algorithm DID fail on circles (IE 6 memory leaks with circular DOM/JS references) — mark-and-sweep fixed this.
+
+**Q2: Mental model for V8's generational heap?**
+> **A:** Two spaces: NEW SPACE (~1-8MB, scavenging GC runs in <1ms) for recently allocated objects. Objects surviving two scavenges are PROMOTED to OLD SPACE. OLD SPACE GC (mark-compact) runs infrequently but takes longer (~10-100ms). This is why "allocation storms" — allocating thousands of objects per frame — can trigger frequent scavenges and drop frames. Pool, reuse, or use typed arrays when you need many objects.
+
+**Q3: Most dangerous misconception?**
+> **A:** Setting a variable to null immediately frees memory:
+> ```js
+> // ❌ Variable = null doesn't free memory — just removes the REFERENCE
+> let bigData = new Array(1_000_000).fill({});
+> bigData = null;   // eligible for GC, but GC may run later
+>
+> // ❌ REAL memory leak: event listener holds reference
+> function setup() {
+>   const bigData = new Array(1_000_000).fill({});
+>   document.addEventListener('click', () => console.log(bigData.length));
+>   // bigData captured by closure — never freed until listener removed
+> }
+>
+> // ✅ Remove the listener to release the closure
+> const handler = () => console.log(bigData.length);
+> document.addEventListener('click', handler);
+> // On cleanup:
+> document.removeEventListener('click', handler);
+> ```
+
+**Q4: When do WeakMap and WeakRef help?**
+> **A:** WeakMap stores object→value pairs where the OBJECT KEY is held weakly — if the key object is otherwise unreachable, the GC can collect both the key and its entry. Perfect for: caching computed properties of external objects without preventing their collection. WeakRef holds a weak reference to an object — `ref.deref()` returns the object or undefined if collected. FinalizationRegistry lets you run cleanup when an object is collected. Use these for: memoisation caches, object-private metadata stores, DOM-attached cleanup.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript memory is managed by V8's generational garbage collector — using mark-and-sweep with tri-color marking in old-space and scavenging in new-space for short-lived objects — with memory leaks arising from unremoved event listeners, closures over large data, detached DOM nodes, and unbounded caches — addressed via WeakMap/WeakRef for weak references, FinalizationRegistry for cleanup callbacks, and object pooling for high-frequency allocation patterns."
+
+## BUILD
+
+### 🏗️ Mini Project: Memory Leak Detector Using WeakRef + FinalizationRegistry
+
+**What you will build:** A component registry that tracks objects without preventing their GC, using WeakRef and FinalizationRegistry to detect when objects are collected — demonstrating both the leak pattern and the fix.
+**Why this project:** Forces hands-on use of WeakRef/FinalizationRegistry and makes GC OBSERVABLE.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-memory && cd js-memory
+node --expose-gc -e "global.gc(); console.log('gc available')"
+npm init -y && npm install -D vitest
+ni memory.js, memory.test.js -ItemType File
+```
+
+#### Step 2 — Leak Detector
+```js
+// memory.js
+const registry = new FinalizationRegistry((name) => {
+  console.log(`[GC] ${name} has been collected`);
+});
+
+export function track(obj, name) {
+  registry.register(obj, name, obj);
+  return obj;
+}
+
+export function untrack(obj) {
+  registry.unregister(obj);
+}
+
+// WeakRef cache — values can be GC'd
+export class WeakCache {
+  #store = new Map();
+
+  set(key, value) {
+    this.#store.set(key, new WeakRef(value));
+  }
+
+  get(key) {
+    const ref = this.#store.get(key);
+    if (!ref) return undefined;
+    const value = ref.deref();
+    if (!value) {
+      this.#store.delete(key);   // clean up dead ref
+      return undefined;
+    }
+    return value;
+  }
+
+  has(key) { return this.get(key) !== undefined; }
+}
+```
+
+#### Step 3 — Leak Patterns + Fixes
+```js
+// leaks.js
+
+// PATTERN 1: Event listener leak
+export function createLeaky() {
+  const bigData = new Array(100_000).fill(0);
+  // Leak: closure over bigData held by listener forever
+  document.addEventListener('click', () => bigData.length);
+  return 'leaky component';
+}
+
+export function createFixed() {
+  const bigData = new Array(100_000).fill(0);
+  const handler = () => bigData.length;
+  document.addEventListener('click', handler);
+  return {
+    destroy() { document.removeEventListener('click', handler); }
+  };
+}
+
+// PATTERN 2: Cache without eviction
+const badCache = new Map();   // grows forever
+export function cacheBad(key, value) { badCache.set(key, value); }
+
+const goodCache = new WeakCache();   // values GC'd when keys die
+export { goodCache };
+
+// PATTERN 3: Detached DOM node
+export function detachDemo() {
+  const div = document.createElement('div');
+  document.body.appendChild(div);
+  document.body.removeChild(div);   // div is detached
+
+  const capturedDiv = div;   // ❌ JS still holds a reference
+  setTimeout(() => console.log(capturedDiv.tagName), 1000);
+  // div not GC'd — capturedDiv closure prevents it
+
+  // Fix: don't capture detached DOM nodes; set to null after use
+}
+```
+
+#### Step 4 — Object Pool For High-Frequency Allocation
+```js
+// pool.js — reuse objects to reduce GC pressure
+export class ObjectPool {
+  #idle = [];
+  #factory;
+  #reset;
+  #maxSize;
+  #created = 0;
+
+  constructor(factory, reset, maxSize = 100) {
+    this.#factory = factory;
+    this.#reset = reset;
+    this.#maxSize = maxSize;
+  }
+
+  acquire() {
+    if (this.#idle.length) return this.#idle.pop();
+    this.#created++;
+    return this.#factory();
+  }
+
+  release(obj) {
+    if (this.#idle.length >= this.#maxSize) return;
+    this.#reset(obj);
+    this.#idle.push(obj);
+  }
+
+  get stats() { return { idle: this.#idle.length, created: this.#created }; }
+}
+
+const vectorPool = new ObjectPool(
+  () => ({ x: 0, y: 0, z: 0 }),
+  (v) => { v.x = v.y = v.z = 0; },
+  50,
+);
+
+function processParticles(count) {
+  const vecs = [];
+  for (let i = 0; i < count; i++) {
+    const v = vectorPool.acquire();
+    v.x = Math.random(); v.y = Math.random(); v.z = Math.random();
+    vecs.push(v);
+  }
+  // ... processing ...
+  vecs.forEach(v => vectorPool.release(v));
+}
+```
+
+#### Step 5 — Tests
+```js
+// memory.test.js
+import { describe, it, expect } from 'vitest';
+import { WeakCache } from './memory.js';
+import { ObjectPool } from './pool.js';
+
+describe('WeakCache', () => {
+  it('stores and retrieves values', () => {
+    const cache = new WeakCache();
+    const obj = { id: 1 };
+    cache.set('k', obj);
+    expect(cache.get('k')).toBe(obj);
+    expect(cache.has('k')).toBe(true);
+  });
+  it('returns undefined for missing keys', () => {
+    const cache = new WeakCache();
+    expect(cache.get('missing')).toBeUndefined();
+  });
+});
+
+describe('ObjectPool', () => {
+  it('reuses objects', () => {
+    const pool = new ObjectPool(() => ({}), (o) => { Object.keys(o).forEach(k => delete o[k]); }, 5);
+    const a = pool.acquire();
+    a.x = 1;
+    pool.release(a);
+    const b = pool.acquire();
+    expect(b).toBe(a);   // same object
+    expect(b.x).toBeUndefined();   // reset
+  });
+  it('creates new objects when pool is empty', () => {
+    const pool = new ObjectPool(() => ({}), () => {}, 2);
+    const a = pool.acquire();
+    const b = pool.acquire();
+    const c = pool.acquire();
+    expect(pool.stats.created).toBe(3);
+  });
+});
+```
+
+**Expected Output:**
+```
+[GC] TrackedObject has been collected  (appears after GC runs)
+WeakCache cleans up dead refs automatically
+
+# Tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Build a memory profiler that snapshots heap size at regular intervals
+- [ ] Add LRU eviction to WeakCache for the strong-key use case
+- [ ] Build a RetainedSizeCalculator that estimates object tree size
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What makes an object eligible for garbage collection?
+**Q2:** Difference between WeakMap and Map?
+**Q3:** Name three common causes of memory leaks in JS. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Does setting a variable to null immediately free memory?
+**Q5:** A junior uses a Map as a component cache — memory grows forever. Fix with WeakMap.
+**Q6:** Why can't you use WeakMap with primitive keys?
+
+### Day 7 — Application
+**Q7:** Build a memoize that uses WeakMap so cached values are GC'd with their keys.
+**Q8:** A React component adds an event listener in useEffect without cleanup — diagnose.
+**Q9:** What's the performance cost of triggering frequent old-gen GC?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through V8's generational GC — new space, old space, scavenging, mark-compact."
+**Q11:** Draw: what happens to a detached DOM node reference held in a closure.
+**Q12:** ★ System design: "Profile and fix a Node.js server that OOMs after 48h — tools, patterns, fixes."

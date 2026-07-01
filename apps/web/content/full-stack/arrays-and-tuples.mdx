@@ -139,3 +139,266 @@ const databaseRows: UserRow[] = [
 ```
 
 *Refer to the official [TypeScript Handbook: Object Types - Tuple Types](https://www.typescriptlang.org/docs/handbook/2/objects.html#tuple-types) for further details.*
+
+## WHY
+
+TypeScript's `tuple` type and typed arrays fill a critical gap: JavaScript arrays are dynamically typed, meaning `const pair = [1, 'hello']` gives you no compile-time guarantee about what's at index 0 or 1. In a full-stack application, this means API responses that return `[userId, userName]` as a pair are untyped by default — a refactor that swaps the order silently breaks runtime behaviour with no compiler warning.
+
+Tuples solve this: `const user: [number, string] = [1, 'Alice']` — TypeScript now enforces that index 0 is always a number and index 1 is always a string. React's `useState` returns a tuple: `const [count, setCount] = useState(0)` is typed as `[number, Dispatch<SetStateAction<number>>]`, giving full autocomplete on both elements.
+
+The production failure mode: a function that returns a pair `[error, data]` pattern (used heavily in Go-style error handling in TypeScript). Without tuple types, developers destructure `const [err, data] = result` and accidentally use them reversed — a class of bug that causes silent null reference errors in production that only appear on error paths.
+
+## THEORY
+
+### TypeScript Tuple Internals
+
+At runtime, TypeScript tuples are plain JavaScript arrays — no runtime enforcement. The type system enforces the contract at compile time only.
+
+```
+Tuple type: [number, string, boolean]
+Runtime:    [42, "hello", true]        // Plain JS array
+           Array prototype methods still work: .length = 3, .map(), .forEach()
+
+Named tuple (TS 4.0+):
+type Point = [x: number, y: number];  // Named elements for documentation
+const p: Point = [10, 20];
+// p[0] = 10 (x), p[1] = 20 (y)
+// Destructuring: const [x, y] = p;
+```
+
+### Typed Arrays vs Regular Arrays
+
+| Type | Elements | Use case | Performance |
+|------|----------|----------|-------------|
+| `number[]` | Any numbers (float64) | General numeric | Normal |
+| `Int32Array` | 32-bit integers | Binary protocols, WebGL | 2-8x faster for bulk ops |
+| `Float64Array` | 64-bit floats | Scientific computing | SIMD-optimizable |
+| `Uint8Array` | 0-255 bytes | File buffers, crypto | Binary I/O |
+| `tuple` | Mixed types, fixed length | Return values, pairs | Same as array |
+
+### Common Misconception
+Developers think `readonly [number, string]` prevents mutation at runtime. It does not — it is compile-time only. At runtime you can still call `.push()` on a tuple. Use `Object.freeze()` if runtime immutability is needed.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "FlowChart", "state": "fs-arrays-tuples" }
+```
+
+## CODE
+
+### Level 1 — Beginner: Typed Arrays and Tuples
+```typescript
+// Typed array — all elements must be string
+const names: string[] = ['Alice', 'Bob', 'Charlie'];
+const scores: number[] = [95, 87, 92];
+
+// Tuple — fixed-length, mixed types, position-specific
+const user: [number, string, boolean] = [1, 'Alice', true];
+const [id, name, isActive] = user; // Destructuring with type inference
+// id: number, name: string, isActive: boolean
+
+// Named tuple (TypeScript 4.0+) — elements have labels
+type RGB = [red: number, green: number, blue: number];
+const color: RGB = [255, 128, 0];
+```
+
+### Level 2 — Intermediate: React useState Pattern
+```typescript
+import { useState, useCallback } from 'react';
+
+// useState returns a tuple — TypeScript infers the type
+const [count, setCount] = useState(0);      // [number, Dispatch<SetStateAction<number>>]
+const [user, setUser] = useState<User | null>(null);
+
+// Custom hook returning a tuple (idiomatic pattern)
+function useToggle(initialValue = false): [boolean, () => void, () => void] {
+  const [value, setValue] = useState(initialValue);
+  const on  = useCallback(() => setValue(true), []);
+  const off = useCallback(() => setValue(false), []);
+  return [value, on, off]; // TypeScript infers tuple type
+}
+
+const [isOpen, open, close] = useToggle();
+```
+
+### Level 3 — Advanced: Go-Style Error Handling with Tuples
+```typescript
+// Tuple as Result type — avoids try/catch pyramid
+type Success<T> = [null, T];
+type Failure<E = Error> = [E, null];
+type Result<T, E = Error> = Success<T> | Failure<E>;
+
+async function fetchUser(id: number): Promise<Result<User>> {
+  try {
+    const res = await fetch(`/api/users/${id}`);
+    if (!res.ok) return [new Error(`HTTP ${res.status}`), null];
+    const data = await res.json() as User;
+    return [null, data];
+  } catch (err) {
+    return [err instanceof Error ? err : new Error(String(err)), null];
+  }
+}
+
+// Caller — no try/catch, explicit error handling
+const [error, user] = await fetchUser(42);
+if (error) { console.error('Failed:', error.message); return; }
+console.log('User:', user.name); // TypeScript knows user is User here
+```
+
+### Level 4 — Expert / Production: TypedArray for Binary Protocol
+```typescript
+// Binary message framing: [messageType: uint8][length: uint32][payload: bytes]
+// Used in: WebSocket protocols, game servers, IoT
+
+function encodeMessage(type: number, payload: string): Uint8Array {
+  const payloadBytes = new TextEncoder().encode(payload);
+  const buffer = new ArrayBuffer(1 + 4 + payloadBytes.length); // type + length + payload
+  const view = new DataView(buffer);
+  view.setUint8(0, type);                          // 1 byte: message type
+  view.setUint32(1, payloadBytes.length, true);    // 4 bytes: payload length (little-endian)
+  new Uint8Array(buffer, 5).set(payloadBytes);     // Remaining: payload bytes
+  return new Uint8Array(buffer);
+}
+
+function decodeMessage(data: Uint8Array): [type: number, payload: string] {
+  const view = new DataView(data.buffer, data.byteOffset);
+  const type = view.getUint8(0);
+  const length = view.getUint32(1, true);
+  const payload = new TextDecoder().decode(data.subarray(5, 5 + length));
+  return [type, payload]; // Named tuple
+}
+
+const encoded = encodeMessage(0x01, 'Hello World');
+const [msgType, text] = decodeMessage(encoded);
+console.log(msgType, text); // 1 "Hello World"
+```
+
+## REAL_WORLD
+
+### How React Uses Tuples for Hook Returns
+
+React's hooks all return tuples: `useState`, `useReducer`, `useTransition`, `useDeferredValue`. The tuple pattern enforces a naming convention — you always get the value first, the setter second — while allowing developers to name them freely via destructuring. React's TypeScript definitions define these precisely: `useState<S>(): [S, Dispatch<SetStateAction<S>>]`.
+
+```typescript
+// Production pattern: API query hook returning [data, loading, error] tuple
+function useQuery<T>(url: string): [T | null, boolean, Error | null] {
+  const [data, setData]   = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetch(url).then(r => r.json()).then(d => {
+      if (!cancelled) { setData(d); setLoading(false); }
+    }).catch(e => {
+      if (!cancelled) { setError(e); setLoading(false); }
+    });
+    return () => { cancelled = true; };
+  }, [url]);
+
+  return [data, loading, error];
+}
+
+const [users, loading, error] = useQuery<User[]>('/api/users');
+```
+
+### Performance Characteristics
+| Operation | Array | Tuple | TypedArray |
+|-----------|-------|-------|------------|
+| Access by index | O(1) | O(1) | O(1) |
+| Iteration | O(n) | O(n) | O(n) — SIMD-optimized |
+| Memory/element | ~8 bytes | ~8 bytes | 1-8 bytes |
+| Type safety | Runtime | Compile-time | Both |
+
+## INTERVIEW
+
+**Q1 (Junior): What is the difference between `string[]` and `[string, string]` in TypeScript?**
+A: `string[]` is an array of any number of strings. `[string, string]` is a tuple — exactly 2 strings, where TypeScript enforces length and position types at compile time. `arr[0]` on `string[]` is `string | undefined`; on a tuple it is guaranteed `string`.
+
+**Q2 (Junior): Why does React's useState return a tuple instead of an object?**
+A: Tuples allow custom naming via destructuring. If useState returned `{ value, setValue }`, every component would use the same names — you couldn't call it `count`/`setCount` vs `name`/`setName`. The tuple `[value, setValue]` lets you destructure as any names you want.
+
+**Q3 (Senior): When would you use TypedArray over number[]?**
+A: TypedArray (Int32Array, Float64Array, etc.) when: (1) working with binary data (WebSockets, file buffers, WebGL), (2) processing large numeric datasets where element size matters (8× smaller than number[]), (3) interop with WebAssembly or native APIs that require specific byte layouts. Regular `number[]` for general purpose.
+
+## FEYNMAN CHECK
+
+### Explain Arrays and Tuples Like I'm 10 Years Old
+> A regular TypeScript array is like a bag — you can put any number of things in it. A tuple is like a box with labeled compartments — the first compartment always holds a number, the second always holds a string, and there are exactly two compartments. The non-obvious part: at runtime they are identical JavaScript arrays — the tuple enforcement exists only while TypeScript is checking your code, before the JavaScript runs. This is why you can still call .push() on a tuple and break the contract at runtime.
+
+---
+
+### 5 Deep Questions
+
+**Q1: Why can't TypeScript enforce tuple constraints at runtime?**
+> **A:** TypeScript is erased at compile time — no type annotations survive to the JavaScript runtime. The JavaScript engine sees only a plain array; it has no concept of "this must be [number, string]". This is the fundamental TypeScript trade-off: safety is static (compile-time), not dynamic.
+
+**Q2: ONE mental model for tuples.**
+> **A:** A tuple is a function's return type made explicit as an array. When a function returns 2+ related values of different types, a tuple documents the exact shape and enforces it — making destructuring safe.
+
+**Q3: Most dangerous misconception with code.**
+> **A:** Treating `readonly` tuples as immutable at runtime.
+> ```typescript
+> const pair = [1, 'hello'] as const; // readonly [1, "hello"] — TypeScript enforced
+> (pair as any).push(999);  // Compiles if cast — runtime allows it!
+> // Use Object.freeze(pair) for true runtime immutability
+> ```
+
+**Q4: How do tuples enable variadic generics (TypeScript 4.0+)?**
+> **A:** Variadic tuple types allow type-safe spread and rest in tuples: `type Concat<T extends unknown[], U extends unknown[]> = [...T, ...U]`. This is how TypeScript types variadic functions and compose operations — React's `useReducer` and `createReducer` patterns rely on this.
+
+**Q5: Senior one-liner.**
+> **A:** "A TypeScript tuple is a compile-time enforcement of a fixed-length array with position-specific types — erased to a plain JavaScript array at runtime — enabling type-safe destructuring patterns like React hooks and Result types without runtime overhead."
+
+## BUILD
+
+### 🏗️ Mini Project: Type-Safe CSV Parser using Tuples
+
+```typescript
+// Parse CSV rows into strongly-typed tuples
+type CSVRow = [id: number, name: string, score: number, active: boolean];
+
+function parseCSVRow(line: string): CSVRow {
+  const [idStr, name, scoreStr, activeStr] = line.split(',').map(s => s.trim());
+  return [parseInt(idStr, 10), name, parseFloat(scoreStr), activeStr === 'true'];
+}
+
+const rows: CSVRow[] = [
+  '1, Alice, 95.5, true',
+  '2, Bob, 87.0, false',
+].map(parseCSVRow);
+
+rows.forEach(([id, name, score, active]) => {
+  console.log(`${id}: ${name} scored ${score} (active: ${active})`);
+});
+```
+
+**Expected Output:**
+```
+1: Alice scored 95.5 (active: true)
+2: Bob scored 87 (active: false)
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the TypeScript syntax for a tuple of [number, string, boolean]?
+**Q2:** Are TypeScript tuples enforced at runtime? What are they at runtime?
+**Q3:** Write a custom hook that returns a [value, toggle] tuple.
+
+### Day 3 — Comprehension
+**Q4:** When would you use a tuple over an object type?
+**Q5:** What is `as const` and how does it relate to readonly tuples?
+**Q6:** Convert this to use a Result tuple: `async function getUser(): Promise<User>`
+
+### Day 7 — Application
+**Q7:** Implement a `zip` function: `zip([1,2,3], ['a','b','c'])` → `[[1,'a'],[2,'b'],[3,'c']]` with tuple types.
+**Q8:** PR review: a function returns `[string, number]` but the caller destructures as `[num, str]`. TypeScript doesn't catch it. Why?
+**Q9:** When is TypedArray significantly faster than number[]?
+
+### Day 14 — Synthesis
+**Q10:** ★ "Implement the Result monad pattern using tuples. Compare to using a union type."
+**Q11:** How do tuples relate to variadic generics and function parameter types?
+**Q12:** ★ "Design a type-safe event system using tuples for [eventName, payload] pairs at scale."

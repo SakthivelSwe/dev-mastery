@@ -105,3 +105,163 @@ While modern browsers are smarter and usually GPU-accelerate animations automati
 A: Absolute positioning coordinates apply to the **Top-Left corner** of the element. `top: 50%` places the top-left corner in the dead center of the screen, pushing the bulk of the element down and to the right. 
 To perfectly center it, you use a Transform! `transform: translate(-50%, -50%);`. 
 Because Transform percentages are relative to the *element itself* (not the screen), this pulls the element exactly 50% of its own width to the left, and 50% of its own height up, aligning its true mathematical center with the center of the screen!
+
+## FEYNMAN CHECK
+
+### Explain CSS Transforms Like I'm 10 Years Old
+> Transforms apply MATH (a 2D or 3D transformation matrix) to an element's pixels AFTER layout has finished. The browser still thinks the element is at its original position — its bounding box, click target, and neighbours all act as if nothing changed — but the GPU paints it translated, rotated, scaled, or skewed. This is why `transform: translateY(-10px)` is 60fps but `margin-top: -10px` is jank: translate skips layout entirely. The function order MATTERS — `translate() rotate()` translates then rotates around the new position; `rotate() translate()` rotates first then translates along the rotated axis (different result).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do transforms solve?**
+> **A:** GPU-accelerated animation without invalidating layout. Before transforms, moving an element required changing `top`/`left`/`margin` — each triggering layout for the entire document subtree, paint for affected pixels, and composite. Transform skips layout and paint entirely; the existing rasterised layer is just moved/rotated/scaled by the compositor. This is the single most important property for smooth 60fps animations.
+
+**Q2: Mental model that makes transforms click?**
+> **A:** Think of the element as a PHOTOGRAPH already taped to the page. Transform doesn't move the tape — it tells the rendering engine how to project that photo at paint time. Layout is fixed; what you see is the transformed projection. Transforms compose left-to-right: `A B C` means C applied first, then B, then A — multiply matrices right-to-left.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing transform functions are commutative:
+> ```css
+> /* ❌ Different result — translates then rotates around the new position */
+> .a { transform: translateX(100px) rotate(45deg); }
+>
+> /* ❌ Different — rotates first, then translates along the rotated X axis */
+> .b { transform: rotate(45deg) translateX(100px); }
+> /* Both are valid; the bug is assuming they're the same. */
+> ```
+
+**Q4: How do transforms interact with the GPU at runtime?**
+> **A:** When a transform contains a 3D function (`translate3d`, `translateZ`, `perspective`) or you set `will-change: transform`, the browser promotes the element to its OWN compositor layer — rasterised once into a texture and uploaded to the GPU. Subsequent transforms are just GPU matrix operations, costing microseconds. The trade-off: each layer consumes VRAM, so over-promoting hundreds of elements crashes mobile devices. The rule: promote only what animates.
+
+**Q5: FAANG-grade definition?**
+> **A:** "CSS `transform` applies a 2D/3D affine transformation matrix to an element's coordinate space at paint time, leaving its layout box unchanged — when combined with compositor-layer promotion (via 3D transforms or `will-change`), the transformation runs entirely on the GPU as a per-frame matrix multiplication, bypassing layout and paint and producing CSS's only reliable path to 60fps animation."
+
+## BUILD
+
+### 🏗️ Mini Project: Card Tilt-on-Hover With 3D Perspective
+
+**What you will build:** A product card that tilts in 3D following the cursor — using `perspective`, `rotateX`, `rotateY`, and `transform-style: preserve-3d` for child layering.
+**Why this project:** Forces all major transform concepts: perspective, axis rotation, 3D nesting, GPU promotion.
+**Time estimate:** 30 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir tilt-card && cd tilt-card
+ni index.html, style.css, app.js -ItemType File
+```
+
+#### Step 2 — HTML
+```html
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><link rel="stylesheet" href="style.css"></head>
+<body>
+  <div class="scene">
+    <div class="card">
+      <div class="shine"></div>
+      <h2>Tilt me</h2>
+      <p>Hover and move the cursor.</p>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body></html>
+```
+
+#### Step 3 — CSS Transform Foundation
+```css
+body { display: grid; place-items: center; min-height: 100vh; margin: 0;
+       background: #0f0f1e; font-family: system-ui; color: white; }
+
+.scene { perspective: 1000px; }   /* viewing distance */
+
+.card {
+  width: 300px; height: 400px;
+  padding: 2rem;
+  background: linear-gradient(135deg, #1e1e3a, #3a1e5a);
+  border-radius: 12px;
+  transform-style: preserve-3d;       /* children participate in 3D */
+  will-change: transform;             /* promote to compositor layer */
+  transition: transform 0.2s ease-out;
+  position: relative;
+  overflow: hidden;
+}
+.shine {
+  position: absolute; inset: 0;
+  background: radial-gradient(circle 200px at var(--mx,50%) var(--my,50%),
+                              rgba(255,255,255,0.25), transparent 60%);
+  pointer-events: none;
+}
+.card h2 { transform: translateZ(40px); }   /* float out of card */
+.card p  { transform: translateZ(20px); }
+```
+
+#### Step 4 — Error Handling: Reduced Motion + Pointer Quit
+```javascript
+const card  = document.querySelector('.card');
+const scene = document.querySelector('.scene');
+
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+scene.addEventListener('pointermove', (e) => {
+  if (reduceMotion) return;
+  const r = scene.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width  - 0.5;   // -0.5 .. 0.5
+  const y = (e.clientY - r.top)  / r.height - 0.5;
+  card.style.transform = `rotateY(${x * 25}deg) rotateX(${-y * 25}deg)`;
+  card.style.setProperty('--mx', `${(x + 0.5) * 100}%`);
+  card.style.setProperty('--my', `${(y + 0.5) * 100}%`);
+});
+scene.addEventListener('pointerleave', () => {
+  card.style.transform = '';
+});
+```
+
+#### Step 5 — Tests
+```javascript
+// Verify GPU promotion
+const cs = getComputedStyle(card);
+console.log('will-change:', cs.willChange);
+console.log('transform:', cs.transform);
+// Manual: open DevTools → Rendering → Layer borders. Card should have an orange border.
+```
+
+**Expected Output:**
+```
+- Card tilts smoothly in 3D following cursor (±25° on both axes)
+- Title and paragraph float OUT of the card via translateZ
+- Shine spotlight follows cursor via CSS custom properties
+- DevTools Layers panel: card is its own compositor layer
+- Reduced-motion users get a static card (no tilt)
+```
+
+**Stretch:**
+- [ ] Add `backface-visibility: hidden` and a flip-to-back animation
+- [ ] Use `@property --tilt-x` to make the transform itself animatable
+- [ ] Wrap in IntersectionObserver to only enable tilt while card is on-screen
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Why is `transform: translate` faster than changing `top`/`left`?
+**Q2:** Are transform functions commutative? Show why.
+**Q3:** Write 3 lines of CSS to center a child via `transform: translate(-50%, -50%)`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What does `transform-style: preserve-3d` do? When do you need it?
+**Q5:** Bug: nested transforms are clipping at the parent's edge in 3D space. Diagnose.
+**Q6:** Optimize: this animation is janky on mobile.
+```css
+.box { transition: left 0.3s; }
+.box.open { left: 200px; }
+```
+
+### Day 7 — Application
+**Q7:** Build a flip-card with front and back faces using `rotateY` and `backface-visibility`.
+**Q8:** A PR uses `will-change: transform` on every card in a 1000-item list. What goes wrong?
+**Q9:** What is the cost of a 4×4 matrix transform vs a simple translateX on the GPU?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain compositor-layer promotion. When does the browser do it automatically? When should you do it manually?"
+**Q11:** Draw the rendering pipeline: how does transform skip layout and paint?
+**Q12:** ★ System design: "Design a complex interactive UI (Figma-like canvas) with 10,000 transformable nodes. How do you batch transforms, manage layers, and stay above 60fps?"

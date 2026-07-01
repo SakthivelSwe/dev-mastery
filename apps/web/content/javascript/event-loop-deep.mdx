@@ -152,3 +152,216 @@ A: The Task Queue (Macrotasks) handles generic async callbacks like `setTimeout`
 
 **Q: If you have a computationally heavy math equation (e.g., calculating a million primes), will Promises prevent the UI from freezing?**
 A: No! The Event Loop only solves I/O concurrency (waiting for network/timers). If you put heavy math *inside* a Promise `.then()`, that math still executes on the single JS Call Stack! The moment the math hits the stack, the Event Loop is blocked, and the browser UI freezes. To execute heavy synchronous math without freezing the UI, you must spin up a completely separate JS thread using **Web Workers**.
+
+## FEYNMAN CHECK
+
+### Explain Event Loop Internals Like I'm 10 Years Old
+> Going DEEPER than the basic queue model: Node.js's event loop has SIX PHASES (timers, pending callbacks, idle/prepare, poll, check, close callbacks) each with its own callback queue. Browser event loops add specific phases for navigation, rendering, input events, with microtasks draining at SPECIFIC checkpoints. Node.js also has `process.nextTick` — its own queue that drains BEFORE microtasks (higher priority than promises). The non-obvious complexity: I/O callbacks live in the POLL phase; setImmediate fires in the CHECK phase; setTimeout fires in TIMERS phase. So `setImmediate(...)` vs `setTimeout(...,0)` ordering depends on where you call them — INSIDE an I/O callback, setImmediate ALWAYS fires first. This level of detail matters for performance-critical Node code and is a senior interview staple.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does Node.js need multiple phases instead of one queue?**
+> **A:** Phases give Node.js precise control over WHEN different callback types run. The POLL phase blocks waiting for I/O (with a timeout); the TIMERS phase processes expired timeouts; CHECK runs setImmediate. This lets I/O-heavy servers prioritise actual network/disk work over speculative timers. Each phase has a queue; the loop drains its queue (up to a limit), then moves to the next phase. Microtasks (including process.nextTick) drain BETWEEN any two callbacks in any phase.
+
+**Q2: Mental model for process.nextTick vs queueMicrotask?**
+> **A:** Node.js has TWO microtask-tier queues: `process.nextTick` (highest priority — drains BEFORE Promise microtasks) and the standard microtask queue (Promises, queueMicrotask). Both drain between EVERY operation, but nextTick drains first. Library code should prefer queueMicrotask for portability (browsers don't have nextTick). Recursive nextTick CAN STARVE the loop just like recursive microtasks.
+
+**Q3: Most dangerous misconception?**
+> **A:** `setTimeout(0)` and `setImmediate` are interchangeable in Node:
+> ```js
+> // ❌ Order depends on context
+> setTimeout(() => console.log('timeout'), 0);
+> setImmediate(() => console.log('immediate'));
+> // Output is NON-DETERMINISTIC — depends on whether main was reached before/after 1ms
+>
+> // ✅ Inside an I/O callback, setImmediate ALWAYS wins
+> fs.readFile('package.json', () => {
+>   setTimeout(() => console.log('timeout'), 0);
+>   setImmediate(() => console.log('immediate'));
+>   // Output: immediate, then timeout — every time
+> });
+> ```
+
+**Q4: How does the browser interleave rendering with JavaScript?**
+> **A:** Browser event loop runs: macrotask → drain microtasks → IF needed, run requestAnimationFrame callbacks → recalc styles + layout + paint → composite. The "rendering" steps only happen when the browser decides (typically aligned to vsync, ~16.67ms at 60Hz). Heavy JS BLOCKS rendering — that's why a sync 50ms loop drops 3 frames. ResizeObserver and IntersectionObserver also fire at specific event-loop checkpoints to avoid layout thrashing.
+
+**Q5: FAANG-grade definition?**
+> **A:** "The Node.js event loop processes callbacks across six dedicated phases (timers, pending callbacks, idle/prepare, poll, check, close) with separate queues per phase, draining process.nextTick and microtask queues between every callback — while browser event loops integrate rendering checkpoints (rAF, ResizeObserver, IntersectionObserver, style recalc, paint) between macrotasks — making the precise ordering of cross-API async operations runtime-dependent and frequently the source of subtle production bugs."
+
+## BUILD
+
+### 🏗️ Mini Project: Demonstrate Every Node Event-Loop Phase Empirically
+
+**What you will build:** A Node.js script that schedules tasks in every phase and prints the actual execution order — verifying setImmediate-after-I/O ordering, process.nextTick priority, and microtask interleaving.
+**Why this project:** Forces deep understanding of Node's internal scheduling — exactly what senior Node interviews test.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir node-loop && cd node-loop
+npm init -y && npm install -D vitest
+ni demo.js, phases.js -ItemType File
+```
+
+#### Step 2 — Phase Demo
+```js
+// demo.js — run with: node demo.js
+import fs from 'node:fs/promises';
+import { setImmediate as setImmediatePromise } from 'node:timers/promises';
+
+console.log('1. sync start');
+
+process.nextTick(() => console.log('3. process.nextTick'));
+
+Promise.resolve().then(() => console.log('4. Promise.then'));
+
+queueMicrotask(() => console.log('5. queueMicrotask'));
+
+setTimeout(() => console.log('6. setTimeout(0)'), 0);
+
+setImmediate(() => console.log('7. setImmediate'));
+
+// I/O callback — order between setTimeout(0) and setImmediate is DETERMINISTIC inside I/O
+import('node:fs').then(({ readFile }) => {
+  readFile('./demo.js', () => {
+    console.log('8. I/O callback (readFile)');
+    setTimeout(() => console.log('10. setTimeout inside I/O'), 0);
+    setImmediate(() => console.log('9. setImmediate inside I/O (always before setTimeout in I/O)'));
+  });
+});
+
+console.log('2. sync end');
+```
+
+#### Step 3 — process.nextTick Starvation
+```js
+// phases.js
+// Demonstrate that nextTick can STARVE other phases
+let count = 0;
+function recurseNextTick() {
+  if (count++ > 1000) {
+    console.log(`Drained ${count} nextTicks before phase advanced`);
+    return;
+  }
+  process.nextTick(recurseNextTick);
+}
+
+console.log('Scheduling 1001 process.nextTicks...');
+recurseNextTick();
+setTimeout(() => console.log('setTimeout FINALLY fires'), 0);
+```
+
+#### Step 4 — Error Handling: setImmediate vs setTimeout(0) Race
+```js
+// race.js — non-deterministic at top level, deterministic in I/O
+// Top level (race condition):
+for (let i = 0; i < 5; i++) {
+  setTimeout(() => console.log('  [top]   timeout', i), 0);
+  setImmediate(() => console.log('  [top]   immediate', i));
+}
+
+// Inside I/O — deterministic
+import { readFile } from 'node:fs';
+readFile(import.meta.filename ?? __filename, () => {
+  for (let i = 0; i < 5; i++) {
+    setTimeout(() => console.log('  [I/O]  timeout', i), 0);
+    setImmediate(() => console.log('  [I/O]  immediate', i));
+  }
+});
+```
+
+#### Step 5 — Tests
+```js
+// phases.test.js
+import { describe, it, expect } from 'vitest';
+
+describe('Node.js phase ordering', () => {
+  it('process.nextTick runs before Promise microtask', () => new Promise((done) => {
+    const log = [];
+    process.nextTick(() => log.push('nt'));
+    Promise.resolve().then(() => log.push('pt'));
+    setImmediate(() => {
+      expect(log).toEqual(['nt', 'pt']);
+      done();
+    });
+  }));
+
+  it('setImmediate fires before setTimeout(0) inside I/O', () => new Promise(async (done) => {
+    const { readFile } = await import('node:fs');
+    readFile(import.meta.url.replace('file://', ''), () => {
+      const log = [];
+      setTimeout(() => log.push('to'), 0);
+      setImmediate(() => {
+        log.push('im');
+        setImmediate(() => {
+          expect(log).toEqual(['im', 'to']);   // immediate always first
+          done();
+        });
+      });
+    });
+  }));
+
+  it('microtasks drain between every macrotask', () => new Promise((done) => {
+    const log = [];
+    setTimeout(() => { log.push('to1'); Promise.resolve().then(() => log.push('pt1')); }, 0);
+    setTimeout(() => { log.push('to2'); Promise.resolve().then(() => log.push('pt2')); }, 0);
+    setTimeout(() => {
+      expect(log).toEqual(['to1', 'pt1', 'to2', 'pt2']);
+      done();
+    }, 10);
+  }));
+});
+```
+
+**Expected Output:**
+```
+1. sync start
+2. sync end
+3. process.nextTick
+4. Promise.then
+5. queueMicrotask
+6. setTimeout(0)
+7. setImmediate
+8. I/O callback (readFile)
+9. setImmediate inside I/O (always before setTimeout in I/O)
+10. setTimeout inside I/O
+
+Drained 1001 nextTicks before phase advanced
+setTimeout FINALLY fires
+```
+
+**Stretch Challenges:**
+- [ ] Compare with Bun and Deno — do they have the same six-phase model?
+- [ ] Use Worker threads to do CPU work and post messages back via the event loop
+- [ ] Profile a real Express server to see the % of time spent in each phase
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Six phases of Node's event loop.
+**Q2:** Which is higher priority: process.nextTick or Promise.then?
+**Q3:** Write code that proves setImmediate runs before setTimeout(0) inside an I/O callback. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is setTimeout(0) vs setImmediate ordering non-deterministic at top level?
+**Q5:** A junior recursively schedules process.nextTick — the server stops responding. Diagnose.
+**Q6:** Refactor to avoid I/O starvation:
+```js
+function processQueue() {
+  while (queue.length) handle(queue.shift());   // blocks event loop
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a CPU-yielding iterator using setImmediate that processes 10k items without blocking.
+**Q8:** A PR adds a tight Promise chain in a server hot path — explain how it blocks I/O.
+**Q9:** What's the cost of process.nextTick vs setImmediate per call?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every queue/phase a callback can be in across browser and Node."
+**Q11:** Draw: Node event loop with phases + queues + microtask drains between each callback.
+**Q12:** ★ System design: "Architect a high-throughput Node server processing 100k req/s — pick scheduling strategies for fairness and latency."

@@ -111,3 +111,192 @@ This will dump a massive JSON file into the `./trace` folder. You can drag and d
 A: **`skipLibCheck` only applies to TypeScript compilation, not Bundler/CI execution rules!**
 Actually, this is a trick question. If `skipLibCheck: true` is enabled, `tsc` will successfully pass. The reason the production build crashed is usually because the *Bundler* (like Webpack's `ForkTsCheckerWebpackPlugin` or an aggressive CI pipeline) was configured with a separate tsconfig or rule that still enforced full library checking, OR the third-party library's types were so fundamentally broken that they corrupted the exported types your application was actively importing.
 However, the most important point is that `skipLibCheck` is a tradeoff: You gain massive speed, but you accept the risk that if a third-party library updates its types and breaks its own internal logic, you won't know about it until you try to use the broken types directly in your own code!
+
+## FEYNMAN CHECK
+
+### Explain TypeScript Performance Like I'm 10 Years Old
+> TypeScript compilation has TWO costs: TYPE CHECKING (runs the type system to validate your code — can dominate on heavy generics) and EMIT (writes .js + .d.ts files — usually fast). On big projects (100k+ lines), tsc can take 60+ seconds. Speed-ups come from: `incremental: true` (cache prior results), `composite` + project references (rebuild only changed packages), `skipLibCheck: true` (don't deeply check dependencies' .d.ts), `isolatedModules` (allow esbuild/swc to transpile per-file, skip type check during dev), and AVOIDING type-system traps (deeply recursive generics, distributive conditionals over huge unions, unnecessary mapped types). The non-obvious trick: use `tsc --extendedDiagnostics` to see WHERE time is spent — usually 70% is in type checking, of which a handful of files dominate.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What slows down tsc the most?**
+> **A:** Three culprits ranked: (1) DEEP RECURSIVE CONDITIONAL TYPES — types that recursively descend into nested structures (`DeepPartial`, `DeepReadonly` on 6-level objects). (2) DISTRIBUTIVE CONDITIONALS OVER HUGE UNIONS — e.g., a literal union with 1000 members triggering a 1000-way distribution. (3) UNNECESSARY `skipLibCheck: false` — TS deeply checks every imported library's .d.ts. The fix order: enable skipLibCheck → cap recursion depth → break huge unions into branded primitives.
+
+**Q2: Mental model for incremental compilation?**
+> **A:** With `incremental: true`, tsc writes a `.tsbuildinfo` file recording what it knows about every file's dependencies and hashes. Next run, tsc reads the cache, walks the dependency graph, and skips files that didn't change AND whose deps didn't change. Project references extend this across multi-package monorepos. Result: 5-second incremental rebuilds even on huge codebases — provided your dependency graph isn't a fully-connected mess.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing `type` aliases are free:
+> ```ts
+> // ❌ This recursively distributes — exponential cost on deep nesting
+> type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
+> type Bad = DeepPartial<{ a: { b: { c: { d: { e: number } } } } }>;   // expensive!
+>
+> // ✅ Cap depth to bound cost
+> type DeepPartial<T, D extends number = 5> =
+>   [D] extends [0] ? T :
+>   { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K], Prev<D>> : T[K] };
+> type Prev<N extends number> = [-1, 0, 1, 2, 3, 4][N] & number;
+> ```
+
+**Q4: How does `skipLibCheck` interact with project safety?**
+> **A:** With `skipLibCheck: true`, TS does NOT type-check .d.ts files of installed libraries — it trusts them. Saves significant time (30-60% on dep-heavy projects). The risk: if a library's .d.ts has errors or conflicts with another library, you don't catch it. In practice this is rare and the speed-up dwarfs the risk. The TS team recommends `skipLibCheck: true` for almost all projects.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript performance optimisation operates on two axes — compile-time cost reduction (incremental builds via .tsbuildinfo, composite project references, skipLibCheck for dependency caching, isolatedModules for parallel single-file transpile) and type-system cost reduction (depth-limited recursion, avoiding distributive conditionals over large unions, branded types instead of huge string unions) — measured and diagnosed via `tsc --extendedDiagnostics` and the TypeScript Trace Analyzer."
+
+## BUILD
+
+### 🏗️ Mini Project: Diagnose and Speed Up a Slow TS Build
+
+**What you will build:** A project with deliberately slow type definitions, profile it with `tsc --extendedDiagnostics`, identify the bottlenecks, apply fixes, and measure the speed-up.
+**Why this project:** Forces real performance-tuning workflow — diagnose → fix → verify.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-perf && cd ts-perf
+npm init -y && npm install -D typescript
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/slow.ts, src/fast.ts -ItemType File
+```
+
+#### Step 2 — Deliberately Slow Types
+```ts
+// src/slow.ts — TYPE-LEVEL BOMBS
+// 1. Deep recursion with no depth limit
+type DeepReadonly<T> = T extends object
+  ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+// 2. Distribution over a huge union
+type HugeUnion =
+  'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'h' | 'i' | 'j' |
+  'k' | 'l' | 'm' | 'n' | 'o' | 'p' | 'q' | 'r' | 's' | 't' |
+  'u' | 'v' | 'w' | 'x' | 'y' | 'z';
+type DistributeMe<T> = T extends string ? `prefix-${T}` : never;
+type Distributed = DistributeMe<HugeUnion>;   // 26-way distribution
+
+// 3. Nested object that triggers DeepReadonly recursion
+interface DeepNested {
+  level1: {
+    level2: {
+      level3: {
+        level4: {
+          level5: { value: string };
+        };
+      };
+    };
+  };
+}
+const x: DeepReadonly<DeepNested> = {} as any;
+```
+
+#### Step 3 — Diagnose
+```bash
+npx tsc --noEmit --extendedDiagnostics
+```
+Look at the output:
+- `Check time`: time spent in type checking
+- `Total time`: end-to-end
+- `Instantiations`: count of type instantiations (huge = problem)
+- `Memory used`: huge spikes = pathological types
+
+#### Step 4 — Fix: Depth-Limited Recursion + Constrained Unions
+```ts
+// src/fast.ts
+// 1. Depth-bounded DeepReadonly
+type Prev = [never, 0, 1, 2, 3, 4, 5][number];   // simple counter
+type SafeDeepReadonly<T, Depth extends number = 5> =
+  [Depth] extends [never] ? T :
+  T extends object
+    ? { readonly [K in keyof T]: SafeDeepReadonly<T[K], Prev[Depth & 0 | 1 | 2 | 3 | 4 | 5]> }
+    : T;
+
+// 2. Avoid distribution over huge unions — use a branded helper
+type Brand<T, B> = T & { __brand?: B };
+type SafeId = Brand<string, 'Id'>;   // single type, no 26-way explosion
+
+const y: SafeDeepReadonly<{ a: { b: { c: number } } }> = {} as any;
+```
+
+#### Step 5 — Verify Speed-Up + Tests
+```bash
+# Before fix:
+npx tsc --noEmit --extendedDiagnostics src/slow.ts
+# After fix:
+npx tsc --noEmit --extendedDiagnostics src/fast.ts
+```
+
+```json
+// tsconfig.json — enable every speed-up
+{
+  "compilerOptions": {
+    "strict": true,
+    "incremental": true,
+    "composite": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext"
+  }
+}
+```
+```bash
+# Subsequent builds should be near-instant
+time npx tsc --noEmit
+```
+
+**Expected Output:**
+```
+# Diagnostics output before fix:
+Files:              42
+Lines:           10,432
+Identifiers:     12,847
+Symbols:         18,221
+Instantiations:  214,389       ← TOO HIGH (deep recursion)
+Memory used:    180,432 KB
+Check time:        2.45 s
+Total time:        2.61 s
+
+# After fix:
+Instantiations:   38,221       ← Reduced 5×
+Memory used:     95,123 KB
+Check time:        0.42 s
+Total time:        0.59 s      ← 4× faster
+```
+
+**Stretch Challenges:**
+- [ ] Convert to project-references monorepo and observe incremental rebuilds
+- [ ] Generate a TS trace with `--generateTrace` and open in chrome://tracing
+- [ ] Use `@typescript-eslint/no-explicit-any` and benchmark its rule cost
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name 3 tsconfig flags that speed up builds.
+**Q2:** What does `incremental: true` do?
+**Q3:** Command to get TS compile diagnostics. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `DeepPartial<T>` get slow on deeply-nested types? What's the fix?
+**Q5:** A junior turns `skipLibCheck: false` "for safety" and the build doubles in time. Diagnose.
+**Q6:** Refactor for performance:
+```ts
+type AllPaths<T> = T extends object ? { [K in keyof T]: AllPaths<T[K]> }[keyof T] | keyof T : never;
+```
+
+### Day 7 — Application
+**Q7:** Set up a monorepo with project references and benchmark incremental vs full rebuild.
+**Q8:** A PR adds a 5000-member literal union for product IDs — the build slows 10×. Propose a fix.
+**Q9:** What is the impact of `isolatedModules` on `const enum` and inline-only types?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through diagnosing a 90-second tsc build down to 10 seconds."
+**Q11:** Draw: how does the project-references DAG control rebuild propagation?
+**Q12:** ★ System design: "A 1M-LOC TS monorepo with 200 packages needs <30s CI builds. Pick a build strategy — tsc references, esbuild + tsc, swc + tsc, or Bazel + tsc."

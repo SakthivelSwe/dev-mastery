@@ -143,3 +143,200 @@ const identity = <T,>(arg: T) => arg;
 const identity = <T extends unknown>(arg: T) => arg;
 ```
 *(Note: This issue only happens with Arrow Functions in `.tsx` files. Standard `function identity<T>(arg: T)` works perfectly because the `function` keyword removes the ambiguity!)*
+
+## FEYNMAN CHECK
+
+### Explain Advanced Generics Like I'm 10 Years Old
+> Advanced generics combine: VARIADIC tuples (`<T extends unknown[]>` to spread types), CONDITIONAL types (`T extends U ? X : Y` to branch at the type level), the `infer` keyword (to extract a type from inside another), and HIGHER-KINDED type tricks (TS doesn't have true HKTs, but workarounds exist via type families). With these you write type functions like `Awaited<T>`, `Returntype<F>`, `Parameters<F>` from scratch. You write typed builders where each method call REFINES the type. You write typed routing libraries that infer params from a URL string literal. The non-obvious limit: TS's type system is TURING-COMPLETE but capped — recursion depth is limited (~50 levels) and overly clever types kill compile speed.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do conditional types solve?**
+> **A:** "If this type, then that type, otherwise something else" at the type level. `type If<C, T, F> = C extends true ? T : F`. Most utility types use them: `NonNullable<T> = T extends null | undefined ? never : T`. They enable type-level pattern matching, type-level if/else, and combined with `infer` they ENRICH types — e.g., extract the resolved type from a Promise: `type Unwrap<T> = T extends Promise<infer U> ? U : T`.
+
+**Q2: Mental model for `infer`?**
+> **A:** `infer` is "give a name to this part of the type so I can use it." `T extends Array<infer Item> ? Item : never` says "if T is an array of some Item type, give me that Item." You can have multiple infers: `T extends (a: infer A) => infer R ? [A, R] : never` extracts both argument type and return type from a function type.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Building deeply recursive types that kill compile speed:
+> ```ts
+> // ❌ DeepPartial via naive recursion — explodes on cyclic shapes
+> type DeepPartial<T> = { [K in keyof T]?: DeepPartial<T[K]> };
+> // For deeply nested types this can hit TS's recursion limit
+>
+> // ✅ Use distribution-aware constraints and depth limiters
+> type DeepPartial<T, Depth extends number = 5> =
+>   [Depth] extends [0] ? T
+>   : { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K], Prev<Depth>> : T[K] };
+> ```
+
+**Q4: How do distributive conditional types work?**
+> **A:** When a conditional type's checked type (the part before `extends`) is a NAKED type parameter, the conditional DISTRIBUTES over union members. `type IsString<T> = T extends string ? true : false`. Then `IsString<'a' | 1>` evaluates `IsString<'a'> | IsString<1>` = `true | false`. To DISABLE distribution, wrap in brackets: `[T] extends [string]` evaluates ONCE against the entire union.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Advanced TypeScript generics combine variadic tuple types, conditional types with distributive semantics, the `infer` keyword for type extraction, and recursive type definitions (with depth limits) — collectively forming a Turing-complete type-level computation system that enables compile-time validation of URL params, SQL queries, state machine transitions, and dependent-typed APIs at the cost of compile-speed and developer cognitive load."
+
+## BUILD
+
+### 🏗️ Mini Project: Type-Safe URL Router That Infers Path Params From Strings
+
+**What you will build:** A `router.get('/users/:id/posts/:postId', handler)` where TypeScript INFERS that handler's params are `{ id: string; postId: string }` — purely from the path string literal, no manual typing required.
+**Why this project:** Forces template literal types, recursive conditional types, and infer extraction — every advanced-generic technique.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-advanced-generics && cd ts-advanced-generics
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/router.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Path Param Extraction (Type-Level)
+```ts
+// src/router.ts
+// Extract param names from a path string literal
+type ExtractParams<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams<`/${Rest}`>]: string }
+    : Path extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// Quick sanity:
+type T1 = ExtractParams<'/users/:id'>;             // { id: string }
+type T2 = ExtractParams<'/users/:id/posts/:pid'>;  // { id: string; pid: string }
+type T3 = ExtractParams<'/static'>;                // {}
+
+export type Handler<Path extends string> =
+  (params: ExtractParams<Path>, query: Record<string, string>) => unknown;
+
+export class Router {
+  private routes = new Map<string, Handler<string>>();
+
+  get<Path extends string>(path: Path, handler: Handler<Path>) {
+    this.routes.set('GET ' + path, handler as Handler<string>);
+  }
+  post<Path extends string>(path: Path, handler: Handler<Path>) {
+    this.routes.set('POST ' + path, handler as Handler<string>);
+  }
+
+  // Naive dispatch (real impl would parse the URL)
+  dispatch(method: 'GET'|'POST', url: string, params: Record<string,string>, query: Record<string,string>) {
+    const route = [...this.routes.keys()].find(k => k.startsWith(method));
+    return this.routes.get(route!)?.(params as never, query);
+  }
+}
+```
+
+#### Step 3 — Use The Router With Inferred Params
+```ts
+// src/main.ts
+import { Router } from './router.js';
+
+const r = new Router();
+
+r.get('/users/:id', (params, query) => {
+  // params is typed { id: string }
+  console.log('User:', params.id, 'query:', query);
+});
+
+r.get('/users/:userId/posts/:postId', (params) => {
+  // params is typed { userId: string; postId: string }
+  console.log('User:', params.userId, 'Post:', params.postId);
+});
+
+r.get('/health', (params) => {
+  // params is typed {} — no inference needed
+  console.log('OK');
+});
+
+// ❌ TS catches misspelled params at compile time
+// r.get('/users/:id', (params) => console.log(params.idd));   // TS error
+```
+
+#### Step 4 — Error Handling: Distributive Conditional Type
+```ts
+// Make every value in params optional via distributive mapping
+type Optionalize<P> = P extends Record<string, string>
+  ? { [K in keyof P]?: P[K] }
+  : never;
+
+// Demo
+type Required = { id: string; postId: string };
+type Optional = Optionalize<Required>;   // { id?: string; postId?: string }
+
+// Use [P] brackets to prevent distribution if needed
+type AllStringsStrict<P> = [P] extends [Record<string, string>] ? true : false;
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expectTypeOf } from 'vitest';
+
+type ExtractParams<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams<`/${Rest}`>]: string }
+    : Path extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+describe('ExtractParams', () => {
+  it('extracts single param', () => {
+    expectTypeOf<ExtractParams<'/users/:id'>>().toEqualTypeOf<{ id: string }>();
+  });
+  it('extracts multiple params', () => {
+    expectTypeOf<ExtractParams<'/users/:userId/posts/:postId'>>()
+      .toEqualTypeOf<{ userId: string; postId: string }>();
+  });
+  it('returns empty object for paths without params', () => {
+    expectTypeOf<ExtractParams<'/health'>>().toEqualTypeOf<{}>();
+  });
+});
+```
+
+**Expected Output:**
+```
+User: 42 query: {}
+User: 1 Post: 99
+OK
+
+# TS rejects misspelled params:
+src/main.ts:N:N - error TS2339: Property 'idd' does not exist on type '{ id: string }'.
+```
+
+**Stretch Challenges:**
+- [ ] Add optional params support (`'/users/:id?'` → `{ id?: string }`)
+- [ ] Add wildcard support (`'/files/*'` → `{ '*': string }`)
+- [ ] Use `@ts-expect-error` in tests to verify malformed routes fail compilation
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does the `infer` keyword do?
+**Q2:** Conditional type syntax — `T extends U ? A : B` — when does it distribute?
+**Q3:** Write `Unwrap<T>` that returns the inner type of a Promise. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `type X<T> = T extends string ? true : false` then `X<'a' | 1>` give `true | false` instead of `false`?
+**Q5:** A type triggers "Type instantiation is excessively deep" — diagnose with code.
+**Q6:** Refactor to a single conditional type:
+```ts
+type IsArr<T> = T extends Array<any> ? true : false;
+type IsStr<T> = T extends string ? true : false;
+type Either<T> = IsArr<T> extends true ? 'arr' : IsStr<T> extends true ? 'str' : 'other';
+```
+
+### Day 7 — Application
+**Q7:** Build a typed query-builder that infers SELECT column types from a string literal.
+**Q8:** A PR's DeepPartial<T> kills compile time. Add a depth-limiter generic and benchmark.
+**Q9:** When do `[T] extends [U]` brackets matter — show an example where omitting them changes behaviour.
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how the Type-Challenges repo's 'Awaited' challenge is solved."
+**Q11:** Draw: the type evaluation tree for a 3-level recursive conditional type.
+**Q12:** ★ System design: "Design a typed event bus that infers payload types from event-name strings parsed from a config object."

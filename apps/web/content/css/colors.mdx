@@ -116,3 +116,272 @@ svg {
 **Q: I set my container to `opacity: 0.5` to make the background semi-transparent. But now the text and the image inside the container are ALSO semi-transparent and hard to read! How do I fix this?**
 A: The `opacity` property applies to the element **and all of its children**. It mathematically flattens the entire DOM node and makes the whole thing see-through. 
 If you *only* want the background color to be transparent, you must leave `opacity: 1` alone, and instead change the `background-color` to use an Alpha channel (e.g., `background-color: rgba(0, 0, 0, 0.5)`). This makes the background see-through, but keeps the text inside it 100% solid and readable!
+
+## FEYNMAN CHECK
+
+### Explain CSS Colors Like I'm 10 Years Old
+> CSS colors come in many notations — `red` (named), `#ff0000` (hex), `rgb(255,0,0)`, `hsl(0,100%,50%)`, and modern `oklch(0.62 0.25 29)`. All eventually map to the same screen pixels, BUT `hsl` and `oklch` let you reason about them ("rotate the hue 30°", "make it 20% darker") which hex doesn't. The big 2023 shift: the sRGB color space (everything before) covers only ~75% of what modern displays can show — `color(display-p3 ...)` and `oklch()` unlock the vivid 30%+ extra range that iPhones, MacBooks, and OLED TVs have had since 2017 but the web couldn't reach.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do CSS colors fundamentally solve?**
+> **A:** They give a single declarative way to refer to colors that maps to actual screen pixels across every device — handling transparency (alpha), color spaces (sRGB → P3 → Rec2020), gamut mapping (what to do when the color you ask for can't be shown), accessibility contrast calculations, and dark-mode adaptation. Without a unified system, every browser and OS would render `#ff0000` differently.
+
+**Q2: What is the ONE mental model that makes CSS colors click?**
+> **A:** Colors are 3 (or 4) numbers in a coordinate space. RGB is "amount of red, green, blue light" (hardware-oriented, hard for humans). HSL is "hue angle, saturation %, lightness %" (designer-friendly, but mathematically lies — equal-lightness HSL values appear different brightnesses). OKLCH is "perceptual lightness, chroma, hue" (mathematically TRUE — equal lightness means equal visual brightness), which is why design systems built in 2024+ use it for systematic color palettes.
+
+**Q3: What is the most dangerous misconception? Show it with code.**
+> **A:** That `hsl()` lightness is perceptually uniform — it isn't:
+> ```css
+> /* ❌ These two colors have the same HSL lightness (50%) but look very different brightnesses */
+> .a { background: hsl(60 100% 50%); }   /* yellow — appears VERY bright */
+> .b { background: hsl(240 100% 50%); }  /* blue   — appears VERY dark   */
+>
+> /* ✅ OKLCH lightness is perceptually accurate — these two look equally bright */
+> .a { background: oklch(0.7 0.2 90); }   /* yellow */
+> .b { background: oklch(0.7 0.2 270); }  /* blue   */
+> ```
+
+**Q4: How does color interact with the GPU and display at the runtime level?**
+> **A:** The browser parses your color value, maps it to the sRGB color space (default), then the GPU rasterises every pixel. On wide-gamut displays (modern iPhones, MacBooks, OLED TVs), the OS COMPRESSES the GPU output back to sRGB — meaning `#ff0000` on an iPhone shows the SAME red as a 2005 monitor, even though the iPhone could display a much more vivid red. Specifying `color(display-p3 1 0 0)` tells the browser "render this in the P3 space" — the GPU outputs the wider-gamut red, unlocking ~30% more color volume.
+
+**Q5: Write a one-sentence definition of CSS colors that a senior engineer at a FAANG company would find technically precise.**
+> **A:** "CSS colors are typed values in a specified color space (sRGB by default, with `color()`, `oklch()`, `lab()` exposing wide-gamut and perceptually-uniform spaces) that the browser resolves into pixel values via gamut mapping, alpha compositing, and final device-color-profile conversion — which is why hex/hsl/named colors clip wide-gamut hardware to sRGB while `color(display-p3)` and `oklch()` unlock the extra ~30% color volume modern displays already have."
+
+## BUILD
+
+### 🏗️ Mini Project: Build a Perceptually-Uniform Color Palette With OKLCH + Contrast Auditor
+
+**What you will build:** A 10-step color palette (50, 100, 200, ..., 900) for a brand hue using OKLCH so every step has equal visual brightness change, plus an automated WCAG contrast checker that flags any text/background pair below AA.
+**Why this project:** Touches every modern color concept — perceptual uniformity, wide gamut, accessibility — in one tool.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir color-system && cd color-system
+ni index.html, palette.js -ItemType File
+```
+
+#### Step 2 — A Brand-Color Generator
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OKLCH palette generator</title>
+  <style>
+    body { font-family: system-ui; padding: 2rem; }
+    .palette { display: grid; grid-template-columns: repeat(10, 1fr); gap: 0; margin: 1em 0; }
+    .swatch { aspect-ratio: 1; display: grid; place-items: center;
+              font-family: monospace; font-size: 0.75em; text-align: center; padding: 0.5em; }
+    .controls { display: flex; gap: 1em; align-items: center; }
+    .controls input { font: inherit; }
+    .audit { margin-top: 2em; }
+    .pass { color: green; }
+    .fail { color: crimson; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>OKLCH brand palette</h1>
+  <div class="controls">
+    <label>Brand hue (0-360):
+      <input id="hue" type="range" min="0" max="360" value="260">
+      <span id="hue-v">260</span></label>
+    <label>Chroma (0-0.4):
+      <input id="chroma" type="range" min="0" max="0.4" step="0.01" value="0.15">
+      <span id="chroma-v">0.15</span></label>
+  </div>
+
+  <div id="palette" class="palette"></div>
+
+  <h2>WCAG contrast audit</h2>
+  <div id="audit" class="audit"></div>
+
+  <script src="palette.js"></script>
+</body>
+</html>
+```
+
+#### Step 3 — Palette Generation + WCAG Audit (`palette.js`)
+```javascript
+const steps = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900];
+
+// Map each step to an OKLCH lightness from very light (0.97) to very dark (0.20)
+const stepLightness = {
+  50: 0.97, 100: 0.93, 200: 0.86, 300: 0.78, 400: 0.68,
+  500: 0.58, 600: 0.48, 700: 0.38, 800: 0.28, 900: 0.20,
+};
+
+const palEl   = document.getElementById('palette');
+const auditEl = document.getElementById('audit');
+const hueIn   = document.getElementById('hue');
+const chrIn   = document.getElementById('chroma');
+
+function buildPalette() {
+  const hue = +hueIn.value, chroma = +chrIn.value;
+  document.getElementById('hue-v').textContent    = hue;
+  document.getElementById('chroma-v').textContent = chroma;
+
+  palEl.innerHTML = '';
+  for (const step of steps) {
+    const L = stepLightness[step];
+    const color = `oklch(${L} ${chroma} ${hue})`;
+    const sw = document.createElement('div');
+    sw.className = 'swatch';
+    sw.style.background = color;
+    sw.style.color = L > 0.55 ? 'black' : 'white';
+    sw.textContent = step + '\n' + color;
+    sw.dataset.lightness = L;
+    palEl.appendChild(sw);
+  }
+  runAudit();
+}
+
+function relativeLuminance([r, g, b]) {
+  // Standard sRGB → relative luminance per WCAG
+  const channel = (v) => {
+    v /= 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+function contrastRatio(rgb1, rgb2) {
+  const l1 = relativeLuminance(rgb1);
+  const l2 = relativeLuminance(rgb2);
+  const [lo, hi] = l1 < l2 ? [l1, l2] : [l2, l1];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+function rgbFromSwatch(el) {
+  // getComputedStyle returns "rgb(r, g, b)" even for OKLCH — browser gamut-maps for us
+  const m = getComputedStyle(el).backgroundColor.match(/\d+/g);
+  return m.slice(0, 3).map(Number);
+}
+
+function runAudit() {
+  const swatches = [...palEl.children];
+  auditEl.innerHTML = '';
+  for (const sw of swatches) {
+    const bg   = rgbFromSwatch(sw);
+    const text = sw.style.color === 'black' ? [0,0,0] : [255,255,255];
+    const r    = contrastRatio(bg, text).toFixed(2);
+    const ok   = r >= 4.5;          // WCAG AA for normal text
+    const row  = document.createElement('div');
+    row.innerHTML = `<strong>step ${sw.textContent.split('\n')[0]}</strong>:
+                     contrast ${r}:1 against ${sw.style.color}
+                     <span class="${ok ? 'pass' : 'fail'}">${ok ? '✓ AA' : '✗ FAIL'}</span>`;
+    auditEl.appendChild(row);
+  }
+}
+
+hueIn.addEventListener('input', buildPalette);
+chrIn.addEventListener('input', buildPalette);
+buildPalette();
+```
+
+#### Step 4 — Edge Cases: Wide-Gamut, Dark Mode, Reduced Transparency
+```html
+<!-- Display-P3 wide-gamut red (more vivid on modern displays) -->
+<div style="background: color(display-p3 1 0 0); height: 50px; margin: 1em 0;">P3 red</div>
+<div style="background: #ff0000;                 height: 50px; margin: 1em 0;">sRGB red</div>
+
+<!-- Side-by-side on a wide-gamut display: P3 is visibly more saturated -->
+
+<!-- Dark mode: use CSS color-scheme for native dark form controls -->
+<style>
+  :root { color-scheme: light dark; }
+  @media (prefers-color-scheme: dark) {
+    body { background: oklch(0.18 0.02 260); color: oklch(0.92 0.02 260); }
+  }
+</style>
+
+<!-- Accessibility: respect prefers-reduced-transparency -->
+<style>
+  .glass { background: rgb(255 255 255 / 0.5); backdrop-filter: blur(10px); }
+  @media (prefers-reduced-transparency) {
+    .glass { background: white; backdrop-filter: none; }
+  }
+</style>
+```
+
+#### Step 5 — Tests
+```javascript
+// Verify perceptually-uniform spacing
+const lights = [...palEl.children].map(el => +el.dataset.lightness);
+const diffs = lights.slice(0, -1).map((l, i) => Math.abs(l - lights[i + 1]));
+const max = Math.max(...diffs), min = Math.min(...diffs);
+console.assert(max - min < 0.10,
+  'OKLCH lightness steps should be approximately uniform');
+
+// Verify WCAG contrast of brand color on white
+const brand500 = palEl.children[5];  // step 500
+const r = contrastRatio(rgbFromSwatch(brand500), [255,255,255]);
+console.log('step-500 on white contrast:', r.toFixed(2));
+console.assert(r >= 3.0, 'brand color on white should be at least 3:1 (large text AA)');
+```
+
+**Expected Output:**
+```
+- 10 swatches with smooth lightness gradient
+- WCAG contrast ratios shown below each swatch
+- Steps 600-900 pass AA against white text
+- Steps 50-300 pass AA against black text
+- Steps 400-500 may fail one or both — that's a real-world design constraint
+- console.assert passes: lightness spacing is uniform
+```
+
+**Stretch Challenges:**
+- [ ] Add a "color-mix(in oklch, brand 50%, white)" demo for tinted variants
+- [ ] Add an "out of P3 gamut" warning when chroma is too high for sRGB
+- [ ] Add a CSV export of `--brand-50` through `--brand-900` CSS custom properties
+
+## SPACED REVIEW
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name 5 CSS color notations and one reason to use each.
+
+**Q2:** What is the difference between `hsl(0,100%,50%)` and `oklch(0.62 0.25 29)`? Why might a designer prefer OKLCH for systematic palettes?
+
+**Q3:** Write the CSS for a button that is brand-blue in light mode and lighter brand-blue in dark mode, using `prefers-color-scheme`.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the minimum WCAG AA contrast ratio for normal-sized body text? For large text? Show 2 color pairs that pass each level.
+
+**Q5:** Describe a real production bug caused by using `hsl()` for a button palette and discovering buttons look different brightnesses across hues.
+
+**Q6:** Refactor this for wide-gamut and accessibility:
+```css
+:root { --brand: #1a73e8; --brand-light: lighten(#1a73e8, 20%); }
+.btn { background: var(--brand); color: white; }
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build a 5-step semantic color system (success, warning, danger, info, neutral) with light and dark mode variants using only CSS custom properties + `color-mix()`.
+
+**Q8:** A page passes Lighthouse but fails axe-core's color-contrast rule on every `<a>`. List 3 root causes and the CSS fix for each.
+
+**Q9:** What is `color-mix()` and what 3 problems does it solve that CSS preprocessors used to handle?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Interview: "How do you build a design system color palette that's perceptually uniform and accessible?"
+
+**Q11:** Draw the dependency graph: colors ↔ css-variables ↔ accessibility-html ↔ design-system.
+
+**Q12:** ★ System design: "Design the color token architecture for a multi-brand SaaS where: each brand has its own primary hue; every component honours WCAG AA; light/dark/high-contrast modes work; tokens propagate to React, iOS, Android."

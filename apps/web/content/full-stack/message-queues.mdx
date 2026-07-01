@@ -119,3 +119,107 @@ When you start the clones, you must assign them all to the exact same `groupId: 
 Kafka divides a Topic into physical lanes called **Partitions** (e.g., 6 partitions). 
 When Kafka detects a Consumer Group, it acts as a load balancer. It mathematically assigns exactly *one* partition to exactly *one* clone! Clone A only reads from Partition 1. Clone B only reads from Partition 2. 
 Because a partition is exclusively locked to a specific clone, it is mathematically impossible for two clones to read the exact same message, guaranteeing that every email is sent exactly once while perfectly distributing the workload across all 6 servers!
+
+## FEYNMAN CHECK
+
+### Explain Message Queues Like I'm 10 Years Old
+> A message queue (RabbitMQ, SQS, Kafka) is the asynchronous middle-man between services. Producer puts a job in the queue; consumer takes one off and processes it. The non-obvious part: queues give you durability (jobs survive consumer crashes), back-pressure (slow consumers don't break producers), and decoupling (producer doesn't need to know who consumes). The trap: at-least-once delivery means consumers MUST be idempotent — handling the same message twice safely.
+
+---
+
+### 5 Deep Questions
+**Q1: When do you need a message queue?**
+> **A:** Slow operations (email sending, report generation) — return 200 immediately, process async. Decoupling producer/consumer deploys. Smoothing traffic spikes. Fan-out (one event, many subscribers). Don't add a queue for synchronous request/response — adds 50ms+ latency and no benefit.
+
+**Q2: ONE model.**
+> **A:** "Producer → broker → queue → consumer. Acks confirm processing. Retry on failure. Dead-letter queue holds messages that failed N times. At-least-once delivery = idempotent consumers required."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Non-idempotent consumer — duplicate delivery charges twice
+> async function processPayment(msg) {
+>   await chargeCustomer(msg.amount);
+>   ack();
+> }
+> // ✅ Idempotency key prevents double-charge
+> async function processPayment(msg) {
+>   if (await alreadyProcessed(msg.idempotencyKey)) return ack();
+>   await chargeCustomer(msg.amount, msg.idempotencyKey);
+>   await markProcessed(msg.idempotencyKey);
+>   ack();
+> }
+> ```
+
+**Q4: RabbitMQ vs Kafka — when each?**
+> **A:** RabbitMQ: task queues, work distribution, low latency, modest throughput. Kafka: event streaming, replay, high throughput (millions/sec), log-based, multiple consumers replay the same events. SQS (AWS): managed, simple, scales massively, less control.
+
+**Q5: Senior one-liner.**
+> **A:** "A message queue is durable async coupling between producer and consumer with at-least-once delivery semantics — its value is back-pressure + replay + decoupling, and skipping idempotent consumers is the #1 production data corruption bug in event-driven systems."
+
+## BUILD
+
+### 🏗️ Mini Project: RabbitMQ Worker with Retry + Dead-Letter
+**Time:** 40 minutes
+
+#### Step 1 — Setup
+```bash
+docker run -d --name rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+npm init -y && npm i amqplib
+touch producer.js consumer.js
+```
+
+#### Step 2 — Setup Queues with DLQ
+```js
+// setup.js
+const amqp = require('amqplib');
+(async () => {
+  const conn = await amqp.connect('amqp://localhost');
+  const ch = await conn.createChannel();
+  await ch.assertExchange('jobs.dlx', 'direct', { durable: true });
+  await ch.assertQueue('jobs.dlq', { durable: true });
+  await ch.bindQueue('jobs.dlq', 'jobs.dlx', 'failed');
+  await ch.assertQueue('jobs.work', { durable: true, deadLetterExchange: 'jobs.dlx', deadLetterRoutingKey: 'failed' });
+  conn.close();
+})();
+```
+
+#### Step 3 — Producer
+```js
+ch.sendToQueue('jobs.work', Buffer.from(JSON.stringify({ id: 42, amount: 100 })), { persistent: true });
+```
+
+#### Step 4 — Consumer with Retry
+```js
+ch.consume('jobs.work', async (msg) => {
+  const job = JSON.parse(msg.content);
+  try { await process(job); ch.ack(msg); }
+  catch { ch.nack(msg, false, false); /* Routes to DLQ */ }
+});
+```
+
+#### Step 5 — Test
+Send a job that throws → ends up in jobs.dlq → manually inspect via management UI.
+
+**Expected Output:** Failed jobs visible in DLQ, not lost.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Sync vs async — when async via queue?
+**Q2:** What does at-least-once delivery mean for consumers?
+**Q3:** Write a 10-line producer + consumer with amqplib.
+
+### Day 3
+**Q4:** RabbitMQ vs Kafka — when each?
+**Q5:** Show non-idempotent consumer bug + idempotency-key fix.
+**Q6:** What is a dead-letter queue?
+
+### Day 7
+**Q7:** Implement exponential backoff retry in a consumer.
+**Q8:** PR processes orders synchronously, blocking the API. Latency cost?
+**Q9:** What is exactly-once delivery and why is it hard?
+
+### Day 14
+**Q10:** ★ "Design event-driven architecture for an e-commerce checkout."
+**Q11:** Link queue → consumer → idempotency → observability.
+**Q12:** ★ "Your DLQ has 50k failed messages. Investigation + reprocess plan?"

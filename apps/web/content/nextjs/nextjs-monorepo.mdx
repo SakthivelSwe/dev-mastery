@@ -132,3 +132,354 @@ During deployment, Vercel will:
 4. Deploy only the compiled output of the `apps/web` directory to the edge network.
 
 This allows you to deploy individual apps from a massive monorepo independently, while Vercel handles the complex dependency linking behind the scenes.
+
+## FEYNMAN CHECK
+
+### Explain Next.js in a Monorepo Like I'm 10 Years Old
+> A monorepo is ONE git repository containing MULTIPLE related projects: web app (Next.js), admin dashboard (Next.js), mobile app (React Native), and shared packages (UI components, types, utilities). Tools like Turborepo, Nx, or pnpm workspaces manage them: shared code in packages/, apps in apps/, dependencies hoisted to root node_modules. Benefits: change a UI component and ALL apps see the change immediately (atomic refactors across the entire codebase), shared TypeScript types (no duplication), one CI/CD pipeline. The non-obvious depth: Next.js needs special configuration to TRANSPILE shared packages. By default, Next.js doesn't compile node_modules — but your shared packages (in node_modules via workspaces) need transpilation. Use transpilePackages: ['@myapp/ui'] in next.config.js. Without this, you get "SyntaxError: Cannot use import statement outside a module" — the #1 monorepo bug.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does Turborepo solve over plain pnpm workspaces?**
+> **A:** pnpm workspaces gives you the structure (shared deps, package linking). Turborepo adds: (1) CACHING — if you ran tests for @myapp/ui already and the source hasn't changed, skip them (saves minutes per CI run). (2) PARALLELISM — runs tasks across packages in parallel respecting dependency order (build @myapp/ui before web app, but build mobile in parallel with web). (3) REMOTE CACHING — share cache between developers' machines and CI (Vercel-hosted). (4) FILTERED EXECUTION — turbo run build --filter=web runs only the web app and its dependencies. On a large monorepo, Turborepo reduces CI time from 30+ minutes to 5 minutes.
+
+**Q2: Mental model for the dependency graph in a monorepo?**
+> **A:** Each package has its own package.json declaring dependencies. Internal deps (other packages in the monorepo) are listed as workspace:* in pnpm or *. Example: apps/web depends on @myapp/ui and @myapp/types — workspace resolves these to packages/ui and packages/types (symlinks). Tools traverse this graph for: build order (UI before apps using UI), affected detection (changing UI rebuilds apps using it, but not mobile-only packages), and visualisation. nx graph or turbo graph generates a visual dependency map — essential for understanding refactor impact.
+
+**Q3: Most dangerous misconception about monorepo Next.js?**
+> **A:** All Next.js features work seamlessly with shared packages:
+> ```typescript
+> // WRONG: importing a workspace package without transpilation
+> // packages/ui/Button.tsx
+> export function Button() { return <button>Click</button>; }
+>
+> // apps/web/page.tsx
+> import { Button } from '@myapp/ui';  // ERROR: Cannot use import statement
+>
+> // CORRECT: configure Next.js to transpile workspace packages
+> // apps/web/next.config.js
+> module.exports = {
+>   transpilePackages: ['@myapp/ui', '@myapp/utils', '@myapp/types'],
+> };
+>
+> // Why? Next.js skips compiling node_modules for speed
+> // But workspace packages live in node_modules via symlinks
+> // They contain TypeScript/JSX that needs Next.js compilation
+> // transpilePackages tells Next.js: "compile these even though they're in node_modules"
+> ```
+
+**Q4: How do you share TypeScript types across packages?**
+> **A:** Create a packages/types package with shared interfaces: export interface User { id: string; email: string; role: 'admin' | 'user'; }. Other packages import via @myapp/types. Critical: set composite: true in tsconfig.json and use Project References — TypeScript can incremental-compile only changed packages. tsconfig in apps/web extends a base config and references the types package: { "extends": "@myapp/tsconfig/nextjs.json", "references": [{ "path": "../../packages/types" }] }. This gives instant cross-package type checking with minimal recompile.
+
+**Q5: FAANG-grade definition of Next.js monorepo architecture.**
+› **A:** "Next.js monorepo architecture uses pnpm/Yarn workspaces or npm workspaces for package linking with Turborepo or Nx for task orchestration — sharing UI components, TypeScript types, utilities, and configurations across multiple Next.js apps (web, admin, marketing site) via internal packages — requiring transpilePackages in next.config.js for Next.js to compile workspace packages excluded from default node_modules transpilation — TypeScript Project References with composite: true for incremental cross-package compilation — Turborepo's remote caching for sharing build/test artifacts across developers and CI — affected-only execution (turbo --filter) for fast PRs that touch few packages — and atomic refactors via single-commit PRs that simultaneously update shared packages and consuming apps — enabling scaling Next.js development from 1 to 100+ developers with consistent tooling and faster iteration."
+
+## BUILD
+
+### 🏗️ Mini Project: Turborepo + Next.js + Shared UI Package + Type-Safe API Layer
+
+**What you will build:** A monorepo with: two Next.js apps (web + admin), shared @myapp/ui package (Button, Card), shared @myapp/types package (User interface), shared @myapp/api-client (typed fetch wrapper), Turborepo orchestration, and TypeScript project references.
+**Why this project:** Forces every monorepo pattern.
+**Time estimate:** 50 minutes
+
+---
+
+#### Step 1 — Initialize Monorepo
+```bash
+mkdir myapp-monorepo && cd myapp-monorepo
+npm init -y
+npm install -D turbo
+
+# Create workspace structure
+mkdir -p apps/web apps/admin packages/ui packages/types packages/api-client packages/tsconfig
+
+# pnpm-workspace.yaml
+cat > pnpm-workspace.yaml << 'EOF'
+packages:
+  - "apps/*"
+  - "packages/*"
+EOF
+
+# Or use npm workspaces (package.json)
+```
+
+```json
+// package.json (root)
+{
+  "name": "myapp-monorepo",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "type-check": "turbo run type-check"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.0"
+  }
+}
+
+// turbo.json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": { "dependsOn": ["^build"] },
+    "type-check": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["^build"], "outputs": ["coverage/**"] }
+  }
+}
+```
+
+#### Step 2 — Shared Types Package
+```json
+// packages/types/package.json
+{
+  "name": "@myapp/types",
+  "version": "0.0.1",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts"
+}
+
+// packages/types/tsconfig.json
+{
+  "extends": "@myapp/tsconfig/base.json",
+  "compilerOptions": { "outDir": "dist", "rootDir": "src", "composite": true },
+  "include": ["src/**/*"]
+}
+
+// packages/types/src/index.ts
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: 'admin' | 'user';
+  createdAt: string;
+}
+
+export interface Post {
+  id: string;
+  title: string;
+  content: string;
+  authorId: string;
+  publishedAt: string | null;
+}
+
+export type ApiResponse<T> = { data: T; error: null } | { data: null; error: string };
+```
+
+#### Step 3 — Shared UI Package
+```json
+// packages/ui/package.json
+{
+  "name": "@myapp/ui",
+  "version": "0.0.1",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "peerDependencies": {
+    "react": "^18 || ^19",
+    "react-dom": "^18 || ^19"
+  }
+}
+
+// packages/ui/src/index.ts
+export { Button } from './Button';
+export { Card } from './Card';
+
+// packages/ui/src/Button.tsx
+import { ButtonHTMLAttributes } from 'react';
+
+interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'danger';
+}
+
+export function Button({ variant = 'primary', className = '', children, ...props }: ButtonProps) {
+  const variants = {
+    primary: 'bg-blue-500 hover:bg-blue-600 text-white',
+    secondary: 'bg-gray-200 hover:bg-gray-300 text-gray-900',
+    danger: 'bg-red-500 hover:bg-red-600 text-white',
+  };
+  return (
+    <button
+      className={`px-4 py-2 rounded font-medium transition ${variants[variant]} ${className}`}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+// packages/ui/src/Card.tsx
+export function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={`bg-white rounded-lg shadow p-6 ${className}`}>
+      {children}
+    </div>
+  );
+}
+```
+
+#### Step 4 — Shared API Client + Next.js Apps
+```typescript
+// packages/api-client/src/index.ts
+import type { User, Post, ApiResponse } from '@myapp/types';
+
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+
+async function request<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', ...init?.headers },
+    });
+    if (!res.ok) return { data: null, error: `HTTP ${res.status}` };
+    return { data: await res.json(), error: null };
+  } catch (err: any) {
+    return { data: null, error: err.message };
+  }
+}
+
+export const api = {
+  users: {
+    list: () => request<User[]>('/users'),
+    get: (id: string) => request<User>(`/users/${id}`),
+  },
+  posts: {
+    list: () => request<Post[]>('/posts'),
+    create: (data: Partial<Post>) => request<Post>('/posts', {
+      method: 'POST', body: JSON.stringify(data),
+    }),
+  },
+};
+
+// apps/web/next.config.js
+module.exports = {
+  // CRITICAL: transpile workspace packages
+  transpilePackages: ['@myapp/ui', '@myapp/types', '@myapp/api-client'],
+  experimental: { typedRoutes: true },
+};
+
+// apps/web/package.json
+{
+  "name": "web",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "lint": "next lint",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@myapp/ui": "workspace:*",
+    "@myapp/types": "workspace:*",
+    "@myapp/api-client": "workspace:*"
+  }
+}
+
+// apps/web/src/app/page.tsx
+import { Button, Card } from '@myapp/ui';
+import { api } from '@myapp/api-client';
+import type { Post } from '@myapp/types';
+
+export default async function HomePage() {
+  const { data: posts, error } = await api.posts.list();
+
+  if (error) return <div>Failed to load: {error}</div>;
+
+  return (
+    <main className="max-w-3xl mx-auto p-8">
+      <h1 className="text-3xl font-bold mb-6">Latest Posts</h1>
+      <div className="space-y-4">
+        {posts?.map((post: Post) => (
+          <Card key={post.id}>
+            <h2 className="text-xl font-semibold">{post.title}</h2>
+            <p className="text-gray-600 mt-2">{post.content}</p>
+            <Button className="mt-4">Read more</Button>
+          </Card>
+        ))}
+      </div>
+    </main>
+  );
+}
+```
+
+#### Step 5 — Run + Verify
+```bash
+# Install all dependencies
+npm install
+
+# Run all apps in parallel (Turborepo)
+npm run dev
+# -> web runs on :3000
+# -> admin runs on :3001
+# -> packages auto-rebuild on changes
+
+# Build everything (respects dependency order)
+npm run build
+# -> builds packages first (parallel where possible)
+# -> then builds apps that depend on them
+# -> caches results for next run
+
+# Build only the web app and its dependencies
+npx turbo run build --filter=web
+
+# Type-check everything across the entire monorepo
+npm run type-check
+# -> uses TypeScript Project References for incremental builds
+
+# Visualize dependency graph
+npx turbo run build --graph
+```
+
+**Expected Output:**
+```
+turbo run dev: starts both apps in parallel, watches all packages
+Change packages/ui/Button.tsx -> both apps hot-reload instantly
+turbo run build (cached): "FULL TURBO" 0.1s if nothing changed
+Add new prop to User type -> all apps using it show type errors immediately
+Filter build: turbo --filter=web only rebuilds web's dependency tree
+Remote caching: CI shares build artifacts across runs
+```
+
+**Stretch Challenges:**
+- [ ] Add a shared @myapp/eslint-config package with rules used by all apps
+- [ ] Add Changesets for versioned releases of internal packages
+- [ ] Set up Turborepo remote caching with Vercel
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What problem does Turborepo solve over plain workspaces?
+**Q2:** What is transpilePackages and why is it needed?
+**Q3:** Write a workspace package.json for a shared UI library. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the most common monorepo Next.js bug?
+**Q5:** A PR's CI takes 30 minutes despite changing one file — diagnose Turborepo cache.
+**Q6:** What are TypeScript Project References and why use them in a monorepo?
+
+### Day 7 — Application
+**Q7:** Add a shared @myapp/auth package usable by web and admin apps.
+**Q8:** A PR uses 'import X from "@myapp/ui/Button"' instead of barrel — explain trade-offs.
+**Q9:** How does --filter improve PR CI time?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Design a Next.js monorepo for a SaaS — what packages, what tooling, why?"
+**Q11:** Draw: monorepo dependency graph — apps depending on shared packages, build order.
+**Q12:** ★ System design: "Scale a Next.js monorepo from 5 to 500 developers — tooling, code ownership, CI/CD, release management."

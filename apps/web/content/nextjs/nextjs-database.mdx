@@ -109,3 +109,312 @@ In the Next.js App Router, the `/users` page is a Server Component. It runs secu
 You only need API Routes if:
 1. You are fetching data from a Client Component (`'use client'`).
 2. You are exposing an API to an external consumer (like a mobile app or a webhook).
+
+## FEYNMAN CHECK
+
+### Explain Next.js Database Integration Like I'm 10 Years Old
+> In Next.js you connect to a database from your Server Components, Server Actions, and Route Handlers — DIRECTLY, no separate API layer needed. Most apps use an ORM (Prisma, Drizzle) which generates type-safe query builders from your database schema. Server Components import the ORM client and run queries inline: const users = await prisma.user.findMany(). The non-obvious depth: NEVER create a new DB connection per request — connection pools are limited (typically 100 connections for Postgres, ~10 for serverless platforms like Vercel). Create a SINGLETON ORM client at module load time, and use globalThis to prevent multiple instances during HMR development. Without this, you'll exhaust the connection pool within minutes and your app will crash with "too many connections" errors.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How do you prevent connection exhaustion in development hot-reload?**
+> **A:** Next.js HMR re-executes module code on file changes — without a singleton pattern, EACH save creates a new ORM client (new pool of connections). Within minutes you exhaust Postgres' max_connections. Solution: store the client on globalThis (preserved across HMR cycles):
+> ```typescript
+> import { PrismaClient } from '@prisma/client';
+> const globalForPrisma = globalThis as unknown as { prisma: PrismaClient };
+> export const prisma = globalForPrisma.prisma ?? new PrismaClient();
+> if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
+> ```
+> In production, modules load once — singleton happens naturally. The trick is HMR-safe development.
+
+**Q2: Mental model for serverless DB connections?**
+> **A:** Serverless functions (Vercel, AWS Lambda) spawn many concurrent instances — each one opens its own DB connections. With Vercel scaling to 1000 concurrent functions, each opening 5 connections, you need 5000 connection slots — Postgres maxes at 100 by default! Solutions: (1) Connection pooler like PgBouncer or Supabase's pooler — multiplexes many app connections onto few DB connections. (2) HTTP-based DB drivers (Neon serverless, Turso) — no persistent connections, each query is a separate HTTP request. (3) Prisma Accelerate or Drizzle's HTTP driver — proxy layer that pools connections.
+
+**Q3: Most dangerous misconception about ORM in Next.js?**
+> **A:** ORM queries in Server Components are always safe from SQL injection:
+> ```typescript
+> // CORRECT: parameterised queries (Prisma does this automatically)
+> const users = await prisma.user.findMany({ where: { email: userInput } });
+> // -> Prisma escapes userInput safely
+>
+> // WRONG: raw queries with template literals
+> const users = await prisma.$queryRaw`SELECT * FROM users WHERE email = ${userInput}`;
+> // Wait — Prisma's $queryRaw with template literal IS parameterised, this is SAFE
+>
+> // DANGEROUS: $queryRawUnsafe with concatenation
+> const users = await prisma.$queryRawUnsafe(`SELECT * FROM users WHERE email = '${userInput}'`);
+> // -> SQL injection vulnerability! userInput is concatenated as raw SQL
+> // Attack: userInput = "'; DROP TABLE users; --"
+> ```
+
+**Q4: How should you handle transactions in Server Components?**
+> **A:** Wrap multi-step operations in transactions for atomicity: await prisma.$transaction(async (tx) => { await tx.user.update(...); await tx.account.create(...); }) — if either fails, BOTH roll back. Important: transactions hold a connection from the pool for their entire duration — long transactions exhaust the pool. Keep transactions SHORT (< 1 second), do all heavy computation BEFORE the transaction, and use raw SQL (BEGIN/COMMIT) only for complex scenarios. Server Components are read-only in spirit — most transactions belong in Server Actions or Route Handlers (mutations), not in page rendering.
+
+**Q5: FAANG-grade definition of Next.js database integration patterns.**
+> **A:** "Next.js database integration uses singleton ORM clients (Prisma, Drizzle, Kysely) instantiated at module load with HMR-safe globalThis pattern — direct query execution in Server Components for reads and Server Actions for mutations — connection pooling via PgBouncer/Supabase Pooler or HTTP-based drivers (Neon Serverless, Turso) to handle serverless function concurrency exceeding native DB connection limits — parameterised queries via ORM query builders or template-literal $queryRaw for safety from SQL injection — transactions for atomic multi-step operations with strict duration constraints — and React's cache() for request-level deduplication of identical queries across components in a single render."
+
+## BUILD
+
+### 🏗️ Mini Project: Production DB Setup — Prisma + Postgres + Connection Pool + Transactions
+
+**What you will build:** A blog API with Prisma + Postgres: HMR-safe singleton client, type-safe queries, transactional post + tags creation, raw SQL for analytics, and connection pool monitoring.
+**Why this project:** Forces every production database pattern.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest db-demo --typescript --tailwind --app
+cd db-demo
+npm install prisma @prisma/client
+npx prisma init --datasource-provider postgresql
+```
+
+```prisma
+// prisma/schema.prisma
+generator client { provider = "prisma-client-js" }
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  name      String
+  posts     Post[]
+  createdAt DateTime  @default(now())
+}
+
+model Post {
+  id        Int       @id @default(autoincrement())
+  title     String
+  content   String
+  published Boolean   @default(false)
+  authorId  Int
+  author    User      @relation(fields: [authorId], references: [id])
+  tags      Tag[]
+  createdAt DateTime  @default(now())
+  @@index([authorId, published])
+}
+
+model Tag {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  posts Post[]
+}
+```
+
+```bash
+npx prisma migrate dev --name init
+npx prisma generate
+```
+
+#### Step 2 — HMR-Safe Singleton Client
+```typescript
+// src/lib/prisma.ts
+import { PrismaClient } from '@prisma/client';
+
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+});
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = prisma;
+}
+
+// Cleanup on shutdown (graceful)
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
+});
+```
+
+#### Step 3 — Type-Safe Server Component Queries
+```typescript
+// src/app/posts/page.tsx
+import { cache } from 'react';
+import { prisma } from '@/lib/prisma';
+import Link from 'next/link';
+
+// cache() dedupes identical calls within one render
+const getPublishedPosts = cache(async (limit: number = 10) => {
+  return prisma.post.findMany({
+    where: { published: true },
+    include: { author: { select: { name: true } }, tags: true },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+  });
+});
+
+export default async function PostsPage() {
+  const posts = await getPublishedPosts(20);
+  return (
+    <main className="p-8 max-w-3xl mx-auto">
+      <h1 className="text-3xl font-bold mb-6">Latest Posts ({posts.length})</h1>
+      {posts.map(post => (
+        <article key={post.id} className="mb-6 pb-6 border-b">
+          <h2 className="text-xl font-semibold">
+            <Link href={`/posts/${post.id}`} className="hover:underline">{post.title}</Link>
+          </h2>
+          <p className="text-sm text-gray-500">
+            By {post.author.name} · {post.tags.map(t => t.name).join(', ')}
+          </p>
+          <p className="mt-2">{post.content.slice(0, 200)}...</p>
+        </article>
+      ))}
+    </main>
+  );
+}
+```
+
+#### Step 4 — Transactions in Server Actions
+```typescript
+// src/app/posts/actions.ts
+'use server';
+import { prisma } from '@/lib/prisma';
+import { revalidatePath } from 'next/cache';
+import { z } from 'zod';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(3).max(200),
+  content: z.string().min(10),
+  tags: z.array(z.string()).max(5),
+  authorEmail: z.string().email(),
+});
+
+export async function createPostAction(input: z.infer<typeof CreatePostSchema>) {
+  const data = CreatePostSchema.parse(input);
+
+  // Transaction: ensure user, post, and tag connections are all atomic
+  const result = await prisma.$transaction(async (tx) => {
+    // 1. Upsert author
+    const author = await tx.user.upsert({
+      where: { email: data.authorEmail },
+      update: {},
+      create: { email: data.authorEmail, name: data.authorEmail.split('@')[0] },
+    });
+
+    // 2. Upsert tags (parallel inside transaction)
+    const tags = await Promise.all(
+      data.tags.map(name =>
+        tx.tag.upsert({ where: { name }, update: {}, create: { name } })
+      )
+    );
+
+    // 3. Create post connected to author and tags
+    const post = await tx.post.create({
+      data: {
+        title: data.title,
+        content: data.content,
+        published: true,
+        author: { connect: { id: author.id } },
+        tags: { connect: tags.map(t => ({ id: t.id })) },
+      },
+      include: { author: true, tags: true },
+    });
+
+    return post;
+  }, {
+    maxWait: 5000,  // wait up to 5s to start transaction
+    timeout: 10000, // transaction must complete within 10s
+  });
+
+  revalidatePath('/posts');
+  return { success: true, postId: result.id };
+}
+```
+
+#### Step 5 — Raw SQL + Tests
+```typescript
+// src/lib/analytics.ts
+import { prisma } from '@/lib/prisma';
+
+// Raw SQL for analytics queries (Prisma's ORM is over-abstraction for aggregates)
+export async function getPostsByDay(days: number = 30) {
+  return prisma.$queryRaw<Array<{ day: Date; count: bigint }>>`
+    SELECT
+      DATE_TRUNC('day', "createdAt") AS day,
+      COUNT(*) AS count
+    FROM "Post"
+    WHERE "createdAt" > NOW() - INTERVAL '1 day' * ${days}
+      AND "published" = true
+    GROUP BY day
+    ORDER BY day DESC
+  `;
+  // Template literal IS parameterised — safe from SQL injection
+}
+
+// Tests
+import { prisma } from '@/lib/prisma';
+
+describe('Database', () => {
+  beforeEach(async () => {
+    await prisma.post.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
+  it('creates post in transaction', async () => {
+    const { createPostAction } = await import('@/app/posts/actions');
+    const result = await createPostAction({
+      title: 'Test Post', content: 'Lorem ipsum dolor sit amet',
+      tags: ['test'], authorEmail: 'test@example.com',
+    });
+    expect(result.success).toBe(true);
+    const count = await prisma.post.count();
+    expect(count).toBe(1);
+  });
+
+  it('rolls back on transaction failure', async () => {
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.user.create({ data: { email: 'a@b.com', name: 'A' } });
+        throw new Error('Forced failure');
+      });
+    } catch {}
+    const user = await prisma.user.findUnique({ where: { email: 'a@b.com' } });
+    expect(user).toBeNull();  // rolled back
+  });
+});
+```
+
+**Expected Output:**
+```
+npx prisma migrate dev -> creates tables
+/posts -> renders posts with author and tags
+createPostAction -> atomic insert of user + tags + post
+HMR save 100 times -> only ONE Prisma client (singleton)
+getPostsByDay(7) -> aggregated daily counts (raw SQL)
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Switch to Drizzle ORM and compare DX
+- [ ] Add Prisma Accelerate for global query caching
+- [ ] Add pgBouncer in docker-compose for connection pooling
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Why use a singleton ORM client in Next.js?
+**Q2:** Difference between $queryRaw and $queryRawUnsafe?
+**Q3:** Write the HMR-safe Prisma singleton pattern. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do serverless functions cause connection exhaustion?
+**Q5:** A PR creates new PrismaClient() inside an API route — diagnose.
+**Q6:** When are ORM queries safe from SQL injection?
+
+### Day 7 — Application
+**Q7:** Build an atomic transfer between two accounts using prisma.$transaction.
+**Q8:** A PR puts a long transaction in a Server Component page — explain pool exhaustion.
+**Q9:** When should you use raw SQL vs ORM?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "How do you handle DB connections in serverless Next.js — connection pooling strategies?"
+**Q11:** Draw: connection pool — app instances → PgBouncer → Postgres.
+**Q12:** ★ System design: "Design the database layer for a Next.js SaaS — multi-tenant isolation, connection pooling, read replicas, migrations."

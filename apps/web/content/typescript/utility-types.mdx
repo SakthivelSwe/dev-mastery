@@ -156,3 +156,195 @@ A: Yes! This is exactly the right use case. A `PATCH /users/{id}` endpoint shoul
 
 **Q: What is the difference between `Pick` and `Omit`? When do you use each?**
 A: Functionally they are opposites. Use `Pick` when you want a small subset of a large type (explicitly listing the few fields you want). Use `Omit` when you want most of a type but need to exclude a few fields (explicitly listing the few fields to exclude). If excluding 2 fields from a 20-field type, `Omit` is much cleaner than `Pick`ing all 18 remaining fields.
+
+## FEYNMAN CHECK
+
+### Explain Utility Types Like I'm 10 Years Old
+> Utility types are TYPE FUNCTIONS that TRANSFORM other types — built into TS, ready to use. `Partial<T>` makes every property optional. `Required<T>` makes every property required. `Readonly<T>` makes them readonly. `Pick<T, K>` selects a subset of keys. `Omit<T, K>` removes keys. `Record<K, V>` builds object types. `Returntype<F>`/`Parameters<F>` extract function pieces. `Awaited<T>` unwraps Promises. They're built using MAPPED TYPES and CONDITIONAL TYPES — you can read their source in lib.es5.d.ts. The non-obvious power: composing them — `Readonly<Partial<Pick<User, 'name' | 'email'>>>` says "an immutable, partial subset of User with only name and email" — useful for API patch payloads.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do utility types solve?**
+> **A:** Repetition. Without them, defining "User but every field optional for PATCH endpoints" means writing `interface UserPatch { id?: number; name?: string; ... }` and keeping it in sync with User. `Partial<User>` does it in one expression that AUTO-UPDATES when User changes. This is type DRY — the source of truth is one interface; the utility types derive variants.
+
+**Q2: Mental model for utility composition?**
+> **A:** Utility types are PURE FUNCTIONS over types. Compose them like math: `Readonly<Pick<User, 'id' | 'role'>>` = "an immutable subtype with only id and role." `NonNullable<T>` removes null|undefined from a type. `Awaited<Promise<Promise<number>>>` recursively unwraps to number. The TypeScript Handbook is a reference; the real skill is knowing WHICH combination expresses your intent.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Confusing `Pick` and `Omit` semantics for unknown unions:
+> ```ts
+> type Animal = { name: string } | { tag: number };
+> type N = Pick<Animal, 'name'>;   // ❌ TS error: 'name' missing from one branch
+> type M = Omit<Animal, 'tag'>;    // produces { name: string } | { /* {} */ } — surprising
+>
+> // ✅ For unions, use a distributive helper
+> type PickFromUnion<T, K extends keyof T> = T extends unknown ? Pick<T, K> : never;
+> ```
+
+**Q4: How does `Awaited<T>` work at compile time?**
+> **A:** It's defined recursively using conditional types — if T is `Promise<U>`, return `Awaited<U>` (recurse); otherwise return T. This unwraps nested promises (`Promise<Promise<number>>` → number), matching the runtime behaviour of `await`. Before Awaited existed (TS 4.5+), you had `UnwrapPromise<T>` defined by hand in every codebase — Awaited standardised it.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Utility types are TypeScript-provided type-level functions (mapped + conditional + infer combinations) that derive related types from a source type — `Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Record`, `Exclude`, `Extract`, `Returntype`, `Parameters`, `Awaited`, `NonNullable` — enabling type DRY by deriving variants instead of repeating field declarations, with composition handling complex transformations like API request/response shape derivation."
+
+## BUILD
+
+### 🏗️ Mini Project: REST API Type Toolkit Using Utility Types
+
+**What you will build:** From ONE `User` interface, derive every type the REST API needs: `CreateUserRequest` (no id), `UpdateUserRequest` (partial, no id), `UserResponse` (readonly), `UserPublic` (omitting passwordHash). All using utility types — no copy-paste.
+**Why this project:** Forces real composition of every common utility type in production.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-utility && cd ts-utility
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/user.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Source of Truth + Derived Types
+```ts
+// src/user.ts
+export interface User {
+  id: number;
+  email: string;
+  passwordHash: string;
+  name: string;
+  age: number;
+  role: 'admin' | 'user' | 'guest';
+  createdAt: Date;
+}
+
+// Create: API caller provides everything except id and createdAt (server assigns)
+export type CreateUserRequest = Omit<User, 'id' | 'createdAt'>;
+
+// Update: everything optional, except id and createdAt cannot be sent
+export type UpdateUserRequest = Partial<Omit<User, 'id' | 'createdAt'>>;
+
+// Response: API returns the full user but immutable + no password
+export type UserResponse = Readonly<Omit<User, 'passwordHash'>>;
+
+// Public profile: a tiny subset for /users/:id/public
+export type UserPublic = Pick<User, 'id' | 'name' | 'role'>;
+
+// Index by role for fast lookup
+export type UsersByRole = Record<User['role'], User[]>;
+```
+
+#### Step 3 — Use The Derived Types
+```ts
+// src/main.ts
+import type {
+  User, CreateUserRequest, UpdateUserRequest,
+  UserResponse, UserPublic, UsersByRole,
+} from './user.js';
+
+function createUser(req: CreateUserRequest): User {
+  return { id: 1, createdAt: new Date(), ...req };
+}
+
+function updateUser(id: number, patch: UpdateUserRequest): void {
+  // ❌ patch.id = 5  → would error if we omitted Partial<>... but we Omit'd id from Update
+  console.log('patching', id, patch);
+}
+
+function toPublic(u: User): UserPublic {
+  return { id: u.id, name: u.name, role: u.role };
+  // TypeScript ensures we don't leak passwordHash or email
+}
+
+const created = createUser({
+  email: 'a@b.io', passwordHash: 'x', name: 'Ana', age: 30, role: 'user',
+});
+updateUser(created.id, { name: 'Anna' });
+console.log(toPublic(created));
+```
+
+#### Step 4 — Error Handling: Compile-Time Safety
+```ts
+// ❌ Can't send id in create
+// createUser({ id: 5, email: 'a@b.io', ... });   // TS error: 'id' not in CreateUserRequest
+
+// ❌ Can't mutate UserResponse
+const resp: UserResponse = { id: 1, email: 'a', name: 'n', age: 1, role: 'guest', createdAt: new Date() };
+// resp.name = 'B';   // TS error: read-only
+
+// ❌ UserPublic doesn't leak passwordHash
+// const wrong: UserPublic = { id: 1, name: 'A', role: 'guest', passwordHash: 'x' };   // TS error
+
+const groups: UsersByRole = { admin: [], user: [created], guest: [] };
+console.log(groups);
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expectTypeOf } from 'vitest';
+import type {
+  User, CreateUserRequest, UpdateUserRequest,
+  UserResponse, UserPublic,
+} from './user.js';
+
+describe('utility-derived types', () => {
+  it('CreateUserRequest omits id and createdAt', () => {
+    expectTypeOf<CreateUserRequest>().not.toHaveProperty('id');
+    expectTypeOf<CreateUserRequest>().not.toHaveProperty('createdAt');
+  });
+  it('UpdateUserRequest makes everything optional', () => {
+    expectTypeOf<UpdateUserRequest>().toEqualTypeOf<{
+      email?: string; passwordHash?: string; name?: string; age?: number;
+      role?: 'admin'|'user'|'guest';
+    }>();
+  });
+  it('UserResponse is readonly and excludes password', () => {
+    expectTypeOf<UserResponse>().not.toHaveProperty('passwordHash');
+  });
+  it('UserPublic is a 3-key projection', () => {
+    expectTypeOf<keyof UserPublic>().toEqualTypeOf<'id' | 'name' | 'role'>();
+  });
+});
+```
+
+**Expected Output:**
+```
+patching 1 { name: 'Anna' }
+{ id: 1, name: 'Ana', role: 'user' }
+
+# tsc errors:
+src/main.ts:N:N - error TS2353: 'passwordHash' does not exist in 'UserPublic'.
+src/main.ts:N:N - error TS2540: Cannot assign to 'name' because it is read-only.
+```
+
+**Stretch Challenges:**
+- [ ] Add a DeepPartial utility for nested patch payloads
+- [ ] Add Branded ID types and use Pick to derive id-only types
+- [ ] Generate matching zod schemas from these TS types via zod's z.object inference
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does `Partial<T>` produce? What about `Required<T>`?
+**Q2:** Difference between `Pick<T, K>` and `Omit<T, K>`?
+**Q3:** Write `Record<'admin' | 'user', boolean>`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What does `Awaited<Promise<Promise<number>>>` resolve to?
+**Q5:** Why does `Pick<A | B, 'name'>` sometimes error? Show the distributive fix.
+**Q6:** Use utility types to derive a "patch" type from this:
+```ts
+interface Profile { id: number; name: string; age: number; bio: string }
+```
+
+### Day 7 — Application
+**Q7:** Build a typed API client factory where input/output types are utility-derived from a single Entity.
+**Q8:** A PR copy-pastes `UserCreate`, `UserUpdate`, `UserResponse` and they drift over time. Refactor with utilities.
+**Q9:** What is the compile-time cost of deeply-composed utility types on a 500-interface project?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every TS utility type and the use case for each."
+**Q11:** Draw: how is `Partial<T>` implemented under the hood (mapped type)?
+**Q12:** ★ System design: "Architect a type-driven API layer where one Entity interface generates request/response/event types — and zod schemas at runtime."

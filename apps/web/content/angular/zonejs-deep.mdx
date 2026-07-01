@@ -137,3 +137,233 @@ A: **ChangeDetection must be triggered from INSIDE the Zone!**
 When you use `runOutsideAngular`, you completely sever the execution context from Angular. 
 Calling `detectChanges()` while physically executing outside the Zone is dangerous and often suppressed by the framework to prevent race conditions. 
 *The Fix:* You do not use `ChangeDetectorRef` to re-enter the framework. You MUST use `this.ngZone.run(() => { this.userData = response; })`. The `.run()` method safely pulls the execution context back inside the Angular Zone, applies your data mutation, and automatically triggers the Change Detection cycle perfectly!
+
+## FEYNMAN CHECK
+
+### Explain Zone.js Deep Like I'm 10 Years Old
+> Zone.js is a JavaScript library that MONKEY-PATCHES every async API in the browser — setTimeout, Promises, XMLHttpRequest, DOM events, fetch — to wrap them with notification hooks. When any async operation completes, Zone.js fires an "async done" notification. Angular's NgZone listens for this notification and triggers change detection. Without Zone.js, Angular wouldn't know when to update the screen after a network response arrives — you'd have to manually call detectChanges(). The non-obvious depth: Zone.js is an invisible monkey-patcher. It replaces the global setTimeout with its own wrapped version — every third-party library that uses setTimeout now runs inside Zone.js's tracking. This is why Angular's change detection "just works" for any async code, but also why Zone.js adds startup overhead and wraps every async call with extra code.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What does Zone.js actually patch?**
+> **A:** Zone.js patches all browser async APIs: setTimeout/setInterval/clearTimeout, requestAnimationFrame, MutationObserver, IntersectionObserver, Promise.then/catch/finally, XMLHttpRequest.open/send, fetch, EventTarget.addEventListener/removeEventListener, and all Node.js async APIs when running in Node. It does this at STARTUP by replacing the global function references. Any code running after Zone.js loads uses the patched versions, triggering zone tracking. Third-party libraries using these APIs are automatically tracked — no configuration needed.
+
+**Q2: Mental model for NgZone and zone.run()?**
+> **A:** NgZone wraps Angular's change detection in a Zone.js zone. Any async operation INSIDE the Angular zone triggers change detection when it completes. zone.runOutsideAngular(() => { heavyWork() }) runs code OUTSIDE the Angular zone — no change detection triggered for async operations in that block. Use this for: continuous animations (requestAnimationFrame loops), WebSocket message handlers, WebWorker communication, intensive computations that update the view only occasionally. zone.run(() => { updateUIState() }) re-enters the Angular zone to trigger change detection at the right moment.
+
+**Q3: Most dangerous misconception about Zone.js?**
+> **A:** Zone.js has zero performance overhead:
+> ```typescript
+> // Zone.js overhead is real and measurable:
+> // 1. Startup: Zone.js adds ~15KB to bundle and patches 40+ APIs at boot
+> // 2. Per-call: each async call has Zone.js wrapper overhead
+> // 3. CD triggering: every microtask completion triggers Angular CD check
+>
+> // For high-frequency scenarios:
+> // ❌ WebSocket receiving 100 messages/second -> 100 CD cycles/second
+>
+> // ✅ Run WebSocket outside Angular zone:
+> this.ngZone.runOutsideAngular(() => {
+>   this.socket.on('message', (msg) => {
+>     this.messages.push(msg);  // no CD triggered
+>     if (this.messages.length % 10 === 0) {
+>       this.ngZone.run(() => this.latestMessages = [...this.messages]);  // CD only every 10
+>     }
+>   });
+> });
+> ```
+
+**Q4: How does zoneless Angular work without Zone.js?**
+> **A:** Angular 18+ supports zoneless mode via provideExperimentalZonelessChangeDetection(). Without Zone.js, change detection is triggered ONLY by: signal changes (reactive), markForCheck() explicit calls, ChangeDetectorRef.markForCheck() in OnPush components, and Angular's own lifecycle hooks. All async code must use signals or explicitly mark for check. Signals make this practical — signal.set() automatically marks components as dirty. Zoneless Angular: ~15KB smaller bundle, no monkey-patching startup cost, faster async operations, but requires all state updates to flow through signals or explicit marking.
+
+**Q5: FAANG-grade definition of Zone.js in Angular.**
+> **A:** "Zone.js is a JavaScript execution context library that monkey-patches browser async APIs (setTimeout, Promise, XHR, fetch, DOM events) at startup — creating execution zones that track async operations and fire onMicrotaskEmpty/onStable events that Angular's NgZone uses to trigger change detection — enabling automatic UI updates after any async operation without manual detectChanges() calls — with NgZone.runOutsideAngular() for performance-critical code that should not trigger CD, NgZone.run() to re-enter for explicit CD triggering — and Angular 18+ zoneless mode (provideExperimentalZonelessChangeDetection) replacing Zone.js entirely with signals-based reactive CD for smaller bundles and reduced async overhead."
+
+## BUILD
+
+### 🏗️ Mini Project: Zone.js Performance Lab — Inside vs Outside Angular Zone
+
+**What you will build:** An app with three scenarios: (1) WebSocket messages triggering too many CD cycles (baseline), (2) WebSocket outside zone with batched updates (optimised), (3) Signals-based version (optimal) — with CD cycle counting to measure the difference.
+**Why this project:** Makes Zone.js overhead observable with measurable CD cycle counts.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new zonejs-demo --standalone --routing false
+cd zonejs-demo
+ng generate component message-feed --standalone
+```
+
+#### Step 2 — Message Feed Baseline (inside zone — too many CD cycles)
+```typescript
+// message-feed.component.ts
+import { Component, NgZone, inject, OnDestroy, OnInit, ChangeDetectorRef } from '@angular/core';
+import { NgFor } from '@angular/common';
+
+@Component({
+  standalone: true,
+  selector: 'app-message-feed',
+  imports: [NgFor],
+  template: `
+    <h2>Message Feed (CD cycles: {{ cdCount }})</h2>
+    <p>Strategy: {{ strategy }}</p>
+    <button (click)="startFeed()">Start</button>
+    <button (click)="stopFeed()">Stop</button>
+    <ul>
+      <li *ngFor="let msg of messages.slice(-5)">{{ msg }}</li>
+    </ul>
+  `,
+})
+export class MessageFeedComponent implements OnDestroy {
+  strategy = 'Inside Zone (default)';
+  messages: string[] = [];
+  cdCount = 0;
+  private interval?: ReturnType<typeof setInterval>;
+  private ngZone = inject(NgZone);
+  private cdr = inject(ChangeDetectorRef);
+
+  ngDoCheck() { this.cdCount++; }
+
+  startFeed() {
+    this.strategy = 'Inside Zone (default)';
+    // Every setInterval fires inside Zone.js -> triggers CD every 100ms
+    this.interval = setInterval(() => {
+      this.messages.push('Message ' + this.messages.length + ' at ' + new Date().toISOString());
+    }, 100);
+  }
+
+  startFeedOptimised() {
+    this.strategy = 'Outside Zone (batched)';
+    // setInterval outside zone -> no CD triggered
+    this.ngZone.runOutsideAngular(() => {
+      this.interval = setInterval(() => {
+        this.messages.push('Message ' + this.messages.length);
+        // Only trigger CD every 10 messages -> 10x fewer CD cycles
+        if (this.messages.length % 10 === 0) {
+          this.ngZone.run(() => {});  // force single CD cycle
+        }
+      }, 100);
+    });
+  }
+
+  stopFeed() { clearInterval(this.interval); }
+  ngOnDestroy() { this.stopFeed(); }
+}
+```
+
+#### Step 3 — Signals Version (Optimal — No Zone Needed)
+```typescript
+// signals-feed.component.ts
+import { Component, signal, computed, effect, inject, NgZone, OnDestroy } from '@angular/core';
+import { NgFor } from '@angular/common';
+
+@Component({
+  standalone: true,
+  selector: 'app-signals-feed',
+  imports: [NgFor],
+  template: `
+    <h2>Signals Feed (targeted updates)</h2>
+    <button (click)="start()">Start</button>
+    <button (click)="stop()">Stop</button>
+    <p>Messages: {{ count() }}</p>
+    <ul>
+      <li *ngFor="let msg of latestFive()">{{ msg }}</li>
+    </ul>
+  `,
+})
+export class SignalsFeedComponent implements OnDestroy {
+  private _messages = signal<string[]>([]);
+  count = computed(() => this._messages().length);
+  latestFive = computed(() => this._messages().slice(-5));
+  private ngZone = inject(NgZone);
+  private interval?: ReturnType<typeof setInterval>;
+
+  start() {
+    // Even inside zone, signals only update components that read them
+    this.interval = setInterval(() => {
+      this._messages.update(msgs => [...msgs, 'Signal msg ' + msgs.length]);
+    }, 100);
+  }
+
+  stop() { clearInterval(this.interval); }
+  ngOnDestroy() { this.stop(); }
+}
+```
+
+#### Step 4 — Measurement
+```typescript
+// Add to AppComponent to count CD cycles across strategies
+@Component({
+  standalone: true,
+  imports: [MessageFeedComponent, SignalsFeedComponent],
+  template: `
+    <h1>Zone.js Performance Lab</h1>
+    <app-message-feed/>
+    <app-signals-feed/>
+  `,
+})
+export class AppComponent {
+  ngDoCheck() { console.count('AppComponent CD'); }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+it('outside zone does not trigger CD directly', fakeAsync(() => {
+  const fixture = TestBed.createComponent(MessageFeedComponent);
+  const cdSpy = spyOn(fixture.componentInstance, 'ngDoCheck').and.callThrough();
+  const ngZone = TestBed.inject(NgZone);
+  fixture.detectChanges();
+  const before = cdSpy.calls.count();
+
+  // Simulate outside-zone operation
+  ngZone.runOutsideAngular(() => {
+    fixture.componentInstance.messages.push('test');
+  });
+  tick(100);
+  // CD should NOT have fired for the out-of-zone update
+  expect(cdSpy.calls.count()).toBe(before);
+}));
+```
+
+**Expected Output:**
+```
+Start (inside zone): CD cycles increment every 100ms (10/sec)
+Open Angular DevTools profiler: constant CD activity
+
+Start optimised (outside zone): CD cycles increment every 1s (batched)
+DevTools profiler: 10x fewer CD marks
+
+Signals feed: only the signal-reading components update
+```
+
+**Stretch Challenges:**
+- [ ] Enable zoneless change detection and verify signals still work
+- [ ] Remove zone.js from the bundle and measure startup time improvement
+- [ ] Add a WebWorker for heavy computation and measure CD isolation
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does Zone.js patch and why?
+**Q2:** What is NgZone.runOutsideAngular and when do you use it?
+**Q3:** Write the Angular provider for zoneless change detection. From memory.
+
+### Day 3 — Comprehension
+**Q4:** A WebSocket handler receives 100 messages/second — how does this affect change detection?
+**Q5:** A PR wraps a requestAnimationFrame loop inside an Angular component — diagnose the perf issue.
+**Q6:** What is the startup overhead of Zone.js and how does zoneless eliminate it?
+
+### Day 7 — Application
+**Q7:** Move a continuous animation loop outside Angular zone and measure CD reduction.
+**Q8:** A PR removes Zone.js and CD stops working — what's missing?
+**Q9:** How do you trigger one CD cycle after batch-processing 1000 events outside the zone?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain how Zone.js enables Angular change detection — what it patches, when CD fires, and how signals replace it."
+**Q11:** Draw: Zone.js async operation tracking — setInterval call, zone notification, Angular CD trigger.
+**Q12:** ★ System design: "Design a real-time trading dashboard in Angular — 1000 price updates/second, smooth 60fps rendering, minimal CPU usage."

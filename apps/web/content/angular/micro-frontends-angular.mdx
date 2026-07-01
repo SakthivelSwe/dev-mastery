@@ -127,3 +127,188 @@ In an Angular application, Services (like `HttpClient` or your custom `AuthServi
 When Webpack loads the Remote app, it loads the Remote's compiled JavaScript. If Module Federation is not configured perfectly, Webpack will instantiate a *second, completely separate instance* of the `@angular/core` framework in memory for the Remote app.
 The Remote app asks its own version of Angular for `HttpClient`, but the Remote's Angular never provided it!
 *The Fix:* You must explicitly configure the `shared` block in the `webpack.config.js` of BOTH apps. You must set `{ singleton: true, strictVersion: true }` for `@angular/core` and `@angular/common`. This forces Webpack to guarantee that only ONE instance of the Angular framework exists in the browser's memory, ensuring that the Host and Remote share the exact same Dependency Injection container!
+
+## FEYNMAN CHECK
+
+### Explain Angular Micro-Frontends Like I'm 10 Years Old
+> Micro-frontends split a LARGE web application into smaller, independently-deployable frontend apps — each owned by a different team. Instead of one monolithic Angular app, you have 5 teams each with their own Angular app (checkout team, catalog team, account team, etc.), each deployable independently. Module Federation (webpack feature) is the key technology: it lets one Angular app LOAD COMPONENTS from another app at runtime — the host app doesn't know anything about the remote app at build time. The non-obvious depth: micro-frontends solve ORGANISATIONAL problems (independent deploys, team autonomy), not technical ones. They add complexity (shared state, style isolation, version mismatches). Only use them if team independence is genuinely blocked by a monolith.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does Module Federation work in Angular?**
+> **A:** Module Federation is a webpack plugin that enables RUNTIME code sharing between separately-built JavaScript bundles. The HOST app declares remotes: { checkout: 'http://checkout.example.com/remoteEntry.js' }. The REMOTE app exposes: { checkout: './CheckoutModule' }. At runtime, when the host navigates to /checkout, webpack fetches remoteEntry.js from the checkout server, downloads the chunk, and instantiates the component. The Angular Router integrates via loadRemoteModule() helper: { path: 'checkout', loadChildren: () => loadRemoteModule({ remoteEntry: '...' }) }. Each remote can be deployed independently.
+
+**Q2: Mental model for shared dependencies in Module Federation?**
+> **A:** If both host and remote use Angular 17, you don't want TWO copies of Angular in the browser. Module Federation's shared: singleton configuration tells webpack to share dependencies: shared: { '@angular/core': { singleton: true, strictVersion: true } }. The first loaded version is used by all remotes. strictVersion: true ensures version mismatch causes an error (not silent failure). The risk: if checkout team uses Angular 17 and catalog team uses Angular 18, one must upgrade. This is the main TECHNICAL challenge of micro-frontends — shared library versioning.
+
+**Q3: Most dangerous misconception about Angular micro-frontends?**
+> **A:** Micro-frontends are simpler than a monolith:
+> ```
+> // Monolith (what teams think they're escaping):
+> - One deployment per release
+> - Teams must coordinate code changes
+>
+> // Micro-frontends (what teams often get instead):
+> - N deployments per release (more complex CI/CD)
+> - Shared state management (how does checkout know cart contents?)
+> - Style conflicts (two Angular apps, two sets of CSS)
+> - Performance: users download N separate bundles
+> - Version mismatches: Angular 17 + Angular 18 in one page
+> - Testing: hard to test cross-team interactions
+>
+> // Only justified when: genuine deploy-blocking team coupling exists
+> // Not justified for: "we want to use different frameworks"
+> ```
+
+**Q4: How do micro-frontends share state and communicate?**
+> **A:** Options in decreasing coupling order: (1) URL/route params — stateless, works well, no coupling. (2) Browser events (CustomEvent) — decoupled, asynchronous. (3) Shared state via a separately-hosted state service module. (4) Native Federation events API. Avoid: direct cross-remote Angular service injection (tight coupling, breaks federation independence). The architectural principle: micro-frontends should communicate via EVENTS and SHARED APIS, not shared Angular services.
+
+**Q5: FAANG-grade definition of Angular micro-frontends.**
+> **A:** "Angular micro-frontends use Module Federation (webpack/rspack plugin) to compose independently-deployable Angular applications at runtime — a host shell app loading remote Angular components/routes via loadRemoteModule() pointing to remote entry points (remoteEntry.js) — with singleton shared dependencies (Angular core, CDK) to prevent duplicate framework instances — Native Federation (@angular-architects/native-federation) providing an ES Modules-based alternative — appropriate for large organisations (50+ engineers, 5+ teams) where independent deployment velocity is genuinely blocked by a monolith, not as a technical solution to a non-existent problem."
+
+## BUILD
+
+### 🏗️ Mini Project: Module Federation Shell + Two Remotes
+
+**What you will build:** A host shell Angular app loading two remote Angular apps (Products and Cart) via Module Federation — each independently buildable and deployable.
+**Why this project:** Forces complete Module Federation setup — the full micro-frontend lifecycle.
+**Time estimate:** 50 minutes
+
+---
+
+#### Step 1 — Setup Three Apps
+```bash
+# Shell (host)
+ng new mfe-shell --standalone --routing
+cd mfe-shell && npm install @angular-architects/module-federation
+ng add @angular-architects/module-federation --project mfe-shell --port 4200 --type host
+
+# Products remote
+cd .. && ng new mfe-products --standalone --routing
+cd mfe-products && npm install @angular-architects/module-federation
+ng add @angular-architects/module-federation --project mfe-products --port 4201 --type remote
+
+# Cart remote
+cd .. && ng new mfe-cart --standalone --routing
+cd mfe-cart && npm install @angular-architects/module-federation
+ng add @angular-architects/module-federation --project mfe-cart --port 4202 --type remote
+```
+
+#### Step 2 — Remote: Products webpack.config.js
+```javascript
+// mfe-products/webpack.config.js
+const { shareAll, withModuleFederationPlugin } = require('@angular-architects/module-federation/webpack');
+module.exports = withModuleFederationPlugin({
+  name: 'mfeProducts',
+  exposes: {
+    './ProductsModule': './src/app/products/products.routes.ts',
+  },
+  shared: { ...shareAll({ singleton: true, strictVersion: true, requiredVersion: 'auto' }) },
+});
+```
+
+#### Step 3 — Shell: Host Routes
+```typescript
+// mfe-shell/src/app/app.routes.ts
+import { loadRemoteModule } from '@angular-architects/module-federation';
+
+export const routes: Routes = [
+  { path: '', redirectTo: 'home', pathMatch: 'full' },
+  {
+    path: 'products',
+    loadChildren: () => loadRemoteModule({
+      type: 'module',
+      remoteEntry: 'http://localhost:4201/remoteEntry.js',
+      exposedModule: './ProductsModule',
+    }).then(m => m.PRODUCTS_ROUTES),
+  },
+  {
+    path: 'cart',
+    loadChildren: () => loadRemoteModule({
+      type: 'module',
+      remoteEntry: 'http://localhost:4202/remoteEntry.js',
+      exposedModule: './CartModule',
+    }).then(m => m.CART_ROUTES),
+  },
+];
+```
+
+#### Step 4 — Cross-MFE Communication via Events
+```typescript
+// Shared event bus via Custom Events
+export const CartEvents = {
+  addItem: (item: any) => {
+    window.dispatchEvent(new CustomEvent('cart:add', { detail: item }));
+  },
+  onItemAdded: (handler: (item: any) => void) => {
+    window.addEventListener('cart:add', (e: any) => handler(e.detail));
+  },
+};
+
+// Products remote: fire event when item added
+addToCart(product: Product) {
+  CartEvents.addItem(product);
+}
+
+// Cart remote: listen for events
+ngOnInit() {
+  CartEvents.onItemAdded(item => this.cart.addItem(item));
+}
+```
+
+#### Step 5 — Tests
+```typescript
+// Test the routing in isolation (no remote needed)
+it('navigates to products route', fakeAsync(() => {
+  const router = TestBed.inject(Router);
+  TestBed.configureTestingModule({
+    imports: [RouterTestingModule.withRoutes(routes)],
+  });
+  router.navigateByUrl('/products');
+  tick();
+  // Module federation loading is mocked in unit tests
+  expect(router.url).toBe('/products');
+}));
+```
+
+**Expected Output:**
+```
+# Start all three servers:
+cd mfe-products && npm start &
+cd mfe-cart && npm start &
+cd mfe-shell && npm start
+
+# Shell at :4200 loads products remote at :4201
+# Navigate /products -> loads Products MFE
+# Navigate /cart -> loads Cart MFE
+# Add item in Products -> CartEvents fires -> Cart MFE updates count
+```
+
+**Stretch Challenges:**
+- [ ] Add Native Federation (@angular-architects/native-federation) instead of webpack Module Federation
+- [ ] Add a shared authentication service module loaded by both remotes
+- [ ] Add a CI/CD pipeline that deploys each remote independently
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What problem do micro-frontends solve?
+**Q2:** What is Module Federation and how does loadRemoteModule work?
+**Q3:** How should micro-frontends communicate with each other? From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the singleton shared dependency problem in Module Federation?
+**Q5:** A junior implements micro-frontends to "use different frameworks per team" — explain the real cost.
+**Q6:** What is the difference between webpack Module Federation and Native Federation?
+
+### Day 7 — Application
+**Q7:** Build a shell + one remote and load it at runtime.
+**Q8:** Two remotes use different versions of Angular — what happens and how do you fix it?
+**Q9:** How do you handle authentication state shared across all remotes?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain the micro-frontend pattern — when is it appropriate and what are the risks?"
+**Q11:** Draw: Module Federation runtime loading — host, remoteEntry.js, webpack chunks.
+**Q12:** ★ System design: "Architect a micro-frontend e-commerce platform for 5 teams — shell, routing, shared state, auth, deployment."

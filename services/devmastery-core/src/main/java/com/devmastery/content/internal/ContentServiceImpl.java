@@ -149,6 +149,103 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
                 .toList();
     }
 
+    private static final List<String> VALID_SECTIONS = List.of(
+            "why", "theory", "visual", "code",
+            "realworld", "interview", "feynman", "build", "spacedreview");
+
+    /** Normalise incoming section key to canonical DB value. */
+    private static String normaliseSection(String raw) {
+        if (raw == null) return "";
+        String s = raw.toLowerCase().replace("-", "").replace("_", "").replace(" ", "");
+        return switch (s) {
+            case "realworld"    -> "realworld";
+            case "spacedreview" -> "spacedreview";
+            default             -> raw.toLowerCase().replace("-", "_").replace(" ", "_");
+        };
+    }
+
+    @Override
+    @Transactional
+    public void upsertTopicSection(String topicSlug, String sectionType, String content) {
+        String section = normaliseSection(sectionType);
+        topics.findBySlug(topicSlug).ifPresent(topic -> {
+            LessonEntity lesson = lessons
+                    .findByTopicIdAndSection(topic.getId(), section)
+                    .orElseGet(() -> LessonEntity.builder()
+                            .topicId(topic.getId())
+                            .section(section)
+                            .title(sectionTitle(section))
+                            .orderIndex(sectionOrder(section))
+                            .build());
+            lesson.setContent(content);
+            lessons.save(lesson);
+        });
+    }
+
+    @Override
+    @Transactional
+    public void importTopicLayers(List<ContentCommandService.TopicImport> topicImports) {
+        int saved = 0, skipped = 0;
+        for (var ti : topicImports) {
+            var topicOpt = topics.findBySlug(ti.slug());
+            if (topicOpt.isEmpty()) { skipped++; continue; }
+            var topic = topicOpt.get();
+            if (ti.layers() == null) continue;
+            for (var entry : ti.layers().entrySet()) {
+                String section = normaliseSection(entry.getKey());
+                String mdx     = entry.getValue();
+                if (!VALID_SECTIONS.contains(section) || mdx == null || mdx.isBlank()) continue;
+                LessonEntity lesson = lessons
+                        .findByTopicIdAndSection(topic.getId(), section)
+                        .orElseGet(() -> LessonEntity.builder()
+                                .topicId(topic.getId())
+                                .section(section)
+                                .title(sectionTitle(section))
+                                .orderIndex(sectionOrder(section))
+                                .build());
+                lesson.setContent(mdx);
+                lessons.save(lesson);
+                saved++;
+            }
+        }
+        log.info("importTopicLayers: {} sections saved, {} slugs skipped", saved, skipped);
+    }
+
+    /** Returns a human-readable title for each section type. */
+    private static String sectionTitle(String section) {
+        return switch (section) {
+            case "why"          -> "Why It Matters";
+            case "theory"       -> "Theory & Deep Dive";
+            case "visual"       -> "Visualization";
+            case "code"         -> "Code Examples";
+            case "realworld"    -> "Real World Applications";
+            case "interview"    -> "Interview Questions";
+            case "feynman"      -> "Feynman Check";
+            case "build"        -> "Build Challenge";
+            case "spacedreview" -> "Spaced Review";
+            default             -> section;
+        };
+    }
+
+    /** Returns the display order index for each section type. */
+    private static int sectionOrder(String section) {
+        return switch (section) {
+            case "why"          -> 1;
+            case "theory"       -> 2;
+            case "visual"       -> 3;
+            case "code"         -> 4;
+            case "realworld"    -> 5;
+            case "interview"    -> 6;
+            case "feynman"      -> 7;
+            case "build"        -> 8;
+            case "spacedreview" -> 9;
+            default             -> 10;
+        };
+    }
+
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(ContentServiceImpl.class);
+
     @Override
     @Transactional
     @CacheEvict(value = CacheNames.USER_PROGRESS, allEntries = true)

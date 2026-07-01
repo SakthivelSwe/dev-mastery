@@ -173,3 +173,230 @@ A: They can, if used improperly. Because a closure forces the V8 engine to keep 
 
 **Q: How does Lexical Scoping differ from Dynamic Scoping?**
 A: JavaScript uses Lexical Scoping, meaning scope is determined by the physical location of the code when it is *written* (compiled). Inner functions always look "up and out" to find variables in the surrounding text blocks. Dynamic Scoping (used in bash/Perl) determines scope based on the call stack at *runtime*—meaning a function's variables change depending on who called it. (JS partially simulates Dynamic Scoping via the `this` keyword, which is why `this` is so confusing!)
+
+## FEYNMAN CHECK
+
+### Explain Closures Like I'm 10 Years Old
+> A closure is a FUNCTION + ITS REMEMBERED SURROUNDING SCOPE. When you create a function inside another function, the inner function REMEMBERS the variables from the outer function — even AFTER the outer function returns. The outer function's local variables are kept alive in memory specifically because the inner function still has a LIVE REFERENCE to them (not a copy). This is how you implement: private state in modules, factory functions, partial application, callbacks that remember context, React hooks (every `useState` slot is a closure over a position in a per-component array). The non-obvious detail: the V8 garbage collector cannot reclaim closed-over variables until ALL closures referencing them are themselves garbage — this is how memory leaks creep in (a forgotten event listener keeps a giant object alive).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do closures fundamentally solve?**
+> **A:** DATA PRIVACY without classes, and STATE PERSISTENCE without globals. Before closures (in languages that lack them), the only way to maintain state across function calls was global variables (polluting namespace, hard to test) or passing state explicitly through every call. Closures let an inner function "carry" its own scoped state. This is how every module-pattern, callback-based event handler, and React hook works under the hood.
+
+**Q2: Mental model for closures?**
+> **A:** "Every function is BORN with a HIDDEN POINTER to the lexical environment that existed when it was created." That environment is a key→value map of all the bindings in the enclosing scopes. When the function later runs, variable lookups walk that scope chain. Crucially, multiple closures created in the same outer call SHARE the same lexical environment — `let counter = (() => { let n = 0; return { inc: () => n++, get: () => n }; })()` — inc and get see the SAME n.
+
+**Q3: Most dangerous misconception?**
+> **A:** Closures capture VALUES at creation time:
+> ```js
+> // ❌ Classic for-loop trap
+> for (var i = 0; i < 3; i++) {
+>   setTimeout(() => console.log(i), 0);   // logs 3, 3, 3
+> }
+>
+> // ✅ Closures capture REFERENCES to bindings — let creates a NEW binding per iteration
+> for (let i = 0; i < 3; i++) {
+>   setTimeout(() => console.log(i), 0);   // logs 0, 1, 2
+> }
+> ```
+
+**Q4: How do closures interact with the garbage collector?**
+> **A:** A closed-over variable is kept alive as long as any reachable function STILL REFERENCES IT. If an inner function captures a 100MB array and that function is stored on a global event listener, the 100MB cannot be freed until the listener is removed. The fix: always remove listeners when components unmount; avoid capturing large objects in long-lived closures; use WeakMap/WeakRef for caches that should not prevent collection.
+
+**Q5: FAANG-grade definition?**
+> **A:** "A closure is a function bundled with its surrounding lexical environment — every JavaScript function captures the bindings of its enclosing scopes at creation time and retains a LIVE REFERENCE (not a snapshot) to them — enabling data encapsulation, module patterns, partial application, and stateful callbacks, while inadvertently extending the lifetime of captured variables until all closures referencing them are themselves unreachable."
+
+## BUILD
+
+### 🏗️ Mini Project: Build useState From Scratch (React-Style Hook)
+
+**What you will build:** A working clone of React's useState that uses a CLOSURE over a hook-slot array — exactly how React tracks state per component across re-renders.
+**Why this project:** Forces the exact closure pattern that powers every React hook.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-closures && cd js-closures
+npm init -y
+npm install -D vitest
+ni useState.js, useState.test.js -ItemType File
+```
+
+#### Step 2 — Mini React Renderer + useState
+```js
+// useState.js
+let currentComponent = null;
+
+export function createRenderer() {
+  const componentStates = new Map();   // component -> { hooks: [], index: 0 }
+
+  function render(componentFn, name = 'Anon') {
+    currentComponent = { name };
+    const state = componentStates.get(name) ?? { hooks: [], index: 0 };
+    state.index = 0;
+    componentStates.set(name, state);
+
+    // Closure: useState below captures 'state' via currentComponent lookup
+    const output = componentFn();
+    currentComponent = null;
+    return output;
+  }
+
+  function useState(initial) {
+    const state = componentStates.get(currentComponent.name);
+    const slotIndex = state.index++;            // CRITICAL: order matters!
+    if (state.hooks[slotIndex] === undefined) {
+      state.hooks[slotIndex] = initial;
+    }
+    const setter = (next) => {
+      state.hooks[slotIndex] =
+        typeof next === 'function' ? next(state.hooks[slotIndex]) : next;
+      console.log(`[${currentComponent?.name ?? 'next render'}] slot ${slotIndex} = `, state.hooks[slotIndex]);
+    };
+    return [state.hooks[slotIndex], setter];
+  }
+
+  return { render, useState };
+}
+```
+
+#### Step 3 — Use The Hook
+```js
+// demo.js
+import { createRenderer } from './useState.js';
+
+const { render, useState } = createRenderer();
+
+function Counter() {
+  const [count, setCount]   = useState(0);
+  const [name,  setName]    = useState('Ana');
+  console.log(`Counter rendered with count=${count}, name=${name}`);
+  return { count, name, setCount, setName };
+}
+
+const r1 = render(Counter, 'C1');     // count=0, name='Ana'
+r1.setCount(5);
+r1.setName('Bob');
+const r2 = render(Counter, 'C1');     // count=5, name='Bob' (state persisted!)
+r2.setCount((prev) => prev + 1);
+const r3 = render(Counter, 'C1');     // count=6
+```
+
+#### Step 4 — Error Handling: Counter Factory (Classic Closure)
+```js
+// factory.js — the canonical closure example
+export function makeCounter(start = 0, step = 1) {
+  let count = start;   // captured by all three returned closures
+  return {
+    inc:   () => (count += step),
+    dec:   () => (count -= step),
+    value: () => count,
+    reset: () => (count = start),
+  };
+}
+
+const c = makeCounter(10, 2);
+console.log(c.value());   // 10
+c.inc(); c.inc(); c.dec();
+console.log(c.value());   // 12 (10+2+2-2)
+c.reset();
+console.log(c.value());   // 10
+```
+
+#### Step 5 — Tests
+```js
+// useState.test.js
+import { describe, it, expect } from 'vitest';
+import { createRenderer } from './useState.js';
+import { makeCounter } from './factory.js';
+
+describe('useState (hook simulation)', () => {
+  it('persists state across renders', () => {
+    const { render, useState } = createRenderer();
+    let setCount;
+    function App() { const [c, set] = useState(0); setCount = set; return c; }
+
+    expect(render(App, 'A')).toBe(0);
+    setCount(5);
+    expect(render(App, 'A')).toBe(5);
+  });
+  it('supports functional updates', () => {
+    const { render, useState } = createRenderer();
+    let setCount;
+    function App() { const [c, set] = useState(0); setCount = set; return c; }
+    render(App, 'B');
+    setCount(c => c + 10);
+    expect(render(App, 'B')).toBe(10);
+  });
+});
+
+describe('makeCounter (closure factory)', () => {
+  it('two counters have INDEPENDENT state', () => {
+    const a = makeCounter();
+    const b = makeCounter();
+    a.inc(); a.inc();
+    expect(a.value()).toBe(2);
+    expect(b.value()).toBe(0);
+  });
+  it('inc, dec, reset share the same count', () => {
+    const c = makeCounter(10);
+    c.inc(); c.inc(); c.dec();
+    expect(c.value()).toBe(11);
+    c.reset();
+    expect(c.value()).toBe(10);
+  });
+});
+```
+
+**Expected Output:**
+```
+Counter rendered with count=0, name=Ana
+[C1] slot 0 =  5
+[C1] slot 1 =  Bob
+Counter rendered with count=5, name=Bob
+[C1] slot 0 =  6
+Counter rendered with count=6, name=Bob
+
+Tests:
+✓ persists state across renders
+✓ supports functional updates
+✓ two counters have INDEPENDENT state
+✓ inc, dec, reset share the same count
+```
+
+**Stretch Challenges:**
+- [ ] Add useEffect with dependency-array semantics
+- [ ] Detect "hook called outside component" and throw
+- [ ] Build a memory leak: capture a 10MB array in a long-lived closure, then fix with WeakRef
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Define a closure in one sentence (mention "live reference").
+**Q2:** What does `for (var i...) setTimeout(...)` log vs `for (let i...)`?
+**Q3:** Write a counter factory using closure. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does React forbid calling hooks inside conditionals? (Hint: hook slot index)
+**Q5:** A junior says "let inside a for-loop is slow" — measure and refute.
+**Q6:** Refactor to use closure for private state:
+```js
+let count = 0;
+window.increment = () => count++;
+window.getCount  = () => count;
+```
+
+### Day 7 — Application
+**Q7:** Build a memoize(fn) using a closure over a Map cache.
+**Q8:** A PR creates 1000 modal dialogs each with an inline onClose listener; memory keeps growing. Diagnose.
+**Q9:** What is the memory cost of one closure? Of 100,000 closures?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how every React useState call links to a specific closure-captured slot."
+**Q11:** Draw: the scope chain when an inner function inside three levels of nesting accesses a var from the outermost.
+**Q12:** ★ System design: "Implement a job-queue library where each task captures context via closures. What memory risks arise at 10k tasks?"
