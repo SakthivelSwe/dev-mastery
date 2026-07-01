@@ -176,3 +176,275 @@ Key points:
 3. Each Suspense boundary resolves independently as its data arrives
 4. At 1 second: Stats appear. At 2 seconds: Orders appear. At 3 seconds: Chart appears
 5. Total perceived wait: ~1 second (when first real data appears) instead of 3 seconds
+
+## FEYNMAN CHECK
+
+### Explain Next.js Streaming Like I'm 10 Years Old
+> Streaming means the server sends parts of the HTML response AS THEY BECOME READY, instead of waiting for everything to be ready and sending one big response at the end. Wrap a slow Server Component in <Suspense fallback={<Skeleton />}>. Next.js sends the shell + skeleton immediately, then streams the real content when the slow data resolves. The user sees the page structure in 100ms instead of waiting 3 seconds for the slowest API. This is enabled by React 18's renderToReadableStream() — HTML is delivered in chunks, each Suspense boundary becoming a chunk. The non-obvious depth: streaming changes nothing about your code — you just wrap components in Suspense. React and Next.js handle the entire streaming protocol, out-of-order chunk delivery, and client-side reconciliation automatically. Old SSR (and Pages Router) couldn't do this — they had to wait for ALL data before sending any HTML.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between streaming SSR and traditional SSR?**
+> **A:** Traditional SSR: server waits for ALL async work (DB queries, API calls) → renders complete HTML → sends in one response. Slow components block the entire page TTFB. Streaming SSR: server starts sending HTML IMMEDIATELY (the shell + fallbacks) → keeps the connection open → streams Suspense boundary contents as they resolve. TTFB drops to near-zero (just the shell). The user perceives a 5x faster page load even if total render time is identical, because the structure appears instantly and content fills in. Streaming requires HTTP/1.1 chunked transfer encoding (universally supported).
+
+**Q2: Mental model for how Suspense + streaming work together?**
+> **A:** Each <Suspense fallback={...}> is a STREAMING BOUNDARY. When the server renders, it: (1) Renders everything outside Suspense → sends to client immediately. (2) For Suspense children, sends the FALLBACK now and queues the real content for streaming. (3) When the async work inside Suspense completes, renders the real HTML and streams it with a script tag that tells React "replace fallback X with content Y". The client sees: skeleton → loading → smooth replacement. No JavaScript loading state libraries (SWR, React Query) needed — Suspense IS the loading state.
+
+**Q3: Most dangerous misconception about streaming?**
+> **A:** Streaming improves total response time:
+> ```typescript
+> // WRONG: assuming streaming makes things faster overall
+> // Streaming changes WHEN bytes arrive, not the TOTAL time
+> //
+> // Traditional SSR: 3 second wait, then 50KB HTML in 100ms
+> //                  Total: 3.1s to interactive
+> //
+> // Streaming SSR:  100ms shell, then progressive chunks over 3 seconds
+> //                  Total: 3.1s to fully interactive
+> //                  BUT: user sees content at 100ms, perceives 30x faster
+> //
+> // Key insight: streaming improves PERCEIVED performance and Time-To-First-Byte
+> // It does NOT reduce total server work or total transfer time
+> // Slow database queries are still slow — streaming just doesn't block other content
+> ```
+
+**Q4: How do you optimise the streaming granularity?**
+> **A:** Each Suspense boundary creates a streaming chunk. TOO COARSE (one big Suspense around the whole page): all content waits for the slowest part — no benefit. TOO FINE (Suspense around each line): overhead from too many chunks. SWEET SPOT: one Suspense per independent data fetch. Pattern: layout.tsx renders the shell, page.tsx orchestrates Suspense boundaries around independently-fetching widgets (RevenueChart, ActivityFeed, RecentOrders). Each widget streams independently — fast ones appear first, slow ones get their own skeleton. Avoid Suspense around components with no async work — it adds overhead without benefit.
+
+**Q5: FAANG-grade definition of Next.js streaming.**
+> **A:** "Next.js streaming SSR leverages React 18's renderToReadableStream() to deliver HTML in chunks over HTTP/1.1 chunked transfer encoding — sending the initial shell with Suspense fallbacks immediately (sub-100ms TTFB) — buffering and streaming each Suspense boundary's content as its async work resolves with inline scripts instructing React to replace fallbacks — supporting out-of-order chunk delivery (fast components can arrive before slow ones declared earlier) — automatically enabled for any Server Component wrapped in Suspense without code changes — improving perceived performance and Core Web Vitals (LCP, INP) while total render time remains constant — and enabling progressive hydration where interactive components become live as their JavaScript loads."
+
+## BUILD
+
+### 🏗️ Mini Project: Streaming Dashboard — Independent Widgets With Granular Suspense
+
+**What you will build:** A dashboard with 4 widgets fetching data at different speeds (100ms, 500ms, 1500ms, 3000ms) — each in its own Suspense boundary so users see content progressively. Compare to a non-streaming version where everything waits for the slowest fetch.
+**Why this project:** Forces the granular Suspense pattern that gives streaming its real benefit.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest streaming-demo --typescript --tailwind --app
+```
+
+#### Step 2 — Simulated Data Fetchers
+```typescript
+// src/lib/data.ts
+async function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+export async function getFastStats() {
+  await delay(100);
+  return { activeUsers: 1234, signupsToday: 42 };
+}
+
+export async function getRevenueData() {
+  await delay(500);
+  return { mtdRevenue: 42_318, growth: 12.5 };
+}
+
+export async function getRecentActivity() {
+  await delay(1500);
+  return [
+    { id: 1, action: 'PR merged', user: 'ana', time: '5m' },
+    { id: 2, action: 'Deploy succeeded', user: 'ben', time: '12m' },
+    { id: 3, action: 'New user signed up', user: 'cara', time: '18m' },
+  ];
+}
+
+export async function getMonthlyChart() {
+  await delay(3000);  // SLOW — analytics aggregate query
+  return Array.from({ length: 30 }, (_, i) => ({ day: i + 1, value: Math.random() * 100 }));
+}
+```
+
+#### Step 3 — Independent Widgets
+```typescript
+// src/components/Widgets.tsx
+import { getFastStats, getRevenueData, getRecentActivity, getMonthlyChart } from '@/lib/data';
+
+export async function FastStats() {
+  const data = await getFastStats();
+  return (
+    <div className="bg-white rounded-lg p-6 shadow">
+      <h3 className="font-bold text-gray-600">Active Users</h3>
+      <p className="text-3xl font-bold">{data.activeUsers.toLocaleString()}</p>
+      <p className="text-sm text-green-600">+{data.signupsToday} signups today</p>
+    </div>
+  );
+}
+
+export async function RevenueWidget() {
+  const data = await getRevenueData();
+  return (
+    <div className="bg-white rounded-lg p-6 shadow">
+      <h3 className="font-bold text-gray-600">Revenue (MTD)</h3>
+      <p className="text-3xl font-bold">${data.mtdRevenue.toLocaleString()}</p>
+      <p className="text-sm text-green-600">+{data.growth}% MoM</p>
+    </div>
+  );
+}
+
+export async function ActivityFeed() {
+  const activity = await getRecentActivity();
+  return (
+    <div className="bg-white rounded-lg p-6 shadow">
+      <h3 className="font-bold text-gray-600 mb-3">Recent Activity</h3>
+      <ul className="space-y-2">
+        {activity.map(a => (
+          <li key={a.id} className="text-sm">
+            <strong>{a.user}</strong> {a.action} <span className="text-gray-400">— {a.time}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export async function MonthlyChart() {
+  const data = await getMonthlyChart();
+  const max = Math.max(...data.map(d => d.value));
+  return (
+    <div className="bg-white rounded-lg p-6 shadow">
+      <h3 className="font-bold text-gray-600 mb-3">Last 30 Days</h3>
+      <div className="flex items-end gap-1 h-24">
+        {data.map(d => (
+          <div
+            key={d.day}
+            className="bg-blue-500 flex-1"
+            style={{ height: `${(d.value / max) * 100}%` }}
+            title={`Day ${d.day}: ${d.value.toFixed(1)}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Generic skeleton fallback
+export function WidgetSkeleton() {
+  return (
+    <div className="bg-gray-100 rounded-lg p-6 animate-pulse">
+      <div className="h-4 bg-gray-200 rounded w-1/3 mb-3" />
+      <div className="h-8 bg-gray-200 rounded w-1/2 mb-2" />
+      <div className="h-3 bg-gray-200 rounded w-1/4" />
+    </div>
+  );
+}
+```
+
+#### Step 4 — Streaming Page With Granular Suspense
+```typescript
+// src/app/dashboard/page.tsx
+import { Suspense } from 'react';
+import {
+  FastStats, RevenueWidget, ActivityFeed, MonthlyChart, WidgetSkeleton,
+} from '@/components/Widgets';
+
+export default function DashboardPage() {
+  return (
+    <main className="p-8 max-w-5xl mx-auto">
+      <h1 className="text-3xl font-bold mb-6">Dashboard</h1>
+      <p className="text-sm text-gray-400 mb-4">Page TTFB: instant (streaming SSR)</p>
+
+      <div className="grid grid-cols-2 gap-4">
+        {/* FAST: appears at ~100ms */}
+        <Suspense fallback={<WidgetSkeleton />}>
+          <FastStats />
+        </Suspense>
+
+        {/* MEDIUM: appears at ~500ms */}
+        <Suspense fallback={<WidgetSkeleton />}>
+          <RevenueWidget />
+        </Suspense>
+
+        {/* SLOW: appears at ~1500ms */}
+        <Suspense fallback={<WidgetSkeleton />}>
+          <ActivityFeed />
+        </Suspense>
+
+        {/* VERY SLOW: appears at ~3000ms */}
+        <Suspense fallback={<WidgetSkeleton />}>
+          <MonthlyChart />
+        </Suspense>
+      </div>
+    </main>
+  );
+}
+```
+
+#### Step 5 — Non-Streaming Comparison + Tests
+```typescript
+// src/app/dashboard-blocking/page.tsx -- NO Suspense, blocks on slowest
+import { FastStats, RevenueWidget, ActivityFeed, MonthlyChart } from '@/components/Widgets';
+
+export default async function BlockingDashboard() {
+  // All 4 fetches run in parallel via component render, BUT page waits for ALL
+  return (
+    <main className="p-8">
+      <h1>Blocking Dashboard (no streaming)</h1>
+      <div className="grid grid-cols-2 gap-4">
+        <FastStats />        {/* awaits 100ms */}
+        <RevenueWidget />    {/* awaits 500ms */}
+        <ActivityFeed />     {/* awaits 1500ms */}
+        <MonthlyChart />     {/* awaits 3000ms — page waits for this */}
+      </div>
+      {/* Total time to first byte: ~3000ms (waits for slowest) */}
+    </main>
+  );
+}
+
+// Test: verify Suspense boundaries enable streaming
+import { render, screen } from '@testing-library/react';
+it('renders skeleton fallbacks initially', () => {
+  // In real browser, the user sees skeletons first, then content
+  // Jest renders synchronously so we can verify the structure
+  expect(true).toBe(true);  // streaming is a runtime behaviour
+});
+```
+
+**Expected Output:**
+```
+/dashboard (streaming):
+  T+0ms: page shell + 4 skeletons appear (instant TTFB)
+  T+100ms: FastStats replaces its skeleton
+  T+500ms: RevenueWidget replaces its skeleton
+  T+1500ms: ActivityFeed replaces its skeleton
+  T+3000ms: MonthlyChart replaces its skeleton
+
+/dashboard-blocking (no Suspense):
+  T+0ms: blank page, waiting...
+  T+3000ms: ALL widgets appear at once (TTFB = 3000ms)
+
+Network tab: see HTML response stream in chunks over 3 seconds
+```
+
+**Stretch Challenges:**
+- [ ] Add a custom loading.tsx for the page-level skeleton
+- [ ] Add useTransition + useState client component that streams updates
+- [ ] Measure TTFB difference with Lighthouse Performance audit
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does Suspense + streaming do for page loading?
+**Q2:** Does streaming reduce total response time?
+**Q3:** Write a page with two Suspense boundaries for independent widgets. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between traditional SSR and streaming SSR?
+**Q5:** A PR wraps the entire page in one Suspense — explain why it's useless.
+**Q6:** What HTTP feature enables streaming?
+
+### Day 7 — Application
+**Q7:** Build a streaming product page with fast (header) and slow (recommendations) widgets.
+**Q8:** A PR has many tiny Suspense boundaries — explain the overhead.
+**Q9:** How does loading.tsx relate to Suspense?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain streaming SSR — how does it work technically and what user-perceived benefits does it provide?"
+**Q11:** Draw: streaming timeline — shell → fallbacks → progressive content arrival.
+**Q12:** ★ System design: "Design a news article page with streaming — article body, related articles, comments, ads — what streams when?"

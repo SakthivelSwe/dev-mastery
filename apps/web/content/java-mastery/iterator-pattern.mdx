@@ -5,149 +5,521 @@ level: 3
 ---
 
 ## WHY
-If you want to print all the elements in an `ArrayList`, you can use a simple `for` loop with an index counter (`for (int i=0; i < list.size(); i++)`). 
-But what if you switch the underlying collection to a `LinkedList`? Using `get(i)` inside a loop on a LinkedList is catastrophic (`O(n^2)` time) because it has to traverse from the head pointer for every single index request.
-What if you switch to a `HashSet`? A Set doesn't even have index positions, so `get(i)` won't compile at all!
 
-The Iterator Pattern solves this by completely decoupling the *traversal logic* from the *business logic*. It provides a universal `Iterator` object that knows exactly how to navigate its specific data structure efficiently, allowing you to iterate over Arrays, Linked Lists, Hash Tables, and Trees using the exact same uniform syntax.
+Imagine you are writing a method `printAll(Collection c)` that prints every element of a collection. With an `ArrayList`, you might write `for (int i = 0; i < list.size(); i++) System.out.println(list.get(i));`. But what happens when somebody passes a `LinkedList` to this same method?
+
+* `LinkedList.get(i)` walks the chain of `Node` pointers from the head every single time. Calling `get(i)` inside a loop turns an `O(n)` traversal into a catastrophic `O(n²)` algorithm. A list of 100,000 elements suddenly performs **10 billion** pointer hops.
+
+What if the caller passes a `HashSet`? Sets have no notion of index — `hashSet.get(0)` does not even compile. Trees, queues, graphs, files, database cursors — each has a completely different traversal mechanism. Writing a separate `printAll` for every data structure violates the **Open–Closed Principle** and creates a maintenance nightmare.
+
+The **Iterator Pattern** (one of the original 23 Gang-of-Four design patterns) decouples the *traversal mechanism* from the *consumer* of the data. Each collection ships its own optimal cursor (`Iterator`) that knows the most efficient way to walk its internal structure. Consumers depend only on the `Iterator` interface — they don't care whether they are walking an array, a doubly-linked list, a red-black tree, or a streaming database `ResultSet`.
+
+```
+Without Iterator                       With Iterator
+----------------                       -------------
+ArrayList   -> for(i)                  ArrayList   ─┐
+LinkedList  -> for(i)  // O(n²)!       LinkedList  ─┤
+HashSet     -> ??? no index            HashSet     ─┼─> Iterator<T>  -> client
+TreeMap     -> recursive               TreeMap     ─┤
+File        -> readLine                FileReader  ─┘
+```
+
+### Concrete business pain this solves
+1. **Polymorphic APIs** — Frameworks like Spring `JdbcTemplate`, Hibernate `ScrollableResults`, Kafka `Consumer.poll()`, and JDBC `ResultSet` all expose iterator-style cursors so client code can stream millions of rows without loading them into RAM.
+2. **Lazy evaluation** — Iterators pull one element at a time on demand. This is the foundation of the Java Streams API, reactive streams, and generator coroutines.
+3. **Fail-fast safety** — Iterators detect concurrent structural modification (`ConcurrentModificationException`) and refuse to corrupt your traversal silently.
+4. **External vs internal iteration** — Iterator gives clients full control over *when* to advance, *whether* to stop early, and *whether* to remove. This is impossible with internal `forEach(Consumer)` style APIs alone.
+
+If you understand the Iterator pattern deeply, you understand the foundation of **every** Java Collection, the Streams API, JPA cursors, reactive `Publisher/Subscriber`, the `BufferedReader.lines()` pipeline, and even modern `Spliterator`-based parallel processing.
+
+---
 
 ## THEORY
-### `Iterable` vs `Iterator`
-In Java, these are two distinct interfaces:
-1. **`java.lang.Iterable`**: Any class that implements this is promising "I can be iterated over". It requires exactly one method: `Iterator<T> iterator()`. Every Collection in Java implements `Iterable`.
-2. **`java.util.Iterator`**: The actual pointer object that does the work. It tracks the current position and provides `hasNext()` and `next()`.
 
-### The Enhanced For-Loop
-In Java 5, the "Enhanced For-Loop" (`for (String s : list)`) was introduced. This is pure syntax sugar! Behind the scenes, the Java Compiler actually rewrites that code into an explicit `Iterator` while-loop. This means the Enhanced For-Loop inherits all the safety, speed, and polymorphism of the Iterator pattern automatically.
+### 1. The two cooperating interfaces
+
+Java separates the **"I can be iterated"** contract from the **"I am a cursor"** contract:
+
+```java
+public interface Iterable<T> {
+    Iterator<T> iterator();                 // factory method
+    default void forEach(Consumer<? super T> action) { ... }
+    default Spliterator<T> spliterator() { ... }
+}
+
+public interface Iterator<T> {
+    boolean hasNext();
+    T next();
+    default void remove() { throw new UnsupportedOperationException(); }
+    default void forEachRemaining(Consumer<? super T> action) { ... }
+}
+```
+
+* **`Iterable<T>`** is implemented by the *collection itself* (`ArrayList`, `HashSet`, `TreeMap.keySet()`, etc.). It is essentially a factory that produces fresh cursors.
+* **`Iterator<T>`** is the *stateful cursor*. Each call to `iterator()` should return a brand-new iterator positioned before the first element, so multiple consumers can walk the same collection independently.
+
+This separation is critical: a collection is *reusable* (you can iterate it many times), but an iterator is *single-use* (once exhausted, it must be discarded).
+
+### 2. The Enhanced For-Loop is pure syntactic sugar
+
+```java
+for (String s : list) {           // your code
+    process(s);
+}
+```
+
+The Java compiler rewrites this at the bytecode level into:
+
+```java
+Iterator<String> __it = list.iterator();    // generated bytecode
+while (__it.hasNext()) {
+    String s = __it.next();
+    process(s);
+}
+```
+
+That means *anything* implementing `Iterable` works automatically in a for-each loop — your custom classes, arrays (special-cased by the compiler), `Stream.iterate()` wrappers, even reactive `Flow.Publisher` bridges.
+
+### 3. Fail-Fast vs Fail-Safe iterators
+
+| Type | Behaviour | Examples |
+|------|-----------|----------|
+| **Fail-Fast** | Throws `ConcurrentModificationException` the moment it detects structural modification through any path other than `iterator.remove()` | `ArrayList`, `HashMap`, `HashSet`, `LinkedList`, `TreeMap` |
+| **Fail-Safe** (weakly consistent) | Iterates over a snapshot or a tolerant view; never throws CME, but may not see updates made after the iterator was created | `ConcurrentHashMap`, `CopyOnWriteArrayList`, `ConcurrentSkipListMap` |
+
+#### How fail-fast actually works internally
+Every fail-fast collection keeps an `int modCount` that is incremented on every structural change (add, remove, clear, resize). When `iterator()` is called, the iterator captures `expectedModCount = modCount`. On every call to `next()` and `remove()`, it executes the **`checkForComodification()`** guard:
+
+```java
+final void checkForComodification() {
+    if (modCount != expectedModCount)
+        throw new ConcurrentModificationException();
+}
+```
+
+This is a *best-effort* heuristic — not a guarantee — but it catches the overwhelming majority of bugs in production.
+
+### 4. The `remove()` contract — the only safe mutation
+
+```java
+Iterator<String> it = list.iterator();
+while (it.hasNext()) {
+    String s = it.next();
+    if (s.isEmpty()) it.remove();   // legal, safe, no CME
+}
+```
+
+`Iterator.remove()` is the only mutation method baked into the contract because the iterator can:
+1. Delete the element it last returned from `next()`.
+2. Bump the collection's `modCount`.
+3. Resync its own `expectedModCount` so the guard still passes.
+
+Calling `it.remove()` twice without an intervening `next()` is illegal and throws `IllegalStateException`.
+
+### 5. ListIterator — bidirectional and indexed
+
+`List` exposes a stronger cursor via `list.listIterator()`:
+
+```java
+public interface ListIterator<E> extends Iterator<E> {
+    boolean hasPrevious();
+    E previous();
+    int nextIndex();
+    int previousIndex();
+    void set(E e);                // replace last returned
+    void add(E e);                // insert before next
+}
+```
+
+This is how `Collections.replaceAll`, `Collections.reverse`, and many internal JDK algorithms work — they need both directions and in-place mutation without rebuilding the list.
+
+### 6. Spliterator — the iterator built for parallelism
+
+Java 8 added `Spliterator` (splittable iterator), the engine behind `Stream.parallel()`. A spliterator can:
+* `tryAdvance(Consumer)` — process one element.
+* `trySplit()` — bisect itself into two halves, enabling work-stealing across CPU cores.
+* Report characteristics (`ORDERED`, `SORTED`, `DISTINCT`, `SIZED`, `IMMUTABLE`, `CONCURRENT`) that the Stream pipeline uses to choose optimizations.
+
+Behind every `stream.parallel()` call is a `Spliterator` that recursively splits the source until each leaf chunk is small enough to be processed by one fork-join worker thread.
+
+### 7. Internal vs External iteration
+
+```java
+list.forEach(System.out::println);                  // INTERNAL — library controls the loop
+for (String s : list) System.out.println(s);        // EXTERNAL — client controls the loop
+```
+
+* **Internal** iteration is easier to parallelize and optimize (the library can rearrange, batch, vectorize).
+* **External** iteration is more powerful — you can `break`, `continue`, maintain side state, throw checked exceptions, or interleave multiple iterators (e.g., zipping two collections).
+
+Most modern APIs offer both; understanding the trade-off is a senior-level interview question.
+
+---
 
 ## VISUALIZATION_CONFIG
+
 ```json
 { "component": "ArchitectureDiagram", "type": "iterator-design-pattern" }
 ```
 
+```mermaid
+classDiagram
+    class Iterable~T~ {
+        <<interface>>
+        +iterator() Iterator~T~
+        +forEach(Consumer) void
+        +spliterator() Spliterator~T~
+    }
+    class Iterator~T~ {
+        <<interface>>
+        +hasNext() boolean
+        +next() T
+        +remove() void
+        +forEachRemaining(Consumer) void
+    }
+    class ListIterator~T~ {
+        <<interface>>
+        +hasPrevious() boolean
+        +previous() T
+        +set(T) void
+        +add(T) void
+    }
+    class ArrayList
+    class LinkedList
+    class HashSet
+    Iterable <|.. ArrayList
+    Iterable <|.. LinkedList
+    Iterable <|.. HashSet
+    Iterator <|-- ListIterator
+```
+
+---
+
 ## CODE
 
-### Level 1 — Beginner
+### Level 1 — Beginner: explicit `Iterator` walk
 ```java
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.*;
 
 public class BasicIterator {
     public static void main(String[] args) {
         List<String> names = new ArrayList<>(List.of("Alice", "Bob", "Charlie"));
-        
-        // The old-school, explicit Iterator loop
+
         Iterator<String> it = names.iterator();
         while (it.hasNext()) {
-            String name = it.next();
+            String name = it.next();          // advances cursor and returns element
             System.out.println(name);
         }
+        // After the loop, hasNext() == false. Calling next() now throws NoSuchElementException.
     }
 }
 ```
 
-### Level 2 — Building Blocks
+### Level 2 — Enhanced for-loop on any `Iterable`
 ```java
-import java.util.Set;
-import java.util.HashSet;
+import java.util.*;
 
 public class EnhancedForLoop {
     public static void main(String[] args) {
-        Set<Integer> numbers = new HashSet<>(Set.of(10, 20, 30));
-        
-        // This is 100% equivalent to the Iterator while-loop.
-        // The compiler generates the Iterator bytecode automatically.
-        // It works on ANY class that implements Iterable!
-        for (Integer num : numbers) {
-            System.out.println(num);
+        Set<Integer> numbers = new LinkedHashSet<>(List.of(10, 20, 30));
+
+        // Compiler rewrites this into an Iterator while-loop automatically.
+        // Order is preserved here because LinkedHashSet guarantees insertion order.
+        for (int n : numbers) {
+            System.out.println(n);
         }
     }
 }
 ```
 
-### Level 3 — Intermediate
+### Level 3 — Safe removal during iteration
 ```java
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.*;
 
 public class SafeRemoval {
     public static void main(String[] args) {
-        List<String> tasks = new ArrayList<>(List.of("TODO", "DONE", "TODO"));
-        
-        // TRAP: Using list.remove() inside a for-loop throws ConcurrentModificationException!
-        
-        // Correct approach: Use the Iterator's dedicated remove() method
+        List<String> tasks = new ArrayList<>(List.of("TODO", "DONE", "TODO", "DONE"));
+
+        // WRONG — throws ConcurrentModificationException
+        // for (String t : tasks) if (t.equals("DONE")) tasks.remove(t);
+
+        // RIGHT — explicit Iterator with remove()
         Iterator<String> it = tasks.iterator();
         while (it.hasNext()) {
             if (it.next().equals("DONE")) {
-                it.remove(); // Safely removes the last element returned by next()
+                it.remove();
             }
         }
-        
-        System.out.println(tasks); // [TODO, TODO]
+        System.out.println(tasks);          // [TODO, TODO]
+
+        // Even better in Java 8+
+        List<String> tasks2 = new ArrayList<>(List.of("TODO", "DONE", "TODO"));
+        tasks2.removeIf("DONE"::equals);    // internally uses Iterator.remove()
+        System.out.println(tasks2);
     }
 }
 ```
 
-### Level 4 — Advanced
+### Level 4 — Building your own `Iterable`
 ```java
-import java.util.Iterator;
-import java.util.NoSuchElementException;
+import java.util.*;
 
-// Implementing a Custom Iterable!
-class CustomRange implements Iterable<Integer> {
+/** A lazy integer range, like Python's range(start, end). */
+class IntRange implements Iterable<Integer> {
     private final int start, end;
-    
-    public CustomRange(int start, int end) {
-        this.start = start; this.end = end;
-    }
+    public IntRange(int start, int end) { this.start = start; this.end = end; }
 
-    @Override
-    public Iterator<Integer> iterator() {
-        // Return an anonymous class implementing Iterator
+    @Override public Iterator<Integer> iterator() {
         return new Iterator<>() {
-            private int current = start;
+            private int cursor = start;
 
-            @Override
-            public boolean hasNext() {
-                return current <= end;
-            }
+            @Override public boolean hasNext() { return cursor < end; }
 
-            @Override
-            public Integer next() {
-                if (!hasNext()) throw new NoSuchElementException();
-                return current++;
+            @Override public Integer next() {
+                if (cursor >= end) throw new NoSuchElementException();
+                return cursor++;
             }
         };
     }
 }
 
-public class Usage {
+public class CustomIterableDemo {
     public static void main(String[] args) {
-        // Because CustomRange implements Iterable, 
-        // we can instantly use it in an Enhanced For-Loop!
-        for (int num : new CustomRange(1, 5)) {
-            System.out.println(num); // Prints 1, 2, 3, 4, 5
+        IntRange r = new IntRange(1, 6);
+        for (int n : r) System.out.println(n);    // 1 2 3 4 5
+
+        // Reusable: each call to iterator() returns a fresh cursor positioned at start.
+        for (int n : r) System.out.println(n);    // 1 2 3 4 5 again
+    }
+}
+```
+
+### Level 5 — Fail-fast detection by hand
+```java
+import java.util.*;
+
+public class FailFastDemo {
+    public static void main(String[] args) {
+        List<Integer> data = new ArrayList<>(List.of(1, 2, 3, 4));
+        Iterator<Integer> it = data.iterator();
+        it.next();                      // OK — returns 1
+        data.add(99);                   // structural change via the LIST, not the iterator
+        try {
+            it.next();                  // boom — modCount != expectedModCount
+        } catch (ConcurrentModificationException e) {
+            System.out.println("Fail-fast triggered: " + e);
         }
     }
 }
 ```
 
-## REAL_WORLD
-When building Spring Boot Database Repositories, you might accidentally pull a massive dataset into memory.
-If you call `List<User> users = userRepository.findAll()`, Hibernate executes the SQL query, loads all 50,000 users into Heap memory simultaneously, and returns the `ArrayList`. This will crash the server with an `OutOfMemoryError`.
+### Level 6 — Fail-safe iterator: `CopyOnWriteArrayList`
+```java
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-To process massive datasets without crashing, Spring Data JPA provides Stream support, which relies directly on the Iterator pattern. 
-Instead of returning a `List`, your repository method returns a `Stream<User>`. Behind the scenes, Hibernate opens an explicit JDBC `ResultSet` Iterator. As you process the stream, the Iterator fetches rows from the PostgreSQL database *one by one*, processes them, and immediately lets the Garbage Collector destroy them. The server memory usage remains flat regardless of whether you process 10 rows or 10 million rows, proving the immense scalability power of the Iterator Pattern.
+public class FailSafeDemo {
+    public static void main(String[] args) {
+        List<String> cow = new CopyOnWriteArrayList<>(List.of("A", "B", "C"));
+        Iterator<String> it = cow.iterator();    // snapshot taken HERE
+        cow.add("D");                             // does NOT affect the snapshot
+        while (it.hasNext()) System.out.print(it.next() + " ");
+        // Output: A B C    (the "D" was added after the snapshot, so it's invisible)
+        System.out.println();
+        System.out.println(cow);                  // [A, B, C, D]
+    }
+}
+```
+
+### Level 7 — `ListIterator` — bidirectional and mutating in place
+```java
+import java.util.*;
+
+public class ListIteratorDemo {
+    public static void main(String[] args) {
+        List<Integer> nums = new ArrayList<>(List.of(1, 2, 3, 4, 5));
+
+        ListIterator<Integer> li = nums.listIterator();
+        while (li.hasNext()) {
+            int v = li.next();
+            if (v % 2 == 0) li.set(v * 10);    // in-place replace
+        }
+        System.out.println(nums);             // [1, 20, 3, 40, 5]
+
+        // Walk backwards
+        while (li.hasPrevious()) System.out.print(li.previous() + " ");
+        // Output: 5 40 3 20 1
+    }
+}
+```
+
+### Level 8 — `Spliterator` and parallel streams
+```java
+import java.util.*;
+import java.util.stream.*;
+
+public class SpliteratorDemo {
+    public static void main(String[] args) {
+        List<Integer> data = IntStream.rangeClosed(1, 1_000_000).boxed().toList();
+        Spliterator<Integer> sp = data.spliterator();
+        Spliterator<Integer> half = sp.trySplit();       // bisect — fork-join uses this
+        System.out.println("Left size:  " + half.estimateSize());
+        System.out.println("Right size: " + sp.estimateSize());
+
+        long sum = data.parallelStream()                 // built on Spliterator internally
+                       .mapToLong(Integer::longValue)
+                       .sum();
+        System.out.println("Sum = " + sum);
+    }
+}
+```
+
+---
+
+## REAL_WORLD
+
+### 1. Hibernate streaming queries — process 10 million rows on a 512 MB heap
+A naive `userRepository.findAll()` loads every `User` row from PostgreSQL into a single `ArrayList` and returns it. On a `users` table with 10 M rows × ~1 KB per row, that needs **10 GB of heap** and crashes the JVM with `OutOfMemoryError: GC overhead limit exceeded`.
+
+The Spring Data JPA fix uses the Iterator pattern end-to-end:
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+    @QueryHints(@QueryHint(name = HINT_FETCH_SIZE, value = "1000"))
+    @Query("select u from User u")
+    Stream<User> streamAll();
+}
+
+@Transactional(readOnly = true)
+public void exportAll() {
+    try (Stream<User> stream = userRepository.streamAll()) {
+        stream.forEach(this::writeToCsv);
+    }
+}
+```
+
+Internally:
+1. Hibernate opens a JDBC `ResultSet` cursor with `fetchSize=1000`.
+2. The PostgreSQL driver opens a server-side cursor (`DECLARE … CURSOR FOR …`) so rows are streamed in 1000-row chunks instead of buffered all at once.
+3. The `Stream<User>` is backed by a `Spliterator` that wraps the cursor.
+4. Each `forEach` call pulls one entity, the previous one becomes eligible for GC, and heap usage stays flat at a few MB regardless of the total row count.
+
+### 2. Kafka consumers — back-pressure via `poll()`
+`KafkaConsumer.poll(timeout)` returns a `ConsumerRecords<K,V>` that is itself `Iterable<ConsumerRecord<K,V>>`. You loop through records, the consumer transparently pages the next batch from the broker, and offsets are committed when you choose. This is the iterator pattern operating across a network boundary.
+
+### 3. File reading — `BufferedReader.lines()`
+```java
+try (Stream<String> lines = Files.lines(Path.of("huge.log"))) {
+    long errors = lines.filter(l -> l.contains("ERROR")).count();
+}
+```
+Reads the file one line at a time through an internal `Iterator<String>` over a `BufferedReader`. A 50 GB log file is processed without ever holding more than a few KB in RAM.
+
+### 4. Reactive Streams (Project Reactor / RxJava)
+A `Publisher<T>` with `Subscription.request(n)` is essentially a *pull-based, back-pressured iterator* operating asynchronously. The control flow `request → onNext → request → onNext` is the iterator pattern adapted for non-blocking I/O.
+
+### 5. Pagination over REST APIs
+Stripe, GitHub, and AWS APIs all return paginated responses with a `next_cursor` token. SDKs wrap this as an `Iterator<T>` that lazily fetches the next page when the local buffer is exhausted, hiding pagination from application code completely.
+
+---
 
 ## INTERVIEW
-**Q: Why does modifying a Collection while iterating over it throw a `ConcurrentModificationException`?**
-A: All Java Collections maintain an internal `modCount` variable that tracks structural modifications (adds/removes). When you create an `Iterator`, it saves a snapshot of the `modCount`. Every time you call `next()`, the Iterator compares its snapshot to the collection's current `modCount`. If they don't match, it means something bypassed the Iterator and modified the list directly, so it throws the exception in a "Fail-Fast" response to prevent corrupted traversal.
 
-**Q: How do you safely remove elements during iteration?**
-A: You must use an explicit `Iterator` and call `iterator.remove()`. The Iterator's remove method safely updates the underlying collection *and* updates its own internal `modCount` snapshot, keeping everything perfectly synchronized and avoiding the exception. (Note: Java 8 introduced `list.removeIf(predicate)` which safely handles this under the hood).
+**Q1: Why does `for (String s : list) list.remove(s)` throw `ConcurrentModificationException`?**
+The compiler rewrites the for-each into an `Iterator` while-loop. The iterator captured `expectedModCount` at creation. When you call `list.remove(s)`, the underlying `ArrayList` increments `modCount` but does not update the iterator's `expectedModCount`. On the next `it.next()` call, the `checkForComodification()` guard sees the mismatch and throws CME. The correct fixes are `iterator.remove()`, `list.removeIf(predicate)`, or iterating a copy.
 
-**Q: Can you iterate backward using an Iterator?**
-A: A standard `Iterator` only goes forward (`hasNext()`, `next()`). However, `List` implementations provide a `ListIterator` via `list.listIterator()`. The `ListIterator` extends `Iterator` and adds `hasPrevious()` and `previous()` methods, allowing seamless bidirectional traversal.
+**Q2: What's the difference between `Iterator` and `ListIterator`?**
+`Iterator` is forward-only with `hasNext()`, `next()`, `remove()`. `ListIterator` (only available on `List`) extends `Iterator` with `hasPrevious()`, `previous()`, `nextIndex()`, `previousIndex()`, `set(E)` for in-place replacement, and `add(E)` for insertion. `ListIterator` is what algorithms like `Collections.reverse` and `Collections.replaceAll` use internally.
+
+**Q3: How are `ConcurrentHashMap` iterators different?**
+They are **weakly consistent** (fail-safe). They never throw CME. They reflect the state of the map at some point at or since the iterator's creation, and may or may not see updates that happen during iteration. This is implemented by traversing the internal bin array without locking and tolerating concurrent rehash/resize via volatile reads.
+
+**Q4: Can a single collection have multiple active iterators?**
+Yes. Each call to `iterator()` produces an independent cursor with its own `cursor` index and `expectedModCount`. They walk the same backing data, but as long as no structural modification happens, they don't interfere. Two readers iterating simultaneously is fine; one reader + one writer will trip fail-fast.
+
+**Q5: Why is `Iterator` better than exposing an index-based `get(i)` API?**
+Because not all collections have indices (sets, maps, trees, streams), and even for those that do, indexed access is `O(n)` per step on linked structures. The iterator hides the traversal complexity — `LinkedList` walks node pointers (`O(1)` per step), `HashSet` walks bins, `TreeMap` performs in-order tree traversal — and exposes a uniform `O(1)`-per-step abstraction.
+
+**Q6: What does `Iterator.remove()` actually do internally for `ArrayList`?**
+It calls `ArrayList.remove(lastRet)` where `lastRet` is the index returned by the most recent `next()`. That triggers a `System.arraycopy` shift of all elements after `lastRet` one position left, decrements `size`, and increments `modCount`. The iterator then sets `cursor = lastRet`, `lastRet = -1`, and copies `modCount` back into `expectedModCount` so further iteration is legal.
+
+**Q7: What is a `Spliterator` and why does the Streams API use it instead of `Iterator`?**
+A `Spliterator` is a splittable iterator. It adds `trySplit()` (bisect the remaining elements into a new spliterator) and characteristic flags (`SIZED`, `ORDERED`, `SUBSIZED`, etc.). The parallel streams engine recursively splits the spliterator across fork-join worker threads. A normal `Iterator` cannot be safely split because it has internal mutable state and no notion of "remaining work to bisect."
+
+**Q8: What is the difference between external iteration (`for (T x : c)`) and internal iteration (`c.forEach(...)`)?**
+External: the *consumer* controls the loop — can break, throw, maintain side state, interleave with another iterator. Internal: the *library* controls the loop — it can decide order, parallelize, batch, vectorize, but the consumer cannot easily break out. Streams use internal iteration to enable laziness and parallelism.
+
+**Q9: Is `Iterable` the same as `Collection`?**
+No. `Iterable` is a much smaller contract — only one method (`iterator()`). `Collection` extends `Iterable` and adds `size()`, `add()`, `contains()`, `remove()`, `clear()`, etc. Many things are `Iterable` but not `Collection`: a `Path` (iterating its name elements), an `XPathNodes`, a custom range, a `DirectoryStream`, etc.
+
+**Q10: How do you make a custom class work with the enhanced for-loop?**
+Implement `Iterable<T>`, return a fresh `Iterator<T>` from `iterator()`, and make sure the iterator correctly implements `hasNext()`/`next()`/`NoSuchElementException`. Once that's done, your class instantly works with `forEach`, can be converted to a stream via `StreamSupport.stream(...)`, and integrates with every collection-aware library in the ecosystem.
+
+---
+
+## FEYNMAN CHECK
+
+Explain the iterator pattern to a junior developer in 60 seconds, without using the word "iterator":
+
+> Imagine a TV remote with only two buttons: **"is there another channel?"** and **"go to the next channel."** That remote works whether you're flipping through cable, Netflix, YouTube, or a custom playlist. The remote doesn't care how each service stores its channels — it just asks the question. Java collections work the same way. Every collection hands you a tiny "remote" when asked, and your code uses the same two buttons to walk through any data structure — array, linked list, hash bucket, tree node, database cursor, network stream — without ever knowing the internal storage.
+
+**Self-test questions** (answer aloud, then verify):
+1. What two methods make up the minimum `Iterator` contract?
+2. Why does `Iterator.remove()` exist as a separate method instead of just calling `collection.remove()`?
+3. What is `modCount` and where does it live?
+4. Name two fail-safe collections and explain how they avoid `ConcurrentModificationException`.
+5. What does the compiler do when it sees `for (T x : iterable) { ... }`?
+6. How does `Spliterator` enable `parallelStream()`?
+7. Why is iterating a `LinkedList` with `get(i)` quadratic, but iterating with `Iterator` linear?
+
+If you can answer all seven without looking, you understand the pattern at a level above 90% of working Java developers.
+
+---
+
+## BUILD
+
+**Mini-project: a chunked log-file reader**
+
+Goal: build a class `LogReader implements Iterable<LogEntry>` that streams a multi-gigabyte log file line by line, parses each line into a `LogEntry(level, timestamp, message)`, and exposes it as a reusable, iterable, stream-friendly source.
+
+### Requirements
+1. The class must be **reusable** — calling `iterator()` twice produces two independent cursors that both read the file from the start.
+2. The class must be **lazy** — opening the `LogReader` must *not* read any bytes; reading starts only when the first `next()` is called.
+3. Each `Iterator<LogEntry>` must **close the underlying `BufferedReader`** when it is exhausted, even if the consumer never calls `forEachRemaining`. Use `AutoCloseable` and a guard flag.
+4. Provide a `stream()` method that returns `Stream<LogEntry>` backed by the iterator, with `Spliterator.ORDERED | Spliterator.NONNULL` characteristics.
+5. Implement **fail-fast** semantics: if the user modifies the underlying file (size changes mid-iteration), throw `ConcurrentModificationException` on the next `next()` call. Detect by storing the file size at iterator creation.
+6. Write unit tests that:
+   * Verify a 1 GB synthetic file is processed with heap usage < 50 MB.
+   * Verify two simultaneous iterators do not interfere.
+   * Verify `stream().parallel().count()` returns the correct number of lines.
+
+### Stretch goals
+* Add `filter(Predicate<LogEntry>)` that returns a *new* `Iterable<LogEntry>` skipping unmatched entries lazily.
+* Support gzip-compressed `.log.gz` files transparently.
+* Add a `tailFollow()` mode that returns an infinite iterator polling the file for new lines (like `tail -f`).
+
+This single mini-project exercises every concept in this lesson: `Iterable`, `Iterator`, `Spliterator`, fail-fast detection, lazy evaluation, resource management, and stream interop.
+
+---
+
+## SPACED REVIEW
+
+**Day 1 — Recall (≤ 60 s each):**
+* Name the two interfaces of the iterator pattern and the methods they declare.
+* Translate `for (String s : list)` into its compiled equivalent.
+* Why is `it.remove()` legal but `list.remove(s)` inside a for-each is not?
+
+**Day 3 — Apply:**
+* Write a `Pair<A,B>` class and a `zip(Iterable<A>, Iterable<B>)` static method that returns an `Iterable<Pair<A,B>>` walking both in lock-step. Confirm it works with the enhanced for-loop.
+* Without running the code, predict the output of a fail-fast iterator over a `HashMap` whose entry is modified by `put(existingKey, newValue)` mid-iteration. (Hint: replacing a value is *not* a structural modification.)
+
+**Day 7 — Synthesize:**
+* Compare `Iterator`, `ListIterator`, `Spliterator`, and `Enumeration` in a 4-column table covering: direction, mutation, splittability, age, typical usage.
+* Read the OpenJDK source of `ArrayList.Itr` and `ArrayList.ListItr`. Annotate every field and explain why each exists.
+
+**Day 21 — Teach:**
+* Record a 5-minute screencast walking a peer through building a custom `Iterable` (the `IntRange` example), then converting it to a `Stream` via `StreamSupport.stream(...)`, and finally explaining how a parallel stream over your range would (or would not) split.
+
+**Day 60 — Production audit:**
+* Find one place in your current codebase where you call `findAll()` on a JPA repository and load a large result into a list. Refactor it to a `Stream<T>` with `@Transactional(readOnly = true)`, a `fetchSize` query hint, and a try-with-resources block. Measure heap before and after with JFR.
+

@@ -158,3 +158,168 @@ When you write `<div class="bg-blue-500 p-4">`, Tailwind (running as a PostCSS p
 A: **No.** Sass is a full programming language with variables, loops, maps, and logic. PostCSS is a modular transformation engine. 
 While PostCSS *can* mimic Sass (using plugins like `postcss-nested` and `postcss-simple-vars`), it requires stitching together dozens of plugins to recreate the full Sass experience. 
 Usually, teams don't replace Sass with PostCSS; they use them together! Sass compiles the `.scss` files into CSS, and then PostCSS (via Autoprefixer) adds the vendor prefixes to the final output.
+
+## FEYNMAN CHECK
+
+### Explain PostCSS Like I'm 10 Years Old
+> PostCSS is a PLUGIN PIPELINE for CSS. Unlike Sass (a single language), PostCSS is a tool that parses CSS into an AST (Abstract Syntax Tree), runs PLUGINS that transform the AST, then serialises back to CSS. Each plugin does ONE job: `autoprefixer` adds vendor prefixes; `postcss-preset-env` polyfills future CSS; `cssnano` minifies; `postcss-import` inlines @imports. Tailwind, modern Vite/Next.js, and most build systems use PostCSS under the hood. The non-obvious power: you can write your OWN plugin in ~50 lines of JS to enforce house rules, generate utilities, or rewrite tokens.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does PostCSS solve that Sass doesn't?**
+> **A:** Sass is monolithic — you get the features Sass ships with. PostCSS is COMPOSABLE — pick exactly the transformations you need, write your own, and skip the rest. Want only autoprefixer? Use only autoprefixer. Want to polyfill `color-mix` for Safari 14? Use `postcss-preset-env` with stage 1. PostCSS is the Babel of CSS — a transformation framework, not a language.
+
+**Q2: Mental model?**
+> **A:** PostCSS converts `color: red;` into an AST node like `{type: 'decl', prop: 'color', value: 'red'}`. Plugins receive these nodes, mutate them, add new ones, or remove them. After all plugins run, PostCSS prints the AST back to CSS. This is identical to how Babel works on JavaScript.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Confusing PostCSS-Nesting with native CSS Nesting:
+> ```css
+> /* ❌ Native CSS nesting requires & for child selectors */
+> .card { color: red; .title { color: blue; } }    /* Invalid: needs & */
+>
+> /* ✅ Native CSS Nesting syntax */
+> .card { color: red; & .title { color: blue; } }
+>
+> /* ✅ postcss-nesting plugin: writes either, compiles to legacy CSS */
+> ```
+
+**Q4: How does PostCSS integrate with a modern build system?**
+> **A:** Vite, Next.js, and Webpack invoke PostCSS automatically when they see a `postcss.config.js` file. The config lists plugins; the bundler runs them on every .css file. Order matters — `postcss-import` must run first (inlines imports), then transformation plugins, then `autoprefixer`, then `cssnano` (last, for minification). A typical pipeline is 5-8 plugins; build time stays under 100ms even on large projects because the AST is small.
+
+**Q5: FAANG-grade definition?**
+> **A:** "PostCSS is a CSS-AST transformation framework — parsing CSS into a Node-based tree, running an ordered chain of plugins that mutate, add, or remove nodes, and serialising back to CSS — enabling composable, project-specific tooling (autoprefixing, future-syntax polyfilling, design-token expansion, minification, custom linting) without prescribing a language."
+
+## BUILD
+
+### 🏗️ Mini Project: Build a PostCSS Pipeline With Autoprefixer + preset-env + Custom Plugin
+
+**What you will build:** A real PostCSS build that polyfills `oklch()` and `@nest` for older browsers, autoprefixes, AND runs a custom plugin that warns about `!important`.
+**Why this project:** Forces all PostCSS fundamentals: configuration, plugin chaining, custom plugin authoring.
+**Time estimate:** 35 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir postcss-pipeline && cd postcss-pipeline
+npm init -y
+npm install --save-dev postcss postcss-cli postcss-preset-env autoprefixer cssnano
+ni src/main.css, postcss.config.js, plugins/no-important.js, index.html -ItemType File
+```
+
+#### Step 2 — Source CSS (modern features)
+```css
+/* src/main.css */
+:root { --hue: 220; }
+
+.card {
+  background: oklch(0.95 0.02 var(--hue));
+  border: 1px solid oklch(0.85 0.02 var(--hue));
+  padding: 1rem;
+  border-radius: 8px;
+
+  & .title {
+    font-size: 1.25rem;
+    color: oklch(0.3 0.05 var(--hue));
+  }
+
+  & :hover { background: oklch(0.92 0.04 var(--hue)); }
+}
+
+.bad { color: red !important; }   /* should trigger our custom plugin warning */
+```
+
+#### Step 3 — Custom Plugin
+```javascript
+// plugins/no-important.js
+module.exports = () => ({
+  postcssPlugin: 'no-important',
+  Declaration(decl, { result }) {
+    if (decl.important) {
+      decl.warn(result, `Avoid !important on "${decl.prop}: ${decl.value}"`, { word: '!important' });
+    }
+  },
+});
+module.exports.postcss = true;
+```
+
+#### Step 4 — PostCSS Config
+```javascript
+// postcss.config.js
+module.exports = {
+  plugins: [
+    require('postcss-preset-env')({
+      stage: 1,
+      features: { 'nesting-rules': true, 'oklab-function': true },
+    }),
+    require('./plugins/no-important'),
+    require('autoprefixer'),
+    require('cssnano')({ preset: 'default' }),
+  ],
+};
+```
+```json
+// package.json (add)
+"scripts": { "build": "postcss src/main.css -o dist/main.css" }
+```
+
+```bash
+npm run build
+# Watch warnings: "Avoid !important on color: red"
+```
+
+#### Step 5 — HTML + Tests
+```html
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><link rel="stylesheet" href="dist/main.css"></head>
+<body>
+  <div class="card">
+    <h2 class="title">PostCSS Pipeline</h2>
+    <p>Nesting → flat selectors. oklch → rgb fallback. Vendor prefixes added.</p>
+  </div>
+  <p class="bad">This line should trigger a warning during build.</p>
+</body></html>
+```
+```javascript
+// In Node tests
+const fs = require('fs');
+const out = fs.readFileSync('dist/main.css', 'utf8');
+console.assert(!out.includes('& '), 'Nesting should be flattened');
+console.assert(out.includes('rgb'),  'oklch should be polyfilled to rgb fallback');
+```
+
+**Expected Output:**
+```
+- src/main.css uses oklch, nesting, custom properties
+- dist/main.css: nesting flattened, oklch has rgb() fallback, vendor prefixes added, minified
+- Build logs: "Avoid !important on color: red" (from custom plugin)
+- File size after cssnano: typically 60-80% smaller than source
+```
+
+**Stretch:**
+- [ ] Write a plugin that auto-converts `px` to `rem` based on a 16px root
+- [ ] Add `postcss-import` and split into multiple source files
+- [ ] Add stylelint and integrate it into the same pipeline
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is PostCSS at a high level? How is it different from Sass?
+**Q2:** Name three commonly-used PostCSS plugins.
+**Q3:** Write a postcss.config.js with autoprefixer + cssnano. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why must plugin order matter? Give an example where wrong order breaks output.
+**Q5:** A custom plugin needs to add a new declaration. What's the minimum API surface to call?
+**Q6:** Refactor: this Sass-only project should migrate to PostCSS — list the plugins needed.
+
+### Day 7 — Application
+**Q7:** Write a PostCSS plugin that prepends `/* (c) DevMastery 2026 */` to every output file.
+**Q8:** A PR adds a plugin that doubles build time. How do you profile and decide whether to keep it?
+**Q9:** How does PostCSS interact with CSS Modules and Tailwind?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every step from `oklch(0.6 0.18 220)` in source to the bytes in the browser's stylesheet."
+**Q11:** Draw: how does PostCSS fit between source CSS, bundler, and browser?
+**Q12:** ★ System design: "Design a CSS toolchain for a monorepo with 50 packages, each with its own design tokens. Where does PostCSS sit? Where does Tailwind?"

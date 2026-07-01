@@ -112,3 +112,203 @@ Because static `import { Chart } from 'chart.js';` statements are executed immed
 }
 ```
 When you use `@defer`, Angular automatically splits the component (and its `Chart.js` dependency) into a separate JavaScript chunk. The Node.js server will ONLY render the `@placeholder` HTML. The browser will render the placeholder, and only download/execute the heavy Chart logic when the user actually scrolls to it on the screen, completely bypassing the server-side crash!
+
+## FEYNMAN CHECK
+
+### Explain Angular Universal (SSR) Like I'm 10 Years Old
+> Angular Universal runs your Angular app on the SERVER — in Node.js — and sends COMPLETE HTML to the browser instead of an empty div + JavaScript. A normal Angular app sends: <app-root></app-root> → browser downloads JS → Angular bootstraps → renders HTML → user sees content (2-4 seconds). With SSR: server renders FULL HTML → browser shows it IMMEDIATELY → JavaScript loads in background → Angular "hydrates" (takes over interactive events). The non-obvious depth: hydration (Angular 16+) reuses the server-rendered DOM instead of discarding it — the browser doesn't re-render, it just attaches event listeners to the existing server HTML. This eliminates the visual flash and improves Core Web Vitals.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between SSR, SSG, and CSR?**
+> **A:** CSR (Client-Side Rendering): browser downloads blank HTML + JS, Angular renders in the browser. Slowest first paint, fastest subsequent navigation. SSR (Server-Side Rendering): server renders HTML per request, sends to browser, Angular hydrates. Fastest First Contentful Paint, still requires server. SSG (Static Site Generation): HTML pre-rendered at BUILD TIME — no server needed, served as static files from CDN. Fastest delivery, but not suitable for dynamic personalised content. Angular 17+ supports all three and lets you mix per-route.
+
+**Q2: Mental model for Angular hydration?**
+> **A:** Before hydration (Angular 16): SSR sent HTML → browser showed it → Angular DESTROYED the server HTML → rebuilt it entirely from scratch with JS (visual flash, duplicate work). After hydration: SSR sends HTML with hydration markers → Angular 16+ recognises the server-rendered DOM → reuses existing DOM nodes → attaches only the event listeners and bindings (no re-render, no visual flash). Hydration requires: server and browser receiving the SAME data for the initial render (otherwise DOM mismatch errors).
+
+**Q3: Most dangerous misconception about Angular Universal?**
+> **A:** All Angular code works the same on the server:
+> ```typescript
+> // WRONG: browser-only APIs crash on Node.js
+> @Component({})
+> export class AnalyticsComponent implements OnInit {
+>   ngOnInit() {
+>     window.gtag('event', 'page_view');  // ReferenceError: window is not defined!
+>     localStorage.setItem('visited', 'true');  // ReferenceError!
+>     document.querySelector('.chart');  // ReferenceError!
+>   }
+> }
+>
+> // CORRECT: check platform before using browser APIs
+> import { isPlatformBrowser } from '@angular/common';
+> import { PLATFORM_ID, inject } from '@angular/core';
+>
+> const platformId = inject(PLATFORM_ID);
+> if (isPlatformBrowser(platformId)) {
+>   window.gtag('event', 'page_view');  // only runs in browser
+> }
+> ```
+
+**Q4: How does Angular 17+ per-route rendering mode work?**
+> **A:** Angular 17+ allows each route to declare its rendering mode: routeConfig.renderMode = RenderMode.Server (SSR per request), RenderMode.Prerender (SSG, rendered at build time), or RenderMode.Client (CSR, no server rendering). You can mix modes: marketing pages use Prerender (CDN-served, fast), authenticated dashboards use Client (personalised, no server needed), product pages use Server (dynamic but SEO-friendly). This granularity replaces the "SSR everything or nothing" trade-off.
+
+**Q5: FAANG-grade definition of Angular Universal.**
+> **A:** "Angular Universal (now Angular SSR) renders Angular applications on Node.js servers using platform-server, producing complete HTML responses for initial requests — enabling improved Time To First Byte, First Contentful Paint, and SEO crawlability — with Angular 16+ non-destructive hydration reusing server-rendered DOM nodes to attach event listeners without re-rendering — Angular 17+ per-route rendering modes (Server, Prerender/SSG, Client) for granular rendering strategy — and the TransferState API for passing server-fetched data to the client to prevent duplicate API calls during hydration."
+
+## BUILD
+
+### 🏗️ Mini Project: SSR Angular App With Hydration and TransferState
+
+**What you will build:** An Angular SSR app that: renders a product list server-side (full HTML sent to browser), uses TransferState to pass server-fetched data to the client (preventing duplicate API calls), and handles browser-only API guards with isPlatformBrowser.
+**Why this project:** Forces SSR setup, TransferState, and platform API guards — the three SSR essentials.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new ssr-demo --standalone --routing --ssr
+# OR add SSR to existing app:
+ng add @angular/ssr
+```
+
+#### Step 2 — Products With TransferState
+```typescript
+// products.service.ts
+import { Injectable, inject, makeStateKey, TransferState } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable, of, tap } from 'rxjs';
+
+export interface Product { id: number; title: string; price: number; }
+const PRODUCTS_KEY = makeStateKey<Product[]>('products');
+
+@Injectable({ providedIn: 'root' })
+export class ProductsService {
+  private http = inject(HttpClient);
+  private transferState = inject(TransferState);
+
+  getProducts(): Observable<Product[]> {
+    const cached = this.transferState.get(PRODUCTS_KEY, null);
+    if (cached) {
+      this.transferState.remove(PRODUCTS_KEY);  // use once, then clear
+      return of(cached);
+    }
+    return this.http.get<Product[]>('https://fakestoreapi.com/products').pipe(
+      tap(products => this.transferState.set(PRODUCTS_KEY, products)),
+    );
+  }
+}
+```
+
+#### Step 3 — Products Component (Server + Client)
+```typescript
+// products.component.ts
+import { Component, inject, PLATFORM_ID, OnInit, signal } from '@angular/core';
+import { isPlatformBrowser } from '@angular/common';
+import { NgFor, NgIf } from '@angular/common';
+import { ProductsService } from '../products.service';
+
+@Component({
+  standalone: true,
+  imports: [NgFor, NgIf],
+  template: `
+    <h1>Products (SSR Demo)</h1>
+    <p *ngIf="isLoading()">Loading...</p>
+    <ul>
+      <li *ngFor="let p of products()">
+        {{ p.title }} — {{ p.price | currency }}
+      </li>
+    </ul>
+    <!-- Only shown in browser, never on server -->
+    <p *ngIf="isBrowser">Rendered in: Browser</p>
+  `,
+})
+export class ProductsComponent implements OnInit {
+  private productsService = inject(ProductsService);
+  private platformId = inject(PLATFORM_ID);
+  products = signal<any[]>([]);
+  isLoading = signal(true);
+  isBrowser = isPlatformBrowser(this.platformId);
+
+  ngOnInit() {
+    this.productsService.getProducts().subscribe(products => {
+      this.products.set(products);
+      this.isLoading.set(false);
+    });
+  }
+}
+```
+
+#### Step 4 — Browser API Guard
+```typescript
+// analytics.service.ts — safe for SSR
+import { Injectable, inject, PLATFORM_ID } from '@angular/core';
+import { isPlatformBrowser } from '@angular/common';
+
+@Injectable({ providedIn: 'root' })
+export class AnalyticsService {
+  private platformId = inject(PLATFORM_ID);
+
+  track(eventName: string, props?: Record<string, unknown>) {
+    if (!isPlatformBrowser(this.platformId)) return;  // no-op on server
+    console.log('[Analytics]', eventName, props);
+    // window.gtag is safe here
+  }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('ProductsService (SSR)', () => {
+  it('uses TransferState on client to avoid duplicate HTTP call', () => {
+    const state = TestBed.inject(TransferState);
+    state.set(PRODUCTS_KEY, [{ id: 1, title: 'A', price: 10 }]);
+    const service = TestBed.inject(ProductsService);
+    const http = TestBed.inject(HttpTestingController);
+    let result: any;
+    service.getProducts().subscribe(r => result = r);
+    http.expectNone('https://fakestoreapi.com/products');  // no HTTP call!
+    expect(result[0].title).toBe('A');
+  });
+});
+```
+
+**Expected Output:**
+```
+npm run build && npm run serve:ssr
+curl http://localhost:4000 | grep "<li>"
+  -> Products listed in HTML (SSR working)
+
+DevTools Network:
+  First load: HTML includes product list (SSR)
+  No duplicate /products API call in browser (TransferState)
+```
+
+**Stretch Challenges:**
+- [ ] Add per-route rendering mode: prerender the products page at build time
+- [ ] Add a meta service for dynamic SSR-friendly SEO tags
+- [ ] Deploy to Vercel/Cloud Run and measure LCP improvement vs CSR
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between SSR, SSG, and CSR?
+**Q2:** What is hydration and how does it improve SSR performance?
+**Q3:** What browser API pitfall must you guard against in Angular Universal? From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is TransferState and why does it prevent duplicate API calls?
+**Q5:** A junior uses window.localStorage in ngOnInit — crashes on SSR. Fix.
+**Q6:** What Angular 17+ feature lets you choose SSR mode per route?
+
+### Day 7 — Application
+**Q7:** Add SSR to an existing Angular app and fix all browser-only API usages.
+**Q8:** Measure First Contentful Paint before and after enabling SSR.
+**Q9:** How do you add dynamic SEO meta tags in Angular SSR?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "What is Angular hydration — how does it work and what problems does it solve?"
+**Q11:** Draw: request flow from browser to Node.js server to Angular render to hydrated client.
+**Q12:** ★ System design: "Choose a rendering strategy for an e-commerce site — product catalogue, cart, checkout, account pages."

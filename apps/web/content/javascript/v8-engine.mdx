@@ -140,3 +140,226 @@ A: In V8, objects rely on Hidden Classes to maintain fast memory offset lookups.
 
 **Q: What is a "Hot" function in V8?**
 A: A function that is executed repeatedly (e.g., inside a loop, or a frequently called utility). The V8 Profiler constantly monitors the execution count of all functions. When the count crosses a specific threshold (the "hot" threshold), V8 flags it and sends the generic bytecode to the TurboFan compiler to be optimized into pure machine code.
+
+## FEYNMAN CHECK
+
+### Explain V8 Like I'm 10 Years Old
+> V8 is the JavaScript ENGINE inside Chrome and Node.js — it converts your JS code into MACHINE CODE that the CPU can run directly. V8 has two compilers: SPARKPLUG (fast, generates OK code immediately — gets you running fast) and TURBOFAN (optimising compiler — watches hot functions and recompiles them to blazing fast machine code). Between them is MAGLEV (2023 — mid-tier). The key idea: JavaScript is DYNAMICALLY TYPED but V8 makes it fast by ASSUMING TYPES. If a function always receives integers, V8 generates integer-optimised code. If you suddenly pass a string, V8 DEOPTIMISES — throws away the optimised code and falls back. The non-obvious insight: predictable patterns (same types, same property order, same array element types) are CRITICAL for performance.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is JIT (Just-In-Time) compilation and why does V8 use it?**
+> **A:** JIT compiles code to machine code AT RUNTIME as it runs, rather than ahead-of-time. V8 starts with the interpreter (Ignition) for fast startup, identifies HOT FUNCTIONS (called many times), and compiles those to optimised machine code (TurboFan). The result: the first call is interpreted (slow), subsequent calls are increasingly fast as optimisations accumulate. This produces near-C performance for hot JS code while preserving dynamic-language flexibility.
+
+**Q2: Mental model for hidden classes and inline caches?**
+> **A:** V8 assigns every object a HIDDEN CLASS (shape/map internally) — a descriptor of its property names and offsets. Objects created with the same properties in the same order share a hidden class. INLINE CACHES: property access is compiled as "if hidden class is C0, load from offset 8." The first call is monomorphic (one hidden class → fast). Adding variety: polymorphic (2-4 classes → slower lookup). Many classes: megamorphic (dictionary lookup → much slower). Write constructors that initialise ALL properties — in the same order every time.
+
+**Q3: Most dangerous misconception?**
+> **A:** Optimisation tricks from 2015 still apply:
+> ```js
+> // ❌ Outdated: avoid try/catch in hot code (pre-2018 V8 de-optimised it)
+> function hotLoop() {
+>   try { doWork(); } catch (e) { handle(e); }   // ✅ Fine in modern V8 (TurboFan)
+> }
+>
+> // ❌ Outdated: arguments object is slow (true in older V8, largely fixed)
+> // ✅ Current real concerns:
+>
+> // 1. Polymorphic property access (STILL IMPORTANT)
+> function add(a, b) { return a.x + b.x; }
+> add({ x: 1 }, { x: 2 });          // monomorphic
+> add({ x: 1, y: 1 }, { x: 2 });    // NOW polymorphic — slower
+>
+> // 2. Array element kind changes (STILL IMPORTANT)
+> const arr = [1, 2, 3];          // PACKED_SMI
+> arr.push(1.5);                   // PACKED_DOUBLE
+> arr.push('x');                   // PACKED
+> // Once promoted, NEVER goes back down
+> ```
+
+**Q4: How does V8 optimise async/await?**
+> **A:** V8's TurboFan has dedicated optimisations for async/await since 2018 (the "zero-cost async" initiative). Each await point compiles to a CONTINUATION (saved stack frame on the heap). V8 reuses Promises internally with an optimised Path ("PromiseReactionJob") for async function continuations. The overhead vs synchronous code is roughly 2 Promise allocations per await — much lower than older Node (which needed 3). In microbenchmarks, async/await is nearly as fast as raw .then chains; in macrobenchmarks, the difference is negligible.
+
+**Q5: FAANG-grade definition?**
+> **A:** "V8 is Google's open-source JavaScript and WebAssembly engine implementing the ECMAScript and WebAssembly specs — using a three-tier JIT pipeline (Ignition interpreter → Maglev mid-tier → TurboFan optimising compiler) with speculation-based optimisations (hidden classes for shape inference, inline caches for property access, type specialisation for arithmetic) and deoptimisation when speculations are violated — with a generational garbage collector (scavenging new-space, mark-compact old-space) and a profiling-guided optimisation cycle that produces near-native performance for hot JS code."
+
+## BUILD
+
+### 🏗️ Mini Project: V8 Optimisation Lab — Prove Hidden Classes, Array Kinds, And Inline Caches With Benchmarks
+
+**What you will build:** A set of micro-benchmarks that empirically demonstrate V8's hidden class, inline cache, and array-element-kind optimisations — with before/after measurements you can run in Node.
+**Why this project:** Makes V8 internals OBSERVABLE — every perf rule becomes a measured data point.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-v8 && cd js-v8
+node --version  # needs Node 18+
+ni bench.js, bench-run.js -ItemType File
+```
+
+#### Step 2 — Hidden Class Benchmarks
+```js
+// bench.js
+import { performance } from 'node:perf_hooks';
+
+function bench(label, fn, iterations = 1_000_000) {
+  // Warm-up
+  for (let i = 0; i < 1000; i++) fn(i);
+  const start = performance.now();
+  for (let i = 0; i < iterations; i++) fn(i);
+  const ms = (performance.now() - start).toFixed(1);
+  console.log(`${label}: ${ms}ms`);
+}
+
+// HIDDEN CLASSES
+
+// Consistent order → same hidden class → FAST
+class ConsistentPoint {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+  }
+}
+
+// Inconsistent order → different hidden classes per call → SLOW (IC pollution)
+function makePoint(x, y, extra) {
+  const p = {};
+  if (extra) p.z = 0;
+  p.x = x;
+  p.y = y;
+  return p;
+}
+
+export function runHiddenClassBench() {
+  bench('consistent class', (i) => new ConsistentPoint(i, i + 1));
+  bench('inconsistent shape', (i) => makePoint(i, i + 1, i % 2));
+}
+```
+
+#### Step 3 — Array Element Kind Benchmarks
+```js
+// bench.js (continued)
+export function runArrayKindBench() {
+  // PACKED_SMI — best, all integers
+  const smiArr = Array.from({ length: 1000 }, (_, i) => i);   // stays PACKED_SMI
+
+  // PACKED_DOUBLE — loses Smi optimisation when float added
+  const dblArr = [...smiArr, 0.5];   // promoted to PACKED_DOUBLE
+
+  // PACKED — loses numeric optimisation when string added
+  const mixArr = [...smiArr, 'x'];   // promoted to PACKED
+
+  // HOLEY — never goes back to PACKED when element is deleted
+  const holeyArr = [...smiArr];
+  delete holeyArr[500];   // now HOLEY
+
+  function sumArray(arr) {
+    let s = 0;
+    for (let i = 0; i < arr.length; i++) s += arr[i];
+    return s;
+  }
+
+  bench('PACKED_SMI sum',    () => sumArray(smiArr),   100_000);
+  bench('PACKED_DOUBLE sum', () => sumArray(dblArr),   100_000);
+  bench('PACKED_MIXED sum',  () => sumArray(mixArr),   100_000);
+  bench('HOLEY sum',         () => sumArray(holeyArr), 100_000);
+}
+```
+
+#### Step 4 — Inline Cache Demo
+```js
+// bench.js (continued)
+export function runICBench() {
+  const obj1 = { x: 1 };
+  const obj2 = { x: 2, y: 2 };   // different shape — IC becomes polymorphic
+  const obj3 = { y: 3, x: 3 };   // different order — IC becomes megamorphic
+
+  function getX(obj) { return obj.x; }
+
+  bench('monomorphic (always same shape)', () => getX(obj1), 5_000_000);
+
+  // Train IC to be polymorphic
+  getX(obj2); getX(obj2);
+  bench('polymorphic (2 shapes)', () => {
+    getX(obj1);
+    getX(obj2);
+  }, 2_500_000);
+
+  // Megamorphic
+  const shapes = Array.from({ length: 10 }, (_, i) => ({ ['k' + i]: i, x: i }));
+  shapes.forEach(s => getX(s));
+  bench('megamorphic (10 shapes)', () => getX(shapes[Math.floor(Math.random() * 10)]), 500_000);
+}
+```
+
+#### Step 5 — Run It
+```js
+// bench-run.js
+import { runHiddenClassBench, runArrayKindBench, runICBench } from './bench.js';
+
+console.log('\n=== HIDDEN CLASS ===');
+runHiddenClassBench();
+
+console.log('\n=== ARRAY ELEMENT KIND ===');
+runArrayKindBench();
+
+console.log('\n=== INLINE CACHE ===');
+runICBench();
+```
+
+**Expected Output:**
+```
+=== HIDDEN CLASS ===
+consistent class: 48ms
+inconsistent shape: 210ms   ← 4× slower
+
+=== ARRAY ELEMENT KIND ===
+PACKED_SMI sum: 120ms
+PACKED_DOUBLE sum: 180ms
+PACKED_MIXED sum: 320ms
+HOLEY sum: 400ms
+
+=== INLINE CACHE ===
+monomorphic (always same shape): 85ms
+polymorphic (2 shapes): 95ms
+megamorphic (10 shapes): 420ms   ← 5× slower
+```
+
+**Stretch Challenges:**
+- [ ] Use `node --print-opt-code --print-deopt-code` to see compiled machine code
+- [ ] Profile with `node --prof` + tick-processor to find hot functions
+- [ ] Add a WebAssembly version of the tight loop and compare
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three compilation tiers V8 uses.
+**Q2:** What is a hidden class?
+**Q3:** What's an inline cache and why does it get "polymorphic"? From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why do array element kinds matter for performance?
+**Q5:** A junior deletes a property from a hot object — V8 perf drops. Diagnose.
+**Q6:** Refactor for hidden class stability:
+```js
+function makeUser(admin) {
+  const u = { name: 'Ana' };
+  if (admin) u.role = 'admin';
+  return u;
+}
+```
+
+### Day 7 — Application
+**Q7:** Write a micro-benchmark comparing for vs forEach vs for-of on PACKED_SMI array.
+**Q8:** A PR hot path receives both {x,y} and {x,y,z} objects — explain IC pollution.
+**Q9:** What are the practical perf rules derived from V8 hidden classes?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how V8 optimises this function: `function add(a, b) { return a + b; }` called 10M times with integers."
+**Q11:** Draw: V8 JIT pipeline from source to machine code.
+**Q12:** ★ System design: "Profile a Node microservice doing 50k RPS and identify the top 3 V8-level bottlenecks — tools, analysis, fixes."

@@ -108,3 +108,128 @@ This is the most common "gotcha" with the Fetch API.
 The `fetch()` Promise only officially "rejects" (triggering the `.catch()` block) if a catastrophic network failure occurs—such as the user's WiFi dropping, the DNS failing to resolve, or the browser blocking the request due to CORS.
 If the server successfully receives the request and successfully replies with a `404 Not Found` or a `500 Server Error`, the network layer worked perfectly! Therefore, `fetch()` considers the request a "success" and triggers `.then()`. 
 *The Fix:* You MUST manually check the `response.ok` boolean (which ensures the status is between 200-299) inside your `.then()` block, and manually `throw new Error()` if it is false, forcing the code into the `.catch()` block!
+
+## FEYNMAN CHECK
+
+### Explain Fetch & XHR Like I'm 10 Years Old
+> Fetch and XHR (XMLHttpRequest) are the browser's mailman — they send HTTP requests to servers and bring responses back. XHR is the old way (callback-based, verbose); fetch is the modern way (promise-based, clean). The non-obvious part: `fetch` does NOT reject on HTTP errors — a 500 response resolves the promise normally. You must check `response.ok` yourself. This is why "my fetch error handler never runs" is the #1 fetch bug.
+
+---
+
+### 5 Deep Questions
+**Q1: fetch vs XHR vs axios?**
+> **A:** XHR: old, callback-based, supports upload progress events. fetch: modern, promise-based, cleaner API, lacks upload progress and timeout natively. axios: library wrapping XHR with interceptors, automatic JSON, timeout, request cancellation. Most apps use fetch + manual extensions.
+
+**Q2: ONE model.**
+> **A:** "fetch(url, init) returns Promise<Response>. Response has .ok, .status, .headers, and async body readers (.json, .text). It only rejects on network failure, never on HTTP errors."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Treats 4xx/5xx as success — error never thrown
+> const data = await fetch('/api').then(r => r.json());
+> // ✅ Check ok explicitly
+> const res = await fetch('/api');
+> if (!res.ok) throw new Error(`HTTP ${res.status}`);
+> const data = await res.json();
+> ```
+
+**Q4: How do you cancel a fetch request?**
+> **A:** Use `AbortController`: create controller, pass `controller.signal` in fetch init, call `controller.abort()` to cancel. The fetch promise rejects with AbortError. Critical for SPA route changes (cancel in-flight requests for the old page).
+
+**Q5: Senior one-liner.**
+> **A:** "fetch is a promise-based network primitive that only rejects on transport failure — production fetch wrappers add status checks, JSON parsing, timeout via AbortController, retry-with-backoff, and request deduplication — most of which axios provides out of the box."
+
+## BUILD
+
+### 🏗️ Mini Project: Production Fetch Wrapper
+**Time:** 35 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir fetch-lib && cd fetch-lib && touch api.js test.html
+```
+
+#### Step 2 — Core
+```js
+// api.js — typed-ish fetch wrapper with timeout, retry, abort
+class HTTPError extends Error {
+  constructor(res) { super(`HTTP ${res.status} ${res.statusText}`); this.res = res; }
+}
+export async function request(url, { method='GET', body, headers={}, timeoutMs=10000, retries=2, signal } = {}) {
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener('abort', onAbort);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  try {
+    let attempt = 0;
+    while (true) {
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: ctrl.signal,
+        });
+        if (!res.ok) throw new HTTPError(res);
+        const ct = res.headers.get('content-type') || '';
+        return ct.includes('json') ? await res.json() : await res.text();
+      } catch (err) {
+        const transient = err.name === 'TypeError' || (err instanceof HTTPError && err.res.status >= 500);
+        if (transient && attempt < retries && method === 'GET') {
+          attempt++;
+          await new Promise(r => setTimeout(r, 2 ** attempt * 200));
+          continue;
+        }
+        throw err;
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+```
+
+#### Step 4 — Error Handling
+```js
+try {
+  const user = await request('/api/users/1', { timeoutMs: 3000 });
+} catch (e) {
+  if (e.name === 'AbortError') console.error('Timeout');
+  else if (e instanceof HTTPError) console.error('HTTP', e.res.status);
+  else console.error('Network', e);
+}
+```
+
+#### Step 5 — Tests
+```js
+// 200 success
+await request('https://jsonplaceholder.typicode.com/users/1');
+// 404 throws
+await request('https://jsonplaceholder.typicode.com/notfound').catch(e => console.log('Caught:', e.res.status));
+```
+
+**Expected Output:** Successful JSON, 404 caught with status.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Why doesn't fetch throw on 500 responses?
+**Q2:** What does AbortController do?
+**Q3:** Write a 5-line fetch with proper error checking.
+
+### Day 3
+**Q4:** fetch vs axios — when each?
+**Q5:** Show the "fetch never errors" bug and the fix.
+**Q6:** Why are upload-progress events missing from fetch?
+
+### Day 7
+**Q7:** Build a request-deduplication layer (same URL in-flight returns same promise).
+**Q8:** PR fires 50 parallel fetches with no concurrency limit. Describe the impact.
+**Q9:** How do you implement retry with exponential backoff?
+
+### Day 14
+**Q10:** ★ "Design a fetch wrapper for an enterprise SPA — what concerns must it handle?"
+**Q11:** Link fetch → AbortController → React effects → cancellation.
+**Q12:** ★ "Your app fires a request that completes after the user navigates away and overwrites the new page's data. Root cause + fix?"

@@ -159,3 +159,176 @@ A: Webpack/Esbuild performs Static Analysis. When it sees the dynamic `import('.
 
 **Q: Can you apply a Route Guard (like `canActivate`) to a Lazy Loaded route?**
 A: Yes, but you must be careful. If you use `canActivate`, Angular will *download the chunk over the network first*, and then run the guard to see if the user is allowed to view it. If they aren't, you just wasted their bandwidth. Instead, use the `canMatch` (or legacy `canLoad`) guard! `canMatch` evaluates the rules *before* downloading the chunk. If the guard returns false, Angular cancels the network request!
+
+## FEYNMAN CHECK
+
+### Explain Angular Lazy Loading Like I'm 10 Years Old
+> Lazy loading means Angular only DOWNLOADS the JavaScript for a feature when the user actually navigates to it — not on initial page load. { path: 'admin', loadComponent: () => import('./admin').then(m => m.AdminComponent) } tells the browser: "When the user goes to /admin, download admin.js then show AdminComponent." This improves initial load time because the browser downloads less JavaScript upfront. The non-obvious depth: Angular's build system (webpack/esbuild) splits your code into CHUNKS at build time — each lazy-loaded route becomes a separate .js file. The size of your initial chunk is what determines Time To Interactive, so lazy-loading infrequently-visited features directly reduces your key performance metric.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does Angular's code splitting work at the build level?**
+> **A:** Angular CLI with esbuild analyses the import() calls in route definitions. Each dynamic import() becomes a SPLIT POINT — esbuild creates a separate JavaScript chunk containing that component and its unique dependencies. Shared dependencies (Angular core, common libraries) are placed in separate vendor chunks and cached by the browser separately. The result: main bundle contains only what's needed for the initial route, with additional chunks loaded on demand. ng build --stats-json lets you see exact chunk sizes.
+
+**Q2: Mental model for loadComponent vs loadChildren?**
+> **A:** loadComponent: () => import('./comp').then(m => m.SomeComponent) lazy-loads a SINGLE standalone component. loadChildren: () => import('./routes').then(m => m.FEATURE_ROUTES) lazy-loads a ROUTES ARRAY — an entire feature area with multiple sub-routes. Use loadComponent for a single standalone view; use loadChildren for a feature module with its own routing hierarchy (sub-routes, nested navigation, feature state).
+
+**Q3: Most dangerous misconception about lazy loading?**
+> **A:** More lazy routes = faster app:
+> ```typescript
+> // WRONG: 50 tiny lazy routes = 50 separate HTTP requests on first navigation
+> { path: 'a', loadComponent: () => import('./a') },  // 2KB chunk
+> { path: 'b', loadComponent: () => import('./b') },  // 2KB chunk
+> // ... 50 more, all tiny, all requiring separate network roundtrips
+>
+> // CORRECT: group related features into one lazy chunk
+> { path: 'settings', loadChildren: () => import('./settings/routes') }
+> // settings/routes includes profile, security, notifications, billing
+> // One 30KB chunk download covers the entire settings area
+>
+> // Rule: lazy-load FEATURE AREAS (5-10+ components), not individual tiny components
+> ```
+
+**Q4: How does Angular's @defer differ from route-based lazy loading?**
+> **A:** @defer (Angular 17+) lazy-loads components at the TEMPLATE level, not route level. @defer (when isVisible) { <app-heavy-chart/> } delays downloading and rendering the component until a condition (viewport visibility, user interaction, timer). Route-based lazy loading downloads the chunk on navigation. @defer downloads the chunk when the template condition triggers — enabling lazy loading of components WITHIN a page, not just at route boundaries.
+
+**Q5: FAANG-grade definition of Angular lazy loading.**
+> **A:** "Angular lazy loading splits the application bundle at route boundaries via dynamic import() in loadComponent/loadChildren route configuration — webpack/esbuild creating separate JS chunks per split point — with preloading strategies (PreloadAllModules, QuicklinkStrategy) for background prefetching of likely-next-visited chunks — @defer enabling template-level on-demand component loading within a page — and feature state lazy registration (NgRx provideState) co-locating feature bundle + state initialisation — all reducing the initial bundle size to only what's needed for Time To Interactive."
+
+## BUILD
+
+### 🏗️ Mini Project: Lazy-Loaded Feature App With Preloading + Bundle Analysis
+
+**What you will build:** A 3-feature Angular app (Home, Admin, Reports) where Admin and Reports are lazy-loaded — plus QuicklinkStrategy preloading and a bundle size analysis with webpack-bundle-analyzer.
+**Why this project:** Forces code-splitting config, preloading, and makes chunk sizes observable.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new lazy-demo --standalone --routing
+cd lazy-demo
+npm install ngx-quicklink webpack-bundle-analyzer
+ng generate component home --standalone
+ng generate component admin --standalone
+ng generate component reports --standalone
+```
+
+#### Step 2 — Routes With Lazy Loading
+```typescript
+// app.routes.ts
+import { Routes } from '@angular/router';
+import { QuicklinkStrategy } from 'ngx-quicklink';
+
+export const routes: Routes = [
+  { path: '', component: HomeComponent },
+  {
+    path: 'admin',
+    loadChildren: () => import('./admin/admin.routes').then(m => m.ADMIN_ROUTES),
+    data: { preload: true },
+  },
+  {
+    path: 'reports',
+    loadComponent: () => import('./reports/reports.component').then(m => m.ReportsComponent),
+    data: { preload: false },  // don't preload — accessed rarely
+  },
+  { path: '**', redirectTo: '' },
+];
+
+// Use QuicklinkStrategy — only preloads routes visible via routerLink
+export const routerConfig = {
+  preloadingStrategy: QuicklinkStrategy,
+  routes,
+};
+```
+
+#### Step 3 — Admin Feature Routes
+```typescript
+// admin/admin.routes.ts
+import { Routes } from '@angular/router';
+export const ADMIN_ROUTES: Routes = [
+  { path: '', loadComponent: () => import('./admin-dashboard.component').then(m => m.AdminDashboardComponent) },
+  { path: 'users', loadComponent: () => import('./admin-users.component').then(m => m.AdminUsersComponent) },
+];
+```
+
+#### Step 4 — Bundle Analysis
+```bash
+# Build with stats
+ng build --stats-json
+
+# Analyse bundle sizes
+npx webpack-bundle-analyzer dist/lazy-demo/stats.json dist/lazy-demo/browser
+
+# Alternatively, use the Angular CLI built-in
+ng build --source-map
+npx source-map-explorer 'dist/lazy-demo/browser/*.js'
+```
+
+#### Step 5 — @defer For Within-Page Lazy Loading
+```typescript
+// reports.component.ts — heavy chart component deferred until visible
+import { Component } from '@angular/core';
+
+@Component({
+  standalone: true,
+  template: `
+    <h1>Reports Dashboard</h1>
+    <p>Summary statistics shown immediately (no defer)</p>
+
+    @defer (on viewport) {
+      <!-- HeavyChartComponent JS downloaded only when scrolled into view -->
+      <app-heavy-chart/>
+    } @placeholder {
+      <div class="chart-skeleton" style="height:300px;background:#eee">Loading chart...</div>
+    } @loading (minimum 200ms) {
+      <p>Fetching chart data...</p>
+    } @error {
+      <p>Chart failed to load</p>
+    }
+  `,
+})
+export class ReportsComponent {}
+```
+
+**Expected Output:**
+```
+ng build output:
+  main.js: ~150KB (only home component + Angular core)
+  chunk-ADMIN.js: ~25KB (admin feature — downloaded on /admin navigation)
+  chunk-REPORTS.js: ~15KB (reports — downloaded on /reports navigation)
+
+DevTools Network tab:
+  Initial load: only main.js downloaded
+  Navigate to /admin: chunk-ADMIN.js downloaded
+```
+
+**Stretch Challenges:**
+- [ ] Add a custom preloading strategy that only preloads routes with data.preload === true
+- [ ] Measure Core Web Vitals improvement with/without lazy loading
+- [ ] Add Angular Universal (SSR) and measure LCP improvement
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the difference between loadComponent and loadChildren?
+**Q2:** How does esbuild create lazy chunks?
+**Q3:** Write a lazy-loaded route definition. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is lazy-loading 50 tiny routes a problem?
+**Q5:** What is @defer and how does it differ from route-based lazy loading?
+**Q6:** What is a preloading strategy and why does it matter?
+
+### Day 7 — Application
+**Q7:** Analyse bundle sizes for an Angular app and identify the largest dependencies.
+**Q8:** A PR puts a 2MB chart library in the root bundle — diagnose and fix.
+**Q9:** How does @defer's on viewport trigger work internally?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Angular's code splitting strategy — how does it work and what metrics does it improve?"
+**Q11:** Draw: webpack/esbuild chunk dependency graph for a lazy-loaded Angular app.
+**Q12:** ★ System design: "Optimise an Angular SPA with 200 routes for sub-1-second Time To Interactive on 3G."

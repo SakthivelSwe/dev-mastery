@@ -86,3 +86,117 @@ The data is cached in Redis with a 60-second TTL. For 60 seconds, everything is 
 At exactly second 61, the cache expires and disappears.
 In that exact millisecond, 1,000 users simultaneously request the page. All 1,000 users experience a "Cache Miss" at the exact same time! All 1,000 Node.js threads immediately pivot and fire the massive `SELECT * FROM products` query against the database simultaneously. The database goes from 0 CPU to 100% CPU in one millisecond and crashes instantly. 
 *The Fix:* You must implement **Mutex Locks (Distributed Locking)** or **Debouncing** in your cache logic. When a Cache Miss occurs, the very first Node.js thread must instantly grab a Redis "Lock". The other 999 threads check for the Lock and are forced to simply *wait* in a holding pattern. The first thread safely queries the database, repopulates the cache, releases the lock, and the 999 waiting threads instantly read from the newly populated cache!
+
+## FEYNMAN CHECK
+
+### Explain Caching Strategies Like I'm 10 Years Old
+> Caching = storing computed/fetched results so the next request returns instantly instead of re-doing the work. Common layers: browser cache, CDN, in-memory app cache, Redis/Memcached, DB query cache. The non-obvious part: cache invalidation is famously hard (Phil Karlton: "There are only two hard things in CS: cache invalidation and naming things"). Stale data served from cache after a write is the #1 cache bug.
+
+---
+
+### 5 Deep Questions
+**Q1: Cache-aside vs write-through vs write-behind?**
+> **A:** Cache-aside: app reads cache, falls back to DB on miss, writes go to DB only — cache fills lazily. Write-through: writes go to cache AND DB synchronously — always consistent. Write-behind: writes to cache, async to DB — fast but loses data on crash. Cache-aside is most common; write-through for strict consistency.
+
+**Q2: ONE model.**
+> **A:** "Cache = key→value+TTL. Read: check cache; if hit, return; if miss, compute, store, return. Write: update source, invalidate cache. TTL bounds staleness; eviction bounds memory."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Cache stampede — 1000 concurrent misses each compute the same expensive value
+> let value = await cache.get(key);
+> if (!value) {
+>   value = await expensiveCompute();
+>   await cache.set(key, value);
+> }
+> // ✅ Single-flight: only one request computes, others wait
+> if (inflight.has(key)) return inflight.get(key);
+> const p = expensiveCompute().then(v => { cache.set(key, v); inflight.delete(key); return v; });
+> inflight.set(key, p);
+> return p;
+> ```
+
+**Q4: What is cache invalidation and what strategies exist?**
+> **A:** TTL-based: simple, eventual consistency, may serve stale. Event-driven: publish invalidation on write — accurate, complex. Versioned keys: include version in key (user:42:v3) — naturally invalidates by changing version. Choose by acceptable staleness window.
+
+**Q5: Senior one-liner.**
+> **A:** "Caching is a memory/latency tradeoff governed by invalidation policy (TTL, event, version), eviction policy (LRU, LFU), and stampede protection (single-flight) — and ignoring any one of the three produces production incidents at scale."
+
+## BUILD
+
+### 🏗️ Mini Project: Cache-Aside with Single-Flight Protection
+**Time:** 30 minutes
+
+#### Step 1 — Setup
+```bash
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+npm init -y && npm i ioredis
+touch cache.js
+```
+
+#### Step 2 — Core
+```js
+const Redis = require('ioredis');
+const redis = new Redis();
+const inflight = new Map();
+
+async function cached(key, ttlSec, compute) {
+  // 1. Try cache
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);
+  // 2. Single-flight — coalesce concurrent misses
+  if (inflight.has(key)) return inflight.get(key);
+  const promise = (async () => {
+    const value = await compute();
+    await redis.set(key, JSON.stringify(value), 'EX', ttlSec);
+    return value;
+  })();
+  inflight.set(key, promise);
+  try { return await promise; }
+  finally { inflight.delete(key); }
+}
+
+// Usage
+async function getUser(id) {
+  return cached(`user:${id}`, 60, async () => {
+    console.log('DB hit for', id);
+    return { id, name: 'Alice' };
+  });
+}
+
+(async () => {
+  await Promise.all([getUser(1), getUser(1), getUser(1)]); // 1 DB hit, not 3
+})();
+```
+
+#### Step 4 — Invalidation
+```js
+async function updateUser(id, data) {
+  await db.update(id, data);
+  await redis.del(`user:${id}`);  // invalidate
+}
+```
+
+**Expected Output:** Log shows 1 DB hit for 3 concurrent calls.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Name 3 cache layers in a typical web app.
+**Q2:** Cache-aside vs write-through.
+**Q3:** Write a 15-line cache-aside helper.
+
+### Day 3
+**Q4:** What is cache stampede?
+**Q5:** Show stampede bug + single-flight fix.
+**Q6:** TTL vs event-driven invalidation.
+
+### Day 7
+**Q7:** Build a versioned-key cache for user profiles.
+**Q8:** PR sets TTL to 1 hour on a heavily-edited resource. Staleness impact?
+**Q9:** LRU vs LFU eviction — when each?
+
+### Day 14
+**Q10:** ★ "Design caching for a product catalogue with 10M items + frequent price updates."
+**Q11:** Link caching → invalidation → eviction → consistency.
+**Q12:** ★ "Cache hit rate dropped from 95% → 60%. Diagnose."

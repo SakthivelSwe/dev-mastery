@@ -144,3 +144,156 @@ A: **Transitions interrupt Component Trees, not JavaScript execution.**
 React Concurrent Mode pauses rendering between components (e.g., after rendering `<ListItem 1>`, it checks if the user typed anything, then renders `<ListItem 2>`).
 React physically cannot pause a synchronous `for` loop or a massive `.map()` or `.reduce()` executing inside a single component's render function, because JavaScript is single-threaded. 
 To fix this, the heavy work must either be split into thousands of individual React child components (so React can yield between them), or the heavy mathematical calculation must be moved entirely off the main thread using a **Web Worker**.
+
+## FEYNMAN CHECK
+
+### Explain React Concurrent Features Like I'm 10 Years Old
+> React 18 introduced CONCURRENT RENDERING: React can pause, interrupt, and restart rendering work based on priority. `startTransition` marks an update as LOW PRIORITY (interruptible). `useDeferredValue` delays a value update so urgent renders happen first. `Suspense` for data fetching lets components "wait" while a parent shows a fallback. Together, they make UIs feel instant: typing in a search box stays instant (high priority) while filtering 10K results renders in the background (low priority, interruptible).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between urgent and transition updates?**
+> **A:** URGENT (direct interactions): typing, clicking, pressing — users expect immediate visual feedback. TRANSITION (secondary effects): filtering a large list, navigating to a new tab, rendering search results — users tolerate slight delay. `startTransition(() => setSearchResults(filtered))` marks the results update as a transition — React renders it at lower priority, keeps the input responsive, and will ABANDON the in-progress render if a new keystroke arrives (restarts with fresh value). The UI never feels blocked.
+
+**Q2: useTransition vs useDeferredValue?**
+> **A:** `useTransition`: wraps the STATE UPDATE — you control when to mark it as a transition: `const [isPending, start] = useTransition(); start(() => setState(v))`. Use when you own the state setter. `useDeferredValue`: wraps the VALUE — React automatically defers the value: `const deferred = useDeferredValue(query)`. Use when you receive a value from a parent (can't control the setter). Both produce similar results — `useTransition` is more explicit; `useDeferredValue` is for consumer components that can't modify the update site.
+
+**Q3: Most dangerous misconception?**
+> **A:** startTransition makes state updates async:
+> ```tsx
+> // ❌ WRONG: thinking startTransition is like setTimeout
+> startTransition(() => {
+>   setResults(filter(query));  // This is still synchronous!
+>   // startTransition just marks it as low-priority, doesn't defer execution
+> });
+>
+> // The difference: WITHOUT startTransition
+> // setQuery('ab') → render immediately → blocks main thread for 200ms
+> // User types 'abc' → has to wait for 200ms render first → laggy
+>
+> // WITH startTransition
+> // setQuery('ab') → renders immediately (urgent)
+> // startTransition(() => setResults(filter('ab'))) → marks as low priority
+> // User types 'abc' → React INTERRUPTS the 'ab' results render
+> // → re-renders with 'abc' → result shows 'abc' filter, never 'ab'
+> ```
+
+**Q4: How does Suspense for data fetching work in React 18?**
+> **A:** A component can "suspend" by throwing a Promise. React catches it, shows the nearest Suspense boundary's fallback, and re-tries when the Promise resolves. Libraries implement this: React Query's `useSuspenseQuery` throws a Promise when data isn't ready; your component renders only when data is available (no isLoading check). Server-side: Next.js App Router uses Suspense + streaming — the server sends the Suspense boundary shell immediately, then streams the resolved content. This is the "declarative loading" model.
+
+**Q5: FAANG-grade definition.**
+> **A:** "React 18 concurrent features implement cooperative multitasking in the React renderer — startTransition marks state updates as interruptible transitions (low priority, discardable if superseded by new updates) keeping urgent interactions (typing, clicking) responsive while heavy renders run in background — useDeferredValue defers a value for rendering while showing the stale value, ideal for consumer components that don't own the update site — Suspense in concurrent mode catches thrown Promises for declarative loading states (no isLoading boolean, component simply renders when data is ready) — and automatic batching in React 18 groups all state updates (including setTimeout, native events, Promises) into single re-renders, reducing cascading re-renders — collectively enabling jank-free UIs for search, filtering, navigation, and data loading without manual optimisation."
+
+## BUILD
+
+### 🏗️ Mini Project: Instant Search With startTransition + useDeferredValue
+
+**What you will build:** A search box over 50,000 items — input stays instant (urgent), results filter in background (transition), with isPending indicator.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1
+```bash
+npm create vite@latest concurrent-demo -- --template react-ts && cd concurrent-demo && npm install
+```
+
+#### Step 2 — Heavy Filter Function
+```ts
+// src/items.ts
+export const items = Array.from({ length: 50_000 }, (_, i) => ({
+  id: i, label: 'Item ' + i,
+  tags: ['alpha','beta','gamma','delta'][i % 4],
+}));
+
+// Artificially slow — simulates expensive filter
+export function heavyFilter(list: typeof items, q: string) {
+  if (!q) return list.slice(0, 20);
+  return list.filter(i => {
+    for (let k = 0; k < 100; k++) Math.sqrt(k);  // CPU work
+    return i.label.toLowerCase().includes(q.toLowerCase());
+  }).slice(0, 50);
+}
+```
+
+#### Step 3 — App With Transition
+```tsx
+// src/App.tsx
+import { useState, useTransition, useDeferredValue, useMemo, memo } from 'react';
+import { items, heavyFilter } from './items';
+
+// Memoised item — only re-renders when label/isPending changes
+const ResultItem = memo(({ label, isPending }: { label: string; isPending: boolean }) => (
+  <li className={`p-2 border-b transition-opacity ${isPending ? 'opacity-40' : 'opacity-100'}`}>{label}</li>
+));
+
+export default function App() {
+  const [query, setQuery] = useState('');
+  const [isPending, startTransition] = useTransition();
+
+  // Deferred version — trails behind query, triggers stale-list rendering
+  const deferredQuery = useDeferredValue(query);
+
+  // Heavy work runs with deferred value — won't block input
+  const results = useMemo(() => heavyFilter(items, deferredQuery), [deferredQuery]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setQuery(e.target.value);  // urgent — input updates instantly
+    startTransition(() => {
+      // Nothing here — useDeferredValue handles deferral automatically
+      // If using startTransition with setState instead:
+      // startTransition(() => setDeferredQuery(e.target.value));
+    });
+  };
+
+  return (
+    <main className="max-w-md mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-2">Concurrent Search (50K items)</h1>
+      <p className="text-sm text-gray-500 mb-4">
+        Type rapidly — input never lags. Results may momentarily show stale list (isPending: {String(isPending)}).
+      </p>
+      <input value={query} onChange={handleChange} placeholder="Search..."
+        className={`w-full px-3 py-2 border rounded mb-2 ${isPending ? 'border-blue-300' : ''}`} />
+      <p className="text-xs text-gray-400 mb-2">
+        Showing: "{deferredQuery}" results ({results.length}) {isPending && '⏳ updating...'}
+      </p>
+      <ul className="border rounded max-h-80 overflow-auto">
+        {results.map(r => <ResultItem key={r.id} label={r.label} isPending={isPending} />)}
+      </ul>
+    </main>
+  );
+}
+```
+
+**Expected Output:**
+```
+Type rapidly "it" → input updates INSTANTLY
+Stale results shown momentarily (opacity reduced)
+After short pause → fresh results appear
+isPending: true while results computing
+Without startTransition/useDeferredValue: input would lag noticeably
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does startTransition do?
+**Q2:** Difference between useTransition and useDeferredValue?
+**Q3:** Write an instant search with startTransition. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Is startTransition async like setTimeout?
+**Q5:** When does React abandon a transition render?
+**Q6:** How does Suspense for data work with concurrent mode?
+
+### Day 7 — Application
+**Q7:** Build a tab switch that shows old tab while new tab loads (useDeferredValue).
+**Q8:** A search box lags on every keystroke — apply concurrent fix.
+**Q9:** When should you NOT use startTransition?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain React 18 concurrent features — startTransition, Suspense, streaming."
+**Q11:** Draw: urgent vs transition update — interrupt, restart, commit.
+**Q12:** ★ System design: "Design UX for a real-time collaborative doc editor — React concurrent, optimistic, conflict resolution."

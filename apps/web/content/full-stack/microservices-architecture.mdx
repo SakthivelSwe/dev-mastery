@@ -67,3 +67,101 @@ A: **You can't. You must use API Composition or Data Duplication (Event Sourcing
 This is the hardest problem in microservices (Distributed Data). There are two main solutions:
 1. **API Composition (Synchronous):** The API Gateway fetches the raw Orders from the `OrderService`. It then looks at the `user_id`s, makes a *second* network request to the `UserService` to fetch the emails, manually staples the JSON data together in RAM, and sends it to the frontend. (This is slow and creates network bottlenecks).
 2. **Event-Driven Duplication (Asynchronous):** When a user signs up in the `UserService`, the service fires a message into a Kafka queue: `"User 42 created with email X"`. The `OrderService` silently listens to this queue, catches the message, and secretly saves a *duplicate* copy of the email address into its own Order Database! Now, when the Order Service needs to query orders, it already has the email address locally, allowing it to perform a blazingly fast local query without ever asking the User Service!
+
+## FEYNMAN CHECK
+
+### Explain Microservices Like I'm 10 Years Old
+> Microservices = breaking one big app (monolith) into many small services that talk over the network. Each service owns one business capability (auth, payments, search) with its own database and team. The non-obvious part: microservices solve organisational problems (10 teams stepping on each other in a monolith) more than technical ones. They INTRODUCE network failure, distributed transactions, observability complexity, and operational burden. This is why "start with a monolith, extract services when team coordination breaks" is now mainstream advice.
+
+---
+
+### 5 Deep Questions
+**Q1: When should you adopt microservices?**
+> **A:** When team coordination becomes the bottleneck (50+ engineers stepping on each other in one repo). Below ~20 engineers, a modular monolith is faster to ship and operate. The cost of microservices (network, observability, ops) only pays off when team independence > coordination cost.
+
+**Q2: ONE model.**
+> **A:** "Service = bounded context with its own DB, owned by one team, deployed independently. Communication via async events (durable, decoupled) or sync APIs (simple, coupled). Distributed monolith = microservices that share a DB or deploy together = worst of both worlds."
+
+**Q3: Misconception with code.**
+> **A:** ```
+> # ❌ Distributed monolith — services share DB
+> [Auth Service] → [shared.users table] ← [Order Service]
+> # Any schema change requires coordinating both
+> # ✅ DB per service + events
+> [Auth Service] → [auth.users] → publishes UserCreated event
+>                                ↓
+>                  [Order Service] → [orders.user_summary]
+> ```
+
+**Q4: How do microservices handle distributed transactions?**
+> **A:** Avoid them. Use Saga pattern: chain of local transactions + compensating actions on failure. Or use outbox pattern: write business data + event in same transaction, separate process publishes events. Two-phase commit across services is fragile and rare in modern systems.
+
+**Q5: Senior one-liner.**
+> **A:** "Microservices trade in-process complexity for distributed-systems complexity — they solve team-scale coordination but introduce network failure, eventual consistency, and observability burden, which is why the modular monolith remains the right starting point for most teams."
+
+## BUILD
+
+### 🏗️ Mini Project: Two-Service Architecture with Events
+**Time:** 40 minutes
+
+#### Step 1 — Setup
+```bash
+docker run -d --name rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+mkdir auth-svc order-svc
+```
+
+#### Step 2 — Auth Service publishes
+```js
+// auth-svc/server.js
+const amqp = require('amqplib');
+async function publish(event) {
+  const conn = await amqp.connect('amqp://localhost');
+  const ch = await conn.createChannel();
+  await ch.assertExchange('user.events', 'topic', { durable: true });
+  ch.publish('user.events', 'user.created', Buffer.from(JSON.stringify(event)));
+}
+// On signup: publish({ id: 42, email: 'a@b.co' });
+```
+
+#### Step 3 — Order Service subscribes
+```js
+// order-svc/server.js
+const conn = await amqp.connect('amqp://localhost');
+const ch = await conn.createChannel();
+await ch.assertExchange('user.events', 'topic', { durable: true });
+const { queue } = await ch.assertQueue('order.user-projection', { durable: true });
+await ch.bindQueue(queue, 'user.events', 'user.*');
+ch.consume(queue, (msg) => {
+  const event = JSON.parse(msg.content);
+  console.log('Order svc projecting:', event);
+  // INSERT INTO order.user_summary ...
+  ch.ack(msg);
+});
+```
+
+#### Step 5 — Test
+Auth signs up user → publishes → Order projects without direct call.
+
+**Expected Output:** Decoupled flow — Order survives Auth being offline.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** Monolith vs microservices — when each?
+**Q2:** What is a distributed monolith?
+**Q3:** Sketch 3 microservices with their communication.
+
+### Day 3
+**Q4:** Sync API vs async event — when each?
+**Q5:** Show shared-DB anti-pattern + DB-per-service fix.
+**Q6:** What is the Saga pattern?
+
+### Day 7
+**Q7:** Implement an outbox pattern for reliable event publishing.
+**Q8:** PR adds direct DB access from Service B to Service A's table. Critique.
+**Q9:** What is a service mesh (Istio/Linkerd) and what does it solve?
+
+### Day 14
+**Q10:** ★ "Migrate a monolith to microservices — what's the strangler-fig strategy?"
+**Q11:** Link microservices → events → saga → observability.
+**Q12:** ★ "Your microservices have 200ms p99 from cascading sync calls. Architectural fix?"

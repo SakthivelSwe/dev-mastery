@@ -142,3 +142,219 @@ A: Yes, technically you can write `condition1 ? result1 : condition2 ? result2 :
 
 **Q: In an `if` statement, does the condition have to be a boolean?**
 A: No! JavaScript uses Implicit Type Coercion. You can place any variable inside an `if(variable)` block. The JS Engine will automatically coerce the variable into a Boolean using Truthy/Falsy rules. For example, `if("hello")` will execute because strings are Truthy, and `if(0)` will not execute because `0` is Falsy.
+
+## FEYNMAN CHECK
+
+### Explain Control Flow Like I'm 10 Years Old
+> Control flow is HOW your program DECIDES what to do next. JS gives you: `if/else` (branch on truthy/falsy), `switch` (multi-way branch on equality), ternary `? :` (compact if/else expression), `try/catch/finally` (handle errors), and `throw` (signal errors). The non-obvious detail: switch uses `===` (strict equality) — `case 1` does NOT match string '1'. Switch cases FALL THROUGH unless you `break` or `return` — a frequent bug. Modern JS prefers OBJECT LOOKUPS and EARLY RETURNS over deep switch/if chains. `try/catch` only catches SYNCHRONOUS throws and PROMISES THAT YOU AWAIT — fire-and-forget async errors slip past.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you use switch vs if-else vs object lookup?**
+> **A:** Use OBJECT LOOKUP `actions[type]?.()` for "map type to handler" — cleanest, fastest (O(1) hash), tree-shakable, no fall-through bugs. Use SWITCH when you need fall-through intentionally or pattern-matching that an object can't express. Use IF-ELSE for actual ranges/conditions (`if (n > 100)`). Modern codebases use ternaries for expressions, early returns for guard clauses, switch only when truly needed.
+
+**Q2: Mental model for try/catch and async?**
+> **A:** A try/catch catches anything that THROWS SYNCHRONOUSLY in its body, OR is awaited and rejects. `try { setTimeout(() => { throw new Error() }) }` does NOT catch — the throw happens in a separate event-loop tick. `try { await fetch('/bad') }` catches the rejection. Modern advice: don't pepper try/catch everywhere; let unhandled errors bubble to global error handlers (window.onerror, process.on('unhandledRejection')), catch only when you can RECOVER.
+
+**Q3: Most dangerous misconception?**
+> **A:** Switch fall-through:
+> ```js
+> // ❌ Forgot break — fall-through silently runs next case
+> switch (status) {
+>   case 'pending':
+>     showSpinner();
+>     // forgot break!
+>   case 'error':
+>     showError();        // runs even when status is 'pending'!
+>     break;
+>   case 'success':
+>     hideSpinner();
+>     break;
+> }
+>
+> // ✅ Always use return or break, OR refactor to object lookup
+> const handlers = { pending: showSpinner, error: showError, success: hideSpinner };
+> handlers[status]?.();
+> ```
+
+**Q4: How does try/catch interact with the JS engine's optimisation?**
+> **A:** Historically (pre-2018), code inside try blocks was DE-OPTIMISED in V8 — try blocks couldn't be optimised by Crankshaft. Modern V8 (Turbofan, 2018+) handles try/catch fully. So "avoid try/catch in hot loops" is OUTDATED advice. However, throwing is still expensive — capturing a stack trace costs microseconds, much more than returning a Result type. For control flow, use return values; for exceptional errors, throw.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript control flow comprises branching constructs (if/else, switch with strict-equality dispatch and explicit fall-through, ternary expressions), iteration (for, while, do-while, for-of, for-in), exception handling (try/catch/finally with throw, scoped to synchronous + awaited async), and labelled break/continue for nested loop control — collectively forming the imperative skeleton onto which modern JS layers functional patterns like Array.map/filter/reduce."
+
+## BUILD
+
+### 🏗️ Mini Project: Order State Machine With Exhaustive Switch + Error Recovery
+
+**What you will build:** A small order-processing state machine: `pending → paid → shipped → delivered` with exhaustive switch handling, retry-on-error logic, and a guard-clause refactor showing the "early return" pattern.
+**Why this project:** Forces switch with default+throw exhaustiveness, try/catch recovery, and object-lookup alternative.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-control && cd js-control
+npm init -y
+npm install -D vitest
+ni order.js, order.test.js -ItemType File
+```
+
+#### Step 2 — State Machine With Switch
+```js
+// order.js
+export function nextState(currentState) {
+  switch (currentState) {
+    case 'pending':   return 'paid';
+    case 'paid':      return 'shipped';
+    case 'shipped':   return 'delivered';
+    case 'delivered': return 'delivered';  // terminal
+    case 'cancelled': return 'cancelled';  // terminal
+    default:
+      // Exhaustiveness check — runtime error if a new state was added
+      throw new Error(`Unknown order state: ${currentState}`);
+  }
+}
+
+// Equivalent object-lookup version — cleaner, tree-shakable
+const TRANSITIONS = {
+  pending:   'paid',
+  paid:      'shipped',
+  shipped:   'delivered',
+  delivered: 'delivered',
+  cancelled: 'cancelled',
+};
+
+export function nextStateLookup(s) {
+  const next = TRANSITIONS[s];
+  if (next === undefined) throw new Error(`Unknown state: ${s}`);
+  return next;
+}
+```
+
+#### Step 3 — Process Order With Retry
+```js
+// processor.js
+export async function processOrder(orderId, attempt = 1) {
+  const MAX_ATTEMPTS = 3;
+  try {
+    const order = await fetchOrder(orderId);
+    if (!order)            return { status: 'error', reason: 'not_found' };
+    if (order.cancelled)   return { status: 'noop',  reason: 'already_cancelled' };
+
+    // Guard clauses — early return, no nested ifs
+    const newState = nextState(order.state);
+    await persistState(orderId, newState);
+    return { status: 'ok', newState };
+  } catch (err) {
+    // Recoverable: retry up to MAX_ATTEMPTS
+    if (err.name === 'NetworkError' && attempt < MAX_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, 2 ** attempt * 100));
+      return processOrder(orderId, attempt + 1);
+    }
+    return { status: 'error', reason: err.message };
+  } finally {
+    console.log(`Processed order ${orderId} (attempt ${attempt})`);
+  }
+}
+
+async function fetchOrder(id) { /* stub */ return { id, state: 'pending', cancelled: false }; }
+async function persistState(id, state) { /* stub */ }
+```
+
+#### Step 4 — Error Handling: Async Try/Catch Gotcha
+```js
+// ❌ This does NOT catch the timer's throw
+async function badAsync() {
+  try {
+    setTimeout(() => { throw new Error('boom'); }, 0);  // uncaught — escapes try
+  } catch (e) {
+    console.log('caught:', e.message);   // never runs
+  }
+}
+
+// ✅ Wrap in a Promise so you can await it
+function laterError() {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error('boom')), 0));
+}
+async function goodAsync() {
+  try { await laterError(); }
+  catch (e) { console.log('caught:', e.message); }   // ✅ runs
+}
+```
+
+#### Step 5 — Tests
+```js
+// order.test.js
+import { describe, it, expect } from 'vitest';
+import { nextState, nextStateLookup } from './order.js';
+
+describe('nextState', () => {
+  it('advances through every state', () => {
+    expect(nextState('pending'))   .toBe('paid');
+    expect(nextState('paid'))      .toBe('shipped');
+    expect(nextState('shipped'))   .toBe('delivered');
+    expect(nextState('delivered')) .toBe('delivered');
+  });
+  it('throws on unknown state', () => {
+    expect(() => nextState('unknown')).toThrow(/Unknown order state/);
+  });
+});
+
+describe('nextStateLookup', () => {
+  it('matches switch behaviour', () => {
+    expect(nextStateLookup('paid')).toBe('shipped');
+  });
+  it('throws on missing state', () => {
+    expect(() => nextStateLookup('phantom')).toThrow();
+  });
+});
+```
+
+**Expected Output:**
+```
+Processed order 42 (attempt 1)
+{ status: 'ok', newState: 'paid' }
+
+# Tests:
+✓ advances through every state
+✓ throws on unknown state
+✓ object lookup matches switch behaviour
+```
+
+**Stretch Challenges:**
+- [ ] Add transition guards (e.g., can only ship if paid)
+- [ ] Convert to XState for visualisable state charts
+- [ ] Add audit-log middleware that wraps every transition
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Does switch use `==` or `===` for matching?
+**Q2:** What does `try { setTimeout(() => { throw 'x' }) }` catch?
+**Q3:** Write an exhaustive switch on `'a' | 'b' | 'c'` that throws on default. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When would you choose switch over an object lookup?
+**Q5:** A junior writes `if (user) if (user.address) if (user.address.city) ...` — refactor with guard clauses.
+**Q6:** Refactor without nested if-else:
+```js
+function getDiscount(user) {
+  if (user.tier === 'gold') return 0.20;
+  else if (user.tier === 'silver') return 0.10;
+  else return 0;
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a retry-with-exponential-backoff wrapper using try/catch.
+**Q8:** A PR throws a string `throw 'error'` instead of `throw new Error('error')`. Why is this bad?
+**Q9:** What is the cost of throwing in modern V8 (vs returning a Result type)?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how async/await rethrowing differs from synchronous throw."
+**Q11:** Draw: control-flow graph for try/catch/finally with a return inside try AND finally.
+**Q12:** ★ System design: "Design the error-handling strategy for a server that calls 10 downstream services — what bubbles, what retries, what circuit-breaks?"

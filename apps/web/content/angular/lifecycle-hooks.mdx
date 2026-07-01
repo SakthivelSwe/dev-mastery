@@ -172,3 +172,200 @@ A: No! `HttpClient` observables are "finite." The moment the server responds wit
 
 **Q: What is `ngDoCheck()`?**
 A: It is a hook that fires on every single Change Detection cycle (potentially hundreds of times a second). It is designed to allow you to write custom dirty-checking logic if Angular's default change detection misses something. It is almost never used in standard application development and will severely degrade performance if used incorrectly.
+
+## FEYNMAN CHECK
+
+### Explain Angular Lifecycle Hooks Like I'm 10 Years Old
+> Angular components go through a life: created → rendered → updated → destroyed. At each stage Angular calls specific methods on your class if you implement them — these are lifecycle hooks. The constructor is like hiring the chef (DI injected, but kitchen not set up yet). ngOnInit is the kitchen opening — all @Inputs are set, ready to call APIs. ngOnChanges fires every time a parent passes new @Input values. ngOnDestroy is closing time — clean up subscriptions, cancel requests, release resources. The non-obvious trap: calling APIs in the constructor is WRONG because @Inputs are undefined there — the component's @Inputs are only set after the first ngOnChanges/ngOnInit.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the full lifecycle hook execution order?**
+> **A:** (1) constructor — DI runs. (2) ngOnChanges — first time (if @Inputs exist). (3) ngOnInit — once, after first ngOnChanges. (4) ngDoCheck — every change detection cycle. (5) ngAfterContentInit — once, after ng-content projected. (6) ngAfterContentChecked — after every check of projected content. (7) ngAfterViewInit — once, after component view and child views initialised. (8) ngAfterViewChecked — after every check of the view. (9) ngOnDestroy — before Angular destroys the component.
+
+**Q2: Mental model for ngOnInit vs ngAfterViewInit?**
+> **A:** ngOnInit fires when the component's CLASS is ready — inputs are set, services injected, but the DOM hasn't been rendered yet. You cannot safely query child elements (@ViewChild) here — they are undefined. ngAfterViewInit fires when the component's DOM is fully rendered — @ViewChild references are guaranteed to be set. Rule: data setup in ngOnInit, DOM manipulation in ngAfterViewInit. With signals, much of this overhead disappears.
+
+**Q3: Most dangerous misconception about lifecycle hooks?**
+> **A:** You only need to unsubscribe manually:
+> ```typescript
+> // WRONG: Memory leak — subscription lives forever after component destroyed
+> export class DataComponent implements OnInit {
+>   ngOnInit() {
+>     this.dataService.getLiveData().subscribe(data => this.data = data);
+>   }
+> }
+>
+> // CORRECT: Use takeUntilDestroyed (Angular 16+)
+> import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+> private destroyRef = inject(DestroyRef);
+> ngOnInit() {
+>   this.dataService.getLiveData()
+>     .pipe(takeUntilDestroyed(this.destroyRef))
+>     .subscribe(data => this.data = data);
+> }
+> ```
+
+**Q4: How does ngOnChanges interact with OnPush change detection?**
+> **A:** ngOnChanges fires when an @Input's REFERENCE changes — exactly what OnPush checks. So OnPush components with ngOnChanges behave consistently: when a new reference arrives via @Input, Angular runs ngOnChanges AND re-renders. Mutating the input object without changing the reference means NEITHER ngOnChanges fires NOR does OnPush re-render — both behave consistently. Use ngDoCheck for custom "did anything actually change" logic if you need to detect mutations.
+
+**Q5: FAANG-grade definition of Angular lifecycle hooks.**
+> **A:** "Angular lifecycle hooks are TypeScript interface methods called by the Angular runtime at specific phases of a component's existence — from class instantiation (constructor), input initialisation (ngOnChanges, ngOnInit), recurring change detection (ngDoCheck, ngAfterContentChecked, ngAfterViewChecked), post-render DOM access (ngAfterViewInit, ngAfterContentInit), to destruction (ngOnDestroy) — with ngOnDestroy the critical cleanup point for Observable subscriptions, increasingly superseded by DestroyRef and takeUntilDestroyed for declarative cleanup."
+
+## BUILD
+
+### 🏗️ Mini Project: Lifecycle Logger — See Every Hook In Order + Proper Cleanup
+
+**What you will build:** A parent-child component pair where every lifecycle hook logs to the screen — showing the exact execution order — plus a long-lived Observable demonstrating proper ngOnDestroy cleanup with takeUntilDestroyed.
+**Why this project:** Makes lifecycle ordering observable and builds the cleanup pattern as muscle memory.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new lifecycle-demo --standalone --routing false
+ng generate component lifecycle-child --standalone
+ng generate service ticker
+```
+
+#### Step 2 — Ticker Service
+```typescript
+// ticker.service.ts
+import { Injectable } from '@angular/core';
+import { interval, map } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class TickerService {
+  tick$ = interval(1000).pipe(map(n => 'Tick #' + n + ' at ' + new Date().toLocaleTimeString()));
+}
+```
+
+#### Step 3 — Child With All Hooks
+```typescript
+// lifecycle-child.component.ts
+import {
+  Component, Input, OnChanges, OnInit, AfterContentInit,
+  AfterViewInit, OnDestroy, SimpleChanges, inject, DestroyRef
+} from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { NgFor } from '@angular/common';
+import { TickerService } from '../ticker.service';
+
+@Component({
+  standalone: true,
+  selector: 'app-lifecycle-child',
+  imports: [NgFor],
+  template: `
+    <h3>Child — Input: {{ title }}</h3>
+    <p>Last tick: {{ lastTick }}</p>
+    <ul><li *ngFor="let log of hookLog">{{ log }}</li></ul>
+  `,
+})
+export class LifecycleChildComponent implements OnChanges, OnInit, AfterContentInit, AfterViewInit, OnDestroy {
+  @Input() title = '';
+  hookLog: string[] = [];
+  lastTick = 'waiting...';
+
+  private destroyRef = inject(DestroyRef);
+  private ticker = inject(TickerService);
+
+  constructor() { this.log('constructor'); }
+
+  ngOnChanges(changes: SimpleChanges) {
+    this.log('ngOnChanges: title = "' + changes['title']?.currentValue + '"');
+  }
+  ngOnInit() {
+    this.log('ngOnInit');
+    this.ticker.tick$.pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(tick => this.lastTick = tick);
+  }
+  ngAfterContentInit() { this.log('ngAfterContentInit'); }
+  ngAfterViewInit()    { this.log('ngAfterViewInit — DOM ready'); }
+  ngOnDestroy()        { this.log('ngOnDestroy — cleanup done'); }
+
+  private log(msg: string) {
+    this.hookLog = [...this.hookLog, '[' + new Date().toISOString().slice(11,19) + '] ' + msg];
+  }
+}
+```
+
+#### Step 4 — Parent Component
+```typescript
+// app.component.ts
+@Component({
+  standalone: true, imports: [LifecycleChildComponent],
+  template: `
+    <button (click)="changeTitle()">Change Title</button>
+    <button (click)="toggleChild()">Toggle Child</button>
+    @if (showChild()) { <app-lifecycle-child [title]="title()" /> }
+  `,
+})
+export class AppComponent {
+  showChild = signal(true);
+  title = signal('Initial Title');
+  private n = 0;
+  changeTitle() { this.title.set('Title ' + ++this.n); }
+  toggleChild() { this.showChild.update(v => !v); }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+it('logs ngOnInit', () => {
+  const fixture = TestBed.createComponent(LifecycleChildComponent);
+  fixture.detectChanges();
+  expect(fixture.componentInstance.hookLog.some(l => l.includes('ngOnInit'))).toBe(true);
+});
+it('logs ngOnChanges when title changes', () => {
+  const fixture = TestBed.createComponent(LifecycleChildComponent);
+  fixture.componentRef.setInput('title', 'A');
+  fixture.detectChanges();
+  fixture.componentRef.setInput('title', 'B');
+  fixture.detectChanges();
+  const changes = fixture.componentInstance.hookLog.filter(l => l.includes('ngOnChanges'));
+  expect(changes.length).toBeGreaterThanOrEqual(2);
+});
+```
+
+**Expected Output:**
+```
+[constructor] -> [ngOnChanges] -> [ngOnInit] -> [ngAfterContentInit] -> [ngAfterViewInit]
+Ticks update every second
+Change Title -> new ngOnChanges logged
+Toggle Child (off) -> [ngOnDestroy] logged, ticker stops
+```
+
+**Stretch Challenges:**
+- [ ] Add ngDoCheck logging and measure how often it fires per second
+- [ ] Rewrite using DestroyRef.onDestroy callback instead of ngOnDestroy interface
+- [ ] Add @defer block and observe when lifecycle hooks fire for deferred components
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Order of the 8 lifecycle hooks.
+**Q2:** Why is calling APIs in the constructor wrong?
+**Q3:** Write the correct pattern for cleaning up an RxJS subscription. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between ngOnInit and ngAfterViewInit?
+**Q5:** A junior forgets ngOnDestroy and subscribes to a WebSocket — diagnose the leak.
+**Q6:** Refactor to takeUntilDestroyed:
+```typescript
+private sub: Subscription;
+ngOnInit() { this.sub = timer(0, 1000).subscribe(() => this.tick()); }
+ngOnDestroy() { this.sub.unsubscribe(); }
+```
+
+### Day 7 — Application
+**Q7:** When would you use ngDoCheck instead of ngOnChanges?
+**Q8:** A PR reads @ViewChild in ngOnInit and gets undefined — diagnose.
+**Q9:** Does ngOnDestroy fire for components inside a destroyed parent?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every Angular lifecycle hook with one production use case each."
+**Q11:** Draw: lifecycle hook execution order for parent + child with ng-content projection.
+**Q12:** ★ System design: "Architect resource management for an Angular app with 200+ components each holding WebSocket connections."

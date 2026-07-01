@@ -224,3 +224,239 @@ If Thread B checks `instance == null` when Thread A has completed step 2 but not
 * **`VarHandle`** (introduced in Java 9): Provides fine-grained control over memory ordering. It allows developers to choose the precise level of fence semantics needed: `get`/`set` (plain), `getVolatile`/`setVolatile` (full volatile semantics), `getAcquire`/`setRelease` (one-way barriers, cheaper than volatile on some CPUs), and `getOpaque`/`setOpaque` (guarantees program order visibility but no cross-thread ordering guarantees).
 
 ---
+
+## REAL_WORLD
+
+### How the Java Memory Model Prevents Data Races at LinkedIn Scale
+
+LinkedIn's Feed service processes billions of feed updates daily across hundreds of JVM instances. Before the JMM was deeply understood by their team, they had a class of intermittent bugs that appeared only under load: user A would see stale feed items even after their following list was updated. Root cause: a non-volatile `boolean updated` flag was being cached in CPU registers and never flushed to main memory, so other threads never saw the update.
+
+The fix was understanding the JMM's happens-before guarantee: a write to a `volatile` field happens-before every subsequent read of that field from any thread.
+
+```java
+// Production pattern — safe publication via volatile
+// Used in: Spring singleton creation, double-checked locking, cache invalidation
+
+public class FeedService {
+    // volatile guarantees: write to 'cache' in thread A is visible to thread B
+    // WITHOUT volatile: thread B may see a half-constructed FeedCache object
+    private volatile FeedCache cache;
+
+    public FeedCache getCache() {
+        FeedCache local = this.cache; // Read once — avoids double volatile read
+        if (local == null) {
+            synchronized (this) {
+                local = this.cache;
+                if (local == null) {
+                    local = new FeedCache(); // Full construction before assignment
+                    this.cache = local;      // Volatile write — visible to all threads
+                }
+            }
+        }
+        return local;
+    }
+}
+
+// Alternative: Java 9+ VarHandle for atomic operations without synchronized
+import java.lang.invoke.VarHandle;
+public class AtomicCounter {
+    private volatile int count = 0;
+    private static final VarHandle COUNT;
+    static {
+        try { COUNT = MethodHandles.lookup().findVarHandle(AtomicCounter.class, "count", int.class); }
+        catch (Exception e) { throw new ExceptionInInitializerError(e); }
+    }
+    // CAS: compare-and-set — atomic increment without locking
+    public int incrementAndGet() {
+        int v; do { v = (int) COUNT.getVolatile(this); } while (!COUNT.compareAndSet(this, v, v + 1));
+        return v + 1;
+    }
+}
+```
+
+### Production Gotcha: Non-Atomic Long/Double Operations
+
+64-bit `long` and `double` reads/writes are NOT guaranteed atomic on 32-bit JVMs — they can be torn (high 32 bits from one thread, low 32 bits from another).
+
+```java
+// ❌ DANGEROUS on 32-bit JVMs — long write is NOT atomic
+private long timestamp = 0L;
+public void setTimestamp(long ts) { this.timestamp = ts; } // Can be seen half-written
+
+// ✅ PRODUCTION-SAFE — volatile guarantees atomic 64-bit read/write on all JVMs
+private volatile long timestamp = 0L;
+// OR: use AtomicLong for read-modify-write operations
+private final AtomicLong timestamp = new AtomicLong(0L);
+```
+**Why it happens:** The JMM only guarantees 32-bit atomicity by default. `volatile long` extends the guarantee to 64-bit. `AtomicLong` additionally guarantees compound operations (getAndIncrement) are atomic.
+
+### Performance Characteristics
+| Operation | Visibility | Ordering | Cost vs unsynchronized |
+|-----------|------------|----------|------------------------|
+| Regular field write | Thread-local cache | May be reordered | 1x |
+| volatile write | All threads (flush) | No reorder past | ~10x |
+| synchronized block | All threads on exit | Full fence | ~50x |
+| AtomicLong CAS | All threads | Sequential | ~5x |
+
+## FEYNMAN CHECK
+
+### Explain the Java Memory Model Like I'm 10 Years Old
+> Imagine you and your friend each have a whiteboard (CPU cache). There is also a big shared whiteboard at the front of the room (main memory). Normally, you both write on your own whiteboard and only occasionally copy things to the shared one. If your friend writes "x = 5" on their whiteboard, you might still see "x = 0" on yours because the shared board hasn't been updated yet. The JMM is a rulebook that says when you are GUARANTEED to see your friend's latest writing. The keyword `volatile` forces both of you to always write directly to the shared board — guaranteeing freshness at the cost of speed. This is why multi-threaded bugs disappear on single-core machines (one cache) but reappear on multi-core systems.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does the JMM fundamentally solve?**
+> **A:** The JMM solves the problem of defining when writes by one thread are guaranteed to be visible to reads by another thread in a multi-core environment. Without a formal memory model, CPU caches and compiler reorderings make sharing state between threads non-deterministic. The JMM does NOT say when visibility happens — it says under what program constructs it is GUARANTEED. The happens-before relation is the formal mechanism: action A happens-before action B means B is guaranteed to see all side-effects of A.
+
+**Q2: ONE mental model for the JMM.**
+> **A:** Think of the JMM as a contract between you (the programmer) and the JVM/CPU. The JVM is allowed to reorder instructions, cache values in registers, and delay writes to main memory — UNLESS you use synchronization primitives that create happens-before edges. `volatile`, `synchronized`, `Thread.start()`, `Thread.join()`, and `Lock.unlock()` all create happens-before edges. If there is no happens-before chain between a write and a read, the read is allowed to see any value — including stale, reordered, or partially-written values.
+
+**Q3: Most dangerous misconception with code.**
+> **A:** "volatile is only for visibility — it doesn't prevent race conditions." Actually, volatile DOES prevent data races on single reads/writes, but does NOT prevent race conditions on compound operations.
+> ```java
+> // ❌ Race condition even with volatile — read-modify-write is not atomic
+> private volatile int counter = 0;
+> public void increment() { counter++; } // Read, add 1, write — 3 steps, not atomic
+> // Thread A reads 5, Thread B reads 5, both write 6 — lost update!
+>
+> // ✅ Use AtomicInteger for compound operations
+> private final AtomicInteger counter = new AtomicInteger(0);
+> public void increment() { counter.incrementAndGet(); } // CAS — atomic
+> ```
+
+**Q4: How does the JMM interact with CPU cache coherence at the hardware level?**
+> **A:** Modern CPUs have L1/L2/L3 caches per core. The MESI protocol (Modified/Exclusive/Shared/Invalid) maintains cache coherence in hardware — but this only guarantees eventual coherence, not ordering. The JMM maps onto CPU memory barriers (mfence, sfence, lfence on x86). A `volatile` write compiles to a `lock` prefix on x86 (full memory barrier), which forces all cached writes to main memory and invalidates other cores' caches. On ARM (weaker memory model), `volatile` requires explicit `dmb` (data memory barrier) instructions, making volatile more expensive on ARM than x86.
+
+**Q5: Senior one-liner.**
+> **A:** "The Java Memory Model defines happens-before relationships that guarantee when a thread's write to shared state is visible to another thread's subsequent read — enforced via memory barriers compiled from `volatile`, `synchronized`, and `java.util.concurrent` primitives — which is why a data race (accessing shared state without happens-before) produces undefined behaviour even on x86 where most races accidentally work."
+
+## BUILD
+
+### 🏗️ Mini Project: Thread-Safe Counter & Visibility Demo
+
+**What you will build:** A program that demonstrates JMM visibility issues, then fixes them with volatile, synchronized, and AtomicInteger — showing empirically why each is needed.
+**Why this project:** Makes the abstract JMM concrete by producing observable bugs and fixes.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 2 — Visibility Bug Demo
+```java
+public class JMMDemo {
+    // WITHOUT volatile — may run forever on multi-core JVMs
+    static boolean running = true; // Change to: static volatile boolean running = true;
+
+    public static void demonstrateVisibility() throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            long count = 0;
+            while (running) count++; // May never see running = false!
+            System.out.println("Stopped after " + count + " iterations");
+        });
+        worker.start();
+        Thread.sleep(100);
+        running = false; // This write may never be seen by worker thread
+        worker.join(1000);
+        if (worker.isAlive()) {
+            System.out.println("BUG: worker never saw running=false — JMM visibility issue!");
+            worker.interrupt();
+        }
+    }
+}
+```
+
+#### Step 3 — Race Condition Demo
+```java
+static int unsafeCounter = 0;
+static AtomicInteger safeCounter = new AtomicInteger(0);
+
+static void demonstrateRace() throws InterruptedException {
+    int THREADS = 10, INCREMENTS = 10_000;
+    Thread[] threads = new Thread[THREADS];
+
+    // Race condition version
+    for (int i = 0; i < THREADS; i++) threads[i] = new Thread(() -> {
+        for (int j = 0; j < INCREMENTS; j++) unsafeCounter++; // Not atomic!
+    });
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+    System.out.println("Unsafe counter (expect 100000): " + unsafeCounter); // Usually < 100000
+
+    // Safe version
+    unsafeCounter = 0;
+    for (int i = 0; i < THREADS; i++) threads[i] = new Thread(() -> {
+        for (int j = 0; j < INCREMENTS; j++) safeCounter.incrementAndGet();
+    });
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+    System.out.println("Safe counter (expect 100000): " + safeCounter.get()); // Always 100000
+}
+```
+
+#### Step 4 — Error Handling
+```java
+// Always use try-finally with locks to prevent deadlock on exception
+Lock lock = new ReentrantLock();
+lock.lock();
+try {
+    // critical section
+} finally {
+    lock.unlock(); // ALWAYS released even if exception thrown
+}
+```
+
+**Expected Output:**
+```
+BUG: worker never saw running=false — JMM visibility issue!  (without volatile)
+Stopped after 38472931 iterations                            (with volatile)
+Unsafe counter (expect 100000): 87432    (race condition — lost updates)
+Safe counter (expect 100000): 100000     (atomic — no lost updates)
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+
+**Q1:** Define the Java Memory Model: what it IS, what happens-before means, and why it matters.
+
+**Q2:** What are the 3 JMM guarantees provided by `volatile`? What does `volatile` NOT guarantee?
+
+**Q3:** Write a double-checked locking singleton using `volatile` correctly in 15 lines.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the difference between a data race and a race condition? Give one example of each.
+
+**Q5:** When would you use `volatile` vs `AtomicInteger` vs `synchronized`? Give a production scenario for each.
+
+**Q6:** Fix this broken counter class:
+```java
+public class Counter {
+    private volatile int count = 0;
+    public void increment() { count++; }
+    public int get() { return count; }
+}
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Implement a thread-safe lazy-initialized cache using ConcurrentHashMap.computeIfAbsent().
+
+**Q8:** You are reviewing a PR: a developer uses a `HashMap` shared between 10 threads with no synchronization because "we only read from it after setup." Is this safe? Explain with JMM reasoning.
+
+**Q9:** What is the time and space cost of `synchronized`? When does it use biased/thin/fat locking?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ "Explain the Java Memory Model to a senior engineer." Cover: happens-before, volatile, synchronized, CPU memory barriers.
+
+**Q11:** Draw the happens-before chain: Thread.start() → run() → join() → continued execution.
+
+**Q12:** ★ System design: "10M concurrent users share a counter (e.g., view count). How do you design this to avoid JMM contention? What changes at 100M? Discuss LongAdder vs AtomicLong vs Redis."

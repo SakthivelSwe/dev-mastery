@@ -142,3 +142,213 @@ const bears = useBearStore(state => state.bears);
 const hasFoxes = useBearStore(state => state.hasFoxes);
 ```
 Or, if you use a single object selector, you must use Zustand's `shallow` comparison function to tell React to only re-render if the extracted properties actually changed!
+
+## FEYNMAN CHECK
+
+### Explain Zustand Like I'm 10 Years Old
+> Zustand: `const useStore = create((set) => ({ count: 0, inc: () => set(s => ({ count: s.count + 1 })) }))`. Then any component: `const count = useStore(s => s.count)`. No Provider, no actions, no reducers. The SELECTOR (`s => s.count`) is critical — the component only re-renders when `s.count` changes. Subscribing without a selector (`useStore()`) re-renders on ANY store change. Selectors are the performance key.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does Zustand avoid Context's re-render problem?**
+> **A:** Context re-renders all consumers when any part changes. Zustand uses publish-subscribe with equality checks: each component's selector runs after every update; result compared with previous via Object.is. Same ref = no re-render. Different ref = re-render. With Context you'd need 10 split contexts for the same granularity; with Zustand, write a precise selector.
+
+**Q2: Mental model — set vs get vs immer?**
+> **A:** `set({ count: 5 })` — partial merge (keeps other fields). `set(fn)` — updater: `set(s => ({ count: s.count + 1 }))`. `get()` — read current state inside actions: `const reset = () => set({ count: get().initial })`. IMMER middleware: `set(s => { s.nested.deep = value })` without manual spreading — cleaner for deeply nested state.
+
+**Q3: Most dangerous misconception?**
+> **A:** No selector is fine:
+> ```tsx
+> // ❌ BAD: re-renders on every store change
+> const store = useCartStore();  // entire store object
+> return <span>{store.items.length}</span>;
+>
+> // ✅ GOOD: precise selector
+> const count = useCartStore(s => s.items.length);
+>
+> // ✅ Multiple values: shallow equality
+> import { shallow } from 'zustand/shallow';
+> const { items, total } = useCartStore(
+>   s => ({ items: s.items, total: s.total }), shallow
+> );
+> ```
+
+**Q4: How do you structure Zustand for a large app?**
+> **A:** SLICE PATTERN: separate files per domain, combined in one store: `create<Combined>()((...a) => ({ ...createCartSlice(...a), ...createAuthSlice(...a) }))`. PERSIST: `persist(creator, { name: 'cart', storage: createJSONStorage(() => localStorage) })`. DEVTOOLS: `devtools(creator)` shows in Redux DevTools. IMMER: nested updates without spread. Never put server-fetched data in Zustand — use React Query.
+
+**Q5: FAANG-grade definition.**
+> **A:** "Zustand is a minimal React state library implementing publish-subscribe (`create(creator)` returns a hook) — components subscribe via selector functions, re-rendering only when selected value changes (Object.is or shallow) — avoiding Context's all-or-nothing re-renders without Provider boilerplate — supporting action co-location, middleware (persist, devtools, immer), and slice pattern — appropriate for client-side shared state while delegating server state to React Query/RTK Query."
+
+## BUILD
+
+### 🏗️ Mini Project: Cart + Auth With Zustand
+
+**What you will build:** Two separate Zustand stores — cart (immer + devtools) and auth (persist) — with precise selectors demonstrating re-render isolation.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npm create vite@latest zustand-demo -- --template react-ts && cd zustand-demo && npm install zustand immer
+```
+
+#### Step 2 — Stores
+```ts
+// src/stores/authStore.ts
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+interface AuthState { user: { name: string } | null; login: (n: string) => void; logout: () => void; }
+export const useAuthStore = create<AuthState>()(
+  persist(
+    set => ({ user: null, login: name => set({ user: { name } }), logout: () => set({ user: null }) }),
+    { name: 'auth', storage: createJSONStorage(() => localStorage) }
+  )
+);
+
+// src/stores/cartStore.ts
+import { create } from 'zustand';
+import { immer } from 'zustand/middleware/immer';
+import { devtools } from 'zustand/middleware';
+import { createSelector } from '@reduxjs/toolkit';  // or use custom memoisation
+
+interface Item { id: number; name: string; price: number; qty: number; }
+interface CartState { items: Item[]; addItem: (i: Omit<Item,'qty'>) => void; removeItem: (id: number) => void; clear: () => void; }
+
+export const useCartStore = create<CartState>()(
+  devtools(immer(set => ({
+    items: [],
+    addItem: item => set(s => {
+      const ex = s.items.find(i => i.id === item.id);
+      if (ex) ex.qty++;
+      else s.items.push({ ...item, qty: 1 });
+    }),
+    removeItem: id => set(s => { s.items = s.items.filter(i => i.id !== id); }),
+    clear: () => set(s => { s.items = []; }),
+  })), { name: 'cart' })
+);
+
+export const selectTotal = (s: CartState) => s.items.reduce((sum, i) => sum + i.price * i.qty, 0);
+export const selectCount = (s: CartState) => s.items.reduce((sum, i) => sum + i.qty, 0);
+```
+
+#### Step 3 — App
+```tsx
+// src/App.tsx
+import { shallow } from 'zustand/shallow';
+import { useCartStore, selectTotal, selectCount } from './stores/cartStore';
+import { useAuthStore } from './stores/authStore';
+
+const products = [{ id: 1, name: 'Book', price: 12 }, { id: 2, name: 'Pen', price: 3 }];
+
+function CartBadge() {
+  const count = useCartStore(selectCount);  // only re-renders on count change
+  return <span className="bg-red-500 text-white rounded-full px-1 text-xs">{count}</span>;
+}
+
+function CartPanel() {
+  const { items, removeItem, clear } = useCartStore(
+    s => ({ items: s.items, removeItem: s.removeItem, clear: s.clear }), shallow
+  );
+  const total = useCartStore(selectTotal);
+  return (
+    <aside className="border rounded p-4 w-56">
+      <h2 className="font-bold mb-2">Cart</h2>
+      {items.length === 0 ? <p className="text-gray-400">Empty</p> : (
+        <>
+          {items.map(i => (
+            <div key={i.id} className="flex justify-between text-sm mb-1">
+              <span>{i.name} ×{i.qty}</span>
+              <button onClick={() => removeItem(i.id)} className="text-red-400">×</button>
+            </div>
+          ))}
+          <hr className="my-1" />
+          <p className="font-bold text-sm">${total.toFixed(2)}</p>
+          <button onClick={clear} className="text-xs text-red-400">Clear</button>
+        </>
+      )}
+    </aside>
+  );
+}
+
+export default function App() {
+  const user = useAuthStore(s => s.user);
+  const { login, logout } = useAuthStore(s => ({ login: s.login, logout: s.logout }), shallow);
+  const addItem = useCartStore(s => s.addItem);
+
+  return (
+    <main className="max-w-2xl mx-auto p-4">
+      <header className="flex justify-between mb-4">
+        <h1 className="font-bold">Shop <CartBadge /></h1>
+        {user
+          ? <div className="flex gap-2"><span>Hi {user.name}</span><button onClick={logout} className="text-red-500 text-sm">Logout</button></div>
+          : <button onClick={() => login('Ana')} className="px-2 py-1 bg-blue-500 text-white rounded text-sm">Login</button>
+        }
+      </header>
+      <div className="flex gap-4">
+        <div className="flex-1 grid grid-cols-2 gap-2">
+          {products.map(p => (
+            <div key={p.id} className="border rounded p-3">
+              <p className="font-medium">{p.name}</p>
+              <p className="text-blue-500">${p.price}</p>
+              <button onClick={() => addItem(p)} className="mt-1 w-full bg-blue-500 text-white rounded py-1 text-sm">Add</button>
+            </div>
+          ))}
+        </div>
+        <CartPanel />
+      </div>
+    </main>
+  );
+}
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { useCartStore, selectTotal } from './stores/cartStore';
+
+describe('cartStore', () => {
+  beforeEach(() => useCartStore.setState({ items: [] }));
+  it('adds item', () => {
+    useCartStore.getState().addItem({ id: 1, name: 'B', price: 10 });
+    expect(useCartStore.getState().items).toHaveLength(1);
+  });
+  it('calculates total', () => {
+    useCartStore.getState().addItem({ id: 1, name: 'B', price: 10 });
+    useCartStore.getState().addItem({ id: 1, name: 'B', price: 10 });
+    expect(selectTotal(useCartStore.getState())).toBe(20);
+  });
+});
+```
+
+**Expected Output:**
+```
+Login → user name appears, persists across page refresh
+Add products → cart badge + panel update
+Redux DevTools shows "cart" store
+Tests: 2 passed
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is a Zustand selector?
+**Q2:** How do you subscribe to multiple values safely?
+**Q3:** Write a Zustand store with add/remove. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Zustand vs Redux — when to choose each?
+**Q5:** A PR subscribes without selector — diagnose.
+**Q6:** How does persist middleware work?
+
+### Day 7 — Application
+**Q7:** Add undo functionality to a Zustand store.
+**Q8:** PR uses Zustand for API data — propose React Query.
+**Q9:** How do you access Zustand state outside React?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare Zustand vs Redux — when would you choose each?"
+**Q11:** Draw: selector subscription — update → selector → same ref → skip / new ref → re-render.
+**Q12:** ★ System design: "Design state for a real-time collaborative editor — Zustand vs CRDT vs Yjs."

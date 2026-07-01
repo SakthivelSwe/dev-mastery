@@ -153,3 +153,220 @@ Today, most developers still use TypeScript's `private` keyword because it looks
 A: 
 - **Interfaces** contain absolutely zero implementation logic. They are completely erased during compilation and do not exist in the final JavaScript file. They simply describe a "Shape" or a contract. A class can implement *multiple* interfaces.
 - **Abstract Classes** can contain full implementations (real functions and properties) alongside abstract signatures. They survive compilation and become real JavaScript classes. A class can only extend *one* abstract class (JavaScript does not support multiple inheritance).
+
+## FEYNMAN CHECK
+
+### Explain TS Classes Like I'm 10 Years Old
+> TS classes are JS classes WITH TYPES on their fields, methods, and constructor parameters. `public`, `private`, `protected`, `readonly` are TS access modifiers — checked at compile time, erased at runtime. Native JS `#privateField` syntax gives TRUE runtime privacy (not just compile-time). TS adds `abstract` classes (cannot be instantiated, force subclasses to implement abstract methods) and `implements` (verify a class matches an interface's shape). The non-obvious power: PARAMETER PROPERTIES — `constructor(private name: string)` auto-declares AND auto-assigns `this.name` in one line. The pitfall: TS `private` is compile-time only; `(instance as any).privateField` accesses it. Use JS `#field` for real privacy.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Difference between TS `private` and JS `#private`?**
+> **A:** `private name: string` is a COMPILE-TIME promise — TS errors if you access `instance.name` from outside, but at runtime the field is fully accessible via `(instance as any).name` or JSON.stringify or reflection. `#name: string` is true runtime privacy — V8 uses a per-instance hidden slot, not accessible by ANY means from outside. Use # for security-critical privacy; use private for clarity in trusted code.
+
+**Q2: Mental model: classes vs interfaces?**
+> **A:** Interfaces describe SHAPES (zero runtime). Classes describe SHAPES + IMPLEMENTATIONS (runtime code). A class can IMPLEMENT one or more interfaces — TS verifies the class has matching public methods. A class can EXTEND ONE base class. Use interfaces for contracts; use classes when you need shared implementation, private state, or inheritance.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Arrow methods bound at construction "fix" `this` wrongly:
+> ```ts
+> // ❌ Arrow on prototype — but no, this isn't on the prototype, it's per-instance
+> class Counter {
+>   count = 0;
+>   increment = () => { this.count++; };   // bound per instance — memory cost
+> }
+> // Pro: this is always correct
+> // Con: not on prototype, can't be overridden by subclass, ~3x memory per method
+>
+> // ✅ Standard method on prototype — bind at call site if needed
+> class Counter {
+>   count = 0;
+>   increment() { this.count++; }
+> }
+> const c = new Counter();
+> btn.onclick = c.increment.bind(c);   // or () => c.increment()
+> ```
+
+**Q4: How do TS abstract classes differ from interfaces at the runtime level?**
+> **A:** An abstract class EMITS runtime code (a constructor function with prototype methods), unlike an interface (which emits nothing). You can call non-abstract methods on the abstract class via super, share state across subclasses, and use `instanceof` checks. Interfaces have none of these — they describe shapes only. Choose abstract class when subclasses share implementation; choose interface when subclasses don't share code.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript classes are JavaScript classes augmented with compile-time access modifiers (public/private/protected/readonly), parameter-property shortcuts, abstract methods/classes, and implements clauses verifying interface conformance — emitting standard JavaScript class output at runtime, with true runtime privacy available only through native ECMAScript #private fields."
+
+## BUILD
+
+### 🏗️ Mini Project: Abstract Repository Pattern + Generic CRUD Mixin
+
+**What you will build:** An abstract `Repository<T>` class with shared find/save logic, concrete `UserRepository` and `OrderRepository` extending it, and a generic Auditable mixin that adds `auditLog` to any class.
+**Why this project:** Forces abstract, generics, mixins, parameter properties, access modifiers — every class feature.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-classes && cd ts-classes
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext --experimentalDecorators
+ni src/repo.ts, src/user-repo.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Abstract Repository
+```ts
+// src/repo.ts
+export interface Identifiable { id: number }
+
+export abstract class Repository<T extends Identifiable> {
+  // Parameter property — auto-declares and auto-assigns
+  constructor(protected readonly entityName: string) {}
+
+  #store = new Map<number, T>();   // true runtime private
+
+  protected abstract validate(entity: T): void;
+
+  save(entity: T): T {
+    this.validate(entity);                  // subclass-provided
+    this.#store.set(entity.id, entity);
+    this.audit(`SAVE ${this.entityName} #${entity.id}`);
+    return entity;
+  }
+
+  find(id: number): T | undefined {
+    return this.#store.get(id);
+  }
+
+  count(): number { return this.#store.size; }
+
+  private audit(msg: string) {
+    console.log(`[${new Date().toISOString()}] ${msg}`);
+  }
+}
+```
+
+#### Step 3 — Concrete Repositories
+```ts
+// src/user-repo.ts
+import { Repository, type Identifiable } from './repo.js';
+
+export interface User extends Identifiable { name: string; email: string }
+export interface Order extends Identifiable { userId: number; amount: number }
+
+export class UserRepository extends Repository<User> {
+  constructor() { super('User'); }
+  protected validate(u: User) {
+    if (!u.email.includes('@')) throw new Error('Invalid email');
+  }
+  findByEmail(email: string): User | undefined {
+    for (let i = 0; i < this.count(); i++) {
+      const u = this.find(i);
+      if (u?.email === email) return u;
+    }
+    return undefined;
+  }
+}
+
+export class OrderRepository extends Repository<Order> {
+  constructor() { super('Order'); }
+  protected validate(o: Order) {
+    if (o.amount <= 0) throw new Error('amount must be positive');
+  }
+}
+```
+
+#### Step 4 — Error Handling: Generic Mixin
+```ts
+// src/main.ts
+import { UserRepository, OrderRepository } from './user-repo.js';
+
+type Constructor<T = {}> = new (...args: any[]) => T;
+
+function Auditable<TBase extends Constructor>(Base: TBase) {
+  return class extends Base {
+    auditLog: string[] = [];
+    log(action: string) {
+      const entry = `${new Date().toISOString()} ${action}`;
+      this.auditLog.push(entry);
+      console.log('[AUDIT]', entry);
+    }
+  };
+}
+
+const AuditedUserRepo = Auditable(UserRepository);
+const repo = new AuditedUserRepo();
+repo.save({ id: 1, name: 'Ana', email: 'a@b.io' });
+repo.log('User 1 created');
+console.log(repo.auditLog);
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect } from 'vitest';
+import { UserRepository, OrderRepository } from './user-repo.js';
+
+describe('Repositories', () => {
+  it('save/find works', () => {
+    const r = new UserRepository();
+    r.save({ id: 1, name: 'A', email: 'a@b.io' });
+    expect(r.find(1)?.name).toBe('A');
+  });
+  it('validate prevents bad input', () => {
+    const r = new UserRepository();
+    expect(() => r.save({ id: 2, name: 'B', email: 'noatsign' })).toThrow();
+  });
+  it('OrderRepo rejects zero amount', () => {
+    const r = new OrderRepository();
+    expect(() => r.save({ id: 1, userId: 1, amount: 0 })).toThrow();
+  });
+  it('cannot instantiate abstract Repository directly', () => {
+    // @ts-expect-error — abstract class cannot be constructed
+    new Repository('X');
+  });
+});
+```
+
+**Expected Output:**
+```
+[2026-06-26T12:00:00.000Z] SAVE User #1
+[AUDIT] 2026-06-26T12:00:00.001Z User 1 created
+[ '2026-06-26T12:00:00.001Z User 1 created' ]
+
+# tsc rejects abstract instantiation:
+src/main.ts:5:13 - error TS2511: Cannot create an instance of an abstract class.
+```
+
+**Stretch Challenges:**
+- [ ] Add a Soft-Delete mixin that overrides find to skip deleted entities
+- [ ] Make the Auditable mixin generic over the action enum
+- [ ] Replace TS `private` with native `#private` everywhere and observe TS errors
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between `private` and `#private` in TS?
+**Q2:** What is a parameter property?
+**Q3:** Write an abstract class `Shape` with abstract `area()` and concrete `describe()`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** When would you use an abstract class instead of an interface?
+**Q5:** A junior writes `increment = () => this.count++` for every method — explain the memory cost.
+**Q6:** Refactor to use parameter properties:
+```ts
+class User {
+  constructor(name: string, age: number) {
+    this.name = name; this.age = age;
+  }
+  name: string; age: number;
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a generic `Cache<K, V>` class with LRU eviction.
+**Q8:** A PR uses `implements` — explain what it does NOT verify (vs class extension).
+**Q9:** What is the runtime cost of an abstract class vs a regular class?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every TS class feature and when to use each over interfaces or plain objects."
+**Q11:** Draw: mixin pattern via class-returning function — type flow for the constructor types.
+**Q12:** ★ System design: "Choose classes vs hooks vs functional composition for a state-management library. Justify."

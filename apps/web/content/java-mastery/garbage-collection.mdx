@@ -1,138 +1,732 @@
 ---
-slug: "garbage-collection"
-title: "Garbage Collection (GC)"
-level: 4
+slug: garbage-collection
+title: Garbage Collection in Java — Complete Guide
+level: intermediate
 ---
 
 ## WHY
-In C and C++, developers must manually manage memory. When you create an object, you must explicitly call `free()` or `delete` to destroy it when you are done. If you forget, the object sits in memory forever, causing a "Memory Leak". Eventually, the server exhausts all RAM and violently crashes. 
-Worse, if you accidentally delete an object but continue using its pointer, you cause a "Dangling Pointer" or "Use-After-Free" vulnerability, which is the root cause of 70% of all software security exploits.
 
-Java completely eliminated this class of bugs by introducing **Garbage Collection (GC)**. The JVM runs a background thread that automatically scans the heap, identifies objects that are no longer being used by the application, and destroys them to free up memory. You never write a single line of memory management code. 
+Garbage Collection (GC) is what makes Java memory management automatic — but "automatic" doesn't mean "free." You need to understand GC to:
+
+1. **Fix OOM errors** — `OutOfMemoryError: Java heap space` means GC can't help; you need to know why
+2. **Eliminate GC pauses** — Production apps with 10-second GC pauses are a real problem; tuning fixes it
+3. **Choose the right GC** — G1, ZGC, Shenandoah have very different pause/throughput tradeoffs
+4. **Avoid memory leaks** — Java has memory leaks! Static collections, listeners, caches that hold references
+5. **Interview mastery** — GC is in every senior Java/backend interview
+
+---
 
 ## THEORY
-### GC Roots and Reachability
-How does the JVM know if an object is "in use"? It uses a Directed Graph algorithm starting from **GC Roots**. 
-GC Roots include:
-1. Active local variables currently executing on Thread Stacks.
-2. Static variables (which live for the life of the class).
-3. Active Java Threads.
 
-The GC traces the pointers from the GC Roots to all connected objects, and then to all objects connected to *those* objects. Any object that is successfully reached is marked as "Alive". Any object that is unreachable (severed from the root tree) is considered "Garbage" and is instantly annihilated.
+### How GC Works — The Fundamental Rule
+
+> **An object is garbage (eligible for GC) when no live thread can reach it through any chain of references.**
+
+"Reaching" means:
+- Direct reference from a local variable, static field, or method parameter (GC roots)
+- Reference from a live object that itself is reachable
+
+```
+GC Roots:
+┌─────────────────────────────────────────┐
+│ • Local variables on thread stacks      │
+│ • Static fields of loaded classes       │
+│ • JNI references                        │
+│ • Active thread objects                 │
+└─────────────────────────────────────────┘
+         ↓ reachable via references
+   Live Objects (NOT collected)
+
+   Unreachable Objects → GC can collect these
+```
 
 ### Generational Hypothesis
-The JVM memory heap is not a single giant pool. Decades of research proved the "Weak Generational Hypothesis": **98% of all objects die extremely young.** (Think about loop variables or temporary strings).
-The JVM physically divides the Heap into two main areas:
-1. **Young Generation**: Where all new objects are born. It fills up quickly and is cleaned constantly (Minor GC). It is extremely fast because almost everything is dead.
-2. **Old Generation (Tenured)**: If an object survives multiple Minor GCs, it is promoted to the Old Gen. These are long-lived objects (like Spring Services or active HTTP Sessions). Cleaning the Old Gen requires a "Major GC", which is much slower and requires freezing the application.
+
+> **Most objects die young.** Empirically, 90%+ of objects become garbage within their creation scope.
+
+```java
+void processRequest(HttpRequest req) {
+    String body = req.getBody();       // dies when method returns
+    List<Line> lines = parse(body);    // dies when method returns
+    // only the Response may survive
+    return buildResponse(lines);
+}
+```
+
+This observation drives **Generational GC**:
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                         HEAP                               │
+│                                                           │
+│  Young Generation              Old Generation             │
+│  ┌───────────────────────┐     ┌─────────────────────┐   │
+│  │  Eden Space           │     │   Tenured Space      │   │
+│  │  (new objects born)   │     │  (survivors > age N) │   │
+│  ├───────────┬───────────┤     └─────────────────────┘   │
+│  │ Survivor 0│ Survivor 1│                                │
+│  │  (from)   │  (to)     │                                │
+│  └───────────┴───────────┘                                │
+│                                                           │
+│  Metaspace (outside heap — class metadata)                │
+└───────────────────────────────────────────────────────────┘
+```
+
+### Object Lifecycle in Generational GC
+
+```
+New object → Eden
+
+Minor GC triggered (Eden full):
+→ Live objects in Eden + Survivor(from) are COPIED to Survivor(to)
+→ age++ for each surviving object
+→ Objects with age > tenuring threshold (default 15) promoted to Old Gen
+
+Major GC / Full GC triggered (Old Gen full):
+→ Collects Old Gen (and possibly Young Gen too)
+→ Much more expensive — pauses application threads
+
+Metaspace GC: triggers if classes are being loaded/unloaded dynamically
+```
+
+### Stop-The-World (STW) Events
+
+Many GC phases require **all application threads to pause** — called "stop-the-world":
+
+```
+Application running:   ████████████████████████████████
+Minor GC pause:                    |||   (few milliseconds)
+Major GC pause:                              ||||||||||||  (100ms-seconds)
+```
+
+Reducing STW pauses is the main goal of modern GC algorithms.
+
+---
+
+### Garbage Collectors Comparison
+
+| GC | Java Version | Algorithm | STW Pauses | Best For |
+|----|-------------|-----------|------------|----------|
+| **Serial** | All | Mark-Compact | High | Single-core, small heap |
+| **Parallel** | All | Parallel Mark-Sweep | Medium | Batch, high throughput |
+| **CMS** | 5-14 (deprecated) | Concurrent Mark-Sweep | Low | Low latency (deprecated) |
+| **G1** | 7+ (default 9+) | Concurrent regions | Low | Balanced latency+throughput |
+| **ZGC** | 15+ | Concurrent, scalable | <1ms | Ultra-low latency |
+| **Shenandoah** | Red Hat OpenJDK | Concurrent compaction | <1ms | Ultra-low latency |
+
+---
+
+### G1GC — The Default (Java 9+)
+
+```
+G1 divides heap into equal-sized regions (~1-32MB each):
+┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+│E │E │E │S0│S1│O │O │O │E │O │H │H │
+└──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+ E=Eden  S=Survivor  O=Old  H=Humongous (large objects)
+
+Key features:
+• Predictable pause time goal: -XX:MaxGCPauseMillis=200
+• Collects regions with most garbage first (hence "Garbage First")
+• Concurrent marking — most work done without STW
+• Compaction — moves live objects to defragment
+• Good for: heaps 4GB–64GB, mixed workloads
+```
+
+### ZGC — Ultra-Low Latency (Java 15+)
+
+```
+• Sub-millisecond STW pauses regardless of heap size (tested to 16TB!)
+• Uses colored pointers and load barriers
+• Concurrent relocation — moves objects while app runs
+• Trades throughput (~15%) for latency
+• Good for: real-time systems, large heaps, microservices with SLA
+```
+
+---
+
+### Memory Leaks in Java
+
+Yes, Java has memory leaks — GC only collects unreachable objects. If you hold a reference, GC won't touch it:
+
+```java
+// Classic memory leak patterns:
+
+// 1. Static collection that only grows
+public class Cache {
+    private static final Map<String, byte[]> CACHE = new HashMap<>();
+
+    public static void store(String key, byte[] data) {
+        CACHE.put(key, data);  // never removed — holds data forever!
+    }
+}
+
+// 2. Listener not removed
+button.addActionListener(myListener);
+// If button outlives myListener, myListener is leaked
+
+// 3. Custom ClassLoader keeping class references
+
+// 4. ThreadLocal not cleaned up
+ThreadLocal<ExpensiveObject> local = new ThreadLocal<>();
+local.set(new ExpensiveObject());
+// In thread pools, thread never dies → ThreadLocal never GC'd!
+// FIX:
+try {
+    // use local.get()
+} finally {
+    local.remove();  // always clean up ThreadLocal
+}
+```
+
+### Reference Types — Controlling GC Eligibility
+
+| Reference | GC Behavior | Use Case |
+|-----------|-------------|----------|
+| **Strong** (default) | Never collected while reachable | Normal references |
+| **SoftReference** | Collected when memory is low | Memory-sensitive caches |
+| **WeakReference** | Collected on next GC cycle | Weak caches, listeners |
+| **PhantomReference** | Collected after finalization | Resource cleanup notification |
+
+```java
+// WeakReference example — object can be GC'd anytime
+WeakReference<ExpensiveObject> weakRef = new WeakReference<>(new ExpensiveObject());
+// Do work...
+ExpensiveObject obj = weakRef.get(); // might return null if GC ran!
+if (obj != null) {
+    obj.doWork();
+}
+
+// WeakHashMap — keys are weakly referenced (entries auto-remove when key GC'd)
+WeakHashMap<Widget, Properties> map = new WeakHashMap<>();
+// When widget is no longer referenced elsewhere, its entry is auto-removed
+```
+
+---
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureDiagram", "type": "jvm-generational-heap" }
+{
+  "type": "none"
+}
 ```
+
+---
 
 ## CODE
 
-### Level 1 — Beginner
+### Level 1 — Beginner: Object Eligibility
+
 ```java
-public class BasicGC {
+// GCEligibility.java
+public class GCEligibility {
     public static void main(String[] args) {
-        String name = new String("Alice");
-        
-        // We severed the connection! 
-        // The String "Alice" is no longer connected to any GC Root.
-        // It is now eligible for Garbage Collection.
-        name = null; 
-        
-        // You can politely ASK the JVM to run the Garbage Collector.
-        // The JVM is allowed to completely ignore you. (Never do this in production).
-        System.gc(); 
+        // Object creation
+        String s1 = new String("hello");  // s1 → object A
+        String s2 = s1;                   // s2 → object A (same ref)
+
+        s1 = null;  // object A still reachable via s2 — NOT eligible for GC
+        s2 = null;  // object A now unreachable — ELIGIBLE for GC
+
+        // Suggest GC (not guaranteed!)
+        System.gc();
+        System.runFinalization();
+
+        // Circular references — GC handles these!
+        // Java uses reachability analysis, NOT reference counting
+        Node a = new Node("A");
+        Node b = new Node("B");
+        a.next = b;
+        b.next = a; // circular: a → b → a
+
+        a = null;
+        b = null;
+        // Both are unreachable from roots — eligible for GC
+        // (Reference counting would fail here, but Java's GC handles it)
+    }
+
+    static class Node {
+        String name;
+        Node next;
+        Node(String name) { this.name = name; }
     }
 }
 ```
 
-### Level 2 — Building Blocks
-```java
-import java.util.ArrayList;
-import java.util.List;
+---
 
-public class OutOfMemoryDemo {
-    public static void main(String[] args) {
-        // A static list is a GC Root!
-        // Anything attached to it will NEVER be garbage collected.
-        List<byte[]> memoryLeak = new ArrayList<>();
-        
-        try {
-            while (true) {
-                // We keep generating 1MB chunks and attaching them to the root.
-                // The GC sees they are attached to 'memoryLeak' and refuses to delete them.
-                // This will crash the JVM with an OutOfMemoryError in seconds.
-                memoryLeak.add(new byte[1024 * 1024]); 
-            }
-        } catch (OutOfMemoryError e) {
-            System.out.println("JVM Heap completely exhausted!");
+### Level 2 — Elementary: Memory Leak Demo & Fix
+
+```java
+// MemoryLeakDemo.java
+import java.util.*;
+
+public class MemoryLeakDemo {
+
+    // LEAKY stack implementation (classic Effective Java example)
+    static class LeakyStack {
+        private Object[] elements;
+        private int size = 0;
+
+        LeakyStack(int capacity) { elements = new Object[capacity]; }
+
+        void push(Object item) { elements[size++] = item; }
+
+        Object pop() {
+            if (size == 0) throw new EmptyStackException();
+            return elements[--size]; // BUG: old reference still held at elements[size]!
+            // → object is popped but array still holds reference → memory leak
         }
     }
-}
-```
 
-### Level 3 — Intermediate (Soft and Weak References)
-```java
-import java.lang.ref.WeakReference;
-import java.lang.ref.SoftReference;
+    // FIXED stack — nulls out the reference
+    static class FixedStack {
+        private Object[] elements;
+        private int size = 0;
 
-public class References {
+        FixedStack(int capacity) { elements = new Object[capacity]; }
+
+        void push(Object item) { elements[size++] = item; }
+
+        Object pop() {
+            if (size == 0) throw new EmptyStackException();
+            Object item = elements[--size];
+            elements[size] = null; // FIXED: null out obsolete reference
+            return item;
+        }
+    }
+
+    // ThreadLocal leak and fix
+    static ThreadLocal<byte[]> threadLocalData = new ThreadLocal<>();
+
+    static void processInThreadPool() {
+        try {
+            threadLocalData.set(new byte[1024 * 1024]); // 1MB per thread
+            // ... do work ...
+        } finally {
+            threadLocalData.remove(); // MUST remove — thread pool threads never die
+        }
+    }
+
     public static void main(String[] args) {
-        Object strong = new Object(); // Standard strong reference. Will never be collected.
-        
-        // WEAK REFERENCE: 
-        // If the GC runs, it will instantly destroy the object, even if memory is plentiful.
-        // Used extensively internally by WeakHashMap to prevent memory leaks in caches.
-        WeakReference<Object> weak = new WeakReference<>(new Object());
-        
-        // SOFT REFERENCE:
-        // The GC will leave this alone normally. It will ONLY destroy it as an absolute 
-        // last resort right before throwing an OutOfMemoryError.
-        // Perfect for caching massive images or database results.
-        SoftReference<Object> soft = new SoftReference<>(new Object());
+        LeakyStack leaky = new LeakyStack(100);
+        FixedStack fixed = new FixedStack(100);
+
+        for (int i = 0; i < 100; i++) {
+            leaky.push(new byte[1024]); // push 100KB
+            fixed.push(new byte[1024]);
+        }
+
+        for (int i = 0; i < 100; i++) {
+            leaky.pop();  // leaky: 100KB still held by array
+            fixed.pop();  // fixed: references nulled, memory freed
+        }
+
+        System.out.println("Check heap in JVisualVM to see the difference");
     }
 }
 ```
 
-### Level 4 — Advanced (JVM Flags & Tuning)
-```bash
-# How to tune the Garbage Collector in Production via JVM Flags:
+---
 
-# 1. Set the initial Heap Size to 4GB (-Xms) and Max Heap Size to 4GB (-Xmx).
-# Setting them equal prevents expensive OS memory reallocation pauses at runtime.
-java -Xms4g -Xmx4g -jar app.jar
+### Level 3 — Intermediate: Reference Types
 
-# 2. Select the G1 Garbage Collector (The default in modern Java).
-# G1 is designed to divide the heap into thousands of small regions to keep pause times low.
-java -XX:+UseG1GC -jar app.jar
+```java
+// ReferenceTypesDemo.java
+import java.lang.ref.*;
+import java.util.*;
 
-# 3. Set a strict Maximum Pause Time Goal. 
-# The GC will dynamically adjust itself to guarantee it never freezes the app for more than 200ms.
-java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar app.jar
+public class ReferenceTypesDemo {
 
-# 4. Use ZGC (The ultimate low-latency collector in Java 21+).
-# ZGC guarantees sub-millisecond pause times, even on 10-Terabyte heaps!
-java -XX:+UseZGC -jar app.jar
+    static class Cache {
+        private final Map<String, SoftReference<byte[]>> cache = new HashMap<>();
+
+        // Soft reference cache — items evicted when JVM needs memory
+        public void put(String key, byte[] data) {
+            cache.put(key, new SoftReference<>(data));
+        }
+
+        public byte[] get(String key) {
+            SoftReference<byte[]> ref = cache.get(key);
+            if (ref == null) return null;
+            byte[] data = ref.get(); // returns null if GC collected it
+            if (data == null) cache.remove(key); // clean up stale entry
+            return data;
+        }
+    }
+
+    // WeakReference — good for listeners/observers
+    static class EventBus {
+        private final List<WeakReference<Listener>> listeners = new ArrayList<>();
+
+        public void subscribe(Listener l) {
+            listeners.add(new WeakReference<>(l));
+        }
+
+        public void publish(String event) {
+            Iterator<WeakReference<Listener>> it = listeners.iterator();
+            while (it.hasNext()) {
+                Listener l = it.next().get();
+                if (l == null) {
+                    it.remove(); // listener was GC'd — clean up
+                } else {
+                    l.onEvent(event);
+                }
+            }
+        }
+    }
+
+    interface Listener { void onEvent(String event); }
+
+    // PhantomReference — cleanup notification after GC
+    static void phantomDemo() throws InterruptedException {
+        ReferenceQueue<Object> queue = new ReferenceQueue<>();
+        PhantomReference<Object> phantom = new PhantomReference<>(new Object(), queue);
+
+        System.gc();
+        Thread.sleep(100);
+
+        Reference<?> ref = queue.poll();
+        if (ref != null) {
+            System.out.println("Object was GC'd — clean up native resources now");
+            // This is how Java Cleaner API works (Java 9+)
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Cache softCache = new Cache();
+        softCache.put("data", new byte[1024]);
+        byte[] retrieved = softCache.get("data");
+        System.out.println("Retrieved: " + (retrieved != null ? "found" : "evicted"));
+
+        EventBus bus = new EventBus();
+        Listener l1 = event -> System.out.println("L1: " + event);
+        bus.subscribe(l1);
+        bus.publish("click"); // L1: click
+
+        l1 = null; // listener becomes eligible for GC
+        System.gc();
+        Thread.sleep(100);
+        bus.publish("hover"); // no output — l1 was GC'd
+
+        phantomDemo();
+    }
+}
 ```
 
-## REAL_WORLD
-The "Stop-The-World" (STW) pause is the most feared event in Java engineering.
-When a Major GC triggers, the JVM must physically freeze all 200 of your Tomcat worker threads to safely reorganize memory and update pointers. If you have a massive 32GB Heap and use an old GC algorithm, this STW pause could take **15 seconds**.
-For 15 seconds, your Spring Boot application is completely paralyzed. It will not accept HTTP requests. External microservices trying to call your API will encounter connection timeouts. Kubernetes health checks will fail, assuming your pod is dead, and Kubernetes will violently terminate and restart your container!
+---
 
-This is why GC Tuning is a highly paid specialty. Modern Java introduced **G1GC** (Java 9 default) and **ZGC** (Java 21 scalable low-latency). ZGC is a phenomenal engineering marvel: it performs almost all of its memory compaction concurrently in the background, mathematically guaranteeing that the Stop-The-World pause will never exceed 1 millisecond, effectively eliminating GC lag from the Java ecosystem entirely.
+### Level 4 — Advanced: GC Tuning & Monitoring
+
+```java
+// GCMonitor.java
+import java.lang.management.*;
+import java.util.*;
+
+public class GCMonitor {
+
+    // Monitor GC pause times
+    public static void printGCStats() {
+        System.out.println("=== GC Statistics ===");
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            System.out.printf("%-30s count=%-6d time=%d ms%n",
+                gc.getName(), gc.getCollectionCount(), gc.getCollectionTime());
+        }
+    }
+
+    // Force GC and measure pause
+    public static long measureGCPause(Runnable trigger) {
+        long before = System.currentTimeMillis();
+        trigger.run();
+        System.gc(); // hint only — JVM may ignore
+        long after = System.currentTimeMillis();
+        return after - before;
+    }
+
+    // Allocation rate test — creates many short-lived objects
+    public static void allocationTest(int iterations) {
+        long gcCountBefore = getTotalGCCount();
+        long gcTimeBefore = getTotalGCTime();
+
+        List<byte[]> retained = new ArrayList<>();
+        for (int i = 0; i < iterations; i++) {
+            // Short-lived objects — most will die in Eden, never reach Old Gen
+            byte[] shortLived = new byte[1024]; // 1KB, dies each iteration
+
+            // Occasionally retain something — promotes to Old Gen
+            if (i % 100 == 0) retained.add(new byte[512]);
+        }
+
+        long gcCountAfter = getTotalGCCount();
+        long gcTimeAfter = getTotalGCTime();
+
+        System.out.printf("GC invocations: %d, total pause: %d ms%n",
+            gcCountAfter - gcCountBefore, gcTimeAfter - gcTimeBefore);
+        System.out.println("Retained objects: " + retained.size());
+    }
+
+    static long getTotalGCCount() {
+        return ManagementFactory.getGarbageCollectorMXBeans().stream()
+            .mapToLong(GarbageCollectorMXBean::getCollectionCount).sum();
+    }
+
+    static long getTotalGCTime() {
+        return ManagementFactory.getGarbageCollectorMXBeans().stream()
+            .mapToLong(GarbageCollectorMXBean::getCollectionTime).sum();
+    }
+
+    public static void main(String[] args) {
+        System.out.println("Active GC: ");
+        ManagementFactory.getGarbageCollectorMXBeans()
+            .forEach(gc -> System.out.println("  " + gc.getName()));
+
+        allocationTest(100_000);
+        printGCStats();
+    }
+}
+
+/*
+ * GC Tuning JVM Flags:
+ *
+ * Choosing GC:
+ *   -XX:+UseG1GC            G1 (default Java 9+)
+ *   -XX:+UseZGC             ZGC (Java 15+ stable)
+ *   -XX:+UseShenandoahGC    Shenandoah (Red Hat)
+ *   -XX:+UseSerialGC        Serial (small apps)
+ *   -XX:+UseParallelGC      Parallel (batch throughput)
+ *
+ * G1 Tuning:
+ *   -XX:MaxGCPauseMillis=200      pause goal (default 200ms)
+ *   -XX:G1HeapRegionSize=4m       region size (1-32MB, power of 2)
+ *   -XX:G1ReservePercent=10       reserve for evacuation
+ *   -XX:InitiatingHeapOccupancyPercent=45  when to start concurrent marking
+ *
+ * ZGC Tuning:
+ *   -XX:+UseZGC
+ *   -XX:ZCollectionInterval=5     force GC every 5 seconds max
+ *   -XX:ZAllocationSpikeTolerance=5  spike tolerance
+ *
+ * Heap sizing:
+ *   -Xms512m -Xmx4g           set min=max to avoid resize pauses
+ *
+ * GC Logging (Java 11+):
+ *   -Xlog:gc*:file=gc.log:time,uptime:filecount=10,filesize=20m
+ */
+```
+
+---
+
+### Level 5 — Expert: GC-Friendly Code Patterns
+
+```java
+// GCFriendlyPatterns.java
+import java.util.*;
+import java.util.stream.*;
+
+public class GCFriendlyPatterns {
+
+    /**
+     * Pattern 1: Object Pooling — reuse objects instead of creating new ones.
+     * Good for: heavy objects (DB connections, threads, StringBuilder).
+     * Bad for: simple objects (JIT optimizes allocation so well it's rarely needed).
+     */
+    static class StringBuilderPool {
+        private final Deque<StringBuilder> pool = new ArrayDeque<>();
+        private final int maxSize = 20;
+
+        public StringBuilder acquire() {
+            StringBuilder sb = pool.pollFirst();
+            return sb != null ? sb : new StringBuilder(256);
+        }
+
+        public void release(StringBuilder sb) {
+            if (pool.size() < maxSize) {
+                sb.setLength(0); // reset without new allocation
+                pool.addFirst(sb);
+            }
+            // else let it be GC'd — pool is full
+        }
+    }
+
+    /**
+     * Pattern 2: Avoid autoboxing in tight loops
+     */
+    static long sumWithBoxing(List<Integer> nums) {
+        long sum = 0;
+        for (Integer n : nums) sum += n; // unboxing Integer → int each iteration
+        return sum;
+    }
+
+    static long sumWithoutBoxing(int[] nums) {
+        long sum = 0;
+        for (int n : nums) sum += n; // no boxing/unboxing — zero allocation
+        return sum;
+    }
+
+    /**
+     * Pattern 3: Pre-size collections to avoid resizing
+     */
+    static List<String> processItems(int count) {
+        List<String> result = new ArrayList<>(count); // pre-sized!
+        // vs new ArrayList<>() which starts with capacity 10 and resizes many times
+        for (int i = 0; i < count; i++) result.add("item_" + i);
+        return result;
+    }
+
+    /**
+     * Pattern 4: Use primitives over wrappers for large arrays
+     */
+    static void primitiveArrayBenefit() {
+        int n = 1_000_000;
+
+        // Integer array: n × (16 bytes object header + 4 bytes int + 8 bytes ref) ≈ 28MB
+        Integer[] boxed = new Integer[n];
+        for (int i = 0; i < n; i++) boxed[i] = i; // 1M Integer objects on heap!
+
+        // int array: n × 4 bytes = 4MB — 7x less memory, much better GC pressure
+        int[] primitive = new int[n];
+        for (int i = 0; i < n; i++) primitive[i] = i; // no objects, no GC
+    }
+
+    /**
+     * Pattern 5: Records for data carriers (Java 16+) — immutable, no extra overhead
+     */
+    record Point(int x, int y) {} // compiler generates equals, hashCode, toString
+    // Use record instead of mutable POJOs — immutability is GC-friendly
+
+    public static void main(String[] args) {
+        StringBuilderPool pool = new StringBuilderPool();
+        StringBuilder sb = pool.acquire();
+        sb.append("Hello, World!");
+        System.out.println(sb);
+        pool.release(sb); // reuse
+
+        // Benchmark boxing vs primitives
+        int[] primitives = IntStream.range(0, 100_000).toArray();
+        List<Integer> boxed = IntStream.range(0, 100_000).boxed().collect(Collectors.toList());
+
+        long t1 = System.nanoTime();
+        sumWithoutBoxing(primitives);
+        long t2 = System.nanoTime();
+        sumWithBoxing(boxed);
+        long t3 = System.nanoTime();
+
+        System.out.printf("Primitive: %,d ns%n", t2 - t1);
+        System.out.printf("Boxed:     %,d ns%n", t3 - t2);
+    }
+}
+```
+
+---
+
+## REAL_WORLD
+
+### Diagnosing GC Issues in Production
+
+```bash
+# Enable GC logging (add to JVM args)
+-Xlog:gc*:file=/var/log/app-gc.log:time,uptime:filecount=5,filesize=50m
+
+# Analyze with GCEasy.io or parse manually
+# Key metrics to watch:
+# - GC pause duration > 500ms → investigate
+# - GC throughput < 95% → too much time in GC
+# - Heap after full GC still > 70% → possible memory leak
+
+# Take heap dump on OOM
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps/
+
+# Analyze heap dump with:
+# - Eclipse MAT (Memory Analyzer Tool)
+# - JProfiler
+# - VisualVM
+```
+
+### Spring Boot GC Metrics
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics
+  metrics:
+    enable:
+      jvm: true
+
+# Access via:
+# GET /actuator/metrics/jvm.gc.pause
+# GET /actuator/metrics/jvm.gc.memory.promoted
+# GET /actuator/metrics/jvm.memory.used
+```
+
+### Alerting on GC Issues
+
+```java
+// Programmatic GC notification (Java 7+)
+for (GarbageCollectorMXBean gcBean : ManagementFactory.getGarbageCollectorMXBeans()) {
+    if (gcBean instanceof NotificationEmitter emitter) {
+        emitter.addNotificationListener((notification, handback) -> {
+            if (notification.getType().equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION)) {
+                GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo
+                    .from((CompositeData) notification.getUserData());
+                long duration = info.getGcInfo().getDuration();
+                if (duration > 500) {
+                    // Alert: GC pause > 500ms!
+                    alerting.send("GC pause: " + duration + "ms, cause: " + info.getGcCause());
+                }
+            }
+        }, null, null);
+    }
+}
+```
+
+---
 
 ## INTERVIEW
-**Q: Can you force the Garbage Collector to run?**
-A: No. You can call `System.gc()`, but this is merely a "suggestion" to the JVM. The JVM's internal heuristics dictate exactly when it runs based on memory pressure. Calling `System.gc()` is considered a massive anti-pattern because if the JVM *does* listen to you, it usually triggers a full Stop-The-World Major GC, crushing application performance.
 
-**Q: What is a Memory Leak in Java?**
-A: A memory leak in Java occurs when you maintain a Strong Reference to an object that you no longer need, preventing the Garbage Collector from destroying it. The most common cause is adding objects to a static `List` or `Map` and forgetting to remove them. Over weeks of uptime, the collection grows infinitely until the heap is exhausted and the JVM throws an `OutOfMemoryError`.
+**Q1: How does Java's garbage collector determine what to collect?**
 
-**Q: What is the purpose of the Survivor Spaces?**
-A: The Young Generation is split into three zones: Eden, Survivor 0 (S0), and Survivor 1 (S1). When Eden fills up, living objects are copied to S0, and Eden is wiped clean instantly. On the next GC, survivors from Eden and S0 are copied to S1, and both Eden and S0 are wiped. This alternating "Ping-Pong" copying mechanism prevents memory fragmentation without ever needing to perform expensive compaction algorithms on the Young Generation.
+> **Strong answer:** Java uses **reachability analysis** (not reference counting like Python). Starting from GC roots (thread stacks, static fields, JNI references), the GC traces all reachable objects. Anything NOT reachable is garbage. This correctly handles circular references — two objects referencing each other but not reachable from any root are both collected. The GC then sweeps/compacts memory, reclaiming unreachable objects.
+
+**Q2: What is Generational GC and why does it help?**
+
+> **Strong answer:** The Generational Hypothesis states most objects die young (created and discarded in the same method). Generational GC exploits this by dividing heap into Young Generation (Eden + Survivors) and Old Generation (tenured). Minor GC collects only Young Gen — it's fast because Young Gen is small and most objects there are dead. Only long-lived survivors are promoted to Old Gen. Full GC (collecting Old Gen) is rare but expensive. This results in much better throughput than collecting the whole heap every time.
+
+**Q3: What is the difference between Minor GC and Full GC?**
+
+> **Strong answer:** Minor GC (Young GC) — collects only the Young Generation (Eden + Survivors). Fast (few milliseconds), frequent, collects most short-lived objects. Full GC — collects the entire heap including Old Generation and sometimes Metaspace. Slow (100ms to seconds), triggers STW pause. Full GC triggers when: Old Gen is nearly full, Metaspace fills, `System.gc()` is called, or GC can't allocate. You want to avoid Full GC in production. G1 and ZGC use concurrent mixed collections to avoid full pauses.
+
+**Q4: What are the different types of Java references (Strong, Soft, Weak, Phantom)?**
+
+> **Strong answer:** Strong — default, object never GC'd while reachable. Soft — `SoftReference`, GC'd only when JVM needs memory (last resort before OOM) — good for memory-sensitive caches. Weak — `WeakReference`, GC'd on next GC cycle regardless of memory — good for non-essential caches, canonical maps. PhantomReference — GC'd after `finalize()` runs; enqueued in a ReferenceQueue to notify cleanup code — used by Java Cleaner (replacing `finalize()`). `WeakHashMap` uses weak keys — entries auto-remove when key is GC'd, good for metadata attached to objects.
+
+**Q5: What causes a memory leak in Java and how do you find one?**
+
+> **Strong answer:** Memory leaks happen when live references keep objects reachable that are logically "done." Common causes: (1) Static collections that grow unboundedly. (2) Listeners/callbacks added but never removed. (3) ThreadLocal not cleaned up in thread pools. (4) Inner classes holding implicit reference to outer class. (5) Caches without eviction. To find: enable GC logging, watch heap usage after Full GC — if it grows over time, that's a leak. Use heap dump (`-XX:+HeapDumpOnOutOfMemoryError`) + Eclipse MAT to find the reference chain preventing collection. Look for "retained heap" — the biggest culprits.
+
+---
+
+## FEYNMAN CHECK
+
+Imagine your desk fills up with papers. Every paper with your name written on it is "live" — you might still need it. A "garbage collector" comes in, looks at every paper, throws away those with no name. The trick is: most papers are quickly discarded (Young Gen). The collector frequently cleans just the new pile of papers (Minor GC). Only occasionally does it clean the whole desk (Full GC) — that's when you have to stop working and wait.
+
+---
+
+## BUILD
+
+**Challenge:** Build a memory-leak detector for your application:
+1. Record heap used before and after 1000 requests
+2. If heap grows consistently across 10 test runs, report a likely leak
+3. Report which GC is running and its pause statistics
+4. Implement a `SoftReference`-based cache with hit/miss tracking
+
+---
+
+## SPACED REVIEW
+
+- Day 1: Explain reachability analysis, GC roots, generational hypothesis
+- Day 3: Describe Minor GC vs Full GC, Eden/Survivor/Old Gen lifecycle
+- Day 7: Explain Strong vs Soft vs Weak vs Phantom references with use cases
+- Day 14: Describe G1GC vs ZGC tradeoffs; demonstrate a ThreadLocal memory leak fix

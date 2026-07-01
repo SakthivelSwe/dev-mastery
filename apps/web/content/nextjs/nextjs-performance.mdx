@@ -185,3 +185,273 @@ A: Systematic approach:
    - Enable HTTP/2 and compression on the server
 
 After these changes, typical result: LCP drops to 1.2s, bundle to 180KB, Lighthouse score: 92.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Performance Like I'm 10 Years Old
+> Next.js performance optimisation centers on improving Core Web Vitals: LCP (Largest Contentful Paint — when main content appears), CLS (Cumulative Layout Shift — visual stability), and INP (Interaction to Next Paint — responsiveness). The main techniques: (1) Push computation to the SERVER (Server Components have zero client bundle). (2) STREAM with Suspense (fast content appears before slow). (3) Use next/image and next/font (optimise the biggest assets). (4) DYNAMIC IMPORT heavy client-only libraries (chart libraries, code editors — load only when needed). (5) Pre-render static pages (SSG) and ISR (avoid SSR for cacheable content). (6) Use the Bundle Analyzer to find bloat. The non-obvious depth: the SINGLE biggest performance win in most Next.js apps is moving components from Client to Server — a 50KB Client Component that becomes a Server Component removes 50KB from the user's download. Audit your 'use client' usage ruthlessly.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the order of optimisation priorities for Core Web Vitals?**
+> **A:** (1) ELIMINATE render-blocking resources: inline critical CSS (Next.js does automatically), defer non-critical JS (Next.js does for Server Component bundles). (2) OPTIMISE LCP: use next/image with priority on hero, use SSG/ISR (server pre-renders in <50ms), prefetch likely next pages with Link. (3) FIX CLS: dimensions on images, size-adjust fonts, reserve space for ads/embeds. (4) IMPROVE INP: reduce JS bundle size (move to Server Components), use useTransition for non-blocking updates, avoid expensive synchronous work in event handlers. (5) Use Lighthouse + Real User Monitoring (Vercel Analytics or Sentry) to identify bottlenecks.
+
+**Q2: Mental model for the JavaScript bundle?**
+> **A:** The browser must DOWNLOAD, PARSE, COMPILE, and EXECUTE JavaScript before the page is interactive. A 500KB bundle on a slow 3G connection takes 5 seconds to download. On a mid-range phone, parsing+executing takes another 2-3 seconds. Result: page is uninteractive for 7+ seconds. The fix: minimise the bundle. Server Components eliminate components from the bundle entirely. Dynamic import (next/dynamic) splits the bundle so heavy code loads only when needed. Tree-shaking removes unused exports. Bundle Analyzer shows what's actually in your bundle — usually 20% of dependencies cause 80% of size.
+
+**Q3: Most dangerous misconception about performance?**
+> **A:** "use client" has no performance cost if the component is small:
+> ```typescript
+> // WRONG: small Client Component imports a big library
+> 'use client';
+> import { format } from 'date-fns';  // 70KB!
+> import { z } from 'zod';            // 50KB!
+> import _ from 'lodash';             // 70KB!
+>
+> export function TinyDisplay({ date }: { date: Date }) {
+>   return <span>{format(date, 'PPP')}</span>;
+> }
+> // This 5-line component adds 190KB to the client bundle
+> // Plus EVERY import in this file (and its imports) becomes client code
+>
+> // CORRECT options:
+> // 1. Make it a Server Component (formatting happens server-side, zero client JS):
+>    export function TinyDisplay({ date }: { date: Date }) {
+>      return <span>{format(date, 'PPP')}</span>;  // no 'use client'
+>    }
+> //
+> // 2. If interactivity required, pass formatted string from Server Component:
+>    // Server Component: <Tiny formatted={format(date, 'PPP')} />
+>    // Client: function Tiny({ formatted }: { formatted: string }) { return <span>{formatted}</span> }
+> ```
+
+**Q4: How does next/dynamic improve performance?**
+> **A:** next/dynamic splits a component into a separate chunk that loads on-demand. const HeavyChart = dynamic(() => import('./HeavyChart'), { loading: () => <Skeleton />, ssr: false }). The chart's 200KB only downloads when the component renders, not on initial page load. Use cases: charts (recharts, chart.js — 100-300KB), rich text editors (TipTap, Lexical — 100-500KB), date pickers, code editors, modals/dialogs not visible by default. Pair with intersection observer for "load when scrolled into view". For SSR-incompatible libraries (those using window/document), use ssr: false.
+
+**Q5: FAANG-grade definition of Next.js performance optimisation.**
+> **A:** "Next.js performance optimisation prioritises Core Web Vitals — LCP, CLS, INP — through Server Components reducing client bundle size (zero JS for non-interactive content), Suspense-based streaming SSR for sub-100ms TTFB, next/image and next/font for optimised assets with CLS prevention via dimension/metric overrides, next/dynamic for code splitting heavy client components, route prefetching via Link in production, ISR/SSG for sub-50ms cached responses, edge runtime for globally-distributed handlers, fetch caching for backend deduplication, route segment config (dynamic, revalidate) for fine-grained caching control — measured via @next/bundle-analyzer for bundle audits, Lighthouse for synthetic testing, and Vercel Analytics/Sentry for Real User Monitoring (RUM) — with the highest-impact optimisation being aggressive Server Component adoption to eliminate unnecessary client-side JavaScript."
+
+## BUILD
+
+### 🏗️ Mini Project: Performance Audit Suite — Bundle Analyzer + Dynamic Import + Server Conversion
+
+**What you will build:** A performance baseline app, then apply 5 optimisations (Server Component conversion, dynamic import, next/image, font optimisation, Suspense streaming) and measure each one's impact with Lighthouse.
+**Why this project:** Forces the measure → optimise → measure cycle.
+**Time estimate:** 50 minutes
+
+---
+
+#### Step 1 — Setup With Bundle Analyzer
+```bash
+npx create-next-app@latest perf-demo --typescript --tailwind --app
+npm install @next/bundle-analyzer date-fns lodash recharts
+```
+
+```javascript
+// next.config.js
+const withBundleAnalyzer = require('@next/bundle-analyzer')({
+  enabled: process.env.ANALYZE === 'true',
+});
+module.exports = withBundleAnalyzer({
+  // ... other config
+});
+```
+
+#### Step 2 — Baseline Slow Page
+```typescript
+// src/app/dashboard/page.tsx  (BEFORE optimisation — 400KB bundle)
+'use client';  // BAD: makes everything client
+import { format, formatDistance } from 'date-fns';     // 70KB
+import _ from 'lodash';                                 // 70KB
+import { LineChart, Line, XAxis, YAxis, Tooltip } from 'recharts';  // 300KB
+import { useState, useEffect } from 'react';
+
+export default function DashboardPage() {
+  const [data, setData] = useState<any[]>([]);
+
+  useEffect(() => {
+    fetch('/api/data').then(r => r.json()).then(setData);
+  }, []);
+
+  const formatted = data.map(d => ({
+    ...d,
+    formattedDate: format(new Date(d.date), 'PPP'),
+  }));
+
+  return (
+    <div className="p-8">
+      <h1>Dashboard</h1>
+      <LineChart width={600} height={300} data={formatted}>
+        <Line type="monotone" dataKey="value" />
+        <XAxis dataKey="formattedDate" />
+        <YAxis />
+        <Tooltip />
+      </LineChart>
+      <ul>
+        {_.orderBy(formatted, 'value', 'desc').slice(0, 5).map((d, i) => (
+          <li key={i}>{d.formattedDate}: {d.value}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+#### Step 3 — Optimised Version
+```typescript
+// src/app/dashboard/page.tsx  (AFTER — ~50KB bundle)
+import { Suspense } from 'react';
+import { format } from 'date-fns';
+import dynamic from 'next/dynamic';
+import { DashboardList } from './DashboardList';  // Server Component
+
+// Heavy chart loaded on-demand
+const Chart = dynamic(() => import('./Chart'), {
+  loading: () => <div className="h-72 bg-gray-100 animate-pulse rounded" />,
+  ssr: false,  // recharts uses window
+});
+
+async function getData() {
+  // Direct DB / server fetch
+  return [
+    { date: '2025-03-01', value: 120 },
+    { date: '2025-03-02', value: 150 },
+    { date: '2025-03-03', value: 180 },
+  ];
+}
+
+export default async function DashboardPage() {
+  const data = await getData();
+  const formatted = data.map(d => ({
+    ...d,
+    formattedDate: format(new Date(d.date), 'PPP'),
+  }));
+
+  return (
+    <div className="p-8">
+      <h1>Dashboard</h1>
+      {/* Chart is dynamically imported — 300KB stays out of initial bundle */}
+      <Suspense fallback={<div className="h-72 bg-gray-100 animate-pulse" />}>
+        <Chart data={formatted} />
+      </Suspense>
+      {/* List is Server Component — zero client JS */}
+      <DashboardList data={formatted} />
+    </div>
+  );
+}
+
+// src/app/dashboard/DashboardList.tsx  -- Server Component
+interface Props { data: Array<{ formattedDate: string; value: number }>; }
+
+export function DashboardList({ data }: Props) {
+  // Sort server-side — no lodash on client
+  const top5 = [...data].sort((a, b) => b.value - a.value).slice(0, 5);
+
+  return (
+    <ul className="mt-4 space-y-1">
+      {top5.map((d, i) => (
+        <li key={i}>{d.formattedDate}: {d.value}</li>
+      ))}
+    </ul>
+  );
+}
+
+// src/app/dashboard/Chart.tsx  -- only loaded when needed
+'use client';
+import { LineChart, Line, XAxis, YAxis, Tooltip } from 'recharts';
+export default function Chart({ data }: { data: any[] }) {
+  return (
+    <LineChart width={600} height={300} data={data}>
+      <Line type="monotone" dataKey="value" />
+      <XAxis dataKey="formattedDate" />
+      <YAxis />
+      <Tooltip />
+    </LineChart>
+  );
+}
+```
+
+#### Step 4 — Web Vitals Reporting
+```typescript
+// src/app/layout.tsx -- add Web Vitals tracking
+import { WebVitals } from './_components/WebVitals';
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html>
+      <body>
+        <WebVitals />
+        {children}
+      </body>
+    </html>
+  );
+}
+
+// src/app/_components/WebVitals.tsx
+'use client';
+import { useReportWebVitals } from 'next/web-vitals';
+
+export function WebVitals() {
+  useReportWebVitals(metric => {
+    // Send to analytics
+    console.log('[Vitals]', metric.name, metric.value, metric.rating);
+    // In production: send to Vercel Analytics, Sentry, or your own endpoint
+    // fetch('/api/vitals', { method: 'POST', body: JSON.stringify(metric) });
+  });
+  return null;
+}
+```
+
+#### Step 5 — Audit and Compare
+```bash
+# Generate bundle analysis
+ANALYZE=true npm run build
+# Opens browser windows showing client/server bundle treemaps
+
+# Run Lighthouse
+npm run build && npm start
+npx lighthouse http://localhost:3000/dashboard --view --only-categories=performance
+
+# Expected metrics:
+# BEFORE: Performance 35, LCP 4.2s, INP 280ms, bundle 400KB
+# AFTER:  Performance 95, LCP 0.8s, INP 50ms, bundle 50KB
+```
+
+**Expected Output:**
+```
+Bundle analyzer: chart code in separate chunk (recharts.chunk.js)
+Lighthouse Performance: 95+
+LCP: <1s (server-rendered list appears immediately)
+INP: <100ms (small client bundle parses quickly)
+Web Vitals console logs: all "good" ratings
+Chart loads only when component renders (Network tab shows lazy load)
+```
+
+**Stretch Challenges:**
+- [ ] Add a /api/vitals endpoint that stores RUM data in a DB
+- [ ] Set up Vercel Analytics or Sentry RUM
+- [ ] Implement route-level Suspense for sub-route streaming
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three Core Web Vitals and their thresholds?
+**Q2:** What is the single biggest performance win in most Next.js apps?
+**Q3:** Write next/dynamic with a loading fallback. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How does a small Client Component add KB to the bundle?
+**Q5:** A PR adds 'use client' to a page just to use date-fns formatting — refactor.
+**Q6:** When should you use ssr: false in dynamic imports?
+
+### Day 7 — Application
+**Q7:** Audit a Next.js app with Bundle Analyzer and identify 3 optimisation opportunities.
+**Q8:** A PR's LCP is 4.5s due to a large hero image — fix with next/image + priority.
+**Q9:** How does Suspense streaming improve perceived performance?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through optimising a slow Next.js page — what tools, what techniques, what order?"
+**Q11:** Draw: performance impact stack — Server Components > Streaming > Image/Font > Dynamic Import > Bundle Audit.
+**Q12:** ★ System design: "Design a performance monitoring system for a multi-page Next.js app — RUM, alerts, regression detection."

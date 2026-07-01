@@ -130,3 +130,401 @@ export const Action = (props: ActionProps) => {
 Breaking changes in Component APIs destroy consumer trust. 
 - **Deprecation:** Never delete a prop immediately. Mark it as `@deprecated` in JSDoc, add a `console.warn` in development mode, and remove it in the next major version release.
 - **Codemods:** For massive API overhauls (e.g., migrating `<Button type="primary">` to `<Button variant="primary">`), provide AST-based codemods (using `jscodeshift`) that automatically rewrite the consumer's source code during the upgrade process.
+
+
+## CODE
+
+### Level 1 — Beginner: Props Contract with TypeScript
+```tsx
+// Explicit props contract — the public API of your component
+interface CardProps {
+  title: string;          // Required — no default possible without it
+  description?: string;   // Optional — component works without it
+  imageUrl?: string;      // Optional with conditional rendering
+  onAction?: () => void;  // Optional callback — no prop = no button rendered
+  variant?: 'default' | 'compact' | 'featured'; // Union type — only valid values
+}
+
+export function Card({ title, description, imageUrl, onAction, variant = 'default' }: CardProps) {
+  return (
+    <div className={`card card--${variant}`}>
+      {imageUrl && <img src={imageUrl} alt="" aria-hidden="true" />} {/* Decorative image */}
+      <h3 className="card__title">{title}</h3>
+      {description && <p className="card__desc">{description}</p>}
+      {onAction && <button onClick={onAction} className="card__action">View details</button>}
+    </div>
+  );
+}
+```
+
+### Level 2 — Intermediate: Compound Component API Pattern
+```tsx
+// Compound components — flexible composition over monolithic props
+// Used by: Radix UI, Headless UI, React Aria
+
+interface CardContextValue {
+  variant: 'default' | 'compact';
+}
+const CardContext = React.createContext<CardContextValue>({ variant: 'default' });
+
+function CardRoot({ children, variant = 'default' }: { children: React.ReactNode; variant?: 'default' | 'compact' }) {
+  return (
+    <CardContext.Provider value={{ variant }}>
+      <article className={`card card--${variant}`}>{children}</article>
+    </CardContext.Provider>
+  );
+}
+function CardHeader({ children }: { children: React.ReactNode }) {
+  return <header className="card__header">{children}</header>;
+}
+function CardBody({ children }: { children: React.ReactNode }) {
+  return <div className="card__body">{children}</div>;
+}
+function CardFooter({ children }: { children: React.ReactNode }) {
+  return <footer className="card__footer">{children}</footer>;
+}
+
+// Namespace export — tree-shakeable and self-documenting
+export const Card = Object.assign(CardRoot, { Header: CardHeader, Body: CardBody, Footer: CardFooter });
+
+// Usage: <Card><Card.Header>Title</Card.Header><Card.Body>Content</Card.Body></Card>
+```
+
+### Level 3 — Advanced: Controlled vs Uncontrolled API
+```tsx
+// Support both controlled (state in parent) and uncontrolled (state in component)
+// This is how HTML inputs work — and every good component mimics this
+
+interface UseControllableStateOptions<T> {
+  value?: T;           // Controlled: parent manages state
+  defaultValue?: T;    // Uncontrolled: component manages state with this initial value
+  onChange?: (value: T) => void;
+}
+
+function useControllableState<T>({ value, defaultValue, onChange }: UseControllableStateOptions<T>) {
+  const [uncontrolledValue, setUncontrolledValue] = React.useState<T | undefined>(defaultValue);
+  const isControlled = value !== undefined;
+  const currentValue = isControlled ? value : uncontrolledValue;
+
+  const setValue = React.useCallback((newValue: T) => {
+    if (!isControlled) setUncontrolledValue(newValue); // Update internal state only when uncontrolled
+    onChange?.(newValue); // Always notify parent regardless of controlled mode
+  }, [isControlled, onChange]);
+
+  return [currentValue, setValue] as const;
+}
+
+interface AccordionProps {
+  value?: string;          // Controlled: parent passes current open item
+  defaultValue?: string;   // Uncontrolled: default open item
+  onValueChange?: (value: string) => void;
+  children: React.ReactNode;
+}
+
+export function Accordion({ value, defaultValue, onValueChange, children }: AccordionProps) {
+  const [openItem, setOpenItem] = useControllableState({ value, defaultValue, onChange: onValueChange });
+  return (
+    <div className="accordion">
+      <AccordionContext.Provider value={{ openItem, setOpenItem }}>
+        {children}
+      </AccordionContext.Provider>
+    </div>
+  );
+}
+```
+
+### Level 4 — Expert / Production: Headless Component with Render Props
+```tsx
+import { useReducer, createContext, useContext, useCallback } from 'react';
+
+// Headless component: provides behaviour, zero UI — consumer owns all markup
+// Used by: Radix Primitives, Headless UI, React Aria
+
+type DisclosureState = { isOpen: boolean };
+type DisclosureAction = { type: 'open' } | { type: 'close' } | { type: 'toggle' };
+
+function disclosureReducer(state: DisclosureState, action: DisclosureAction): DisclosureState {
+  switch (action.type) {
+    case 'open':   return { isOpen: true };
+    case 'close':  return { isOpen: false };
+    case 'toggle': return { isOpen: !state.isOpen };
+  }
+}
+
+interface DisclosureContextValue {
+  isOpen: boolean;
+  open: () => void;
+  close: () => void;
+  toggle: () => void;
+}
+const DisclosureContext = createContext<DisclosureContextValue | null>(null);
+
+export function useDisclosure() {
+  const ctx = useContext(DisclosureContext);
+  if (!ctx) throw new Error('useDisclosure must be used within <Disclosure>');
+  return ctx;
+}
+
+interface DisclosureRenderProps {
+  isOpen: boolean;
+  open: () => void;
+  close: () => void;
+  toggle: () => void;
+}
+
+interface DisclosureProps {
+  defaultOpen?: boolean;
+  onOpenChange?: (isOpen: boolean) => void;
+  children: (props: DisclosureRenderProps) => React.ReactNode;
+}
+
+export function Disclosure({ defaultOpen = false, onOpenChange, children }: DisclosureProps) {
+  const [state, dispatch] = useReducer(disclosureReducer, { isOpen: defaultOpen });
+
+  const open   = useCallback(() => { dispatch({ type: 'open' });   onOpenChange?.(true);  }, [onOpenChange]);
+  const close  = useCallback(() => { dispatch({ type: 'close' });  onOpenChange?.(false); }, [onOpenChange]);
+  const toggle = useCallback(() => { dispatch({ type: 'toggle' }); onOpenChange?.(!state.isOpen); }, [state.isOpen, onOpenChange]);
+
+  const value: DisclosureContextValue = { isOpen: state.isOpen, open, close, toggle };
+
+  return (
+    <DisclosureContext.Provider value={value}>
+      {children({ isOpen: state.isOpen, open, close, toggle })}
+    </DisclosureContext.Provider>
+  );
+}
+
+// Usage — consumer controls all markup:
+// <Disclosure defaultOpen={false}>
+//   {({ isOpen, toggle }) => (
+//     <div>
+//       <button onClick={toggle} aria-expanded={isOpen}>FAQ Section</button>
+//       {isOpen && <p>Answer content here</p>}
+//     </div>
+//   )}
+// </Disclosure>
+```
+## REAL_WORLD
+
+### How Radix UI Designs Component APIs
+
+Radix UI (used by Vercel, Linear, Loom) pioneered the "unstyled primitives" API model — components expose behaviour and accessibility only, leaving styling to consumers. Their key innovation is the compound component pattern: `<Select.Root>`, `<Select.Trigger>`, `<Select.Content>` compose together with shared context, giving consumers control over every DOM node while the root manages ARIA relationships automatically.
+
+```tsx
+// Production pattern — Radix-style compound component API
+// Context: Full-control component composition with internal ARIA wiring
+
+// ROOT manages state — isOpen, selectedValue, onValueChange
+const SelectContext = React.createContext<SelectContextValue | null>(null);
+
+function SelectRoot({ value, onValueChange, children }: SelectRootProps) {
+  const [open, setOpen] = useState(false);
+  return (
+    <SelectContext.Provider value={{ value, onValueChange, open, setOpen }}>
+      {children}
+    </SelectContext.Provider>
+  );
+}
+
+// TRIGGER composes into root context — aria-expanded mirrors root state
+function SelectTrigger({ children, asChild }: SelectTriggerProps) {
+  const { open, setOpen, value } = useSelectContext();
+  const Comp = asChild ? Slot : 'button';  // asChild lets consumer control tag
+  return (
+    <Comp
+      aria-expanded={open}
+      aria-haspopup="listbox"
+      onClick={() => setOpen(prev => !prev)}
+    >
+      {children ?? value}
+    </Comp>
+  );
+}
+
+// Usage — consumer controls every DOM node
+<Select.Root value={country} onValueChange={setCountry}>
+  <Select.Trigger className="border rounded px-3 py-2">
+    {country ?? 'Select country'}
+  </Select.Trigger>
+  <Select.Content className="shadow-lg rounded mt-1">
+    <Select.Item value="AU">Australia</Select.Item>
+    <Select.Item value="US">United States</Select.Item>
+  </Select.Content>
+</Select.Root>
+```
+
+### Production Gotcha: Prop Explosion from Insufficient Composition
+```tsx
+// ❌ Monolithic API — every customisation point needs a prop
+<DataTable
+  headerClassName="..."
+  rowClassName="..."
+  cellClassName="..."
+  emptyStateContent={<>...</>}
+  loadingContent={<>...</>}
+  onRowClick={...}
+  // 40 more props...
+/>
+
+// ✅ Compound API — consumers compose at natural DOM boundaries
+<DataTable.Root data={rows} onRowClick={onRowClick}>
+  <DataTable.Header>...</DataTable.Header>
+  <DataTable.Body renderRow={(row) => <DataTable.Row>{...}</DataTable.Row>} />
+  <DataTable.EmptyState>No results</DataTable.EmptyState>
+</DataTable.Root>
+```
+**Why it happens:** Monolithic components try to anticipate every customisation need via props. Compound components give consumers direct DOM control, eliminating prop explosion entirely.
+
+### Performance Characteristics
+| API Style | Bundle Impact | Flexibility |
+|-----------|--------------|-------------|
+| Monolithic | Single import | Low — props only |
+| Compound | Tree-shakeable | High — full DOM control |
+
+## INTERVIEW
+
+**Q1 (Junior): What makes a component API "good" from a consumer's perspective?**
+A: A good API is predictable (follows existing HTML/library conventions), minimal (only exposes what consumers need, not internal implementation details), and composable (works with other components without conflicts). The key test: can a new developer use the component correctly from reading the prop types alone, without reading the implementation? If they must read the source to understand how `showHeader` and `headerContent` interact, the API has failed.
+
+**Q2 (Junior): What is prop drilling and how do compound components solve it?**
+A: Prop drilling is passing props through multiple component layers just to reach a deeply nested child — a parent passes `headerClassName` down through three layers that don't use it, just to reach the header. Compound components solve this by sharing state through React Context: the root holds state and each sub-component reads what it needs directly, eliminating intermediary prop passing. Radix UI, Headless UI, and React Aria all use this pattern.
+
+**Q3 (Mid): What is the `asChild` prop pattern (Radix primitive) and why is it powerful?**
+A: `asChild` clones the component's logic onto the consumer's element using Radix's `Slot` utility. Instead of rendering a `<button>` itself, the component transfers all its handlers and ARIA attributes to whatever the consumer renders. This allows consumers to use their own Link component, custom elements, or custom tags while getting all the behaviour — without the component needing to know the tag in advance. It is the cleanest solution to the "polymorphic component" problem.
+
+**Q4 (Mid): When does a boolean prop become a code smell? Show with an example.**
+A: Boolean props become a smell when they mutually exclusive with other booleans, creating implicit enum state. `isLoading / isError / isEmpty / isSuccess` on a single component means only one should be true at a time — but nothing in TypeScript prevents two being true simultaneously, creating undefined visual states. The fix: use a discriminated union `status: 'idle' | 'loading' | 'error' | 'success'` which makes invalid states unrepresentable.
+
+**Q5 (Senior): How do you design a component API for long-term evolution without breaking changes?**
+A: Use additive-only versioning: new props must have defaults that preserve existing behaviour. Deprecate via console.warn + TypeScript `@deprecated` JSDoc. Use semantic versioning strictly — major only for breaking changes. For structural changes (adding a sub-component to a monolithic component), introduce the new API alongside the old one for one major version. The key constraint is that 200 consuming teams cannot upgrade in sync — the component must serve both old and new APIs during transition.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "ConceptMap", "state": "design-system-component-api" }
+```
+
+## FEYNMAN CHECK
+
+### Explain Component API Design Like I'm 10 Years Old
+> A component API is like a TV remote control — it has buttons (props) that let you control what the TV does, but you can't rewire the screen yourself. Good API design means the right buttons are on the remote, they're labelled clearly, and you can't press two conflicting buttons at once. Bad API design means 40 unlabelled buttons, some of which break other buttons when pressed. The non-obvious part: every prop you add to a component is a promise you must keep forever — removing it breaks everyone who used it. This is why the best APIs start tiny.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the "principle of least surprise" applied to component APIs?**
+> **A:** The principle says that component behaviour should match what an experienced developer would predict from the prop name and type alone, without reading documentation. A prop named `disabled` should behave exactly like native HTML `disabled`. A prop named `onChange` should fire on every change, not on blur. Violating this creates subtle bugs that take hours to debug because the developer assumes correct behaviour.
+
+**Q2: The ONE model for API surface size.**
+> **A:** "Start with the minimum necessary, make everything else a prop — but not before it's needed (YAGNI)." Every prop added before it's needed becomes an API liability. Every prop withheld until needed can be added additively without breaking changes.
+
+**Q3: Misconception with code.**
+> **A:** Using boolean props for mutually exclusive states.
+> ```tsx
+> // ❌ Both could be true — undefined behaviour
+> <Alert isError={true} isSuccess={true} />
+>
+> // ✅ Discriminated union — invalid state unrepresentable
+> <Alert variant="error" />
+> <Alert variant="success" />
+> ```
+
+**Q4: How does TypeScript shape API design?**
+> **A:** TypeScript enables discriminated unions that make invalid states unrepresentable at compile time, required vs optional prop enforcement, and `@deprecated` annotations that surface in IDE hover. A component's TypeScript interface IS the API contract — writing the types first forces clarity on what the component does before any implementation.
+
+**Q5: Senior one-liner.**
+> **A:** "Component API design is the discipline of exposing the minimum surface that enables maximum composition — which is why every additional prop is a breaking-change risk and every compound sub-component is a flexibility gain."
+
+## BUILD
+
+### 🏗️ Mini Project: Compound Select Component
+
+**What you will build:** A fully accessible Select with compound component API: `<Select.Root>`, `<Select.Trigger>`, `<Select.Content>`, `<Select.Item>`.
+**Why this project:** Forces you to implement shared context, ARIA relationship management, and the asChild pattern.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir compound-select && cd compound-select
+npx create-next-app@latest . --typescript --no-src-dir --app
+touch components/Select.tsx components/Select.test.tsx
+```
+
+#### Step 2 — Core
+```tsx
+// components/Select.tsx
+const Ctx = React.createContext<{ value:string; set:(v:string)=>void; open:boolean; toggle:()=>void } | null>(null);
+const useCtx = () => { const c = React.useContext(Ctx); if(!c) throw new Error('Must use inside Select.Root'); return c; };
+
+function Root({ value, onChange, children }: { value:string; onChange:(v:string)=>void; children:React.ReactNode }) {
+  const [open, setOpen] = React.useState(false);
+  return <Ctx.Provider value={{ value, set: onChange, open, toggle: () => setOpen(p=>!p) }}>{children}</Ctx.Provider>;
+}
+
+function Trigger({ children }: { children?: React.ReactNode }) {
+  const { value, open, toggle } = useCtx();
+  return <button aria-haspopup="listbox" aria-expanded={open} onClick={toggle}>{children ?? value}</button>;
+}
+
+function Content({ children }: { children:React.ReactNode }) {
+  const { open } = useCtx();
+  return open ? <ul role="listbox">{children}</ul> : null;
+}
+
+function Item({ value, children }: { value:string; children:React.ReactNode }) {
+  const { set, value: selected } = useCtx();
+  return <li role="option" aria-selected={selected===value} onClick={()=>set(value)}>{children}</li>;
+}
+
+export const Select = { Root, Trigger, Content, Item };
+```
+
+#### Step 4 — Error Handling
+```tsx
+// Throw descriptive error if sub-component used outside Root
+const useCtx = () => {
+  const c = React.useContext(Ctx);
+  if (!c) throw new Error('Select.Trigger must be used inside Select.Root');
+  return c;
+};
+```
+
+#### Step 5 — Tests
+```tsx
+test('opens on trigger click', () => {
+  render(<Select.Root value="" onChange={()=>{}}><Select.Trigger>Pick</Select.Trigger><Select.Content><Select.Item value="a">A</Select.Item></Select.Content></Select.Root>);
+  fireEvent.click(screen.getByRole('button'));
+  expect(screen.getByRole('listbox')).toBeInTheDocument();
+});
+```
+
+**Expected Output:**
+```
+✓ opens on trigger click
+✓ item click calls onChange
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is a compound component? What problem does it solve vs a monolithic component?
+**Q2:** Why should a component API start with the minimum surface? What is the cost of extra props?
+**Q3:** Write a 15-line compound component with Context in TSX.
+
+### Day 3 — Comprehension
+**Q4:** What is the `asChild` pattern? When is it the right choice?
+**Q5:** Show the boolean prop explosion bug and the discriminated union fix.
+**Q6:** Refactor a 10-prop monolithic Card into a compound Card.Root + Card.Header + Card.Body.
+
+### Day 7 — Application
+**Q7:** Build a compound Tabs component (Root/List/Tab/Panel) with keyboard navigation.
+**Q8:** A PR adds `isLoading`, `isError`, `isEmpty` to a Table. Describe the invalid-state risk.
+**Q9:** What TypeScript utility types enforce required props only in specific variant combinations?
+
+### Day 14 — Synthesis
+**Q10:** ★ "Design the API for a DataTable component used by 200 teams. What composition model do you choose and why?"
+**Q11:** Map component-api → compound-pattern → context → asChild — which enables which?
+**Q12:** ★ "A monolithic 60-prop component is causing 80% of design system support tickets. How do you migrate to compound components without breaking 200 consumers?"

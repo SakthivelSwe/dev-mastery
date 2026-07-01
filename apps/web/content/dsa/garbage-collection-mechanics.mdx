@@ -194,3 +194,272 @@ CMS used a free-list design to manage the Old Generation without compaction, whi
 G1 avoids this by partitioning the heap into thousands of discrete, equal-sized regions. When G1 performs a garbage collection cycle (both Mixed and Young GCs), it utilizes a copy-and-evacuate algorithm. It selects a set of regions with the highest amount of garbage (hence "Garbage First"), copies the remaining live objects into a single, clean, empty region, and reclaims the source regions completely. This process inherently compacts the memory on the fly, eliminating fragmentation without requiring a global STW compaction phase.
 
 ---
+
+## REAL_WORLD
+
+### How the JVM G1 Garbage Collector Works at Netflix Scale
+
+Netflix runs thousands of JVM services handling 250M+ streaming members. At peak traffic, GC pause times directly translate to request timeouts. Netflix's Engineering blog documented a case where unchecked GC pauses caused P99 latency spikes from 20ms to 2 seconds — a 100x degradation that triggered cascading retries across microservices.
+
+Their solution: migrate from CMS (Concurrent Mark-Sweep) to G1GC, tune region sizes, and add JVM flags to cap pause times. G1GC's key innovation over CMS: it divides the heap into equal-sized regions (~1-32MB each) and collects the regions with the most garbage first (hence "Garbage First"), making pause times predictable and bounded.
+
+```java
+// Production JVM flags used at Netflix-scale services
+// -XX:+UseG1GC                           Enable G1 garbage collector
+// -XX:MaxGCPauseMillis=200               Target max pause time (soft goal)
+// -XX:G1HeapRegionSize=16m               Region size — tune based on object sizes
+// -XX:InitiatingHeapOccupancyPercent=35  Start concurrent GC at 35% heap used
+// -XX:G1ReservePercent=15                Keep 15% heap as emergency reserve
+// -Xms4g -Xmx4g                          Fixed heap size — prevents resize pauses
+
+// Monitoring GC in production (log to file, parse with GCEasy.io)
+// -Xlog:gc*:file=/var/log/app/gc.log:time,uptime:filecount=5,filesize=20m
+
+public class GcAwareCache {
+    private final Map<String, SoftReference<byte[]>> cache = new ConcurrentHashMap<>();
+
+    // SoftReference — JVM clears these BEFORE throwing OutOfMemoryError
+    // Correct for caches: data is cleared under memory pressure automatically
+    public void put(String key, byte[] data) {
+        cache.put(key, new SoftReference<>(data));
+    }
+
+    public Optional<byte[]> get(String key) {
+        SoftReference<byte[]> ref = cache.get(key);
+        if (ref == null) return Optional.empty();
+        byte[] data = ref.get(); // Returns null if GC has collected the referent
+        if (data == null) cache.remove(key); // Clean up stale entry
+        return Optional.ofNullable(data);
+    }
+}
+```
+
+### Production Gotcha: Premature Promotion to Old Gen
+
+The #1 GC production bug: objects that should be short-lived end up in Old Gen because they survive multiple minor GC cycles.
+
+```java
+// ❌ DANGEROUS — creates long-lived StringBuilders inside a hot loop
+// Each iteration the builder survives into Survivor space, then Old Gen
+for (Request req : incomingRequests) {
+    StringBuilder sb = new StringBuilder(); // Allocated in Eden
+    sb.append(req.getHeader());
+    sb.append(req.getBody());
+    String result = sb.toString();
+    process(result); // If process() is slow, sb may survive multiple minor GCs
+}
+
+// ✅ PRODUCTION-SAFE — pre-allocate and reset, stays in Eden
+private static final ThreadLocal<StringBuilder> SB_POOL =
+    ThreadLocal.withInitial(() -> new StringBuilder(512));
+
+for (Request req : incomingRequests) {
+    StringBuilder sb = SB_POOL.get();
+    sb.setLength(0); // Reset without allocation — stays in same Eden slot
+    sb.append(req.getHeader()).append(req.getBody());
+    process(sb.toString());
+}
+```
+**Why it happens:** Each minor GC increments an object's age counter. After `-XX:MaxTenuringThreshold` (default 15) survivals, the object is promoted to Old Gen. Large Old Gen → infrequent but long Full GC pauses.
+
+### Performance Characteristics
+| GC Phase | Duration | Frequency | Notes |
+|----------|----------|-----------|-------|
+| Minor GC (Eden) | 1–50ms | Every 100ms–10s | Stop-the-world, fast |
+| G1 Concurrent Mark | Concurrent | When heap 35% full | No stop-the-world |
+| G1 Mixed GC | 50–200ms | After concurrent mark | Evacuates young + some old |
+| Full GC (fallback) | 1–30s | Rarely (config error) | Stop-the-world, avoid |
+
+## FEYNMAN CHECK
+
+### Explain GC Mechanics Like I'm 10 Years Old
+> Imagine your bedroom is RAM. You keep taking toys out of the toy box (allocating objects) and leaving them on the floor. Garbage Collection is a robot cleaner that periodically picks up toys you are no longer playing with and puts them back in the box. The non-obvious part: the robot uses a "mark-and-sweep" strategy — it first marks every toy that is reachable from your hands (GC roots), then sweeps away everything unmarked. Young toys (just taken out) are checked most often because most toys end up back in the box quickly (the "generational hypothesis"). This is why Java has Eden space — a fast-to-collect area where most objects die young.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem does GC fundamentally solve, and why can't you just use reference counting?**
+> **A:** GC solves the problem of reclaiming memory from unreachable objects automatically, eliminating use-after-free bugs and memory leaks from manual management. Reference counting (Python's primary mechanism) cannot handle circular references — if A references B and B references A, both have reference count > 0 forever even if nothing else references them. The JVM uses tracing GC instead: starting from GC roots (stack frames, static fields, JNI references), it traces ALL reachable objects — if an object is not reachable from any root, it is garbage regardless of its reference count. Python supplements refcounting with a cyclic garbage collector for exactly this reason.
+
+**Q2: What is the ONE mental model for generational GC?**
+> **A:** "Most objects die young." Empirical data shows 90%+ of objects become unreachable within milliseconds of creation (temporary strings, loop variables, event objects). The generational hypothesis exploits this: partition the heap into Young (Eden + Survivors) and Old generations. Minor GC only scans Young gen — typically 10-100x smaller than Old gen — making it 10-100x faster. Only the small fraction of objects that survive multiple minor GCs get promoted to Old gen, where expensive Major GC runs infrequently.
+
+**Q3: Most dangerous misconception with code.**
+> **A:** "Setting an object to null immediately frees its memory." In reality, null just removes the reference; memory is reclaimed only when GC runs.
+> ```java
+> // ❌ Misconception: expects immediate memory release
+> byte[] bigArray = new byte[100_000_000]; // 100MB
+> bigArray = null; // Memory is NOT freed here
+> // GC hasn't run — still 100MB allocated. System.gc() is a hint, not a command.
+>
+> // ✅ Correct mental model: memory is reclaimed at next GC cycle
+> // To reduce GC pressure: avoid large short-lived allocations; use object pools
+> ```
+
+**Q4: How does GC interact with the JIT compiler at the runtime level?**
+> **A:** The JIT compiler and GC cooperate through "safepoints" — specific bytecode positions where all threads can be paused safely for GC. The JIT inserts safepoint checks into compiled code (typically at method returns and loop back-edges). When GC needs to stop the world, it sets a flag; each thread reaches its next safepoint and pauses. This is why a tight loop with no safepoints can block GC ("safepoint stall"). G1 and ZGC reduce stop-the-world time by doing most work concurrently, only needing brief safepoints for root scanning and reference updates.
+
+**Q5: Senior one-liner.**
+> **A:** "GC is a tracing algorithm that identifies the live object graph via reachability from GC roots, then reclaims unreachable memory — with generational collection exploiting the empirical observation that 90% of objects die in the Eden space — which is why GC pressure (not individual allocations) determines pause frequency and why reducing allocation rate is more effective than tuning GC parameters."
+
+## BUILD
+
+### 🏗️ Mini Project: GC Root Tracer & Memory Pressure Simulator
+
+**What you will build:** A Java program that simulates memory pressure, triggers GC, and logs GC activity — teaching you to read GC logs and interpret GC behaviour.
+**Why this project:** Forces you to understand allocation rates, GC pauses, SoftReference vs WeakReference behaviour, and GC tuning.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir gc-demo && cd gc-demo
+# Run with GC logging enabled:
+# java -Xmx256m -Xlog:gc*:stdout:time -cp . GCDemo
+```
+
+#### Step 2 — Core: Memory Pressure Simulator
+```java
+import java.lang.ref.*;
+import java.util.*;
+
+public class GCDemo {
+    // WeakReference — cleared at next GC even if memory is available
+    // SoftReference — cleared only when JVM needs memory (good for caches)
+    static WeakReference<byte[]> weakRef;
+    static SoftReference<byte[]> softRef;
+
+    public static void main(String[] args) throws InterruptedException {
+        demonstrateGenerations();
+        demonstrateReferenceTypes();
+    }
+
+    static void demonstrateGenerations() {
+        System.out.println("=== Generational GC Demo ===");
+        long before = Runtime.getRuntime().freeMemory();
+
+        // Short-lived allocations — go into Eden, collected by minor GC
+        for (int i = 0; i < 10_000; i++) {
+            byte[] shortLived = new byte[1024]; // 1KB, immediately unreachable
+        }
+
+        System.gc();
+        long after = Runtime.getRuntime().freeMemory();
+        System.out.println("Memory reclaimed: " + (after - before) / 1024 + "KB");
+    }
+
+    static void demonstrateReferenceTypes() throws InterruptedException {
+        byte[] data = new byte[10 * 1024 * 1024]; // 10MB
+        weakRef = new WeakReference<>(data);
+        softRef = new SoftReference<>(data);
+        data = null; // Remove strong reference
+
+        System.out.println("Before GC — weak: " + (weakRef.get() != null) + ", soft: " + (softRef.get() != null));
+        System.gc();
+        Thread.sleep(100);
+        // WeakReference cleared; SoftReference still present (memory not tight)
+        System.out.println("After GC  — weak: " + (weakRef.get() != null) + ", soft: " + (softRef.get() != null));
+
+        // Now create memory pressure — force soft reference collection
+        List<byte[]> pressure = new ArrayList<>();
+        try {
+            while (true) pressure.add(new byte[1024 * 1024]); // Fill heap
+        } catch (OutOfMemoryError e) {
+            System.out.println("OOM — soft ref cleared: " + (softRef.get() == null));
+        }
+    }
+}
+```
+
+#### Step 3 — GC Log Analyzer
+```java
+// Read and parse GC log output
+// Run with: java -Xmx128m -verbose:gc GCDemo
+// Output pattern: [GC (Allocation Failure) [PSYoungGen: 32768K->2048K(38400K)] 32768K->2060K(125952K), 0.003s]
+// Parse: Young before→after(capacity), Heap before→after(capacity), pause time
+```
+
+#### Step 4 — Error Handling
+```java
+// Handle OutOfMemoryError gracefully in production
+Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+    System.out.println("JVM shutting down — heap usage: " +
+        (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024 + "MB");
+}));
+```
+
+#### Step 5 — Tests
+```java
+// Test: WeakReference is cleared after GC
+byte[] obj = new byte[1024];
+WeakReference<byte[]> ref = new WeakReference<>(obj);
+assert ref.get() != null : "Should be alive";
+obj = null;
+System.gc();
+Thread.sleep(100);
+assert ref.get() == null : "Should be collected after GC";
+System.out.println("WeakReference test passed ✅");
+```
+
+**Expected Output:**
+```
+=== Generational GC Demo ===
+Memory reclaimed: ~10000KB
+Before GC — weak: true, soft: true
+After GC  — weak: false, soft: true
+OOM — soft ref cleared: true
+WeakReference test passed ✅
+```
+
+**Stretch Challenges:**
+- [ ] Add a `PhantomReference` and `ReferenceQueue` to detect when an object is about to be collected
+- [ ] Use `-XX:+PrintGCDetails` and identify Eden vs Survivor vs Old gen usage in the logs
+- [ ] Implement an object pool (flyweight pattern) to reduce Eden pressure
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+
+**Q1:** Define GC in one sentence: what it IS, how the mark-and-sweep mechanism works, and when it runs.
+
+**Q2:** What is the generational hypothesis? Name the 3 Java heap generations and what happens in each.
+
+**Q3:** Write a 10-line Java snippet that creates a WeakReference and verifies it is cleared after System.gc().
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the difference between Minor GC, Major GC, and Full GC? Give a production scenario where Full GC causes an outage.
+
+**Q5:** What is "object promotion"? What JVM flag controls the tenuring threshold, and what bug results from setting it too low?
+
+**Q6:** Fix this code that causes premature Old Gen promotion:
+```java
+// Hot loop — called 1M times/second
+public String buildKey(String prefix, long id) {
+    return new StringBuilder(prefix).append("-").append(id).toString();
+}
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build an LRU cache using SoftReference values. What happens to cache entries under memory pressure? Why is this preferable to WeakReference for a cache?
+
+**Q8:** You are on-call. P99 latency spikes to 5s every 30 minutes for exactly 200ms. GC logs show Full GC pause. Diagnose the cause and fix it.
+
+**Q9:** What is the time complexity of mark-and-sweep GC? What is "GC throughput" and how does it relate to allocation rate?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ "Walk me through what happens in the JVM from the moment you call `new Object()` to when that object's memory is reclaimed." Cover: TLAB, Eden, Survivor, Old Gen, GC phases.
+
+**Q11:** Draw the dependency: GC → safepoints → JIT → thread scheduling. Why does a tight loop with no safepoint check block GC?
+
+**Q12:** ★ System design: "Your JVM service handles 50K requests/second. GC pauses are causing P99 > 500ms. What metrics do you check? What GC algorithm do you choose and why? What JVM flags do you set?"

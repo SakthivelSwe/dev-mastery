@@ -147,3 +147,170 @@ interface UserObj {
 
 type CleanUser = RemoveFunctions<UserObj>; // Results in { name: string; }
 ```
+
+## FEYNMAN CHECK
+
+### Explain Mapped Types Like I'm 10 Years Old
+> A mapped type is a TYPE-LEVEL FOR LOOP over the keys of another type. `{ [K in keyof T]: T[K] }` says "for every key K in T, produce a property K with value T[K]" — that's just a copy. Add modifiers: `{ [K in keyof T]?: T[K] }` makes every prop optional (this IS `Partial<T>`). `{ readonly [K in keyof T]: T[K] }` makes them readonly. `{ -readonly [K in keyof T]: T[K] }` REMOVES readonly. `{ [K in keyof T]: T[K] | null }` makes every value nullable. KEY REMAPPING (TS 4.1+): `{ [K in keyof T as `get${Capitalize<K & string>}`]: () => T[K] }` transforms `{ name: string }` into `{ getName: () => string }`. This is how Vue's typed reactivity and Mongoose's getter/setter types are built.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do mapped types solve?**
+> **A:** Deriving NEW types from EXISTING types by transforming each property. Without them, you'd write `Partial<User>` by hand: `{ id?: number; name?: string; email?: string; ... }` — tedious and brittle. With mapped types, ONE definition (`Partial<T> = { [K in keyof T]?: T[K] }`) works for every type forever.
+
+**Q2: Mental model for mapped types?**
+> **A:** Iteration over keys. `{ [K in Keys]: ValueExpr }` is "for each K in Keys, produce a property K with type ValueExpr." Keys is usually `keyof T`. The value expression can use K (to reference the original) or T[K] (to reference the original's value type). Add `?` and `readonly` (with `-` to remove). Add `as NewKey` to rename.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Forgetting that mapped types preserve modifiers:
+> ```ts
+> // ❌ Doesn't actually remove optional flag
+> type StripOptional<T> = { [K in keyof T]: T[K] };
+> type Original = { a?: string; b: number };
+> type Result = StripOptional<Original>;   // { a?: string; b: number } — still optional!
+>
+> // ✅ Use - modifier
+> type StripOptional<T> = { [K in keyof T]-?: T[K] };
+> // Note: this is essentially Required<T>
+> ```
+
+**Q4: How does key remapping interact with template literals?**
+> **A:** Combined with template literals, key remapping enables "transform keys by string pattern" — `as `on${Capitalize<K & string>}`` turns `{ click }` into `{ onClick }`. This is how event-handler types in React are typed (`{ onClick, onMouseOver, ... }` derived from a dom-events object). The TS 4.1+ `as` clause runs after the K binding, so you can compute the new key from K's value.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Mapped types are type-level iterations over the keys of an object type, with optional/readonly modifiers (addable via no prefix, removable via -), and key remapping via the `as` clause combined with template literal types — collectively enabling Partial, Required, Readonly, Record, and the entire utility-type family, plus framework-level typing for reactive systems, event handlers, and ORM-derived shapes."
+
+## BUILD
+
+### 🏗️ Mini Project: Type-Safe Form-State Builder With Mapped Getters/Setters
+
+**What you will build:** From `interface User { name: string; age: number }`, generate a form-state type with `{ name, setName, age, setAge }` and a typed factory function — all via mapped types and key remapping.
+**Why this project:** Forces mapped types + key remapping + template literals — the foundation of typed React forms libraries.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-mapped && cd ts-mapped
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/form.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Mapped Type Magic
+```ts
+// src/form.ts
+type Capitalize_<S extends string> = S extends `${infer F}${infer R}` ? `${Uppercase<F>}${R}` : S;
+
+// For each key K, add { K: T[K]; setK: (v: T[K]) => void }
+export type FormState<T> = {
+  [K in keyof T]: T[K];
+} & {
+  [K in keyof T as `set${Capitalize_<K & string>}`]: (value: T[K]) => void;
+};
+
+export function createForm<T extends Record<string, unknown>>(initial: T): FormState<T> {
+  const state = { ...initial } as Record<string, unknown>;
+  const setters: Record<string, (v: unknown) => void> = {};
+  for (const key of Object.keys(initial)) {
+    const setter = 'set' + key.charAt(0).toUpperCase() + key.slice(1);
+    setters[setter] = (v) => { state[key] = v; };
+  }
+  return { ...state, ...setters } as FormState<T>;
+}
+```
+
+#### Step 3 — Use The Form Builder
+```ts
+// src/main.ts
+import { createForm } from './form.js';
+
+interface User { name: string; age: number; email: string }
+
+const form = createForm<User>({ name: 'Ana', age: 30, email: 'a@b.io' });
+
+console.log(form.name);             // 'Ana'
+form.setName('Anna');               // typed: setName(value: string) => void
+form.setAge(31);                    // typed: setAge(value: number) => void
+console.log(form.name, form.age);   // 'Anna' 31
+
+// ❌ TS catches misuse
+// form.setName(99);                // string expected
+// form.setEmail = (v) => {};       // can't reassign — fine, runtime mutability is a different concern
+```
+
+#### Step 4 — Error Handling: ReadOnly + Strip Modifiers
+```ts
+// Make every prop readonly
+type DeepReadonly<T> = { readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K] };
+
+// Strip readonly + optional
+type Mutable<T> = { -readonly [K in keyof T]-?: T[K] };
+
+interface Frozen { readonly name?: string }
+type Thawed = Mutable<Frozen>;   // { name: string }
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect, expectTypeOf } from 'vitest';
+import { createForm, type FormState } from './form.js';
+
+describe('FormState', () => {
+  it('generates setters at type level', () => {
+    type F = FormState<{ name: string }>;
+    expectTypeOf<F>().toHaveProperty('setName');
+  });
+  it('createForm exposes initial values', () => {
+    const f = createForm({ x: 1, y: 'a' });
+    expect(f.x).toBe(1);
+    expect(f.y).toBe('a');
+  });
+  it('setters mutate fields', () => {
+    const f = createForm({ count: 0 });
+    f.setCount(5);
+    expect(f.count).toBe(5);
+  });
+});
+```
+
+**Expected Output:**
+```
+Ana
+Anna 31
+
+Tests:
+generates setters at type level   ✓
+createForm exposes initial values ✓
+setters mutate fields             ✓
+```
+
+**Stretch Challenges:**
+- [ ] Add validators via a second mapped type: `{ validateName: (v) => boolean }`
+- [ ] Make the form-state reactive (Proxy-based) so setters trigger subscribers
+- [ ] Filter properties by type: emit setters only for primitive-valued keys
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Syntax for a mapped type?
+**Q2:** What do `?` and `readonly` modifiers do? How do you REMOVE them?
+**Q3:** Write `Partial<T>` using a mapped type. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What does `as` in a mapped type clause do?
+**Q5:** A type `{ [K in keyof T]?: T[K] }` doesn't make a deeply nested object's fields optional — diagnose and fix.
+**Q6:** Write a type that converts `{ name: string; age: number }` to `{ getName: () => string; getAge: () => number }`.
+
+### Day 7 — Application
+**Q7:** Build a typed Reactive store using mapped types + Proxy.
+**Q8:** A PR adds DeepPartial without using mapped types — refactor.
+**Q9:** What is the cost difference of `Partial<T>` vs writing the optional fields manually?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Implement Required, Readonly, and Mutable from scratch using mapped types."
+**Q11:** Draw: type evaluation for a mapped type combined with key remapping + template literal.
+**Q12:** ★ System design: "Architect a typed reactive framework where component state's setters/validators are auto-derived via mapped types from a single source schema."

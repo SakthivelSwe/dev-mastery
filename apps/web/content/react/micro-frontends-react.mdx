@@ -135,3 +135,202 @@ The Host app (`store.example.com`) does not need to rebuild. It does not need to
 A: **No, because of Shared Dependencies.**
 In the `webpack.config.js` for both apps, we added `shared: { react: { singleton: true } }`.
 This is a critical feature of Module Federation. When the Host app boots up, it loads its copy of React into a shared global scope. When the Remote app downloads, Webpack checks the global scope. It sees that React is already loaded. Instead of downloading React again from Team A's server, the Remote app seamlessly hooks into the Host's existing React instance! This guarantees optimal performance and prevents the dreaded "multiple instances of React" error.
+
+## FEYNMAN CHECK
+
+### Explain Micro-Frontends Like I'm 10 Years Old
+> Micro-frontends split a large frontend app into INDEPENDENT pieces — each piece owned by a separate team, deployed independently, and possibly using different frameworks. Like microservices for the UI. In React: Module Federation (Webpack) lets one app consume another app's components at RUNTIME without rebuilding. App shell (host) loads Checkout (remote) which loads Cart (remote) — each deployed separately. The non-obvious depth: the hard problems are shared dependencies (both apps need React but only one version should load), routing (who controls the URL), and cross-app communication (how does Checkout know the cart changed?). Most micro-frontend problems are organisational, not technical.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the main micro-frontend integration patterns?**
+> **A:** BUILD-TIME (npm package): shared components as npm packages — teams publish, others install and rebuild. Simple but tight coupling (rebuild required for updates). RUNTIME via Module Federation: components loaded dynamically at runtime — no rebuild of host app. Iframe: complete isolation — security, no JS conflicts, but limited integration (no shared state, URL). Web Components (Custom Elements): framework-agnostic, good for leaf components. Single-SPA: routing-based orchestration. Reality: Module Federation for React-to-React sharing; iframes for complete isolation (payment widgets, third-party embeds).
+
+**Q2: How does Module Federation handle shared dependencies?**
+> **A:** Each federated module declares its dependencies (react, react-dom). Module Federation negotiates at runtime: if the host already loaded React 18.3.0 and the remote requires React 18.x, they share the same instance (prevents two React copies loading). If versions are incompatible (host: 18, remote: 17), they load separately — potentially breaking hook rules (React hooks must use ONE React instance). Always set `singleton: true` for React in the shared config, and ensure all remotes use compatible versions.
+
+**Q3: Most dangerous misconception?**
+> **A:** Micro-frontends are always better:
+> ```
+> ❌ Micro-frontend for a 5-person team on a single product
+> Reality: massive overhead — separate CI/CD, shared dep management, routing coordination,
+> cross-app state sharing, integration testing complexity, performance overhead
+> (multiple bundles, multiple React instances risk, extra network requests)
+>
+> ✅ Micro-frontends when:
+> - 3+ teams working on different domains (checkout, product, account) independently
+> - Different release cadences (billing deploys weekly, product deploys daily)
+> - Different tech stacks per team (legacy AngularJS + new React)
+> - You'd otherwise coordinate merges across 20 engineers constantly
+>
+> ✅ For a single team: use a monorepo with well-designed module boundaries instead
+> ```
+
+**Q4: How do micro-frontends communicate?**
+> **A:** Options (least to most coupling): (1) URL params (routing-based — cleanest, no direct coupling). (2) Custom events (window.dispatchEvent — loose coupling, but global). (3) Shared state store (Redux/Zustand singleton loaded once — tight coupling but direct). (4) Shared service (auth service injected into all MFEs). (5) Props via host orchestration (host passes data to remotes via Module Federation's exposeConfig). Best practice: use URL for route state, custom events or a shared event bus for cross-domain events, avoid shared state stores.
+
+**Q5: FAANG-grade definition.**
+> **A:** "Micro-frontends decompose frontend monoliths into independently deployable, team-owned UI fragments — integrated via four main patterns: build-time (npm package, rebuild required), runtime (Module Federation, dynamic loading at runtime, dependency negotiation via singleton semantics), iframe (complete isolation, limited integration), and Web Components (framework-agnostic) — with Webpack Module Federation as the leading React solution (host consumes remote-exposed components at runtime, shared React/ReactDOM prevent duplicate instances) — solving team autonomy, release cadence independence, and incremental migration of legacy apps — but introducing: routing coordination, cross-app state management, version compatibility enforcement, duplicate dependency risk, and integration testing complexity — most appropriate for organisations with 3+ autonomous teams on distinct domain boundaries, not for single-team products where a well-structured monorepo is simpler."
+
+## BUILD
+
+### 🏗️ Mini Project: Module Federation Host + Remote
+
+**What you will build:** Two Vite apps: Host (app shell) and Remote (exposes a CartWidget). Host loads CartWidget at runtime from Remote — no rebuild when Remote changes.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup Two Apps
+```bash
+mkdir mfe-demo && cd mfe-demo
+npm create vite@latest host -- --template react-ts
+npm create vite@latest remote -- --template react-ts
+cd remote && npm install
+cd ../host && npm install
+# Install Module Federation plugin for Vite
+cd ../remote && npm install @originjs/vite-plugin-federation
+cd ../host && npm install @originjs/vite-plugin-federation
+```
+
+#### Step 2 — Remote App (Exposes CartWidget)
+```ts
+// remote/vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import federation from '@originjs/vite-plugin-federation';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    federation({
+      name: 'remote',
+      filename: 'remoteEntry.js',
+      exposes: {
+        './CartWidget': './src/CartWidget',
+      },
+      shared: ['react', 'react-dom'],  // share single React instance
+    }),
+  ],
+  build: { target: 'esnext' },
+  preview: { port: 5001 },
+});
+
+// remote/src/CartWidget.tsx
+import { useState } from 'react';
+
+export function CartWidget() {
+  const [items, setItems] = useState<string[]>([]);
+  const products = ['Book', 'Pen', 'Notebook'];
+  return (
+    <div className="border rounded p-4 bg-blue-50">
+      <h3 className="font-bold mb-2">🛒 Cart Widget (from Remote)</h3>
+      <p className="text-xs text-gray-500 mb-2">Loaded at runtime via Module Federation</p>
+      <div className="flex gap-2 mb-2">
+        {products.map(p => (
+          <button key={p} onClick={() => setItems([...items, p])}
+            className="px-2 py-1 bg-blue-500 text-white rounded text-sm">{p}</button>
+        ))}
+      </div>
+      <ul className="text-sm">
+        {items.map((item, i) => <li key={i}>• {item}</li>)}
+      </ul>
+      <p className="text-sm font-bold mt-2">Items: {items.length}</p>
+    </div>
+  );
+}
+export default CartWidget;
+```
+
+#### Step 3 — Host App (Consumes Remote)
+```ts
+// host/vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import federation from '@originjs/vite-plugin-federation';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    federation({
+      name: 'host',
+      remotes: {
+        remote: 'http://localhost:5001/assets/remoteEntry.js',
+      },
+      shared: ['react', 'react-dom'],
+    }),
+  ],
+  build: { target: 'esnext' },
+});
+
+// host/src/App.tsx
+import { lazy, Suspense } from 'react';
+
+// Loaded from REMOTE at runtime — not in host bundle
+const CartWidget = lazy(() => import('remote/CartWidget'));
+
+export default function App() {
+  return (
+    <main className="max-w-2xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-2">Host App Shell</h1>
+      <p className="text-sm text-gray-500 mb-4">
+        This app shell loads CartWidget from a SEPARATE deployed app (Remote) at runtime.
+        You can update the Remote without rebuilding the Host.
+      </p>
+
+      <div className="mb-4 p-4 bg-gray-50 border rounded">
+        <h2 className="font-bold">Local Component (in Host bundle)</h2>
+        <p>This renders from the host app's code.</p>
+      </div>
+
+      <Suspense fallback={<div className="animate-pulse h-40 bg-gray-200 rounded" />}>
+        <CartWidget />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+#### Step 4 — Run Both
+```bash
+# Terminal 1: build and serve Remote
+cd remote && npm run build && npm run preview
+# Remote available at http://localhost:5001
+
+# Terminal 2: run Host (dev mode)
+cd host && npm run dev
+# Host at http://localhost:5173 — loads CartWidget from Remote at runtime
+```
+
+**Expected Output:**
+```
+Host loads → "Cart Widget (from Remote)" appears (loaded from localhost:5001)
+Add items → state works (same React instance shared)
+Network tab: remoteEntry.js fetched from :5001 — lazy, on demand
+Stop Remote server → CartWidget shows Suspense fallback
+Update CartWidget text → rebuild Remote → Host shows updated text (no Host rebuild)
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What problem do micro-frontends solve?
+**Q2:** How does Module Federation share React between host and remote?
+**Q3:** What are the 4 micro-frontend integration patterns?
+
+### Day 3 — Comprehension
+**Q4:** When should you NOT use micro-frontends?
+**Q5:** Two MFEs load React twice — diagnose (singleton config).
+**Q6:** How do micro-frontends communicate across domain boundaries?
+
+### Day 7 — Application
+**Q7:** Add cross-app event bus: remote emits 'cart:updated', host listens.
+**Q8:** A PR loads React twice in MFE setup — fix shared singleton config.
+**Q9:** How do you test a component consumed via Module Federation?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through Module Federation — host, remote, shared deps, runtime loading."
+**Q11:** Draw: Module Federation — host bundle, remote entry, runtime negotiation, shared React.
+**Q12:** ★ System design: "Design micro-frontend architecture for a bank portal — teams, boundaries, communication, CI/CD."

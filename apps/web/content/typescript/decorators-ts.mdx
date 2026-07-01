@@ -155,3 +155,210 @@ Before TypeScript 5.0, decorators were an "Experimental" feature enabled by `"ex
 In TS 5.0, the official ECMAScript Stage 3 standard was implemented. The signature completely changed to `(originalMethod, context)`.
 The old and new decorators are mathematically incompatible!
 *The Fix:* If you are maintaining a legacy project (like Angular), you MUST ensure `"experimentalDecorators": true` remains in your `tsconfig.json` to force TypeScript to use the old parsing logic. If you want to use the new standard decorators, you must rewrite them to accept the new `context` object format.
+
+## FEYNMAN CHECK
+
+### Explain Decorators Like I'm 10 Years Old
+> A decorator is a function that ANNOTATES a class, method, field, or accessor — wrapping or modifying it without changing the original code. `@Logger` above a method runs Logger(method) at class-definition time. There are TWO versions: (1) The LEGACY decorators (`experimentalDecorators: true` + `emitDecoratorMetadata`) used by Angular, NestJS, TypeORM. (2) The STAGE-3 decorators (TC39 standard, TS 5.0+) — different API, different semantics, future-proof. They cannot easily coexist. Decorators are powerful — they enable Dependency Injection, ORM mappings, validation rules, RPC stubs — but at the cost of "magic" and complex bug surfaces. The TS 5.0 stage-3 decorators fixed many issues but are not yet supported by Angular as of TS 5.x.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why do frameworks like Angular, NestJS, TypeORM love decorators?**
+> **A:** Decorators provide a declarative way to attach METADATA to classes/methods. Angular uses `@Component`, `@Injectable` to register classes with the DI container. TypeORM uses `@Entity`, `@Column` to map classes to database tables. NestJS uses `@Controller`, `@Get` to define HTTP routes. The runtime metadata (via `reflect-metadata`) lets the framework introspect what was decorated. Without decorators, all this metadata would need to be in separate config files or builder calls.
+
+**Q2: Mental model for decorator execution order?**
+> **A:** Decorators are FUNCTIONS that run at class DEFINITION time (once per class), not per instance. Order: field initializers → constructor → method decorators (in source order, bottom to top for stacked) → class decorator (last). With multiple stacked decorators `@A @B method() {}`, B runs first, then A wraps the result.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Mixing legacy and stage-3 decorators:
+> ```ts
+> // ❌ With experimentalDecorators: true, a stage-3 decorator silently fails
+> function legacy(target: any, key: string, descriptor: PropertyDescriptor) { /* legacy */ }
+> function stage3(value: Function, ctx: ClassMethodDecoratorContext) { /* stage 3 */ }
+>
+> class A {
+>   @legacy
+>   foo() {}
+> }
+> // If both decorators present, behaviour depends on the experimentalDecorators flag
+>
+> // ✅ Pick ONE — stage-3 for new projects, legacy ONLY when stuck with frameworks needing it
+> ```
+
+**Q4: How do stage-3 decorators differ from legacy?**
+> **A:** Stage-3 decorators have a NEW SIGNATURE: `(value, context) => newValue`. The `context` carries metadata (`kind`, `name`, `addInitializer`). They support field decorators that return an initial-value function. They have NO emitDecoratorMetadata equivalent — frameworks must use `context.metadata` instead. They run later in class definition (after fields), with stricter ordering rules. Migration is non-trivial because the API surface is completely different.
+
+**Q5: FAANG-grade definition?**
+> **A:** "TypeScript decorators are functions applied to classes, methods, fields, and accessors at class-definition time — existing in two incompatible flavours: the legacy (`experimentalDecorators`) form used by Angular/Nest/TypeORM with reflect-metadata for runtime introspection, and the stage-3 standardised form (TS 5.0+) with a context-object API and built-in metadata support but limited framework adoption."
+
+## BUILD
+
+### 🏗️ Mini Project: Build a Mini DI Container Using Stage-3 Decorators
+
+**What you will build:** A tiny dependency-injection system using stage-3 decorators — `@Injectable` marks a class as a service, `@Inject` resolves dependencies in the constructor — mimicking how Angular and NestJS work.
+**Why this project:** Forces stage-3 decorator API (`context.metadata`, factory pattern, initializers) — the modern way.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-decorators && cd ts-decorators
+npm init -y
+npm install -D typescript vitest
+# Stage-3 decorators need target ES2022+, NO experimentalDecorators
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/di.ts, src/services.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Mini DI Container
+```ts
+// src/di.ts
+const REGISTRY = new Map<string, new (...args: any[]) => any>();
+
+export function Injectable(name: string) {
+  return function <T extends new (...args: any[]) => any>(
+    constructor: T,
+    _ctx: ClassDecoratorContext,
+  ): T {
+    REGISTRY.set(name, constructor);
+    return constructor;
+  };
+}
+
+export function resolve<T>(name: string): T {
+  const ctor = REGISTRY.get(name);
+  if (!ctor) throw new Error(`Service '${name}' not registered`);
+  return new ctor();
+}
+
+// Method decorator: logs every call
+export function LogCall<This, Args extends unknown[], Out>(
+  originalMethod: (this: This, ...args: Args) => Out,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Out>,
+) {
+  const methodName = String(context.name);
+  return function (this: This, ...args: Args): Out {
+    console.log(`→ ${methodName}(${JSON.stringify(args)})`);
+    const result = originalMethod.call(this, ...args);
+    console.log(`← ${methodName} returned`, result);
+    return result;
+  };
+}
+```
+
+#### Step 3 — Services Using The Decorators
+```ts
+// src/services.ts
+import { Injectable, LogCall } from './di.js';
+
+@Injectable('logger')
+export class Logger {
+  @LogCall
+  info(msg: string): string {
+    console.log('[INFO]', msg);
+    return msg;
+  }
+}
+
+@Injectable('userService')
+export class UserService {
+  @LogCall
+  findById(id: number) {
+    return { id, name: `User ${id}` };
+  }
+}
+```
+
+#### Step 4 — Error Handling: Resolve + Compose
+```ts
+// src/main.ts
+import './services.js';   // triggers decorator registration
+import { resolve } from './di.js';
+import type { Logger } from './services.js';
+import type { UserService } from './services.js';
+
+const logger = resolve<Logger>('logger');
+const userService = resolve<UserService>('userService');
+
+logger.info('App started');
+const user = userService.findById(42);
+console.log('Got:', user);
+
+// Error path
+try { resolve<unknown>('unregistered'); }
+catch (e) { console.error('Expected:', (e as Error).message); }
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect, vi } from 'vitest';
+import { Injectable, LogCall, resolve } from './di.js';
+
+describe('mini DI', () => {
+  it('@Injectable registers and resolves', () => {
+    @Injectable('test') class T { hello() { return 'hi'; } }
+    expect(resolve<T>('test').hello()).toBe('hi');
+  });
+
+  it('@LogCall wraps method calls', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    @Injectable('greeter') class G {
+      @LogCall greet(n: string) { return `Hi ${n}`; }
+    }
+    expect(resolve<G>('greeter').greet('Ana')).toBe('Hi Ana');
+    expect(log).toHaveBeenCalledTimes(2);   // → and ← logs
+    log.mockRestore();
+  });
+
+  it('resolving unknown service throws', () => {
+    expect(() => resolve('nope')).toThrow();
+  });
+});
+```
+
+**Expected Output:**
+```
+→ info(["App started"])
+[INFO] App started
+← info returned App started
+→ findById([42])
+← findById returned { id: 42, name: 'User 42' }
+Got: { id: 42, name: 'User 42' }
+Expected: Service 'unregistered' not registered
+```
+
+**Stretch Challenges:**
+- [ ] Add @Inject so dependencies are auto-wired into constructors
+- [ ] Add a @Cache decorator with TTL
+- [ ] Compare with legacy decorators by enabling `experimentalDecorators` in a copy
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Two flavours of TS decorators — name them and the tsconfig flags involved.
+**Q2:** When does a decorator function actually run?
+**Q3:** Write a simple `@Log` method decorator that logs entry. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is mixing legacy and stage-3 decorators broken?
+**Q5:** A junior decorator returns nothing — why does the method break sometimes?
+**Q6:** Refactor this legacy decorator to stage-3:
+```ts
+function Log(target: any, key: string, desc: PropertyDescriptor) {
+  const orig = desc.value;
+  desc.value = function(...args:any[]) { console.log(key); return orig.apply(this, args); };
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a @Validate(schema) decorator that throws if arguments don't match.
+**Q8:** A PR uses decorators in a library — explain why this is hostile to consumers.
+**Q9:** What is the runtime cost of decorators per-class-instantiation?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how Angular's @Component decorator wires a class into the DI system."
+**Q11:** Draw: decorator execution order for a class with field, method, and class decorators.
+**Q12:** ★ System design: "Choose between decorators, HOFs, and config files for a typed validation framework. Justify."

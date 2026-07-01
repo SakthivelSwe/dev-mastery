@@ -184,3 +184,326 @@ A: Multiple scaling strategies, in order of implementation complexity:
 6. **Separate the API:** Extract API routes that hit the database into a separate microservice. Scale the API independently from the frontend.
 
 The fastest ROI is usually CDN + static generation, which can reduce origin server load by 80-90% for content-heavy sites.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Deployment Like I'm 10 Years Old
+> Next.js produces three deployment targets: (1) STANDALONE Node.js server — runs the full Next.js runtime (SSR, ISR, API routes, middleware) on any Node.js host: Vercel, Render, AWS, your own server. (2) STATIC EXPORT (output: 'export') — pure HTML/CSS/JS files, deployable to any static host (S3 + CloudFront, GitHub Pages, Netlify) but LOSES SSR, ISR, API routes, image optimisation, middleware. (3) CONTAINER (Docker) — wraps standalone output in a Docker image for Kubernetes/ECS deployment. Vercel is Next.js's "native" platform — they built Next.js, so all features work out-of-the-box with zero configuration. Other platforms require care: Cloudflare needs Edge Runtime, AWS Lambda needs OpenNext, self-hosted needs a process manager (PM2) and reverse proxy (Nginx). The non-obvious depth: ENVIRONMENT VARIABLES that start with NEXT_PUBLIC_ are inlined into the CLIENT BUNDLE at build time — exposed to anyone viewing source. NEVER put API keys, secrets, or database URLs in NEXT_PUBLIC_ variables. Server-only variables (no prefix) are only available in Server Components, API routes, and middleware.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What's the difference between Vercel, self-hosted Node, and serverless deployment?**
+> **A:** VERCEL: serverless functions per route, edge network, automatic preview deployments per PR, CDN-cached static assets, zero config. Drawback: vendor lock-in, can be expensive at scale. SELF-HOSTED NODE: full control, one long-running process, lower per-request cost, you manage scaling/SSL/CDN. Drawback: more ops work, no auto-scaling without K8s/ECS. SERVERLESS (AWS Lambda via OpenNext): pay-per-request, automatic scaling, but cold starts hurt latency (~500ms) — mitigated with provisioned concurrency. Rule: use Vercel for prototypes and SaaS, self-hosted for cost-sensitive at scale, serverless for highly variable traffic.
+
+**Q2: Mental model for environment variables in Next.js?**
+> **A:** Three scopes: (1) PROCESS env (server only): DATABASE_URL, JWT_SECRET — available in Server Components, API routes, middleware. NEVER sent to client. (2) NEXT_PUBLIC_ prefix: inlined into client bundle at BUILD TIME. Example: NEXT_PUBLIC_GA_ID — visible in DevTools. Use for non-sensitive config (analytics IDs, public API URLs). (3) Runtime env (process.env at runtime in serverless): on Vercel, server env vars are available at request time. On Docker, you must pass them via -e VAR=value. Critical: if you change a NEXT_PUBLIC_ variable, you must REBUILD — they're baked into the bundle, not read at runtime.
+
+**Q3: Most dangerous misconception about deployment?**
+> **A:** All Next.js features work on every platform:
+> ```typescript
+> // WRONG: deploying to Cloudflare Pages without checking compatibility
+> //
+> // Cloudflare Pages requires Edge Runtime
+> // -> next/image doesn't work (uses sharp, requires Node.js)
+> // -> ISR doesn't work (no persistent file cache)
+> // -> Server Actions only work in Edge Runtime mode
+> // -> Many npm packages incompatible (no fs, no native modules)
+> //
+> // CORRECT: check the deployment target's compatibility BEFORE building
+> // Vercel:          100% Next.js features work
+> // Netlify:         95% (with the Next.js plugin)
+> // Cloudflare:      Edge Runtime only, limited
+> // AWS Lambda:      Use OpenNext (translation layer)
+> // Self-hosted:     100% with output: 'standalone' + Node.js 20+
+> // Docker:          100% with standalone output, configure properly
+> ```
+
+**Q4: How do you build an optimised production Docker image?**
+> **A:** Use multi-stage build with output: 'standalone' in next.config.js (Next.js bundles only the deps the app actually uses, ~100MB image instead of ~1GB). Stage 1: install deps (npm ci). Stage 2: build the app (npm run build). Stage 3: copy only the standalone output, public assets, and the server.js entrypoint. Use a minimal base image (node:20-alpine, ~50MB). Set NODE_ENV=production. Run as a non-root user. Add HEALTHCHECK for orchestration. Result: production-ready image with optimal cold start and security.
+
+**Q5: FAANG-grade definition of Next.js deployment strategy.**
+> **A:** "Next.js deployment selects from three output modes: standalone Node.js server (next start, full feature support), static export (HTML/CSS/JS only, no SSR/API/ISR/image-opt), or containerised standalone via Docker — targeting platforms ranging from Vercel (native, zero-config, all features) to Cloudflare Pages (Edge Runtime only, limited APIs) to AWS Lambda via OpenNext (serverless adapter handling routing and image optimisation) to self-hosted with PM2 + Nginx — with environment variables scoped as server-only (process.env, never sent to client) or client-inlined (NEXT_PUBLIC_ prefix, build-time baked into the bundle, never use for secrets) — preview deployments per PR for review workflows — and observability via Vercel Analytics, Sentry, OpenTelemetry, or Prometheus depending on platform — chosen based on traffic patterns, cost constraints, feature requirements, and operational maturity."
+
+## BUILD
+
+### 🏗️ Mini Project: Production-Ready Deployment — Docker + Vercel Config + CI/CD
+
+**What you will build:** Configure a Next.js app for deployment to Docker AND Vercel simultaneously: standalone output, multi-stage Dockerfile, vercel.json with security headers, environment variable management, GitHub Actions CI/CD.
+**Why this project:** Forces every production deployment concern.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest deploy-demo --typescript --tailwind --app
+```
+
+#### Step 2 — next.config.js for Production
+```javascript
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Bundle only what the app uses — for Docker/self-host
+  output: 'standalone',
+
+  // Compress responses
+  compress: true,
+
+  // Disable x-powered-by header (security)
+  poweredByHeader: false,
+
+  // Image domains
+  images: {
+    remotePatterns: [
+      { protocol: 'https', hostname: 'cdn.example.com' },
+    ],
+  },
+
+  // Strict production checks
+  reactStrictMode: true,
+
+  // Security headers
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+          {
+            key: 'Strict-Transport-Security',
+            value: 'max-age=63072000; includeSubDomains; preload',
+          },
+          {
+            key: 'Content-Security-Policy',
+            value: `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https://api.example.com`,
+          },
+        ],
+      },
+    ];
+  },
+
+  // Redirects
+  async redirects() {
+    return [
+      { source: '/old-blog/:slug', destination: '/blog/:slug', permanent: true },
+    ];
+  },
+
+  // Experimental features for production
+  experimental: {
+    optimizePackageImports: ['lodash', 'date-fns'],  // tree-shake more aggressively
+  },
+};
+
+module.exports = nextConfig;
+```
+
+#### Step 3 — Optimised Multi-Stage Dockerfile
+```dockerfile
+# Dockerfile
+# ───────── Stage 1: install dependencies ─────────
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --frozen-lockfile
+
+# ───────── Stage 2: build the application ─────────
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ───────── Stage 3: production runtime ─────────
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Non-root user for security
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+# Copy only the standalone output (much smaller than full node_modules)
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+# Health check for orchestrators
+HEALTHCHECK --interval=30s --timeout=3s   CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+
+CMD ["node", "server.js"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - NEXT_PUBLIC_GA_ID=${NEXT_PUBLIC_GA_ID}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+```
+
+#### Step 4 — Vercel Configuration
+```json
+// vercel.json
+{
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "framework": "nextjs",
+  "regions": ["iad1", "sfo1"],
+  "functions": {
+    "src/app/api/long-task/route.ts": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/cleanup",
+      "schedule": "0 2 * * *"
+    }
+  ],
+  "redirects": [
+    { "source": "/old", "destination": "/new", "permanent": true }
+  ]
+}
+```
+
+#### Step 5 — GitHub Actions CI/CD + Health Endpoint
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run type-check
+      - run: npm test
+      - run: npm run build
+      - name: Upload bundle analysis
+        if: github.event_name == 'pull_request'
+        run: ANALYZE=true npm run build
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Vercel
+        run: |
+          npm i -g vercel
+          vercel --token ${{ secrets.VERCEL_TOKEN }} --prod --yes
+
+  docker:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# src/app/api/health/route.ts -- for Docker healthcheck
+import { NextResponse } from 'next/server';
+
+export async function GET() {
+  // Could also check DB connectivity, cache, etc.
+  return NextResponse.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+}
+
+# .env.example
+# Server-only secrets (never exposed to client)
+DATABASE_URL=postgresql://user:pass@localhost:5432/db
+JWT_SECRET=change-me-in-production
+
+# Public variables (inlined into client bundle at build time)
+NEXT_PUBLIC_GA_ID=G-XXXXX
+NEXT_PUBLIC_API_URL=https://api.example.com
+```
+
+**Expected Output:**
+```
+docker build -t myapp .  -> ~150MB image
+docker run -p 3000:3000 myapp  -> running production server
+GET /api/health  -> {"status":"ok","uptime":12.5,...}
+Vercel: vercel --prod  -> deployed to global edge network
+GitHub Actions: tests run on every PR, deploy on merge to main
+Security headers: visible in browser DevTools → Network → Response Headers
+```
+
+**Stretch Challenges:**
+- [ ] Add blue/green deployment with health-check-based traffic switch
+- [ ] Add OpenTelemetry instrumentation for distributed tracing
+- [ ] Add a /api/metrics endpoint for Prometheus scraping
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three Next.js output modes and their trade-offs?
+**Q2:** Difference between NEXT_PUBLIC_ and server-only env vars?
+**Q3:** Write a minimal Dockerfile for standalone Next.js. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What happens if you change NEXT_PUBLIC_API_URL without rebuilding?
+**Q5:** A PR puts JWT_SECRET in NEXT_PUBLIC_JWT_SECRET — explain the security disaster.
+**Q6:** Why is output: 'standalone' essential for Docker deployments?
+
+### Day 7 — Application
+**Q7:** Configure CSP headers that allow analytics but block inline scripts.
+**Q8:** A PR's Docker image is 1.2GB — diagnose and reduce to 150MB.
+**Q9:** When should you use Vercel vs self-hosted vs serverless?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through deploying a production Next.js app — platform choice, env vars, security, CI/CD."
+**Q11:** Draw: deployment pipeline — code → CI → tests → build → Docker → registry → orchestrator → traffic.
+**Q12:** ★ System design: "Design deployment for a Next.js SaaS — multi-region, blue/green, secrets management, observability, cost optimisation."

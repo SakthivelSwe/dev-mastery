@@ -129,3 +129,235 @@ A: Three possible caching layers could be showing stale data:
 3. **Full Route Cache:** If the profile page is statically generated, it's cached as HTML. Fix: Either make the page dynamic (`export const dynamic = 'force-dynamic'`) or use ISR with short revalidation periods.
 
 The correct fix for user-specific data like profiles is to use `cache: 'no-store'` or mark the route as `dynamic = 'force-dynamic'` so it always reads fresh from the database. Personal, user-specific data should never be cached at the route level — only shared, public data benefits from route-level caching.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Caching Like I'm 10 Years Old
+> Next.js has FOUR independent caching layers that work together: (1) REQUEST MEMOIZATION — within a single render, identical fetches are deduplicated. (2) DATA CACHE — fetch results are persisted between requests (the "ISR cache"). (3) FULL ROUTE CACHE — entire rendered HTML pages are cached at the CDN/server. (4) ROUTER CACHE — client-side cache of visited routes for fast back/forward navigation. Each layer can be controlled independently. The non-obvious depth: these caches DO NOT automatically invalidate when your data changes — you must explicitly call revalidatePath() or revalidateTag() in mutations (Server Actions, webhooks) to bust the relevant cache layers. Forgetting to revalidate is the #1 cause of "why is my page showing stale data?" bugs.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What does each of the four cache layers do?**
+> **A:** (1) REQUEST MEMOIZATION: in-memory cache for a single rendered page — identical fetch() calls in different components share one result. Lives for one request. (2) DATA CACHE: persistent (across requests) cache of fetch() results based on the cache option. Stored on disk in production. Invalidated by revalidate timeout, revalidatePath, or revalidateTag. (3) FULL ROUTE CACHE: the entire rendered HTML and RSC payload for a route, stored on disk. Built at build time for SSG, regenerated on ISR. Invalidated by revalidatePath. (4) ROUTER CACHE: in browser memory, stores visited route segments for instant back/forward navigation. Invalidated by router.refresh() or Server Actions.
+
+**Q2: Mental model for cache invalidation?**
+> **A:** revalidatePath('/products') invalidates the Full Route Cache for /products — the page rebuilds on next request. revalidateTag('products') invalidates ALL Data Cache entries tagged 'products' (works across pages — invalidating one tag busts many pages). router.refresh() invalidates the Router Cache (client side). The combination pattern: a Server Action mutation calls both revalidateTag('products') (for the data) AND revalidatePath('/products') (for the page) to ensure full freshness across all cache layers.
+
+**Q3: Most dangerous misconception about Next.js caching?**
+> **A:** Cache settings on individual fetches are isolated:
+> ```typescript
+> // WRONG: thinking fetches with different cache options work independently
+> async function Page() {
+>   const products = await fetch('/api/products', { cache: 'force-cache' });
+>   const user = await fetch('/api/user', { cache: 'no-store' });  // forces DYNAMIC rendering!
+>   // Adding ONE no-store fetch makes the ENTIRE page dynamic
+>   // products fetch is still cached, but the page is no longer SSG
+>   return <div>{...}</div>;
+> }
+>
+> // CORRECT: if you want SSG with dynamic user data, put user data in a Client Component
+> // OR use unstable_noStore() to opt specific subtrees out of caching
+> // OR accept dynamic rendering and add suspense boundaries
+> ```
+
+**Q4: When should you use revalidateTag vs revalidatePath?**
+> **A:** Use revalidatePath('/products') when: you know which specific page needs to update, the mutation affects one page predictably. Use revalidateTag('products') when: many pages use the same data (a tag invalidates ALL fetches with that tag across all routes), the data is shared (one product update affects /products, /products/[id], /admin/products, /home), or you're using a CMS where editorial changes affect unpredictable pages. revalidateTag is more powerful but requires tagging fetches upfront with next: { tags: ['products'] }.
+
+**Q5: FAANG-grade definition of Next.js caching.**
+> **A:** "Next.js implements four cooperating cache layers — Request Memoization (per-render fetch deduplication via React cache), Data Cache (persistent fetch result cache controlled by cache and revalidate options), Full Route Cache (rendered HTML + RSC payload cached on disk per route), and Router Cache (client-side visited route segments) — with explicit invalidation via revalidatePath (route-level) and revalidateTag (cross-route tag-based) from Server Actions and Route Handlers — automatic invalidation on time-based revalidate intervals — and granular opt-out via unstable_noStore() or fetch cache: 'no-store' — enabling sub-50ms TTFB for cached routes while supporting on-demand freshness for mutations."
+
+## BUILD
+
+### 🏗️ Mini Project: Caching Layer Demo — Tag-Based Invalidation Across Multiple Pages
+
+**What you will build:** A products app with: products list page (SSG with tag), product detail page (ISR with same tag), admin edit form (Server Action that invalidates the tag) — demonstrating how revalidateTag invalidates ALL pages using that data.
+**Why this project:** Forces all four cache layers and tag-based cross-route invalidation.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest cache-demo --typescript --tailwind --app
+```
+
+#### Step 2 — Data Layer With Tagged Fetches
+```typescript
+// src/lib/products-api.ts
+import { unstable_cache } from 'next/cache';
+
+interface Product { id: number; name: string; price: number; }
+
+const PRODUCTS_TAG = 'products';
+
+export async function getProducts(): Promise<Product[]> {
+  // Fetch with revalidation and tag
+  const res = await fetch('https://dummyjson.com/products', {
+    next: {
+      revalidate: 3600,         // re-fetch from origin after 1 hour
+      tags: [PRODUCTS_TAG],     // can be invalidated by revalidateTag('products')
+    },
+  });
+  const data = await res.json();
+  return data.products.map((p: any) => ({ id: p.id, name: p.title, price: p.price }));
+}
+
+export async function getProduct(id: number): Promise<Product | null> {
+  const res = await fetch(`https://dummyjson.com/products/${id}`, {
+    next: {
+      revalidate: 3600,
+      tags: [PRODUCTS_TAG, `product-${id}`],  // multiple tags — invalidate by either
+    },
+  });
+  if (!res.ok) return null;
+  const p = await res.json();
+  return { id: p.id, name: p.title, price: p.price };
+}
+
+// unstable_cache for non-fetch data (DB, ORM)
+export const getProductCount = unstable_cache(
+  async () => {
+    return (await getProducts()).length;
+  },
+  ['product-count'],         // cache key
+  { tags: [PRODUCTS_TAG], revalidate: 3600 },
+);
+```
+
+#### Step 3 — Pages Using Tagged Data
+```typescript
+// src/app/products/page.tsx -- list page
+import Link from 'next/link';
+import { getProducts, getProductCount } from '@/lib/products-api';
+
+export default async function ProductsPage() {
+  const [products, count] = await Promise.all([getProducts(), getProductCount()]);
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-bold">Products ({count})</h1>
+      <p className="text-xs text-gray-400">Generated: {new Date().toISOString()}</p>
+      <ul className="mt-4 space-y-2">
+        {products.slice(0, 5).map(p => (
+          <li key={p.id}>
+            <Link href={`/products/${p.id}`} className="text-blue-600 hover:underline">
+              {p.name} — ${p.price}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+// src/app/products/[id]/page.tsx -- detail page (same tag)
+import { getProduct } from '@/lib/products-api';
+export default async function ProductPage({ params }: { params: { id: string } }) {
+  const product = await getProduct(Number(params.id));
+  if (!product) return <div>Not found</div>;
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-bold">{product.name}</h1>
+      <p>Price: ${product.price}</p>
+      <p className="text-xs text-gray-400">Generated: {new Date().toISOString()}</p>
+    </main>
+  );
+}
+```
+
+#### Step 4 — Mutation Action Invalidates Tag (Bust All Pages)
+```typescript
+// src/app/admin/actions.ts
+'use server';
+import { revalidateTag, revalidatePath } from 'next/cache';
+
+export async function updateProductAction(id: number, name: string, price: number) {
+  // Simulate updating an external CMS
+  console.log(`Updating product ${id} to ${name}, ${price}`);
+
+  // Invalidate ALL pages and queries tagged 'products'
+  revalidateTag('products');
+  // Or specifically: revalidateTag(`product-${id}`); for only the detail page
+
+  return { success: true };
+}
+
+export async function invalidateAllProductCaches() {
+  revalidateTag('products');
+  revalidatePath('/products');
+}
+```
+
+#### Step 5 — Admin Form + Tests
+```typescript
+// src/app/admin/page.tsx
+import { updateProductAction } from './actions';
+import { Suspense } from 'react';
+
+export default function AdminPage() {
+  async function handleUpdate(formData: FormData) {
+    'use server';
+    const id = Number(formData.get('id'));
+    const name = formData.get('name') as string;
+    const price = Number(formData.get('price'));
+    await updateProductAction(id, name, price);
+    // After this returns, BOTH /products AND /products/[id] pages will regenerate
+    // on their next visit — single tag invalidates all dependent caches
+  }
+
+  return (
+    <form action={handleUpdate} className="p-8 space-y-3 max-w-md">
+      <h1 className="text-2xl font-bold">Update Product</h1>
+      <input name="id" type="number" placeholder="Product ID" required className="border p-2 w-full" />
+      <input name="name" placeholder="New name" required className="border p-2 w-full" />
+      <input name="price" type="number" step="0.01" required className="border p-2 w-full" />
+      <button className="px-4 py-2 bg-blue-500 text-white rounded">Update (invalidates all)</button>
+    </form>
+  );
+}
+
+// Cache invalidation test
+import { updateProductAction } from '@/app/admin/actions';
+it('returns success', async () => {
+  const result = await updateProductAction(1, 'New Name', 99.99);
+  expect(result.success).toBe(true);
+});
+```
+
+**Expected Output:**
+```
+/products -> generated, served from cache for 1 hour
+/products/1 -> generated, served from cache for 1 hour
+POST /admin -> updateProductAction -> revalidateTag('products')
+Next visit /products -> regenerates (new timestamp)
+Next visit /products/1 -> regenerates (new timestamp)
+ALL pages using that tag busted with ONE call
+```
+
+**Stretch Challenges:**
+- [ ] Add a /api/revalidate webhook for external CMS to invalidate tags
+- [ ] Add cache headers and inspect them in Network tab
+- [ ] Measure performance: fetch with vs without caching using Lighthouse
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Four Next.js cache layers and their purpose?
+**Q2:** Difference between revalidatePath and revalidateTag?
+**Q3:** Write fetch() with cache tag. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How does one no-store fetch affect the entire page's caching?
+**Q5:** A junior calls fetch() in a loop in a Server Component — does it dedupe?
+**Q6:** What is unstable_cache and when do you use it instead of fetch caching?
+
+### Day 7 — Application
+**Q7:** Implement tag-based cache invalidation when a CMS publishes content.
+**Q8:** A PR forgets revalidateTag after updating a DB record — describe the symptom.
+**Q9:** How does the Router Cache affect client-side navigation?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain all four Next.js cache layers and how they cooperate."
+**Q11:** Draw: cache layer diagram — Request → Data → Full Route → Router cache flow.
+**Q12:** ★ System design: "Design caching for a multi-tenant SaaS dashboard — per-tenant invalidation, shared data, mutation hooks."

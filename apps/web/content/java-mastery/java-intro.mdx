@@ -1,215 +1,428 @@
 ---
-title: "JDK vs JRE vs JVM"
 slug: "java-intro"
+title: "JDK vs JRE vs JVM"
 level: 1
 ---
 
 ## WHY
 
-Before the Java Virtual Machine (JVM) was invented, programs were compiled directly into machine code specific to the operating system and hardware architecture they were running on (like C or C++). This meant if you wrote a program for Windows on an x86 processor, you had to completely recompile it—and often rewrite platform-specific code—if you wanted it to run on a Linux ARM machine. This was a nightmare for distribution and cross-platform compatibility.
+Before Java, software distribution was painful. If you compiled for Windows x64, you got a Windows x64 executable. To run on Linux ARM, you recompiled and often changed code. The same source did not guarantee the same runtime behavior.
 
-The fundamental tension was: **performance vs. portability**. Native compiled code was fast but locked to a specific platform. Interpreted languages were portable but terribly slow.
+Java changed this with **WORA: Write Once, Run Anywhere**:
 
-Java introduced the **"Write Once, Run Anywhere" (WORA)** philosophy to solve this exact pain. Instead of compiling to machine code, the Java compiler (`javac`) compiles your human-readable Java code into an intermediate format called **bytecode** (`.class` files). This bytecode is completely platform-agnostic. 
+1. Source code (`.java`) compiles to platform-independent bytecode (`.class`)
+2. JVM implementation for each OS/CPU executes that bytecode
+3. Same bytecode runs on Windows/Linux/macOS/ARM/x86 without recompilation
 
-To run this bytecode, you need a virtual machine—the JVM—installed on the target operating system. The JVM acts as a translator, reading the universal bytecode and translating it into the specific machine code for the host OS on the fly. Without understanding this trifecta (JDK, JRE, JVM), you'll struggle to debug `ClassNotFoundException`s, misunderstand how memory is managed, and fail to grasp why Java was revolutionary.
+Understanding JDK/JRE/JVM is foundational because it explains:
+
+- why Java is both portable and fast
+- why class loading errors happen
+- how memory is managed (heap, stack, metaspace)
+- why startup and warmup behavior differ from native binaries
+- how production tuning flags (`-Xmx`, `-XX:+UseG1GC`) actually work
+
+If you skip these basics, you'll write Java apps but fail to debug them in production.
 
 ## THEORY
 
-To understand how Java works under the hood, you must understand its three core components:
+### JDK vs JRE vs JVM
 
-1.  **JVM (Java Virtual Machine):** The engine that actually runs the code. It is an abstract computing machine that provides a runtime environment. It is *platform-dependent* (there is a different JVM for Windows, Mac, and Linux), but it allows Java bytecode to be *platform-independent*.
-2.  **JRE (Java Runtime Environment):** The JVM + core class libraries (`java.lang`, `java.util`, etc.). If you only want to *run* a Java application, you only need the JRE.
-3.  **JDK (Java Development Kit):** The JRE + development tools (compiler `javac`, packager `jar`, debugger `jdb`, etc.). If you want to *write* and compile Java code, you need the JDK.
+| Component | Includes | Used For |
+|-----------|----------|----------|
+| **JVM** | Execution engine only | Running bytecode |
+| **JRE** | JVM + core libraries (`java.base`, `java.util`, etc.) | Running Java applications |
+| **JDK** | JRE + dev tools (`javac`, `jar`, `jdb`, `jlink`, `jpackage`) | Building, debugging, packaging |
 
-### The Internal Mechanics: From Code to Execution
+Modern distributions usually ship JDK only; JRE is conceptually still valid.
 
-When you write a Java program and hit run, a complex pipeline executes:
+### End-to-End Pipeline: Source to Native Execution
 
-**1. Compilation (The JDK Phase)**
-You write a `HelloWorld.java` file. The `javac` compiler parses this file, checks for syntax errors, and generates a `HelloWorld.class` file containing bytecode. Bytecode is a highly optimized set of instructions designed to be executed by the JVM, not a physical CPU.
+```
+Hello.java
+   │ javac
+   ▼
+Hello.class (bytecode + constant pool + metadata)
+   │ java Hello
+   ▼
+JVM starts
+  ├─ ClassLoader loads class bytes
+  ├─ Bytecode verifier validates safety
+  ├─ Linking + initialization
+  ├─ Interpreter executes bytecode initially
+  └─ JIT compiles hot methods to native machine code
 
-**2. Class Loading (The JVM Phase)**
-When you execute `java HelloWorld`, the JVM starts up. Its **ClassLoader** subsystem takes over:
-*   **Loading:** It finds the `HelloWorld.class` file on your disk (using the CLASSPATH) and loads its binary data into the JVM's memory area called the **Metaspace**.
-*   **Linking:** It verifies the bytecode (Bytecode Verifier ensures no malicious memory access), prepares static variables, and resolves symbolic references.
-*   **Initialization:** It executes static initializers.
+Result: long-running Java apps approach native performance
+```
 
-**3. Execution Engine (The Core of the JVM)**
-The JVM now needs to run the bytecode. It uses a hybrid approach:
-*   **Interpreter:** Initially, it reads bytecode instructions one by one and translates them into machine code. This is slow.
-*   **JIT (Just-In-Time) Compiler:** As the program runs, the JVM profiles the code. If it detects a block of code (like a loop) is executed frequently (a "hot spot"), the JIT compiler compiles that entire block into highly optimized native machine code. The next time the JVM hits that code, it runs the native machine code directly, skipping the interpreter. This is why Java is incredibly fast for long-running server applications.
+### What is in a `.class` file?
+
+A class file is binary, not source-like text. Key sections:
+
+| Section | Purpose |
+|---------|---------|
+| Magic number (`0xCAFEBABE`) | Identifies valid Java class file |
+| Version | Bytecode target version (e.g., 61 = Java 17) |
+| Constant Pool | String literals, method refs, type refs |
+| Access flags | `public`, `final`, `interface`, etc. |
+| Fields/Methods | Signatures and bytecode instructions |
+| Attributes | Line numbers, annotations, debug info |
+
+### Class Loading Phases
+
+When JVM loads class `com.app.UserService`:
+
+1. **Loading**: find bytes, create `Class<?>` object in metaspace
+2. **Linking**:
+   - verification: bytecode safety
+   - preparation: allocate static fields, default values
+   - resolution: symbolic refs to direct refs
+3. **Initialization**: execute static initializers (`<clinit>`) and explicit static assignments
+
+### Interpreter + JIT = Hybrid Runtime
+
+Java is not "just interpreted". HotSpot runtime strategy:
+
+- Start with interpreter for quick startup
+- Profile method call counts and branch frequencies
+- Methods that become "hot" are JIT compiled
+- Hot code is aggressively optimized: inlining, escape analysis, loop unrolling, vectorization
+
+This gives Java a startup/warmup tradeoff:
+
+- Short-lived scripts: slower than precompiled native
+- Long-running services: very competitive performance
+
+### JVM Memory Areas (High-Level)
+
+| Area | Stores |
+|------|--------|
+| Heap | Objects and arrays |
+| Java Stack (per thread) | Method frames, local vars, operand stack |
+| Metaspace | Class metadata |
+| Program Counter (per thread) | Current bytecode instruction address |
+| Native Stack | JNI/native call frames |
 
 ### Common Misconceptions
-*   *Myth:* Java is slow because it's interpreted.
-    *Reality:* Java is a compiled *and* interpreted language. Modern JVMs with advanced JIT compilers (like C2 in HotSpot) produce native code that often rivals or beats C++ in long-running applications due to runtime profiling and dynamic optimizations (like method inlining based on actual runtime types).
+
+| Myth | Reality |
+|------|---------|
+| Java is slow because interpreted | JVM uses JIT-compiled native code for hot paths |
+| Java has no memory leaks because GC | Leaks happen if references are retained forever |
+| `String.class.getClassLoader()` null means error | Null means Bootstrap classloader loaded it |
+| `==` compares string values | `==` compares references; use `.equals()` |
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeStepsVisualizer", "steps": ["write-code", "compile", "classloader", "execution"] }
+{ "type": "none" }
 ```
 
 ## CODE
 
-### Level 1 — Beginner
+### Level 1 - Beginner
+
 ```java
-// This is the simplest possible Java program
-public class HelloWorld {
-    // The main method is the entry point for the JVM
+// File: HelloJvm.java
+public class HelloJvm {
+    // JVM entry point: public static void main(String[])
     public static void main(String[] args) {
-        // This instructs the JVM to print text to the standard output console
         System.out.println("Hello, JVM!");
     }
 }
-// Expected Output: Hello, JVM!
 ```
 
-### Level 2 — Building Blocks
-```java
-public class JvmMemoryDemo {
-    public static void main(String[] args) {
-        // Primitives are stored on the JVM Thread Stack
-        int localVariable = 42; 
-        
-        // Objects are allocated on the JVM Heap. 
-        // 'message' is just a reference on the stack pointing to the Heap object.
-        String message = new String("Allocated on Heap"); 
-        
-        System.out.println("Value: " + localVariable + ", String: " + message);
-    }
-}
-// Expected Output: Value: 42, String: Allocated on Heap
+```powershell
+# Compile
+javac HelloJvm.java
+
+# Run
+java HelloJvm
 ```
 
-### Level 3 — Intermediate
+### Level 2 - Building Blocks
+
+Inspect bytecode and runtime properties.
+
 ```java
 import java.util.Properties;
 
-public class JvmEnvironmentInfo {
+public class RuntimeInfo {
     public static void main(String[] args) {
-        // The JVM provides system properties about its own environment
-        Properties props = System.getProperties();
-        
-        System.out.println("Java Version: " + props.getProperty("java.version"));
-        System.out.println("JVM Name: " + props.getProperty("java.vm.name"));
-        System.out.println("OS Architecture: " + props.getProperty("os.arch"));
-        
-        // Getting memory stats from the JVM Runtime
-        Runtime runtime = Runtime.getRuntime();
-        long maxMemoryMB = runtime.maxMemory() / (1024 * 1024);
-        System.out.println("Max Heap Memory: " + maxMemoryMB + " MB");
+        Properties p = System.getProperties();
+
+        System.out.println("java.version      = " + p.getProperty("java.version"));
+        System.out.println("java.vendor       = " + p.getProperty("java.vendor"));
+        System.out.println("java.vm.name      = " + p.getProperty("java.vm.name"));
+        System.out.println("java.vm.version   = " + p.getProperty("java.vm.version"));
+        System.out.println("os.name           = " + p.getProperty("os.name"));
+        System.out.println("os.arch           = " + p.getProperty("os.arch"));
+
+        Runtime rt = Runtime.getRuntime();
+        long mb = 1024L * 1024L;
+        System.out.println("availableProcessors = " + rt.availableProcessors());
+        System.out.println("maxMemory(MB)       = " + (rt.maxMemory() / mb));
+        System.out.println("totalMemory(MB)     = " + (rt.totalMemory() / mb));
+        System.out.println("freeMemory(MB)      = " + (rt.freeMemory() / mb));
     }
 }
-// Output will vary based on your local machine and JVM version
 ```
 
-### Level 4 — Advanced
+```powershell
+javac RuntimeInfo.java
+java RuntimeInfo
+
+# Inspect bytecode
+javap -c RuntimeInfo
+```
+
+### Level 3 - Intermediate
+
+Use MXBeans for JVM internals.
+
 ```java
-import java.lang.management.ManagementFactory;
-import java.lang.management.RuntimeMXBean;
+import java.lang.management.*;
+import java.util.List;
 
-public class JvmInternalsDemo {
+public class JvmMxBeanDemo {
     public static void main(String[] args) {
-        // Accessing Management eXtension (JMX) beans to inspect the running JVM
-        RuntimeMXBean runtimeBean = ManagementFactory.getRuntimeMXBean();
-        
-        System.out.println("JVM Start Time: " + runtimeBean.getStartTime());
-        System.out.println("JVM Uptime (ms): " + runtimeBean.getUptime());
-        
-        // Printing all arguments passed to the JVM (e.g., -Xmx, -XX:+UseG1GC)
-        System.out.println("JVM Arguments:");
-        runtimeBean.getInputArguments().forEach(arg -> System.out.println("  " + arg));
+        RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
+        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
+        ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+
+        System.out.println("JVM Name          : " + runtime.getVmName());
+        System.out.println("JVM Vendor        : " + runtime.getVmVendor());
+        System.out.println("JVM Start Time    : " + runtime.getStartTime());
+        System.out.println("JVM Uptime (ms)   : " + runtime.getUptime());
+
+        System.out.println("Input JVM Args:");
+        for (String arg : runtime.getInputArguments()) {
+            System.out.println("  " + arg);
+        }
+
+        MemoryUsage heap = memory.getHeapMemoryUsage();
+        MemoryUsage nonHeap = memory.getNonHeapMemoryUsage();
+        System.out.println("Heap Used (MB)    : " + heap.getUsed() / (1024 * 1024));
+        System.out.println("Heap Max (MB)     : " + heap.getMax() / (1024 * 1024));
+        System.out.println("NonHeap Used (MB) : " + nonHeap.getUsed() / (1024 * 1024));
+
+        System.out.println("Live Threads      : " + threads.getThreadCount());
+        System.out.println("Peak Threads      : " + threads.getPeakThreadCount());
+
+        List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean gc : gcBeans) {
+            System.out.println("GC: " + gc.getName() +
+                " count=" + gc.getCollectionCount() +
+                " time(ms)=" + gc.getCollectionTime());
+        }
     }
 }
-// Used in production APM tools (Application Performance Monitoring)
 ```
 
-### Level 5 — Expert
+### Level 4 - Advanced
+
+Warmup and JIT effects demonstration.
+
 ```java
-public class ClassLoaderDemo {
+public class JitWarmupDemo {
+
+    // Candidate for JIT optimization
+    static long computeSum(int n) {
+        long sum = 0;
+        for (int i = 1; i <= n; i++) {
+            sum += i;
+        }
+        return sum;
+    }
+
+    static long timedRun(int loops, int n) {
+        long start = System.nanoTime();
+        long sink = 0;
+        for (int i = 0; i < loops; i++) {
+            sink ^= computeSum(n);
+        }
+        long elapsed = System.nanoTime() - start;
+        // Prevent dead-code elimination
+        if (sink == 42) {
+            System.out.println("Impossible");
+        }
+        return elapsed;
+    }
+
     public static void main(String[] args) {
-        // Inspecting the ClassLoader hierarchy
-        
-        // 1. Application ClassLoader (loads your classes from classpath)
-        ClassLoader appLoader = ClassLoaderDemo.class.getClassLoader();
-        System.out.println("App ClassLoader: " + appLoader.getName());
-        
-        // 2. Platform ClassLoader (Extension ClassLoader in Java 8)
-        ClassLoader platformLoader = appLoader.getParent();
-        System.out.println("Platform ClassLoader: " + platformLoader.getName());
-        
-        // 3. Bootstrap ClassLoader (loads core rt.jar/modules like java.lang.String)
-        // Implemented in native C++ code, so it returns null in Java!
-        ClassLoader bootstrapLoader = String.class.getClassLoader();
-        System.out.println("Bootstrap ClassLoader (String.class): " + bootstrapLoader);
+        int loops = 20_000;
+        int n = 10_000;
+
+        // Cold run: mostly interpreted
+        long cold = timedRun(loops, n);
+        System.out.println("Cold run ms  = " + cold / 1_000_000);
+
+        // Warmup runs: JVM profiles and JIT-compiles hot methods
+        for (int i = 0; i < 5; i++) {
+            timedRun(loops, n);
+        }
+
+        // Hot run: mostly JIT native execution
+        long hot = timedRun(loops, n);
+        System.out.println("Hot run ms   = " + hot / 1_000_000);
+        System.out.println("Speedup x    = " + String.format("%.2f", (double) cold / hot));
     }
 }
-// Expected Output:
-// App ClassLoader: app
-// Platform ClassLoader: platform
-// Bootstrap ClassLoader (String.class): null
 ```
+
+Optional JIT introspection flags:
+
+```powershell
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation JitWarmupDemo
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining JitWarmupDemo
+```
+
+### Level 5 - Expert
+
+Compile Java source in-memory at runtime with JavaCompiler API.
+
+```java
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
+import java.io.*;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.net.URLClassLoader;
+
+public class RuntimeCompilerDemo {
+    public static void main(String[] args) throws Exception {
+        String className = "DynamicHello";
+        String source = """
+            public class DynamicHello {
+                public static String message() {
+                    return \"Hello from dynamically compiled Java class!\";
+                }
+            }
+            """;
+
+        File dir = new File("dynamic-src");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("Failed to create directory: " + dir.getAbsolutePath());
+        }
+
+        File javaFile = new File(dir, className + ".java");
+        try (FileWriter fw = new FileWriter(javaFile)) {
+            fw.write(source);
+        }
+
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        if (compiler == null) {
+            throw new IllegalStateException("No compiler found. Run with a JDK, not a JRE runtime-only image.");
+        }
+
+        int result = compiler.run(null, null, null, javaFile.getPath());
+        if (result != 0) {
+            throw new RuntimeException("Compilation failed with code " + result);
+        }
+
+        try (URLClassLoader loader = new URLClassLoader(new URL[]{dir.toURI().toURL()})) {
+            Class<?> clazz = loader.loadClass(className);
+            Method m = clazz.getMethod("message");
+            String value = (String) m.invoke(null);
+            System.out.println(value);
+        }
+    }
+}
+```
+
+This demonstrates that Java is not only "compile then run". In advanced systems, you can generate/compile/load code dynamically.
 
 ## REAL_WORLD
 
-You might think you never directly interact with the JVM, but you do it constantly. Every time you run a Spring Boot application, you are configuring the JVM.
-
-When deploying a real-world Spring Boot application (e.g., to a Docker container or Kubernetes pod), one of the most critical decisions is tuning the JVM flags. A junior developer might just run `java -jar app.jar`. A senior developer configures the JVM to match the container's constraints.
-
-For example, in a production `Dockerfile` for a Spring Boot 3 app, you will see something like this:
+### Docker and Kubernetes JVM Basics
 
 ```dockerfile
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-XX:+UseG1GC", "-jar", "app.jar"]
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY app.jar .
+
+# Reasonable container-aware defaults
+ENTRYPOINT [
+  "java",
+  "-XX:MaxRAMPercentage=75.0",
+  "-XX:+UseG1GC",
+  "-XX:+HeapDumpOnOutOfMemoryError",
+  "-XX:HeapDumpPath=/tmp",
+  "-jar",
+  "app.jar"
+]
 ```
 
-Here, we are instructing the JVM directly:
-*   `-XX:MaxRAMPercentage=75.0`: Tells the JVM to use exactly 75% of the Docker container's available memory for the Heap. (If you don't do this, the JVM might assume it has access to the host machine's 64GB of RAM, allocate too much, and the Linux OOM Killer will terminate your container!).
-*   `-XX:+UseG1GC`: Explicitly selects the Garbage First Garbage Collector, optimized for low pause times in web applications.
+Why these flags matter:
 
-Furthermore, APM (Application Performance Monitoring) tools like Datadog, New Relic, or Spring Boot Actuator (`/actuator/metrics`) work by attaching to the JVM and reading the JMX beans (like we did in the Level 4 code example) to monitor thread counts, memory usage, and garbage collection pauses in real-time.
+- `MaxRAMPercentage`: prevents JVM from over-allocating heap inside memory-limited containers
+- `UseG1GC`: balanced latency/throughput for most microservices
+- `HeapDumpOnOutOfMemoryError`: essential postmortem artifact
+
+### Production Diagnostics Checklist
+
+```text
+1) Check java -version, vendor, and JVM flags used in runtime
+2) Capture thread dump (jcmd <pid> Thread.print) for lock/contention issues
+3) Capture heap info (jcmd <pid> GC.heap_info)
+4) Start JFR recording for 60-120s
+5) Inspect GC pauses, allocation hotspots, and blocked threads in JMC
+```
 
 ## INTERVIEW
 
 ### Q1: What is the difference between JDK, JRE, and JVM?
-**Difficulty:** Easy | **Companies:** All
 
-❌ **Weak answer:** "JDK is for coding, JRE is for running, and JVM is the machine."
+**Weak:** JDK is for coding, JRE for running, JVM is machine.
 
-✅ **Strong answer:** 
-"The JVM (Java Virtual Machine) is the abstract execution engine that actually runs Java bytecode. The JRE (Java Runtime Environment) is the JVM plus the core class libraries needed to run a program. The JDK (Java Development Kit) is the JRE plus development tools like the `javac` compiler and `jdb` debugger. You need the JDK to develop, but only the JRE to execute."
+**Strong:** JVM is the execution engine that runs bytecode. JRE is JVM plus standard runtime libraries required to execute Java apps. JDK is JRE plus development tools like `javac`, `jar`, `javadoc`, `jdb`, and packaging utilities. You need JDK to build, JRE-equivalent runtime to execute.
 
-### Q2: Is Java a compiled or an interpreted language?
-**Difficulty:** Medium | **Companies:** Amazon, Oracle
+---
 
-❌ **Weak answer:** "It's both because it compiles to bytecode and then runs."
+### Q2: Is Java compiled or interpreted?
 
-✅ **Strong answer:** 
-"It is both compiled and interpreted, but modern JVMs use a hybrid JIT approach. First, `javac` compiles the `.java` source code into platform-independent bytecode (`.class`). When running, the JVM initially interprets this bytecode line-by-line. However, the HotSpot JVM employs a Just-In-Time (JIT) compiler. It profiles the running code to identify 'hot spots' (frequently executed methods). It then compiles those specific hot spots down to native machine code on the fly, heavily optimizing them. This means a long-running Java application actually executes as highly optimized native code, not interpreted bytecode."
+**Weak:** Both.
 
-### Q3: Explain the ClassLoader hierarchy in Java.
-**Difficulty:** Hard | **Companies:** Google, LinkedIn
+**Strong:** Java is compiled to bytecode by `javac`, then initially interpreted by JVM. Hot methods are JIT compiled into native machine code during runtime. So execution is hybrid: interpreted startup + compiled steady-state.
 
-❌ **Weak answer:** "It loads classes into memory when you use them."
+---
 
-✅ **Strong answer:** 
-"Java uses a delegation model for class loading with three main tiers. When a class needs to be loaded, the request is delegated upwards. 
-1. The **Application ClassLoader** (loads from your classpath) delegates to its parent.
-2. The **Platform (or Extension) ClassLoader** delegates to its parent.
-3. The **Bootstrap ClassLoader** (written in native code, loads core classes like `java.lang.String`). 
-If the Bootstrap loader can't find it, it drops back down to Platform, and then to Application. This prevents you from writing your own malicious `java.lang.String` class and overriding the core system class, enforcing security."
+### Q3: Why does `String.class.getClassLoader()` return null?
 
-### Q4: Why does `String.class.getClassLoader()` return `null`?
-**Difficulty:** Medium | **Companies:** Morgan Stanley, JP Morgan
+**Weak:** Because String is special.
 
-❌ **Weak answer:** "Because String is a primitive type."
+**Strong:** `String` is loaded by Bootstrap classloader, implemented natively in HotSpot and not represented as a normal Java `ClassLoader` instance. JVM API exposes it as null.
 
-✅ **Strong answer:** 
-"Because `java.lang.String` is a core Java class, it is loaded by the Bootstrap ClassLoader. In most JVM implementations (like HotSpot), the Bootstrap ClassLoader is not written in Java; it is written in native C++ code. Therefore, there is no Java `ClassLoader` object to return, so the API specification dictates it returns `null`."
+---
 
-### Q5: What is the Metaspace and how does it differ from PermGen?
-**Difficulty:** Hard | **Companies:** Netflix, Atlassian
+### Q4: What causes `NoClassDefFoundError` if code compiles fine?
 
-❌ **Weak answer:** "It's where memory is stored, they just renamed it in Java 8."
+**Weak:** Classpath issue.
 
-✅ **Strong answer:** 
-"Prior to Java 8, class metadata (like bytecode, method names, and the String pool) was stored in the Permanent Generation (PermGen) space, which was contiguous with the Java Heap and had a fixed maximum size. This frequently caused `java.lang.OutOfMemoryError: PermGen space` during application redeployments due to classloader leaks. In Java 8, PermGen was completely removed and replaced by Metaspace. Metaspace allocates memory directly out of native OS memory, not the Java Heap. By default, it can auto-grow to use all available system memory, significantly reducing OOM errors related to class metadata."
+**Strong:** `NoClassDefFoundError` means class existed during compile-time but was unavailable (or failed static initialization) at runtime. Common causes: missing transitive dependency in deployment artifact, wrong classpath/module-path, shading conflicts.
+
+---
+
+### Q5: Why can long-running Java services become faster after startup?
+
+**Weak:** JVM optimizes over time.
+
+**Strong:** JIT profiles execution and compiles hot methods with runtime-specific optimizations (inlining, branch profiling, escape analysis). After warmup, more code paths run as optimized native machine code rather than interpreted bytecode.
+
+## FEYNMAN CHECK
+
+Think of Java like shipping recipes instead of cooked food. `.java` source becomes a universal recipe card (`.class` bytecode). Every country has its own kitchen (JVM implementation) that reads the same card and cooks it with local tools (OS/CPU instructions). JDK is full kitchen + chef tools. JRE is just kitchen + ingredients to cook. JVM is the stove and cooking engine itself.
+
+## BUILD
+
+1. Write `HelloJvm.java`, compile/run it, then inspect bytecode with `javap -c`.
+2. Create a small app that prints heap/thread/GC stats using MXBeans.
+3. Write a warmup benchmark showing cold vs hot execution times and explain speedup.
+4. Bonus: Use JavaCompiler API to compile a tiny class at runtime and invoke it via reflection.
+
+## SPACED REVIEW
+
+- Day 1: JDK vs JRE vs JVM in one sentence each.
+- Day 3: Explain Java execution pipeline from source code to native execution.
+- Day 7: List class loading phases and what happens in each.
+- Day 14: Explain interpreter vs JIT and why warmup matters.
+- Day 30: Diagnose a startup/runtime failure and classify it: compile error, class loading error, runtime exception, or GC/memory issue.

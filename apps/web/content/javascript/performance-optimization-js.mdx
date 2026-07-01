@@ -169,3 +169,226 @@ A: A Reflow is triggered when you change properties that affect the physical geo
 
 **Q: Why is the Virtual DOM considered fast?**
 A: Modifying the raw HTML DOM is actually very fast; the slow part is the browser recalculating Layout and CSS after every change. If a developer manually updates the DOM 50 times in a row, they might accidentally trigger 50 Reflows. The Virtual DOM is just a pure JavaScript object in memory. Updating it 1,000 times is instantaneous. React calculates all the changes in memory first, and then applies the absolute minimum number of precise, batched changes to the real DOM, ensuring the browser only calculates Layout exactly once.
+
+## FEYNMAN CHECK
+
+### Explain JS Performance Like I'm 10 Years Old
+> Making JavaScript fast means: doing LESS work, doing it FEWER TIMES, and giving the V8 engine PREDICTABLE patterns to optimise. The main levers: AVOID LAYOUT THRASH (batch DOM reads then writes), DEBOUNCE/THROTTLE expensive event handlers, use MEMOISATION to skip repeated computations, move CPU work to WEB WORKERS, prefer TYPED ARRAYS for numerical data, avoid creating garbage in hot paths (object pool), and let the browser batch visual updates with requestAnimationFrame. The non-obvious insight: the number-one JS performance issue in 2026 is not algorithmic complexity — it is BUNDLE SIZE (parse + eval time). A 1MB uncompressed bundle delays interactivity by ~800ms on mid-range mobile. Tree-shaking, code-splitting, and proper lazy-loading matter more than micro-optimisations.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the five performance bottleneck categories?**
+> **A:** (1) PARSE/EVAL — large bundles are slow to download, parse, and JIT compile. (2) STYLE/LAYOUT — DOM mutations causing repeated reflow. (3) JS CPU — synchronous operations blocking the main thread (>50ms = "long task"). (4) GARBAGE COLLECTION — allocation storms triggering frequent GC pauses. (5) NETWORK — too many requests, large resources, no caching. Profiling (Chrome DevTools Performance panel, Lighthouse, Node --prof) identifies which category is hot before optimising.
+
+**Q2: Mental model for debounce vs throttle?**
+> **A:** DEBOUNCE: delay the call until N ms after the LAST invocation — "wait until they stop typing." Scroll-to-anchor search, save-as-you-type. THROTTLE: allow the call at most once per N ms — "fire at most once per interval regardless of how often triggered." Scroll position for analytics, resize listener for responsive layout. BOTH are for reducing high-frequency callbacks — pick based on "fire after calm" (debounce) vs "fire regularly" (throttle).
+
+**Q3: Most dangerous misconception?**
+> **A:** Micro-optimisations matter more than algorithmic choices:
+> ```js
+> // ❌ Obsessing over == vs === perf
+> // Irrelevant — both are ns-level differences
+
+> // ❌ Caching array.length in a loop  (modern V8 already does this)
+> for (let i = 0, len = arr.length; i < len; i++) {}  // no measurable gain
+
+> // ✅ ACTUAL wins:
+> // 1. Replace O(n²) with O(n log n) algorithm
+> // 2. Avoid a 500ms reflow on every keystroke
+> // 3. Tree-shake 200KB unused code from the bundle
+> // 4. Replace synchronous DB call with async + connection pool
+> // 5. Move image processing to a Web Worker
+> ```
+
+**Q4: How does memoisation interact with garbage collection?**
+> **A:** A naive memoisation cache (Map keyed by args) holds STRONG REFERENCES to every result — cache grows unboundedly and prevents GC. Solutions: (1) LRU cache with max size — evict oldest on overflow. (2) WeakMap for object keys — GC'able when key is unreachable (only works for object args). (3) TTL-based expiry — expires after N seconds. The right choice depends on: result size, arg types, access patterns, and memory constraints.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript performance optimisation spans: bundle reduction (code-splitting, tree-shaking, dynamic import for non-critical paths), runtime CPU (algorithmic complexity, debounce/throttle, Web Worker offloading, WASM for compute-heavy tasks), memory (object pooling, WeakMap caches, avoiding closures over large data), rendering (batched DOM mutations, CSS transforms for GPU compositing, requestAnimationFrame scheduling), and network (HTTP/2 multiplexing, preload/prefetch, resource hints, edge caching) — with profiling as the mandatory prerequisite to any optimisation decision."
+
+## BUILD
+
+### 🏗️ Mini Project: Search-As-You-Type With Debounce + Web Worker + LRU Cache
+
+**What you will build:** A search box that debounces keystrokes, offloads the actual search to a Web Worker, caches results in an LRU cache, and shows render timing in the console.
+**Why this project:** Combines every major perf technique in one realistic UI feature.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-perf && cd js-perf
+ni index.html, debounce.js, lru.js, search.worker.js, app.js -ItemType File
+```
+
+#### Step 2 — Utilities
+```js
+// debounce.js
+export function debounce(fn, ms) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), ms);
+  };
+}
+
+export function throttle(fn, ms) {
+  let last = 0;
+  return function (...args) {
+    const now = Date.now();
+    if (now - last >= ms) { last = now; fn.apply(this, args); }
+  };
+}
+
+// lru.js
+export class LRUCache {
+  #max; #map = new Map();
+  constructor(max = 100) { this.#max = max; }
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const val = this.#map.get(key);
+    this.#map.delete(key);
+    this.#map.set(key, val);   // move to tail (most recent)
+    return val;
+  }
+  set(key, value) {
+    if (this.#map.has(key)) this.#map.delete(key);
+    else if (this.#map.size >= this.#max) {
+      this.#map.delete(this.#map.keys().next().value);  // evict LRU (head)
+    }
+    this.#map.set(key, value);
+  }
+  get size() { return this.#map.size; }
+}
+```
+
+#### Step 3 — Web Worker Search
+```js
+// search.worker.js
+const DATA = Array.from({ length: 50_000 }, (_, i) => ({
+  id: i,
+  title: 'Item ' + i,
+  tags: ['js', 'ts', 'react', 'vue', 'angular'].filter((_, j) => (i + j) % 3 === 0),
+}));
+
+self.onmessage = ({ data: { query, reqId } }) => {
+  const q = query.toLowerCase().trim();
+  const start = performance.now();
+  const results = q
+    ? DATA.filter(d => d.title.toLowerCase().includes(q) || d.tags.some(t => t.includes(q)))
+    : [];
+  self.postMessage({ results: results.slice(0, 20), reqId, elapsed: performance.now() - start });
+};
+```
+
+#### Step 4 — App Integration
+```js
+// app.js
+import { debounce } from './debounce.js';
+import { LRUCache } from './lru.js';
+
+const worker = new Worker(new URL('./search.worker.js', import.meta.url));
+const cache  = new LRUCache(50);
+let reqId = 0;
+
+const input   = document.getElementById('query');
+const results = document.getElementById('results');
+const stats   = document.getElementById('stats');
+
+const search = debounce((query) => {
+  const cached = cache.get(query);
+  if (cached) { render(cached, 0, 'CACHE'); return; }
+
+  const id = ++reqId;
+  worker.postMessage({ query, reqId: id });
+}, 200);
+
+worker.onmessage = ({ data: { results: res, reqId: id, elapsed } }) => {
+  if (id !== reqId) return;   // stale response — ignore
+  cache.set(input.value, res);
+  render(res, elapsed, 'WORKER');
+};
+
+function render(items, elapsed, source) {
+  const start = performance.now();
+  results.innerHTML = items.map(i =>
+    '<li>' + i.title + ' [' + i.tags.join(', ') + ']</li>').join('');
+  stats.textContent = source + ' | search: ' + elapsed.toFixed(1) + 'ms | render: ' + (performance.now() - start).toFixed(1) + 'ms | cache: ' + cache.size;
+}
+
+input.addEventListener('input', e => search(e.target.value));
+```
+
+#### Step 5 — Tests
+```js
+// perf.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { debounce, throttle } from './debounce.js';
+import { LRUCache } from './lru.js';
+
+describe('debounce', () => {
+  it('delays invocation', async () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    const d = debounce(fn, 100);
+    d(); d(); d();
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+});
+
+describe('LRUCache', () => {
+  it('returns undefined for missing key', () => {
+    const c = new LRUCache(3);
+    expect(c.get('x')).toBeUndefined();
+  });
+  it('evicts LRU on overflow', () => {
+    const c = new LRUCache(2);
+    c.set('a', 1); c.set('b', 2);
+    c.get('a');        // a is now MRU
+    c.set('c', 3);     // b evicted (LRU)
+    expect(c.get('b')).toBeUndefined();
+    expect(c.get('a')).toBe(1);
+    expect(c.get('c')).toBe(3);
+  });
+});
+```
+
+**Expected Output:**
+```
+WORKER | search: 12.3ms | render: 0.8ms | cache: 1
+WORKER | search: 11.1ms | render: 0.6ms | cache: 2
+CACHE  | search: 0ms    | render: 0.5ms | cache: 2  (same query again → cache hit)
+```
+
+**Stretch Challenges:**
+- [ ] Add requestIdleCallback to render results only when browser is idle
+- [ ] Replace Web Worker with WASM for even faster search
+- [ ] Add virtual scrolling to render only visible items from 50k results
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between debounce and throttle?
+**Q2:** What is "layout thrashing"?
+**Q3:** Write a debounce function. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does bundle size matter more than micro-optimisations for mobile?
+**Q5:** A junior memoises a function with a plain object cache — memory grows forever. Fix.
+**Q6:** When should you use a Web Worker vs WASM vs just optimising the algorithm?
+
+### Day 7 — Application
+**Q7:** Build a performance profiler that measures time for each step in a data pipeline.
+**Q8:** A PR has a 3MB lodash import — explain tree-shaking and the fix.
+**Q9:** What Lighthouse score does a 1MB bundle get for Time-to-Interactive on 3G?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Profile a React SPA that feels janky on scroll — walk me through every tool and fix."
+**Q11:** Draw: critical rendering path and where JS execution fits in.
+**Q12:** ★ System design: "Optimise a dashboard that renders 10k data points every 2 seconds — WebGL, Canvas, virtual DOM, or direct DOM?"

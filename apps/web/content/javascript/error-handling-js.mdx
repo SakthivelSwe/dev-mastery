@@ -196,3 +196,261 @@ try {
 }
 ```
 Because the `setTimeout` callback goes to the Web APIs and eventually the Task Queue, the main `try/catch` block finishes executing and dies instantaneously. One second later, the callback hits the Call Stack, explodes, and the application crashes. The `catch` block was long gone. You must put the `try/catch` *inside* the callback, or use Promises/Async-Await.
+
+## FEYNMAN CHECK
+
+### Explain JS Error Handling Like I'm 10 Years Old
+> JavaScript has two error worlds: SYNCHRONOUS (throw/try/catch/finally) and ASYNCHRONOUS (unhandled promise rejections, onerror, onunhandledrejection). Sync errors: `throw new Error('msg')` creates an Error with a stack trace; `try { ... } catch (e) { ... } finally { ... }` catches it. Types: Error (base), TypeError, RangeError, ReferenceError, SyntaxError, URIError, EvalError — extend Error for custom ones. Async: if a Promise rejects and nobody catches it, it fires window.onunhandledRejection (browser) or process.on('unhandledRejection') (Node). The non-obvious rule: ALWAYS throw Error OBJECTS, not strings — only Error objects have a stack trace, which is invaluable for debugging in production.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you catch an error vs let it propagate?**
+> **A:** Catch when you can RECOVER — translate to a safe default, retry, show user-friendly feedback, or convert to a domain error type. Let propagate when you cannot meaningfully recover (let the outer boundary handle it). The pattern: narrow try/catch scopes around only the operation that might fail, not entire functions. A global error boundary (React's ErrorBoundary, Express error middleware, process.on('unhandledRejection')) handles unrecoverable errors gracefully.
+
+**Q2: Mental model for error wrapping?**
+> **A:** When catching and re-throwing, ALWAYS add context: `throw new Error('Failed to load user profile', { cause: originalError })`. ES2022's Error `cause` option chains errors — the original stack trace is preserved. This produces "stacktrace chains" useful in production: you see "Failed to load user profile → cause: HTTP 404" instead of just "HTTP 404" with no call-site context.
+
+**Q3: Most dangerous misconception?**
+> **A:** Try/catch catches async errors automatically:
+> ```js
+> // ❌ Promise rejection in setTimeout is uncaught
+> async function fetchData() {
+>   try {
+>     setTimeout(async () => {
+>       const r = await fetch('/bad');  // rejection here
+>       if (!r.ok) throw new Error('bad');
+>     }, 0);
+>   } catch (e) {
+>     console.log('caught:', e);  // never runs
+>   }
+> }
+>
+> // ✅ Return/await the promise
+> async function fetchData() {
+>   try {
+>     const r = await fetch('/bad');
+>     if (!r.ok) throw new Error('bad');
+>   } catch (e) {
+>     console.log('caught:', e);  // works
+>   }
+> }
+> ```
+
+**Q4: How do custom error classes improve error handling?**
+> **A:** Custom errors let you DISCRIMINATE error types: `catch (e) { if (e instanceof NetworkError) retry(); else if (e instanceof AuthError) redirect('/login'); else throw e; }`. Each custom error can carry structured data (status code, request URL, validation messages) beyond a string message. The classic pattern: an AppError base class with error codes, all domain errors extend it, global handler checks instanceof chain.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript error handling spans synchronous throw/catch/finally (with typed Error subclasses and the ES2022 `cause` chain), asynchronous promise rejection (caught by .catch/.then(undefined, handler)/try-await or escaping to unhandledRejection global handlers), and cross-boundary error context via Error wrapping — with custom Error subclasses enabling type-discriminated recovery, and global process/window handlers as the safety net for unrecoverable errors."
+
+## BUILD
+
+### 🏗️ Mini Project: Typed Error Hierarchy With Global Handler + Result Type
+
+**What you will build:** An AppError base class hierarchy (NetworkError, AuthError, ValidationError, NotFoundError), a global handler that routes each type, and a Result<T, E> pattern comparison showing when to use which.
+**Why this project:** Forces custom Error classes, instanceof discrimination, Error.cause chaining, and global error boundaries.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-errors && cd js-errors
+npm init -y && npm install -D vitest
+ni errors.js, handler.js, errors.test.js -ItemType File
+```
+
+#### Step 2 — Error Hierarchy
+```js
+// errors.js
+
+// Base: all domain errors extend this
+export class AppError extends Error {
+  constructor(message, { code, cause, data } = {}) {
+    super(message, { cause });
+    this.name = this.constructor.name;
+    this.code = code ?? 'APP_ERROR';
+    this.data = data ?? {};
+    if (Error.captureStackTrace) Error.captureStackTrace(this, this.constructor);
+  }
+  toJSON() {
+    return { error: this.name, code: this.code, message: this.message, data: this.data };
+  }
+}
+
+export class NetworkError extends AppError {
+  constructor(message, { status, url, cause } = {}) {
+    super(message, { code: 'NETWORK_ERROR', cause, data: { status, url } });
+    this.status = status;
+    this.url = url;
+  }
+}
+
+export class AuthError extends AppError {
+  constructor(message, reason = 'UNAUTHORIZED') {
+    super(message, { code: reason });
+  }
+  get isExpired() { return this.code === 'TOKEN_EXPIRED'; }
+}
+
+export class ValidationError extends AppError {
+  constructor(message, fields = {}) {
+    super(message, { code: 'VALIDATION_FAILED', data: { fields } });
+    this.fields = fields;
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource, id) {
+    super(`${resource} with id ${id} not found`, { code: 'NOT_FOUND', data: { resource, id } });
+  }
+}
+```
+
+#### Step 3 — Global Error Handler
+```js
+// handler.js
+import { NetworkError, AuthError, ValidationError, NotFoundError, AppError } from './errors.js';
+
+export function handleError(error, context = {}) {
+  // Type-discriminated recovery
+  if (error instanceof AuthError) {
+    if (error.isExpired) refreshToken();
+    else redirectToLogin();
+    return;
+  }
+  if (error instanceof NetworkError) {
+    const { status, url } = error.data;
+    logMetric({ event: 'network_error', status, url });
+    showRetryUI();
+    return;
+  }
+  if (error instanceof ValidationError) {
+    showFieldErrors(error.fields);
+    return;
+  }
+  if (error instanceof NotFoundError) {
+    showEmptyState(error.data.resource);
+    return;
+  }
+  if (error instanceof AppError) {
+    logError(error, 'unhandled_app_error', context);
+    showGenericError();
+    return;
+  }
+  // Unknown / non-domain error — escalate
+  logError(error, 'unhandled_unknown_error', context);
+  throw error;
+}
+
+// Global async boundary
+if (typeof window !== 'undefined') {
+  window.onunhandledrejection = (e) => { handleError(e.reason); e.preventDefault(); };
+}
+process.on?.('unhandledRejection', (reason) => handleError(reason));
+```
+
+#### Step 4 — Error Wrapping + cause
+```js
+// Using Error.cause for context chains
+async function loadUserProfile(userId) {
+  let rawUser;
+  try {
+    const res = await fetch(`/api/users/${userId}`);
+    if (res.status === 404) throw new NotFoundError('User', userId);
+    if (res.status === 401) throw new AuthError('Session expired', 'TOKEN_EXPIRED');
+    if (!res.ok) throw new NetworkError(`API error`, { status: res.status, url: res.url });
+    rawUser = await res.json();
+  } catch (e) {
+    if (e instanceof AppError) throw e;   // already typed
+    throw new NetworkError('Failed to load user profile', { cause: e });  // wrap + preserve
+  }
+  return rawUser;
+}
+
+// Caller sees chained context
+try {
+  await loadUserProfile(999);
+} catch (e) {
+  console.error(e.message);          // "User with id 999 not found"
+  console.error(e.cause?.message);   // original error if wrapped
+  console.log(e.toJSON());
+}
+```
+
+#### Step 5 — Tests
+```js
+// errors.test.js
+import { describe, it, expect } from 'vitest';
+import { AppError, NetworkError, AuthError, ValidationError, NotFoundError } from './errors.js';
+
+describe('error hierarchy', () => {
+  it('custom errors are instanceof AppError AND their own class', () => {
+    const e = new NetworkError('fail', { status: 503 });
+    expect(e).toBeInstanceOf(Error);
+    expect(e).toBeInstanceOf(AppError);
+    expect(e).toBeInstanceOf(NetworkError);
+    expect(e.status).toBe(503);
+  });
+  it('AuthError.isExpired discriminates expired token', () => {
+    expect(new AuthError('x', 'TOKEN_EXPIRED').isExpired).toBe(true);
+    expect(new AuthError('x', 'UNAUTHORIZED').isExpired).toBe(false);
+  });
+  it('ValidationError carries field errors', () => {
+    const e = new ValidationError('bad', { email: 'invalid' });
+    expect(e.fields.email).toBe('invalid');
+  });
+  it('Error cause chain preserved', () => {
+    const root = new TypeError('root cause');
+    const wrapped = new NetworkError('outer', { cause: root });
+    expect(wrapped.cause).toBe(root);
+  });
+  it('toJSON produces serialisable shape', () => {
+    const e = new NotFoundError('User', 42);
+    const j = e.toJSON();
+    expect(j).toEqual({ error: 'NotFoundError', code: 'NOT_FOUND', message: 'User with id 42 not found', data: { resource: 'User', id: 42 } });
+  });
+});
+```
+
+**Expected Output:**
+```
+User with id 999 not found
+{ error: 'NotFoundError', code: 'NOT_FOUND', message: '...', data: {...} }
+
+# 5/5 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add Sentry-style breadcrumbs that accumulate before an error
+- [ ] Add a Result<T, E> type and compare vs throw for a pure function
+- [ ] Integrate OpenTelemetry spans with each error
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Types built into JS Error hierarchy.
+**Q2:** When does a Promise rejection become "unhandled"?
+**Q3:** Write a custom NotFoundError class extending Error. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why throw Error objects instead of strings?
+**Q5:** A junior has `catch(e) { throw 'failed' }` — what's wrong?
+**Q6:** Add Error.cause wrapping:
+```js
+async function loadData() {
+  try { return await fetchRaw(); }
+  catch (e) { throw new AppError('load failed'); }
+}
+```
+
+### Day 7 — Application
+**Q7:** Build an error-boundary HOC for React that logs + shows fallback.
+**Q8:** A PR catches all errors and returns null — why is this wrong?
+**Q9:** What should process.on('unhandledRejection') do in a production Node server?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through a production error — from throw to Sentry, all the layers."
+**Q11:** Draw: error propagation in a 4-layer async call chain.
+**Q12:** ★ System design: "Architect error handling for a 20-service microservices system — tracing, correlation IDs, alerting."

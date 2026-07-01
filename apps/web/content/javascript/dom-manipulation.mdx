@@ -136,3 +136,237 @@ Browsers are smart. When you change multiple DOM properties (`style.width = '10p
 However, if you *write* to the DOM (changing a style) and then immediately *read* from the DOM (`offsetHeight`), the browser panics. It is forced to instantly halt everything, recalculate the entire page layout synchronously just to guarantee it gives you the correct `offsetHeight` value!
 If you do this inside a loop, the framerate drops to 0 FPS.
 *The Fix:* Always batch your DOM Reads and DOM Writes. Do all your reading (`offsetHeight`, `getBoundingClientRect`) in one block, save them to variables, and then do all your writing (`style.height`) in a separate block!
+
+## FEYNMAN CHECK
+
+### Explain DOM Manipulation Like I'm 10 Years Old
+> The DOM (Document Object Model) is the LIVE TREE of objects the browser creates from your HTML — every element is a node you can read and change with JavaScript. `document.querySelector` finds a node; `element.textContent`, `element.innerHTML`, `element.setAttribute` change it; `element.appendChild`, `element.remove()` add/delete nodes. The non-obvious cost: every DOM mutation can trigger REFLOW (recalculate layout — expensive) and REPAINT (redraw pixels). Batching updates with DocumentFragment or innerHTML assignment triggers ONE reflow. Reading layout properties (`offsetWidth`, `getBoundingClientRect`) FORCES a synchronous reflow mid-JS — called "layout thrashing" when done inside a loop. requestAnimationFrame groups DOM reads and writes with the browser's paint cycle.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why is DOM manipulation slow?**
+> **A:** JavaScript and the browser's layout engine run in the SAME THREAD but different subsystems. Mutating a DOM property marks the layout as "dirty." The next time you READ a layout property (offsetHeight, scrollTop, getBoundingClientRect), the browser MUST flush the dirty layout synchronously — even mid-JS — to return an accurate value. If you alternate reads and writes in a loop (read offsetHeight → write style → read offsetHeight → write style...), each write-read pair forces a reflow — "layout thrashing." Read all → write all avoids this.
+
+**Q2: Mental model for reflow vs repaint?**
+> **A:** REFLOW (layout) re-computes the geometry of every affected element (position, size, box model). Changing width, height, margin, padding, top/left, or adding/removing elements triggers it — it cascades through children. REPAINT re-draws pixels for affected elements without changing geometry — changing color, background, visibility. Reflow is 10-20× more expensive than repaint. CSS transforms (translate, scale) bypass both — the GPU handles them in the composite layer (no reflow, no repaint).
+
+**Q3: Most dangerous misconception?**
+> **A:** innerHTML is always safe:
+> ```js
+> // ❌ innerHTML from user input = XSS
+> searchBox.innerHTML = `Results for: ${userQuery}`;
+> // If userQuery = '<img onerror=alert(1) src=x>', that runs!
+>
+> // ✅ Use textContent for text; sanitise before innerHTML
+> searchBox.textContent = `Results for: ${userQuery}`;   // escaped by browser
+> // Or use DOMPurify for rich HTML
+> searchBox.innerHTML = DOMPurify.sanitize(userHTML);
+> ```
+
+**Q4: How does event delegation reduce DOM overhead?**
+> **A:** Instead of attaching a listener to EVERY button in a 1000-row table, attach ONE listener to the table. When a button is clicked, the event BUBBLES up through its ancestors — the table-level listener catches it via `e.target`. This works because of DOM event bubbling. Benefit: ONE listener vs 1000, no listener-leak when rows are added/removed dynamically. Pattern: `container.addEventListener('click', e => { if (e.target.matches('button.delete')) ...; })`.
+
+**Q5: FAANG-grade definition?**
+> **A:** "The DOM API is the browser-provided interface for reading and mutating the document tree — with synchronous reflow forced whenever layout properties are read after a mutation (layout thrashing), batching via DocumentFragment or template-cloning for performance, event delegation leveraging bubbling for efficient dynamic-content listeners, and CSS transforms/will-change for GPU-composited animations that bypass layout entirely."
+
+## BUILD
+
+### 🏗️ Mini Project: Virtual Infinite Scroll With Event Delegation
+
+**What you will build:** An infinite-scroll list of 10,000 rows rendered as a "virtual" window — only 20 rows in the DOM at any time, scrolling managed via transform — with event delegation for row clicks.
+**Why this project:** Forces DOM batching, layout-thrash avoidance, event delegation, and IntersectionObserver patterns.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-dom && cd js-dom
+ni index.html, virtualList.js -ItemType File
+```
+
+#### Step 2 — HTML
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    #viewport { height: 500px; overflow-y: auto; position: relative; border: 1px solid #ccc; }
+    #spacer    { position: absolute; width: 100%; pointer-events: none; }
+    #rows      { position: absolute; width: 100%; }
+    .row       { height: 40px; line-height: 40px; padding: 0 12px; border-bottom: 1px solid #eee; cursor: pointer; }
+    .row:hover { background: #f5f5f5; }
+    .row.selected { background: #dce8ff; }
+  </style>
+</head>
+<body>
+  <h2>Virtual List (10,000 rows)</h2>
+  <div id="viewport">
+    <div id="spacer"></div>
+    <div id="rows"></div>
+  </div>
+  <p id="info">Click a row</p>
+  <script type="module" src="virtualList.js"></script>
+</body>
+</html>
+```
+
+#### Step 3 — Virtual List Implementation
+```js
+// virtualList.js
+const TOTAL_ROWS = 10_000;
+const ROW_HEIGHT = 40;
+const BUFFER = 5;
+
+const viewport = document.getElementById('viewport');
+const spacer   = document.getElementById('spacer');
+const rows     = document.getElementById('rows');
+const info     = document.getElementById('info');
+
+// Set spacer height so scrollbar reflects total height
+spacer.style.height = (TOTAL_ROWS * ROW_HEIGHT) + 'px';
+
+let visibleStart = 0;
+let selectedIndex = -1;
+
+function renderRows() {
+  const scrollTop = viewport.scrollTop;
+  const viewportH = viewport.clientHeight;   // read once — avoid thrash
+  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - BUFFER);
+  const end   = Math.min(TOTAL_ROWS, Math.ceil((scrollTop + viewportH) / ROW_HEIGHT) + BUFFER);
+
+  if (start === visibleStart && rows.children.length === end - start) return;
+
+  visibleStart = start;
+  rows.style.transform = `translateY(${start * ROW_HEIGHT}px)`;
+
+  // Batch DOM writes in one DocumentFragment
+  const frag = document.createDocumentFragment();
+  for (let i = start; i < end; i++) {
+    const div = document.createElement('div');
+    div.className = 'row' + (i === selectedIndex ? ' selected' : '');
+    div.dataset.index = i;
+    div.textContent = `Row ${i + 1}: Item #${(i * 37 + 7) % 10000}`;
+    frag.appendChild(div);
+  }
+  rows.replaceChildren(frag);   // ONE DOM write replaces everything
+}
+
+// Event delegation — ONE listener on the list
+rows.addEventListener('click', (e) => {
+  const row = e.target.closest('.row');
+  if (!row) return;
+  const index = Number(row.dataset.index);
+  selectedIndex = index;
+  info.textContent = `Selected row ${index + 1}`;
+  renderRows();   // re-render to update selection highlight
+});
+
+viewport.addEventListener('scroll', renderRows, { passive: true });
+renderRows();   // initial render
+```
+
+#### Step 4 — Error Handling: Layout-Thrash Avoidance
+```js
+// BAD: alternates reads and writes — forces reflow each time
+function badUpdateWidths(items) {
+  items.forEach(el => {
+    const w = el.offsetWidth;      // read → FLUSH dirty layout
+    el.style.width = (w * 2) + 'px'; // write → mark dirty
+  });
+}
+
+// GOOD: read all, write all — ONE layout flush
+function goodUpdateWidths(items) {
+  const widths = items.map(el => el.offsetWidth);   // read phase
+  items.forEach((el, i) => el.style.width = (widths[i] * 2) + 'px'); // write phase
+}
+
+// requestAnimationFrame to batch correctly
+function scheduleUpdate(items) {
+  requestAnimationFrame(() => {
+    const widths = items.map(el => el.offsetWidth);
+    items.forEach((el, i) => (el.style.width = (widths[i] + 50) + 'px'));
+  });
+}
+```
+
+#### Step 5 — Tests
+```js
+// dom.test.js (Vitest + happy-dom)
+import { describe, it, expect, beforeEach } from 'vitest';
+
+describe('virtual list', () => {
+  beforeEach(() => {
+    document.body.innerHTML = `<div id="viewport" style="height:200px;overflow-y:auto;">
+      <div id="spacer"></div><div id="rows"></div></div><p id="info"></p>`;
+  });
+
+  it('creates DocumentFragment not individual DOM appends', () => {
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < 5; i++) {
+      const div = document.createElement('div');
+      div.textContent = 'Row ' + i;
+      frag.appendChild(div);
+    }
+    const container = document.getElementById('rows');
+    container.replaceChildren(frag);
+    expect(container.children.length).toBe(5);
+  });
+
+  it('event delegation catches dynamic children', () => {
+    const container = document.createElement('div');
+    const log = [];
+    container.addEventListener('click', e => {
+      if (e.target.matches('.item')) log.push(e.target.textContent);
+    });
+    const btn = document.createElement('div');
+    btn.className = 'item'; btn.textContent = 'A';
+    container.appendChild(btn);
+    btn.click();
+    expect(log).toEqual(['A']);
+  });
+});
+```
+
+**Expected Output:**
+```
+Virtual list: only ~20 rows in DOM regardless of 10,000 total
+Scroll → rows update in <1ms (GPU transform, not layout reflow)
+Click any row → info bar updates, row highlighted
+
+# Tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add keyboard navigation (arrow keys scroll, Enter selects)
+- [ ] Add variable row heights (measure with ResizeObserver)
+- [ ] Replace manual scroll with IntersectionObserver for sentinel-based pagination
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between reflow and repaint?
+**Q2:** What is layout thrashing?
+**Q3:** Write event delegation for a ul list. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why do CSS transforms bypass reflow?
+**Q5:** A junior updates 1000 rows in a loop with individual appends — diagnose.
+**Q6:** Refactor to avoid layout thrashing:
+```js
+els.forEach(el => { const h = el.offsetHeight; el.style.height = (h+10)+'px'; });
+```
+
+### Day 7 — Application
+**Q7:** Build a drag-to-reorder list using pointer events and DOM insertion.
+**Q8:** A PR reads scrollTop inside a scroll handler repeatedly — explain the forced synchronous layout risk.
+**Q9:** When does document.createElement + appendChild outperform innerHTML?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through browser rendering pipeline — DOM → CSSOM → layout → paint → composite."
+**Q11:** Draw: event bubbling/capturing path for a nested button click.
+**Q12:** ★ System design: "Build a realtime collaborative document editor (like Figma) — how do you batch DOM updates at 60fps?"

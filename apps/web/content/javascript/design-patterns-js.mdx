@@ -179,3 +179,274 @@ A: **Global State Persists Across Tests!**
 Unit tests must run in complete isolation. If Test A runs, modifies the Singleton (e.g., `AppConfig.setTheme('dark')`), and finishes, the Singleton *remains in memory*.
 When Test B runs, it expects a fresh, clean environment, but it gets the polluted Singleton from Test A. This causes "Flaky Tests"—tests that pass when run individually but fail randomly when run in a suite. 
 *The Fix:* Instead of hardcoding `AppConfig.getInstance()` inside your components, you should pass the configuration into the component as a parameter via **Dependency Injection**. This allows the test runner to easily pass in a fake, temporary configuration object for each specific test!
+
+## FEYNMAN CHECK
+
+### Explain Design Patterns Like I'm 10 Years Old
+> Design patterns are REUSABLE SOLUTIONS to COMMON PROBLEMS in code. They're not code you copy — they're ideas you adapt. The Gang of Four book (1994) catalogued 23 patterns in three categories: CREATIONAL (how to create objects: Singleton, Factory, Builder, Prototype), STRUCTURAL (how to compose objects: Adapter, Decorator, Facade, Proxy, Composite), and BEHAVIOURAL (how objects communicate: Observer, Strategy, Command, Iterator, Chain of Responsibility). JavaScript has its own idiomatic patterns: Module (IIFE-based), Revealing Module, Mixin, Observer (EventEmitter), Pub/Sub, Prototype-delegation, Middleware (Express). The non-obvious point: overuse of patterns is the biggest mistake. Patterns solve ACTUAL problems — applying them to simple code adds complexity without benefit.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problems do creational patterns solve?**
+> **A:** They hide the complexity of OBJECT CONSTRUCTION. Factory Method hides which subclass to instantiate (useful when the exact type isn't known until runtime). Builder assembles complex objects step-by-step — great for objects with many optional configs (QueryBuilder, URL builder, test fixtures). Singleton ensures ONE instance (logger, config, connection pool — but beware: global state, hard to test, anti-pattern in most modern DI frameworks).
+
+**Q2: Mental model for Observer vs Pub/Sub?**
+> **A:** OBSERVER: subjects hold direct REFERENCES to observers — tight coupling. `eventEmitter.on('data', handler)` — the emitter knows its listeners. PUB/SUB: a message BROKER decouples publishers from subscribers — publishers post to a topic, subscribers listen on a topic, neither knows the other. Redux (central store), MessageBus, MQTT. Pub/Sub is better for cross-component communication; Observer for tight component relationships.
+
+**Q3: Most dangerous misconception?**
+> **A:** Singleton is always a pattern worth using:
+> ```js
+> // ❌ Singleton makes testing hard — global state leaked between tests
+> class Database {
+>   static instance;
+>   static getInstance() { return (Database.instance ??= new Database()); }
+> }
+> // In test: can't inject a different DB, tests pollute each other
+>
+> // ✅ Use Dependency Injection instead — pass the dependency
+> class UserService {
+>   constructor(private db: Database) {}  // injectable!
+> }
+> // Test: new UserService(mockDb)
+> // Singleton only genuinely needed for: performance-sensitive system resources
+> //   (e.g., V8 isolate, WASM module) — everywhere else, prefer DI
+> ```
+
+**Q4: How does the Strategy pattern differ from Polymorphism?**
+> **A:** Polymorphism (via inheritance) bakes the algorithm into the CLASS hierarchy — you swap algorithms by changing the class. Strategy bakes the algorithm into a FUNCTION/OBJECT that's INJECTED at runtime — you swap algorithms by passing a different function. Strategy is more flexible (compose multiple strategies, switch at runtime, easier to test), but adds more abstraction. Modern FP idiom: pass a function. Classic OOP: inject a Strategy object. Lodash's sortBy(arr, iteratee) is the Strategy pattern with a function.
+
+**Q5: FAANG-grade definition?**
+> **A:** "JavaScript design patterns are recurring solution templates for common software design problems — divided into creational (Factory, Builder, Singleton), structural (Adapter, Decorator, Proxy, Facade, Composite), and behavioural (Observer, Strategy, Command, Chain of Responsibility, Iterator, Mediator) patterns from the Gang of Four — augmented by JavaScript-specific idioms (Module/IIFE, Mixin, Prototype Delegation, Middleware Pipeline) — valuable as a shared vocabulary and as starting points, but anti-patterns when applied mechanically to problems they don't genuinely solve."
+
+## BUILD
+
+### 🏗️ Mini Project: Mini Express-Style Middleware Pipeline (Chain of Responsibility)
+
+**What you will build:** A composable middleware pipeline that processes HTTP-like request objects through auth, rate-limiting, validation, and logging middlewares — exactly how Express, Koa, and Next.js API routes work internally.
+**Why this project:** Forces Chain of Responsibility + Decorator-via-wrapper + Command — three patterns in one realistic project.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-patterns && cd js-patterns
+npm init -y && npm install -D vitest
+ni middleware.js, patterns.js, patterns.test.js -ItemType File
+```
+
+#### Step 2 — Middleware Pipeline
+```js
+// middleware.js
+export function createApp() {
+  const stack = [];
+
+  return {
+    use(fn) { stack.push(fn); return this; },
+
+    async handle(req, res) {
+      let index = 0;
+      const next = async () => {
+        const mw = stack[index++];
+        if (mw) await mw(req, res, next);
+      };
+      await next();
+      return res;
+    },
+  };
+}
+
+// Middleware implementations
+export function authMiddleware(req, res, next) {
+  if (!req.headers?.authorization) {
+    res.status = 401; res.body = { error: 'Unauthorized' }; return;
+  }
+  req.user = { id: 1, role: 'user' };
+  return next();
+}
+
+export function rateLimitMiddleware(limit = 100) {
+  const counts = new Map();
+  return (req, res, next) => {
+    const key = req.ip ?? 'unknown';
+    const current = (counts.get(key) ?? 0) + 1;
+    counts.set(key, current);
+    if (current > limit) {
+      res.status = 429; res.body = { error: 'Too Many Requests' }; return;
+    }
+    req.rateInfo = { remaining: limit - current };
+    return next();
+  };
+}
+
+export function logMiddleware(req, res, next) {
+  const start = Date.now();
+  return next().then(() => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} ${res.status} ${Date.now()-start}ms`);
+  });
+}
+```
+
+#### Step 3 — Other Patterns Demo
+```js
+// patterns.js
+
+// OBSERVER — EventEmitter
+export class EventEmitter {
+  #events = new Map();
+  on(e, fn)  { (this.#events.get(e) ?? this.#events.set(e, new Set()).get(e)).add(fn); }
+  off(e, fn) { this.#events.get(e)?.delete(fn); }
+  emit(e, ...args) { for (const fn of this.#events.get(e) ?? []) fn(...args); }
+}
+
+// STRATEGY — sorting
+const sortStrategies = {
+  asc:       (a, b) => a.localeCompare(b),
+  desc:      (a, b) => b.localeCompare(a),
+  byLength:  (a, b) => a.length - b.length,
+};
+export const sortWith = (arr, strategy = 'asc') =>
+  [...arr].sort(sortStrategies[strategy] ?? sortStrategies.asc);
+
+// DECORATOR — adding retry to any async function
+export function withRetry(fn, maxAttempts = 3, delayMs = 100) {
+  return async function (...args) {
+    let lastErr;
+    for (let i = 0; i < maxAttempts; i++) {
+      try { return await fn(...args); }
+      catch (e) { lastErr = e; if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs)); }
+    }
+    throw lastErr;
+  };
+}
+
+// BUILDER — query builder
+export class QueryBuilder {
+  #table; #conditions = []; #limit; #offset; #orderBy;
+
+  from(table)          { this.#table = table; return this; }
+  where(cond)          { this.#conditions.push(cond); return this; }
+  order(col, dir='ASC'){ this.#orderBy = { col, dir }; return this; }
+  take(n)              { this.#limit = n; return this; }
+  skip(n)              { this.#offset = n; return this; }
+
+  build() {
+    let q = 'SELECT * FROM ' + this.#table;
+    if (this.#conditions.length) q += ' WHERE ' + this.#conditions.join(' AND ');
+    if (this.#orderBy) q += ' ORDER BY ' + this.#orderBy.col + ' ' + this.#orderBy.dir;
+    if (this.#limit)   q += ' LIMIT ' + this.#limit;
+    if (this.#offset)  q += ' OFFSET ' + this.#offset;
+    return q;
+  }
+}
+```
+
+#### Step 4 — Wire Everything Together
+```js
+// demo.js
+import { createApp, authMiddleware, rateLimitMiddleware, logMiddleware } from './middleware.js';
+import { sortWith, withRetry, QueryBuilder } from './patterns.js';
+
+const app = createApp();
+app.use(logMiddleware)
+   .use(rateLimitMiddleware(5))
+   .use(authMiddleware);
+
+const req = { method: 'GET', url: '/users', headers: { authorization: 'Bearer x' }, ip: '127.0.0.1' };
+const res = { status: 200, body: null };
+await app.handle(req, res);
+console.log('response:', res);
+
+console.log(sortWith(['banana', 'apple', 'cherry'], 'asc'));
+console.log(sortWith(['banana', 'apple', 'cherry'], 'byLength'));
+
+const q = new QueryBuilder()
+  .from('users').where('age > 18').where('role = "admin"').order('name').take(10).skip(20)
+  .build();
+console.log(q);
+```
+
+#### Step 5 — Tests
+```js
+// patterns.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { createApp, authMiddleware } from './middleware.js';
+import { sortWith, withRetry, QueryBuilder } from './patterns.js';
+
+describe('middleware pipeline', () => {
+  it('stops pipeline on 401', async () => {
+    const app = createApp();
+    const next = vi.fn();
+    app.use(authMiddleware).use(next);
+    const req = { method: 'GET', url: '/', headers: {} };
+    const res = {};
+    await app.handle(req, res);
+    expect(res.status).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('QueryBuilder', () => {
+  it('builds a query with all options', () => {
+    const q = new QueryBuilder().from('users').where('active = true').order('name').take(5).build();
+    expect(q).toBe('SELECT * FROM users WHERE active = true ORDER BY name ASC LIMIT 5');
+  });
+});
+
+describe('withRetry decorator', () => {
+  it('retries on failure', async () => {
+    const fn = vi.fn()
+      .mockRejectedValueOnce(new Error('x'))
+      .mockResolvedValue('ok');
+    const wrapped = withRetry(fn, 3, 1);
+    expect(await wrapped()).toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+});
+```
+
+**Expected Output:**
+```
+[2026-06-26] GET /users 200 2ms
+response: { status: 200, body: null }
+['apple', 'banana', 'cherry']
+['apple', 'banana', 'cherry']   (by length: 5, 6, 6)
+SELECT * FROM users WHERE age > 18 AND role = "admin" ORDER BY name ASC LIMIT 10 OFFSET 20
+
+# All tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add a CQRS-style command bus pattern
+- [ ] Implement Undo/Redo using the Command pattern
+- [ ] Build a type-safe dependency injection container
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three categories of GoF patterns.
+**Q2:** Difference between Observer and Pub/Sub?
+**Q3:** Write a Singleton in JS. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is Singleton usually an anti-pattern in modern code?
+**Q5:** A junior uses inheritance to add retry logic — refactor to a Decorator function.
+**Q6:** Refactor to Strategy:
+```js
+function format(data, type) {
+  if (type === 'json') return JSON.stringify(data);
+  if (type === 'csv')  return data.map(r => r.join(',')).join('\n');
+}
+```
+
+### Day 7 — Application
+**Q7:** Build an event bus that supports wildcard subscriptions (`user.*`).
+**Q8:** A PR implements a Builder with 12 parameters as constructor args — refactor.
+**Q9:** What's the performance cost of the middleware pipeline pattern at 100k req/s?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every place design patterns appear in the React codebase."
+**Q11:** Draw: class diagram for Strategy pattern applied to a payment processor.
+**Q12:** ★ System design: "Design a plugin system for a SaaS — factory + observer + command patterns combined."

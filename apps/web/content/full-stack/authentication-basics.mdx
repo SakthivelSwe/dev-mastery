@@ -132,3 +132,117 @@ A: **You can't (easily), which is the fatal flaw of stateless JWTs.**
 Because the JWT is stateless, the server doesn't track it in a database. The token is cryptographically valid until its expiration time runs out (e.g., 1 hour). If you hit a "panic button" on the server, the server has no physical way to instantly invalidate the hacker's token, because the token lives entirely on the hacker's laptop!
 To solve this, you must compromise on the "stateless" nature of JWTs. 
 You must implement a **Token Revocation Blocklist**. When the panic button is pressed, the server writes that specific user's ID to a high-speed Redis database. Now, every time the JWT Bouncer middleware runs, it must *first* verify the mathematical signature, and *then* query the Redis database to see if the user's ID was recently revoked. This effectively turns the stateless JWT into a stateful session!
+
+## FEYNMAN CHECK
+
+### Explain Authentication Like I'm 10 Years Old
+> Authentication is "who are you?" Authorisation is "what can you do?" Login = the server checks your password and gives you a wristband (session token or JWT) you wave on every request to prove you're you. The non-obvious part: passwords must NEVER be stored plain — they're salted and hashed (bcrypt/argon2). Even if attackers steal your DB, they can't recover passwords from hashes. This is why "passwords stored in plain text" is the #1 security failure that gets companies on the news.
+
+---
+
+### 5 Deep Questions
+**Q1: How does password hashing protect users?**
+> **A:** Bcrypt/argon2 are one-way functions — given the hash, you can't recover the password. Salt makes pre-computed rainbow tables useless. Iteration count slows brute-force. If your DB leaks, attackers must brute-force each password individually at billions of guesses per second — but a 12-char random password still takes years.
+
+**Q2: ONE model.**
+> **A:** "Authn = prove identity (password, OTP, biometric). Authz = check permission (role, ACL). Session = wristband (cookie session, JWT). Refresh = renew wristband without re-authn."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Plain-text comparison — breach = total password compromise
+> if (user.password === input) return 'ok';
+> // ✅ Bcrypt compare — slow + salted
+> const ok = await bcrypt.compare(input, user.passwordHash);
+> ```
+
+**Q4: Sessions vs JWT — when each?**
+> **A:** Session cookie: server stores session ID → user, can revoke instantly. JWT: signed claim, stateless, can't be revoked until expiry. Sessions for first-party web; JWT for microservices/mobile/cross-domain. Mixing both (session ID inside JWT) gives revocability + statelessness.
+
+**Q5: Senior one-liner.**
+> **A:** "Authentication is identity proof via hashed credentials + multi-factor; authorisation is permission check via roles/ACLs; sessions/JWTs are transport — and conflating any of these three causes the most-exploited security bugs in production."
+
+## BUILD
+
+### 🏗️ Mini Project: Secure Login with bcrypt + JWT
+**Time:** 40 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir auth-demo && cd auth-demo
+npm init -y && npm i express bcrypt jsonwebtoken
+touch server.js
+```
+
+#### Step 2 — Core
+```js
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const SECRET = process.env.JWT_SECRET || 'dev-only-change-in-prod';
+const app = express();
+app.use(express.json());
+
+const users = new Map();   // demo only, use real DB
+
+app.post('/signup', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password || password.length < 8) return res.status(400).json({ error: 'weak' });
+  if (users.has(email)) return res.status(409).json({ error: 'exists' });
+  const passwordHash = await bcrypt.hash(password, 12);  // 12 rounds ≈ 250ms
+  users.set(email, { email, passwordHash });
+  res.status(201).json({ email });
+});
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = users.get(email);
+  // Always run bcrypt even if user missing — prevents timing-based user enumeration
+  const ok = user ? await bcrypt.compare(password, user.passwordHash) : await bcrypt.compare(password, '$2b$12$invalid');
+  if (!user || !ok) return res.status(401).json({ error: 'invalid' });
+  const token = jwt.sign({ sub: email }, SECRET, { expiresIn: '15m' });
+  res.json({ token });
+});
+
+function authn(req, res, next) {
+  const h = req.headers.authorization || '';
+  const [, token] = h.match(/^Bearer (.+)$/) || [];
+  if (!token) return res.status(401).json({ error: 'no token' });
+  try { req.user = jwt.verify(token, SECRET); next(); }
+  catch { res.status(401).json({ error: 'bad token' }); }
+}
+
+app.get('/me', authn, (req, res) => res.json({ sub: req.user.sub }));
+
+app.listen(3000);
+```
+
+#### Step 5 — Test
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"email":"a@b.co","password":"hunter2!!!!"}' http://localhost:3000/signup
+TOKEN=$(curl -s -X POST -H "Content-Type: application/json" -d '{"email":"a@b.co","password":"hunter2!!!!"}' http://localhost:3000/login | jq -r .token)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/me
+```
+
+**Expected Output:** `{ "sub": "a@b.co" }`
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** authn vs authz — define each.
+**Q2:** Why salt + hash passwords?
+**Q3:** Write a bcrypt hash + compare in 6 lines.
+
+### Day 3
+**Q4:** Sessions vs JWT — pros/cons.
+**Q5:** Show plain-text-password bug and bcrypt fix.
+**Q6:** What is timing-based user enumeration?
+
+### Day 7
+**Q7:** Add refresh token rotation to a JWT auth flow.
+**Q8:** PR stores JWT in localStorage. Describe the XSS risk.
+**Q9:** What is MFA and what attacks does it prevent?
+
+### Day 14
+**Q10:** ★ "Design auth for a SaaS with SSO, MFA, and API keys."
+**Q11:** Link authn → authz → sessions → JWT → OAuth.
+**Q12:** ★ "A breach exposes your password DB. Walk the incident response."

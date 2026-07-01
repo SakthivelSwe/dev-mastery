@@ -188,3 +188,206 @@ A: **The RxJS Error Completion Trap.**
 In RxJS, if an Error propagates into the main observable stream, the stream completes (dies) and will never listen to another event again. 
 If your `catchError` block is placed on the *outer* observable (the `this.actions$.pipe(...)`), the error destroys the entire Action Listener stream.
 *The Fix:* You MUST place the `catchError` block on the *inner* observable (inside the `exhaustMap` or `switchMap`, attached directly to the `this.userService.getAll().pipe(...)`). This way, the inner HTTP stream dies, but the outer Action Listener stream stays alive, ready to catch the next `[Data] Load Items` action!
+
+## FEYNMAN CHECK
+
+### Explain NgRx Like I'm 10 Years Old
+> NgRx brings Redux to Angular: ALL application state lives in a single immutable STORE (a JavaScript object). To change state, you dispatch an ACTION (a plain object describing what happened: { type: '[Cart] Add Item', item: {...} }). REDUCERS are pure functions that take the current state + action and return the NEW state. EFFECTS handle ASYNC operations — they listen for specific actions, call APIs, and dispatch success/failure actions. SELECTORS are memoised functions that compute derived state from the store. The non-obvious value: because every state change flows through an action, you get COMPLETE TRACEABILITY — you can replay, time-travel debug, or log every state transition. This is why financial systems, audit logs, and large enterprise apps use NgRx.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What are the benefits of the Redux pattern at scale?**
+> **A:** (1) PREDICTABILITY — state can only change through reducers, no hidden mutations. (2) TRACEABILITY — every state change is an action with a type string, loggable and replayable. (3) TIME-TRAVEL DEBUGGING — Redux DevTools lets you step backwards through state history. (4) TESTING — reducers are pure functions (trivially unit-testable), effects are Observables (marble-testable). (5) COLLABORATION — large teams can work on different feature state slices without interference. The cost: boilerplate, indirection, and learning curve.
+
+**Q2: Mental model for Effects?**
+> **A:** An Effect is an Observable that listens to the action stream (Actions), filters for specific action types (ofType()), performs async work (switchMap/mergeMap to HTTP), and dispatches new actions with the result. The canonical pattern: loadUsers$ = createEffect(() => this.actions$.pipe(ofType(UserActions.load), switchMap(() => this.http.get('/api/users').pipe(map(users => UserActions.loadSuccess({ users })), catchError(err => of(UserActions.loadFailure({ error: err.message }))))))) . Effects are the "async middleware" of NgRx — they keep reducers pure by handling all side effects.
+
+**Q3: Most dangerous misconception about NgRx?**
+> **A:** The store is the single source of truth for everything:
+> ```typescript
+> // WRONG: putting UI state in the store
+> // This creates unnecessary boilerplate for trivial UI state
+> interface AppState {
+>   isMenuOpen: boolean;     // just use component signal/property
+>   isDropdownOpen: boolean; // just use component signal/property
+>   searchInputValue: string;// just use a FormControl
+> }
+>
+> // CORRECT: only shared, serializable, replayable state in NgRx
+> interface AppState {
+>   currentUser: User | null;
+>   products: Product[];
+>   cart: CartItem[];
+>   // NOT: modal visibility, form field values, tooltip hover state
+> }
+>
+> // Rule: NgRx for domain state that MATTERS for business logic
+> // Signals/services for UI state that is ephemeral
+> ```
+
+**Q4: How do feature states and lazy loading work in NgRx?**
+> **A:** NgRx supports FEATURE STATE — each lazy-loaded route registers its own slice of the store when the route loads. The route's providers array includes provideState(featureReducer). This means the Admin feature's state doesn't exist in the store until the user navigates to /admin. Feature states are tree-shakeable — users who never visit admin never download or initialise that state. Selectors use createFeatureSelector to access the feature slice, maintaining type safety.
+
+**Q5: FAANG-grade definition of NgRx.**
+> **A:** "NgRx is Angular's Redux implementation — providing a single immutable state store (Store) updated only through pure reducer functions (createReducer/on), with action creator factories (createAction) as the event bus, Effects for async side-effect handling via RxJS Observable chains (ofType, switchMap, catchError), and memoised selectors (createSelector, createFeatureSelector) for derived state computation — supporting lazy feature state registration, Redux DevTools integration for time-travel debugging, and SignalStore for a signals-native alternative — appropriate for large apps requiring auditability, testability, and team-scale state discipline."
+
+## BUILD
+
+### 🏗️ Mini Project: NgRx Products Feature — Actions, Reducer, Selectors, Effects
+
+**What you will build:** A complete NgRx feature for a products list: createAction for CRUD actions, createReducer with on() for state transitions, createSelector for derived state, and createEffect for HTTP loading — the standard NgRx feature pattern.
+**Why this project:** Forces every NgRx concept in context — the complete state management lifecycle.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new ngrx-demo --standalone --routing
+cd ngrx-demo
+npm install @ngrx/store @ngrx/effects @ngrx/entity @ngrx/store-devtools
+ng generate feature products --module app --creators
+```
+
+#### Step 2 — Actions
+```typescript
+// products.actions.ts
+import { createAction, props } from '@ngrx/store';
+export interface Product { id: number; title: string; price: number; }
+
+export const ProductActions = {
+  load: createAction('[Products] Load'),
+  loadSuccess: createAction('[Products] Load Success', props<{ products: Product[] }>()),
+  loadFailure: createAction('[Products] Load Failure', props<{ error: string }>()),
+  add: createAction('[Products] Add', props<{ product: Product }>()),
+  remove: createAction('[Products] Remove', props<{ id: number }>()),
+};
+```
+
+#### Step 3 — Reducer
+```typescript
+// products.reducer.ts
+import { createReducer, on } from '@ngrx/store';
+import { EntityAdapter, EntityState, createEntityAdapter } from '@ngrx/entity';
+import { ProductActions, Product } from './products.actions';
+
+export interface ProductsState extends EntityState<Product> {
+  loading: boolean;
+  error: string | null;
+}
+
+const adapter: EntityAdapter<Product> = createEntityAdapter<Product>();
+const initialState: ProductsState = adapter.getInitialState({ loading: false, error: null });
+
+export const productsReducer = createReducer(
+  initialState,
+  on(ProductActions.load, state => ({ ...state, loading: true, error: null })),
+  on(ProductActions.loadSuccess, (state, { products }) =>
+    adapter.setAll(products, { ...state, loading: false })),
+  on(ProductActions.loadFailure, (state, { error }) =>
+    ({ ...state, loading: false, error })),
+  on(ProductActions.add, (state, { product }) => adapter.addOne(product, state)),
+  on(ProductActions.remove, (state, { id }) => adapter.removeOne(id, state)),
+);
+
+export const { selectAll, selectTotal } = adapter.getSelectors();
+```
+
+#### Step 4 — Selectors and Effects
+```typescript
+// products.selectors.ts
+import { createFeatureSelector, createSelector } from '@ngrx/store';
+import { ProductsState, selectAll } from './products.reducer';
+
+const selectProductsState = createFeatureSelector<ProductsState>('products');
+export const selectAllProducts = createSelector(selectProductsState, selectAll);
+export const selectLoading = createSelector(selectProductsState, s => s.loading);
+export const selectError = createSelector(selectProductsState, s => s.error);
+export const selectCount = createSelector(selectAllProducts, p => p.length);
+export const selectExpensive = createSelector(selectAllProducts, p => p.filter(x => x.price > 50));
+
+// products.effects.ts
+import { Injectable, inject } from '@angular/core';
+import { createEffect, Actions, ofType } from '@ngrx/effects';
+import { HttpClient } from '@angular/common/http';
+import { switchMap, map, catchError } from 'rxjs/operators';
+import { of } from 'rxjs';
+import { ProductActions, Product } from './products.actions';
+
+@Injectable()
+export class ProductEffects {
+  private actions$ = inject(Actions);
+  private http = inject(HttpClient);
+
+  loadProducts$ = createEffect(() =>
+    this.actions$.pipe(
+      ofType(ProductActions.load),
+      switchMap(() =>
+        this.http.get<Product[]>('https://fakestoreapi.com/products').pipe(
+          map(products => ProductActions.loadSuccess({ products })),
+          catchError(err => of(ProductActions.loadFailure({ error: err.message }))),
+        )
+      ),
+    )
+  );
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('productsReducer', () => {
+  it('sets loading on load action', () => {
+    const state = productsReducer(undefined, ProductActions.load());
+    expect(state.loading).toBe(true);
+  });
+  it('stores products on loadSuccess', () => {
+    const products = [{ id: 1, title: 'A', price: 10 }];
+    const state = productsReducer(undefined, ProductActions.loadSuccess({ products }));
+    expect(state.ids.length).toBe(1);
+    expect(state.loading).toBe(false);
+  });
+  it('stores error on loadFailure', () => {
+    const state = productsReducer(undefined, ProductActions.loadFailure({ error: 'Network error' }));
+    expect(state.error).toBe('Network error');
+    expect(state.loading).toBe(false);
+  });
+});
+```
+
+**Expected Output:**
+```
+dispatch(load) -> loading: true
+Effect calls API -> dispatch(loadSuccess) -> products in store
+dispatch(remove, id) -> product removed from EntityAdapter
+Selectors: selectExpensive filters products over $50
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add NgRx SignalStore version and compare boilerplate
+- [ ] Add optimistic updates for add/remove with rollback on failure
+- [ ] Add ReduxDevTools and time-travel through state changes
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Four building blocks of NgRx.
+**Q2:** What is the difference between a reducer and an effect?
+**Q3:** Write an NgRx action with props. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What state should NOT be in the NgRx store?
+**Q5:** A junior puts every component's local UI state in NgRx — explain the problem.
+**Q6:** What is EntityAdapter and what does it give you?
+
+### Day 7 — Application
+**Q7:** Build a complete NgRx feature: actions, reducer, selectors, and effect for a cart.
+**Q8:** A PR uses exhaustMap in an Effect for a paginated list load — explain the problem.
+**Q9:** How do feature states work with lazy-loaded routes?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through the Redux pattern in Angular NgRx — data flow from dispatch to UI update."
+**Q11:** Draw: NgRx data flow — component dispatch, reducer, store, selector, component re-render.
+**Q12:** ★ System design: "Design state management for a real-time collaborative document editor — NgRx with WebSocket effects."

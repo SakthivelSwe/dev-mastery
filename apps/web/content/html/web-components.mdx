@@ -136,3 +136,236 @@ By writing the `<apple-button>` as a native Web Component, the company builds it
 ## INTERVIEW
 **Q: Why must a custom element name always contain a hyphen (e.g., `<user-card>`)?**
 A: To completely eliminate the risk of naming collisions. The W3C (the organization that dictates HTML standards) made a strict promise: *They will never, ever create an official HTML tag that contains a hyphen.* By forcing developers to use hyphens for custom components, it guarantees that your `<custom-tabs>` component will never accidentally conflict with an official `<tabs>` element that Google Chrome might release 10 years from now.
+
+## FEYNMAN CHECK
+
+### Explain Web Components Like I'm 10 Years Old
+> Web Components are the browser's native version of "build your own HTML tag." `<my-counter></my-counter>` is a real element you can register in 20 lines of JS, with: its own internal HTML (Shadow DOM), its own CSS (scoped — outside CSS can't reach in), its own lifecycle callbacks (`connectedCallback`, `disconnectedCallback`, `attributeChangedCallback`), and full DOM API parity. Once defined, your tag works in React, Angular, Vue, plain HTML, even server-rendered pages — it's the only "framework" that's built into the browser itself.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do Web Components fundamentally solve?**
+> **A:** Cross-framework component reuse. A React component only works in React; an Angular directive only works in Angular. A Web Component works EVERYWHERE because it's a native browser element. This is why GitHub, Salesforce, and Adobe build their design systems as Web Components — one codebase serves React-using teams, Angular-using teams, and plain-HTML pages.
+
+**Q2: What is the ONE mental model that makes Web Components click?**
+> **A:** A Web Component is just a class extending `HTMLElement`, registered with `customElements.define('my-tag', MyClass)`. The browser instantiates your class whenever it parses `<my-tag>`. Lifecycle callbacks fire at known points (constructor → connectedCallback → attributeChangedCallback → disconnectedCallback). Shadow DOM is OPT-IN — you call `this.attachShadow({mode:'open'})` only if you want scoped CSS.
+
+**Q3: What is the most dangerous misconception? Show it with code.**
+> **A:** Doing rendering in the constructor:
+> ```javascript
+> // ❌ Forbidden — the spec disallows DOM mutation in constructors.
+> //    The element isn't yet inserted into the document, attributes aren't yet parsed.
+> class MyEl extends HTMLElement {
+>   constructor() {
+>     super();
+>     this.innerHTML = '<p>' + this.getAttribute('label') + '</p>'; // attribute is null!
+>   }
+> }
+>
+> // ✅ Render in connectedCallback, when the element is in the DOM
+> class MyEl extends HTMLElement {
+>   connectedCallback() {
+>     this.innerHTML = '<p>' + this.getAttribute('label') + '</p>';
+>   }
+> }
+> ```
+
+**Q4: How does `attributeChangedCallback` interact with the browser's attribute parsing pipeline?**
+> **A:** You opt into observation by declaring `static observedAttributes = ['label', 'disabled']`. The browser then calls `attributeChangedCallback(name, oldValue, newValue)` whenever any observed attribute is set, removed, or changed — including the initial parse-time values. This is how custom elements stay in sync with declarative `<my-tag label="hello">` AND imperative `el.setAttribute('label','hi')` — one callback handles both.
+
+**Q5: Write a one-sentence FAANG-precise definition.**
+> **A:** "A Web Component is a user-defined HTML element implemented as a class extending `HTMLElement`, registered via `customElements.define`, with optional Shadow DOM for style/markup encapsulation, optional Template/Slot composition, and four lifecycle hooks (`constructor`, `connectedCallback`, `disconnectedCallback`, `attributeChangedCallback`) — providing the only framework-agnostic, browser-native component model that interoperates with React, Angular, Vue, and plain HTML simultaneously."
+
+## BUILD
+
+### 🏗️ Mini Project: A `<theme-toggle>` Custom Element That Works Everywhere
+
+**What you will build:** A self-contained `<theme-toggle>` button you can drop into any HTML page. It persists choice to localStorage, syncs across tabs, respects `prefers-color-scheme`, dispatches a custom event, and ships with proper a11y.
+**Why this project:** Touches every Web Component lifecycle hook + custom events + scoped styling + state persistence.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir theme-toggle && cd theme-toggle
+ni index.html, theme-toggle.js -ItemType File
+```
+
+#### Step 2 — Markup
+```html
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>theme-toggle demo</title>
+<style>
+  :root[data-theme="dark"] { background: #111; color: #eee; }
+</style></head>
+<body>
+  <h1>Theme demo</h1>
+  <theme-toggle></theme-toggle>
+  <script type="module" src="./theme-toggle.js"></script>
+</body></html>
+```
+
+#### Step 3 — The Custom Element
+```javascript
+class ThemeToggle extends HTMLElement {
+  // Tell the browser which attributes to observe
+  static observedAttributes = ['theme'];
+
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this.shadowRoot.innerHTML = `
+      <style>
+        button { font: inherit; padding: 0.5em 1em; cursor: pointer;
+                 background: var(--bg, #f0f0f0); color: inherit;
+                 border: 1px solid currentColor; border-radius: 4px; }
+      </style>
+      <button type="button" aria-pressed="false">
+        <span class="label"></span>
+      </button>
+    `;
+    this.btn   = this.shadowRoot.querySelector('button');
+    this.label = this.shadowRoot.querySelector('.label');
+    this.btn.addEventListener('click', () => this.toggle());
+  }
+
+  connectedCallback() {
+    // Restore from localStorage, or fall back to system preference
+    const saved = localStorage.getItem('theme');
+    const sys   = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    this.setAttribute('theme', saved ?? sys);
+
+    // Sync with other tabs (storage event fires in OTHER tabs only)
+    this._onStorage = (e) => {
+      if (e.key === 'theme' && e.newValue) this.setAttribute('theme', e.newValue);
+    };
+    window.addEventListener('storage', this._onStorage);
+  }
+
+  disconnectedCallback() {
+    // Avoid memory leak — remove the listener we added in connectedCallback
+    window.removeEventListener('storage', this._onStorage);
+  }
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    if (name === 'theme' && newValue !== oldValue) {
+      // Apply to <html> so all CSS can react
+      document.documentElement.dataset.theme = newValue;
+      localStorage.setItem('theme', newValue);
+      this.label.textContent = newValue === 'dark' ? '🌙 Dark' : '☀️ Light';
+      this.btn.setAttribute('aria-pressed', String(newValue === 'dark'));
+
+      // Let parent app react if it wants
+      this.dispatchEvent(new CustomEvent('themechange', {
+        detail: { theme: newValue },
+        bubbles: true, composed: true     // crosses shadow boundary
+      }));
+    }
+  }
+
+  toggle() {
+    const current = this.getAttribute('theme');
+    this.setAttribute('theme', current === 'dark' ? 'light' : 'dark');
+  }
+}
+
+customElements.define('theme-toggle', ThemeToggle);
+```
+
+#### Step 4 — Edge Cases: SSR, Lazy Definition, Multiple Instances
+```html
+<!-- Pattern: the element appears in HTML BEFORE the JS runs (SSR / no-JS).
+     The browser silently upgrades it to a custom element once defined. -->
+<theme-toggle></theme-toggle>
+<script type="module">
+  // Late definition — instances already in the DOM upgrade on define()
+  await new Promise(r => setTimeout(r, 1000));
+  await import('./theme-toggle.js');
+</script>
+```
+
+#### Step 5 — Tests
+```javascript
+// Verify the element is upgraded
+const el = document.querySelector('theme-toggle');
+console.assert(el instanceof HTMLElement, 'should be an element');
+console.assert(el.shadowRoot,             'should have shadow root');
+
+// Verify event dispatches across shadow boundary
+let receivedTheme;
+document.addEventListener('themechange', (e) => receivedTheme = e.detail.theme);
+el.toggle();
+console.assert(receivedTheme === 'dark' || receivedTheme === 'light',
+  'themechange should fire on toggle');
+
+// Verify persistence
+console.assert(localStorage.getItem('theme'), 'theme should be persisted');
+```
+
+**Expected Output:**
+```
+- Button toggles between ☀️ Light and 🌙 Dark, page background changes
+- aria-pressed updates for screen-reader users
+- Reload keeps the chosen theme (localStorage)
+- Open two tabs: toggling in one updates the other (storage event)
+- themechange CustomEvent bubbles to document level
+```
+
+**Stretch Challenges:**
+- [ ] Add `form-associated` via `ElementInternals` so it participates in form submit
+- [ ] Add a "system" tri-state (light / dark / auto-follow-OS)
+- [ ] Publish as an npm package and consume it in React + Vue + plain HTML to prove portability
+
+## SPACED REVIEW
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name the FOUR Web Component lifecycle callbacks and when each fires.
+
+**Q2:** What does `static observedAttributes` do? What happens if you forget it?
+
+**Q3:** Write the minimum 7-line custom element that logs "connected" when added to the DOM.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the difference between OPEN and CLOSED shadow DOM? When does each make sense?
+
+**Q5:** Describe the bug caused by doing DOM work in a custom element's constructor. Why does the spec forbid it?
+
+**Q6:** Refactor this broken custom element:
+```javascript
+class MyEl extends HTMLElement {
+  constructor() {
+    super();
+    this.innerHTML = '<p>' + this.getAttribute('msg') + '</p>';  // always null!
+    document.body.addEventListener('click', this.onBodyClick);    // never removed!
+  }
+}
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build a `<lazy-img>` element that defers loading until visible (Intersection Observer), supports blur placeholder, and dispatches a `load` event.
+
+**Q8:** A custom element works in plain HTML but breaks in React. List 3 React-specific gotchas (refs, attribute vs prop, event naming) and the workaround for each.
+
+**Q9:** What is `ElementInternals` and what does "form-associated custom element" let you do?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Interview: "Why would a company invest in Web Components for their design system?"
+
+**Q11:** Draw the dependency graph: web-components ↔ template-slot ↔ html-attributes ↔ html5-apis.
+
+**Q12:** ★ System design: "Design the architecture for a 200-component design system delivered as web components, consumed by React, Angular, and Vue teams, with theme tokens, accessibility, SSR, and a documentation site."

@@ -94,3 +94,189 @@ Because Nx maintains an internal Dependency Graph of your entire architecture, i
 When you run `nx affected:test`, Nx looks at the Git diff (comparing your PR to the `main` branch). It sees you changed `shared-ui`.
 It looks at the Dependency Graph and traces the arrows backwards. It sees that `App 1`, `App 2`, and `App 3` import `shared-ui`. It sees that the other 7 apps *do not* import `shared-ui`.
 Therefore, it is mathematically impossible for your code change to have broken the other 7 apps. Nx automatically ignores them, saving massive amounts of CI compute time!
+
+## FEYNMAN CHECK
+
+### Explain Nx Monorepo Like I'm 10 Years Old
+> Nx is a build system and monorepo tool that keeps MULTIPLE Angular apps and shared libraries in ONE repository. Instead of 5 separate repos for 5 apps, you have one repo where all apps can share code (a common UI library, auth utilities, API types) without publishing to npm. Nx adds: smart caching (only rebuild what changed), affected analysis (only test affected projects), code generators, and a dependency graph visualiser. The non-obvious depth: Nx's affected analysis works by building a dependency graph from your import statements. If you change a shared library, Nx runs tests only for all apps/libraries that import it — not for unrelated ones. This can reduce CI time from 30 minutes to 3 minutes on large repos.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between an Nx app and an Nx library?**
+> **A:** An APP is deployable — it has a build target producing a dist folder. A LIBRARY is a collection of reusable code — it doesn't deploy on its own but is imported by apps and other libraries. Nx enforces library access rules via tags: { "sourceTag": "scope:shared" } ensures only allowed consumers import it. Library types by convention: feature (smart component + routing), UI (presentational components), data-access (services, state), util (pure functions), shell (composition). This separation prevents spaghetti dependencies.
+
+**Q2: Mental model for Nx computation cache?**
+> **A:** Nx caches the OUTPUT of tasks (build, test, lint) keyed by the HASH of: source files, task config, environment. If nothing in the hash changed, Nx replays the cached output instead of running the task. Remote cache (Nx Cloud) shares the cache across machines — a developer or CI run benefits from cache produced by other developers or CI runs. Practical result: nx affected:test after a small change runs in seconds instead of minutes because most tests are served from cache.
+
+**Q3: Most dangerous misconception about Nx monorepos?**
+> **A:** Nx monorepos eliminate all coordination overhead:
+> ```
+> // Nx solves: code sharing, incremental builds, consistent tooling
+>
+> // Nx does NOT solve:
+> // - Too many PRs landing on the same library simultaneously (merge conflicts)
+> // - Breaking changes in shared libraries affect ALL consumers at once
+> // - CI still runs affected tests for everyone if a widely-used lib changes
+>
+> // Solution: well-defined library boundaries, backward-compatible changes,
+> // versioning policies for shared libs, and feature flags for gradual rollouts
+> ```
+
+**Q4: How does Nx enforce architectural boundaries?**
+> **A:** @nx/enforce-module-boundaries ESLint rule reads the nx.json project tags and the constraints array. Example constraint: { sourceTag: 'scope:feature', onlyDependOn: ['scope:ui', 'scope:util'] } prevents feature libs from importing other feature libs. This is CHECKED at lint time — violations fail CI before code reaches review. This enforces the Hexagonal Architecture or Clean Architecture patterns programmatically — developers cannot accidentally create circular dependencies between layers.
+
+**Q5: FAANG-grade definition of Nx Monorepo.**
+> **A:** "Nx is a smart monorepo build system for JavaScript/TypeScript projects — providing workspace management for multiple applications and libraries in a single repository, computation caching (local + Nx Cloud remote cache) via task output hashing, project graph-based affected analysis (nx affected runs only tasks for changed projects and their dependents), code generators (nx generate), architectural boundary enforcement via @nx/enforce-module-boundaries ESLint rules with tag-based constraints, and first-class Angular support via @nx/angular plugin — enabling large organisations to scale development velocity without sacrificing build performance."
+
+## BUILD
+
+### 🏗️ Mini Project: Nx Workspace With Shell App + Shared UI Library + Feature Library
+
+**What you will build:** An Nx workspace with: one Angular shell app, one shared UI library (button, card components), one feature library (user-feature with UserListComponent + UserService) — with module boundaries enforced via tags.
+**Why this project:** Forces the complete Nx library structure and boundary enforcement pattern.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-nx-workspace@latest nx-demo --preset=angular-standalone --appName=shell --bundler=esbuild
+cd nx-demo
+
+# Generate libraries
+nx generate @nx/angular:library --name=shared/ui --directory=libs/shared/ui --standalone --tags=scope:shared,type:ui
+nx generate @nx/angular:library --name=feature/users --directory=libs/feature/users --standalone --tags=scope:feature,type:feature
+```
+
+#### Step 2 — Shared UI Library: Button Component
+```typescript
+// libs/shared/ui/src/lib/button/button.component.ts
+import { Component, Input, Output, EventEmitter } from '@angular/core';
+
+@Component({
+  standalone: true,
+  selector: 'ui-button',
+  template: '<button [class]="variant" [disabled]="disabled" (click)="clicked.emit()"><ng-content/></button>',
+})
+export class ButtonComponent {
+  @Input() variant: 'primary' | 'secondary' = 'primary';
+  @Input() disabled = false;
+  @Output() clicked = new EventEmitter<void>();
+}
+
+// libs/shared/ui/src/index.ts — public API
+export { ButtonComponent } from './lib/button/button.component';
+```
+
+#### Step 3 — Feature Library: Users
+```typescript
+// libs/feature/users/src/lib/user.service.ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+
+export interface User { id: number; name: string; email: string; }
+
+@Injectable({ providedIn: 'root' })
+export class UserService {
+  private http = inject(HttpClient);
+  getUsers() { return this.http.get<User[]>('https://jsonplaceholder.typicode.com/users'); }
+}
+
+// libs/feature/users/src/lib/user-list/user-list.component.ts
+import { Component, inject, OnInit } from '@angular/core';
+import { NgFor } from '@angular/common';
+import { ButtonComponent } from '@nx-demo/shared/ui';  // cross-library import
+import { UserService } from '../user.service';
+
+@Component({
+  standalone: true,
+  selector: 'feature-user-list',
+  imports: [NgFor, ButtonComponent],
+  template: `
+    <h2>Users</h2>
+    <ul><li *ngFor="let user of users">{{ user.name }}</li></ul>
+    <ui-button variant="primary" (clicked)="load()">Reload</ui-button>
+  `,
+})
+export class UserListComponent implements OnInit {
+  users: any[] = [];
+  private userService = inject(UserService);
+  ngOnInit() { this.load(); }
+  load() { this.userService.getUsers().subscribe(u => this.users = u); }
+}
+```
+
+#### Step 4 — Enforce Module Boundaries
+```json
+// .eslintrc.json — boundary rules
+{
+  "rules": {
+    "@nx/enforce-module-boundaries": ["error", {
+      "enforceBuildableLibDependency": true,
+      "depConstraints": [
+        { "sourceTag": "type:feature", "onlyDependOn": ["type:ui", "type:util"] },
+        { "sourceTag": "type:ui", "onlyDependOn": ["type:util"] },
+        { "sourceTag": "scope:feature", "notDependOn": ["scope:feature"] }
+      ]
+    }]
+  }
+}
+```
+
+#### Step 5 — Nx Commands
+```bash
+# Show dependency graph
+nx graph
+
+# Build only affected projects
+nx affected:build --base=main
+
+# Test only affected projects
+nx affected:test --base=main
+
+# Run everything in parallel
+nx run-many --target=test --all --parallel=5
+
+# Check boundary violations
+nx lint
+
+# Output:
+# nx graph -> visual dependency graph in browser
+# nx affected:test -> only tests affected by your changes
+```
+
+**Expected Output:**
+```
+nx graph: shell -> feature/users -> shared/ui (correct dependency direction)
+Boundary violation: feature/users imports another feature lib -> lint error
+nx affected:test: only runs tests for changed libs and their consumers
+```
+
+**Stretch Challenges:**
+- [ ] Add Nx Cloud and share cache across team members
+- [ ] Add a data-access library and enforce it can only be used by feature libs
+- [ ] Add a publishable library and configure it for npm publishing
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the difference between an Nx app and an Nx library?
+**Q2:** What is nx affected and when does it save time?
+**Q3:** Write the nx generate command for a standalone Angular library. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How does Nx computation cache work — what does it hash?
+**Q5:** A junior creates a circular dependency between two libraries — how does Nx catch it?
+**Q6:** What are the four common Nx library types?
+
+### Day 7 — Application
+**Q7:** Set up module boundary rules preventing feature libs from importing other feature libs.
+**Q8:** A CI pipeline takes 45 minutes for a 20-app repo — how does Nx affected reduce this?
+**Q9:** What is Nx Cloud and how does it extend caching?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Nx monorepo architecture — how do library tags and module boundaries enforce clean architecture?"
+**Q11:** Draw: Nx dependency graph for a 5-app, 10-library workspace.
+**Q12:** ★ System design: "Migrate a 5-team, 5-repo Angular organisation to a Nx monorepo — risks, migration plan, boundary strategy."

@@ -152,3 +152,237 @@ A: No. Because asynchronous callbacks are executed later by the Event Loop (afte
 
 **Q: Why does the Node.js standard library use Error-First Callbacks?**
 A: Because of the `try/catch` limitation mentioned above, asynchronous functions cannot simply `throw` an error back to the caller. The only way to reliably inform the caller that a background failure occurred is to pass the Error object directly into the callback function. Making the Error the absolute first parameter (`(err, data)`) became a standardized convention so developers would never forget to check for failures before processing data.
+
+## FEYNMAN CHECK
+
+### Explain Callbacks Like I'm 10 Years Old
+> A callback is a FUNCTION YOU PASS TO ANOTHER FUNCTION so it can call YOU back when something happens. Synchronous: `[1,2,3].map(x => x*2)` — map calls your callback immediately for each element. Asynchronous: `setTimeout(fn, 1000)` — the runtime invokes fn LATER. Node.js classically used "error-first callbacks" `(err, result) => ...` — every API took a callback whose FIRST arg was the error (or null). Before Promises this led to "callback hell" — deeply nested error handling, hard to compose. Modern code rarely writes raw callbacks for async — Promises and async/await are the answer. But callbacks are STILL EVERYWHERE for sync: array methods, event listeners, sort comparators.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why did the JS ecosystem move away from callbacks for async?**
+> **A:** Three pains: (1) NESTING — chaining async ops produced "pyramid of doom" 6+ levels deep. (2) ERROR HANDLING — you had to check err in every callback; one forgotten check meant silent failures. (3) COMPOSITION — combining 5 concurrent operations required manual coordination (counter pattern). Promises (ES6) solved nesting via .then chains. async/await (ES2017) made async look synchronous. Today raw callbacks survive only for sync APIs and event listeners.
+
+**Q2: Mental model for sync vs async callbacks?**
+> **A:** SYNC callbacks run BEFORE the calling function returns: `arr.forEach(cb)` finishes cb on every element before forEach returns. ASYNC callbacks are SCHEDULED — pushed onto the macrotask or microtask queue, run later when the event loop pulls them. Always document which one your API uses — mixing the two ("Zalgo") is a famous anti-pattern that breaks invariants. Node.js's process.nextTick made fs.readFile callbacks deterministically async.
+
+**Q3: Most dangerous misconception?**
+> **A:** Errors in async callbacks bubble like sync errors:
+> ```js
+> // ❌ This try/catch does NOTHING — the throw is async
+> try {
+>   setTimeout(() => { throw new Error('boom'); }, 0);
+> } catch (e) {
+>   console.log('caught:', e.message);   // never runs
+> }
+> // The error becomes an "unhandledRejection" / "uncaughtException"
+>
+> // ✅ Catch inside the callback or use a Promise
+> setTimeout(() => {
+>   try { riskyOp(); } catch (e) { console.error(e); }
+> }, 0);
+> ```
+
+**Q4: How do callbacks interact with the event loop?**
+> **A:** When you call setTimeout(cb), the runtime asks the OS for a timer. When it fires, cb is pushed to the MACROTASK queue. The event loop picks the next macrotask when the call stack is empty AND all microtasks have drained. So `setTimeout(cb, 0)` is "run after the current sync code AND all queued promises." Promise .then callbacks go to the MICROTASK queue (drained between macrotasks) — that's why they always fire before any setTimeout.
+
+**Q5: FAANG-grade definition?**
+> **A:** "A callback is a function passed as an argument to another function, invoked synchronously by sync APIs (Array.map, sort) or asynchronously by I/O APIs (setTimeout, fs.readFile, event listeners) — historically the standard async pattern with error-first `(err, result)` conventions, largely superseded by Promises and async/await for chaining and error propagation, but retained for sync iteration, event handling, and library APIs that need fine-grained scheduling control."
+
+## BUILD
+
+### 🏗️ Mini Project: Convert Callback-Based File API To Promises
+
+**What you will build:** Take a fake callback-style file system API (`fs.readFile(path, cb)`), wrap it in a Promise version using `promisify`, then use it with async/await — exactly how Node.js libraries migrated.
+**Why this project:** Forces the historical pattern AND the modern migration in one project.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-callbacks && cd js-callbacks
+npm init -y
+npm install -D vitest
+ni fakeFs.js, promisify.js, demo.js, callbacks.test.js -ItemType File
+```
+
+#### Step 2 — Fake Callback-Style FS
+```js
+// fakeFs.js — classic Node.js error-first callback API
+const store = new Map();
+
+export function writeFile(path, content, cb) {
+  setTimeout(() => {
+    try {
+      if (typeof path !== 'string') return cb(new TypeError('path must be a string'));
+      store.set(path, content);
+      cb(null);
+    } catch (e) {
+      cb(e);
+    }
+  }, 10);
+}
+
+export function readFile(path, cb) {
+  setTimeout(() => {
+    if (!store.has(path)) return cb(new Error(`ENOENT: ${path}`));
+    cb(null, store.get(path));
+  }, 10);
+}
+
+export function deleteFile(path, cb) {
+  setTimeout(() => {
+    if (!store.delete(path)) return cb(new Error(`ENOENT: ${path}`));
+    cb(null);
+  }, 10);
+}
+```
+
+#### Step 3 — promisify (Like util.promisify)
+```js
+// promisify.js
+export function promisify(fn) {
+  return function (...args) {
+    return new Promise((resolve, reject) => {
+      fn.call(this, ...args, (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+  };
+}
+```
+
+#### Step 4 — Error Handling: Callback Hell vs Async/Await
+```js
+// demo.js
+import * as cbFs from './fakeFs.js';
+import { promisify } from './promisify.js';
+
+// ─── Old way: callback hell ────────────────────────
+function oldWay() {
+  cbFs.writeFile('a.txt', 'hello', (err) => {
+    if (err) return console.error(err);
+    cbFs.readFile('a.txt', (err, content) => {
+      if (err) return console.error(err);
+      cbFs.writeFile('b.txt', content.toUpperCase(), (err) => {
+        if (err) return console.error(err);
+        cbFs.deleteFile('a.txt', (err) => {
+          if (err) return console.error(err);
+          console.log('Old way: done');
+        });
+      });
+    });
+  });
+}
+
+// ─── New way: async/await ─────────────────────────
+const writeFile  = promisify(cbFs.writeFile);
+const readFile   = promisify(cbFs.readFile);
+const deleteFile = promisify(cbFs.deleteFile);
+
+async function newWay() {
+  try {
+    await writeFile('a.txt', 'hello');
+    const content = await readFile('a.txt');
+    await writeFile('b.txt', content.toUpperCase());
+    await deleteFile('a.txt');
+    console.log('New way: done');
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+oldWay();
+newWay();
+```
+
+#### Step 5 — Tests
+```js
+// callbacks.test.js
+import { describe, it, expect, vi } from 'vitest';
+import * as fs from './fakeFs.js';
+import { promisify } from './promisify.js';
+
+describe('callback fs', () => {
+  it('readFile returns content via callback', () => new Promise((done) => {
+    fs.writeFile('t.txt', 'hi', () => {
+      fs.readFile('t.txt', (err, c) => {
+        expect(err).toBeNull();
+        expect(c).toBe('hi');
+        done();
+      });
+    });
+  }));
+  it('error-first: invalid path triggers err arg', () => new Promise((done) => {
+    fs.writeFile(123, 'x', (err) => {
+      expect(err).toBeInstanceOf(TypeError);
+      done();
+    });
+  }));
+});
+
+describe('promisify', () => {
+  it('converts error-first callback to resolved Promise', async () => {
+    const readFile = promisify(fs.readFile);
+    await promisify(fs.writeFile)('p.txt', 'ok');
+    const v = await readFile('p.txt');
+    expect(v).toBe('ok');
+  });
+  it('converts error to rejection', async () => {
+    const readFile = promisify(fs.readFile);
+    await expect(readFile('missing.txt')).rejects.toThrow(/ENOENT/);
+  });
+});
+```
+
+**Expected Output:**
+```
+Old way: done
+New way: done
+
+Tests:
+✓ readFile returns content via callback
+✓ error-first: invalid path triggers err arg
+✓ promisify converts error-first callback to resolved Promise
+✓ promisify converts error to rejection
+```
+
+**Stretch Challenges:**
+- [ ] Add a callbackify(asyncFn) that goes the other direction
+- [ ] Add timeout/cancel to your promisified versions
+- [ ] Implement an "always-async" guarantee using process.nextTick / queueMicrotask
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the "error-first callback" convention?
+**Q2:** Does `Array.map(cb)` invoke cb sync or async?
+**Q3:** Write a setTimeout that logs 'hi' after 500ms. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `try { setTimeout(() => { throw new Error() }) } catch(e) {}` not catch?
+**Q5:** A junior writes "Zalgo" code — a function that calls cb sync sometimes and async other times. Why is this bad?
+**Q6:** Refactor with promisify + async/await:
+```js
+fs.readFile('a', (e, a) => {
+  if (e) throw e;
+  fs.readFile('b', (e, b) => {
+    if (e) throw e;
+    console.log(a + b);
+  });
+});
+```
+
+### Day 7 — Application
+**Q7:** Implement parallelCallback(fns, finalCb) — runs all fns in parallel, finalCb gets results array.
+**Q8:** A PR adds a callback API to a new library — explain why you'd insist on Promise return instead.
+**Q9:** What's the call-stack depth cost of deeply nested callbacks vs Promise chains?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain the differences between callbacks, Promises, async/await, and event-emitter patterns for async code."
+**Q11:** Draw: callback queue vs microtask queue ordering for nested setTimeout + Promise.
+**Q12:** ★ System design: "Migrate a 500-file callback-based legacy codebase to Promises — what tooling, what order, what risks?"

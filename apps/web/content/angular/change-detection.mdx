@@ -158,3 +158,161 @@ A: Under the hood, when the Observable emits a new value, the `async` pipe extra
 
 **Q: How do you completely detach a component from the Change Detection tree?**
 A: You can call `this.cdr.detach()`. Angular will never check this component again, even if `Zone.js` fires. To update the UI, you must manually call `this.cdr.detectChanges()`. This is heavily used when wrapping highly complex, non-Angular DOM manipulators (like massive WebGL canvases) that manage their own rendering loops.
+
+## FEYNMAN CHECK
+
+### Explain Angular Change Detection Like I'm 10 Years Old
+> Change detection is how Angular knows when to update the screen. When something changes (click, timer, HTTP response), Angular runs a change detection cycle — it walks the ENTIRE component tree from root to leaves, checks if any template bindings have new values, and updates the DOM for those that changed. Zone.js patches every async API (setTimeout, Promises, events, HTTP) to notify Angular after they complete. The non-obvious depth: with signals (Angular 16+), Angular tracks exactly which components read which signals — it only re-renders components that read a changed signal, bypassing the full tree walk. This is like the difference between checking every house on the street for a lost cat (Default) vs having GPS on the cat (signals).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What triggers change detection in the Default strategy?**
+> **A:** Zone.js patches all browser async APIs. When any async operation completes — a setTimeout callback, a fetch() resolving, a click event handler — Zone.js notifies Angular, which runs a full change-detection cycle from the root component downward. Every component in the tree is checked for binding changes. This is reliable but expensive for large trees (1000+ components) because Angular must check every binding in every component even if they couldn't possibly have changed.
+
+**Q2: Mental model for OnPush optimization?**
+> **A:** With ChangeDetectionStrategy.OnPush, Angular only re-checks a component when: (1) An @Input reference changes, (2) An event inside the component fires, (3) An Observable linked via async pipe emits, (4) You manually call markForCheck() or detectChanges(). Angular marks the component as "clean" after checking and skips it in future cycles. The component's subtree is also skipped — massive performance gains for large stable subtrees.
+
+**Q3: Most dangerous misconception about change detection?**
+> **A:** OnPush detects all changes automatically:
+> ```typescript
+> @Component({ changeDetection: ChangeDetectionStrategy.OnPush })
+> export class SearchComponent {
+>   results: string[] = [];
+>   search() {
+>     this.results.push('new result');
+>     // Angular does NOT re-render — results reference unchanged!
+>   }
+> }
+>
+> // CORRECT: create new reference
+> search() {
+>   this.results = [...this.results, 'new result'];
+>   // Or use signals:
+>   // this.results.update(r => [...r, 'new result']);
+> }
+> ```
+
+**Q4: How do signals replace Zone.js for change detection?**
+> **A:** With signals, Angular tracks which components READ which signals. When a signal's value changes, Angular marks ONLY the components that read it as dirty — no full tree walk. With provideExperimentalZonelessChangeDetection() (Angular 18+), you can remove Zone.js entirely — startup is faster (no 15KB Zone.js), async operations are lighter, and change detection is surgical per component, not per tree.
+
+**Q5: FAANG-grade definition of Angular change detection.**
+> **A:** "Angular change detection synchronises component state with the DOM — defaulting to Zone.js-triggered full-tree traversal (checking every binding after any async operation) with ChangeDetectionStrategy.OnPush enabling subtree skipping (only checking components whose @Input references changed or events fired) — and signals-based reactive change detection (Angular 16+) achieving surgical per-component updates based on signal dependency tracking, enabling zoneless applications with near-zero change detection overhead."
+
+## BUILD
+
+### 🏗️ Mini Project: Change Detection Profiler — Default vs OnPush vs Signals
+
+**What you will build:** Three implementations of the same counter-grid (20 cells) using Default, OnPush, and Signals strategies — with ngDoCheck instrumentation showing how many times each strategy runs per timer tick.
+**Why this project:** Makes the performance difference empirically measurable — removes doubt about when to use each strategy.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new cd-profiler --standalone --routing false
+ng generate component cell-default --standalone
+ng generate component cell-on-push --standalone
+ng generate component cell-signal --standalone
+```
+
+#### Step 2 — Default Cell (checked every cycle)
+```typescript
+@Component({
+  standalone: true, selector: 'app-cell-default',
+  template: `<div (click)="increment()">{{ count }} (checks: {{ checkCount }})</div>`,
+})
+export class CellDefaultComponent {
+  @Input() cellId = 0;
+  count = 0; checkCount = 0;
+  ngDoCheck() { this.checkCount++; }
+  increment() { this.count++; }
+}
+```
+
+#### Step 3 — OnPush Cell (skipped unless @Input changes or event fires)
+```typescript
+@Component({
+  standalone: true, selector: 'app-cell-on-push',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `<div (click)="increment()">{{ count }} (checks: {{ checkCount }})</div>`,
+})
+export class CellOnPushComponent {
+  @Input() cellId = 0;
+  count = 0; checkCount = 0;
+  ngDoCheck() { this.checkCount++; }
+  increment() { this.count++; }
+}
+```
+
+#### Step 4 — Signal Cell (reactive, minimal re-renders)
+```typescript
+@Component({
+  standalone: true, selector: 'app-cell-signal',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `<div (click)="increment()">{{ count() }} (updates: {{ updateCount() }})</div>`,
+})
+export class CellSignalComponent {
+  @Input() cellId = 0;
+  count = signal(0); updateCount = signal(0);
+  increment() { this.count.update(n => n + 1); this.updateCount.update(n => n + 1); }
+}
+```
+
+#### Step 5 — App With Timer
+```typescript
+@Component({
+  standalone: true, imports: [CellDefaultComponent, CellOnPushComponent, CellSignalComponent, NgFor],
+  template: `
+    <h2>Timer: {{ time }}</h2>
+    <h3>Default (all 20 checked every tick)</h3>
+    <app-cell-default *ngFor="let id of ids" [cellId]="id"/>
+    <h3>OnPush (only event cell checked)</h3>
+    <app-cell-on-push *ngFor="let id of ids" [cellId]="id"/>
+    <h3>Signals (only updated cell re-renders)</h3>
+    <app-cell-signal *ngFor="let id of ids" [cellId]="id"/>
+  `,
+})
+export class AppComponent implements OnInit {
+  ids = Array.from({ length: 20 }, (_, i) => i);
+  time = '';
+  ngOnInit() { setInterval(() => this.time = new Date().toLocaleTimeString(), 1000); }
+}
+```
+
+**Expected Output:**
+```
+After 5 seconds:
+  Default cell checkCount: 5+ (checked every second even without clicking)
+  OnPush cell checkCount: 1-2 (only checked when clicked)
+  Signal cells: only the clicked cell updates its view
+```
+
+**Stretch Challenges:**
+- [ ] Use Angular DevTools profiler to visualise the CD tree
+- [ ] Enable zoneless CD with provideExperimentalZonelessChangeDetection()
+- [ ] Benchmark 1000 cells — Default vs OnPush vs Signals render time
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What triggers a change detection cycle in the Default strategy?
+**Q2:** When does OnPush skip a component?
+**Q3:** Write a component with OnPush strategy. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does mutating an array in an OnPush component not update the view?
+**Q5:** An OnPush component does not update after an HTTP call — diagnose.
+**Q6:** When would you use ChangeDetectorRef.markForCheck() vs detectChanges()?
+
+### Day 7 — Application
+**Q7:** Build a grid of 500 cells and measure render time Default vs OnPush.
+**Q8:** A PR has a setInterval in a root component — how many components get checked per tick?
+**Q9:** What does Zone.js actually patch and what would break without it?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Zone.js-based vs signal-based change detection in Angular — tradeoffs."
+**Q11:** Draw: Angular change detection tree traversal with OnPush vs signals.
+**Q12:** ★ System design: "Migrate a 200-component Angular app from Zone.js to zoneless signals — strategy, risks, rollout plan."

@@ -145,3 +145,269 @@ Next.js looks for `app/dashboard/@analytics/settings/page.tsx` to figure out wha
 
 **The Fix:**
 You must provide a `default.tsx` file inside the slot (`app/dashboard/@analytics/default.tsx`). If Next.js cannot find a matching route for a slot during client-side navigation, it will fall back to rendering the `default.tsx` file instead of crashing.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Parallel Routes Like I'm 10 Years Old
+> Parallel routes let you render MULTIPLE pages in the SAME LAYOUT simultaneously, each fetching their own data independently. Define a folder like @notifications inside your route — the layout receives it as a named prop alongside children. Navigating to /dashboard/notifications/[id] populates the @notifications slot WITHOUT changing the main content. Combined with intercepting routes, this enables URL-addressable modals: clicking a tweet shows it in a modal that lives in a parallel slot — bookmarkable, shareable, with browser back button working correctly. The non-obvious depth: each parallel slot has its OWN loading.tsx, error.tsx, and Suspense boundary — meaning if the notifications slot is slow, only that slot shows a skeleton while the main content remains interactive. Errors in one slot don't break the others.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between parallel routes and conditional rendering?**
+> **A:** Conditional rendering: { showModal && <Modal /> } — the modal state lives in React, isn't in the URL, doesn't survive page refresh, no browser back button support. Parallel routes: the modal IS the URL — /tweets/(.)tweet/123 — refreshing shows the modal, sharing the URL shows the modal, browser back closes it. Parallel routes also enable independent loading/error states per slot (impossible with conditional rendering — one error crashes the whole tree). Parallel routes work seamlessly with Server Components (each slot can independently fetch server data).
+
+**Q2: Mental model for default.tsx and slot fallbacks?**
+> **A:** When a parallel slot has no active route, Next.js renders its default.tsx. If default.tsx doesn't exist, Next.js renders nothing for that slot — but on hard navigation/refresh, this causes a 404! Always provide default.tsx that exports default function Default() { return null; } at minimum. The pattern: each parallel slot has a default.tsx (rendered when slot is empty), a (..)path/[id]/page.tsx (rendered when the slot has an active route), and optionally loading.tsx + error.tsx for independent feedback. Without default.tsx, parallel routes break on hard refresh — common bug.
+
+**Q3: Most dangerous misconception about parallel routes?**
+> **A:** Parallel routes share state across slots:
+> ```typescript
+> // WRONG: assuming slots can communicate via React Context
+> // app/(dashboard)/layout.tsx
+> export default function Layout({ children, analytics, notifications }) {
+>   const [count, setCount] = useState(0);  // ERROR: layout is Server Component
+>   // Even if Client Component, you can't share state to slots:
+>   // children, analytics, notifications are SEPARATE React trees
+>   return (...);
+> }
+>
+> // CORRECT: slots are INDEPENDENT React trees
+> // For shared state: use URL state (searchParams), cookies, or a shared store (Zustand/Jotai)
+> // For shared data: fetch it in the layout and pass via props to each slot
+> // -> Wait, slots are not children you compose — they're rendered by the layout from named props
+> //    The layout determines composition; slots cannot receive runtime props from siblings
+>
+> // The clean pattern: each slot is independent; share via URL or persistent storage
+> ```
+
+**Q4: How do parallel routes implement URL-addressable modals?**
+> **A:** Combine parallel routes with intercepting routes ((.) prefix). Structure: app/feed/page.tsx (feed list), app/feed/@modal/(..)post/[id]/page.tsx (intercepted modal version), app/post/[id]/page.tsx (full page version). Navigation: clicking from /feed → /post/123 is INTERCEPTED — the URL becomes /post/123 but instead of navigating away from /feed, the modal slot renders the post on top. Refreshing /post/123 directly hits the full page (no interception on hard navigation). Sharing /post/123 works for both contexts. Browser back closes the modal (returns to /feed).
+
+**Q5: FAANG-grade definition of parallel routes.**
+> **A:** "Next.js parallel routes (@slot folder convention) enable simultaneous rendering of multiple independent route trees within a shared layout — each slot receiving its own loading.tsx, error.tsx, default.tsx (mandatory fallback for empty slots on hard navigation), and route handlers — accessible as named props to the parent layout component — implemented via React's component composition where the layout determines slot placement — enabling sophisticated UI patterns like URL-addressable modals (via intercepting routes), conditional rendering based on auth state, parallel dashboards with independent data fetching, and multi-pane layouts with independent navigation — without sharing state between slots (each tree is isolated)."
+
+## BUILD
+
+### 🏗️ Mini Project: Twitter-Style Feed With Intercepted Modal + Parallel Analytics Slot
+
+**What you will build:** A feed page with: main timeline (children), notifications slot (@notifications), and a clicked-tweet modal via intercepting parallel route. Refreshing on the modal URL shows the full page; sharing works for both.
+**Why this project:** Forces parallel routes + intercepting routes + default.tsx — the modal pattern.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — File Structure
+```bash
+npx create-next-app@latest parallel-demo --typescript --tailwind --app
+```
+
+```
+src/app/
+  layout.tsx
+  page.tsx
+  feed/
+    layout.tsx              # has slots: {children, modal, notifications}
+    page.tsx                # main timeline
+    @notifications/
+      default.tsx           # default content when slot empty
+      page.tsx              # /feed/notifications -> sidebar with notifications
+      loading.tsx
+    @modal/
+      default.tsx           # MUST EXIST — renders nothing when no modal open
+      (..)tweet/
+        [id]/
+          page.tsx          # intercepted route — renders as modal
+    tweet/
+      [id]/
+        page.tsx            # full tweet page (when navigated directly)
+```
+
+#### Step 2 — Feed Layout With Three Slots
+```typescript
+// src/app/feed/layout.tsx
+interface Props {
+  children: React.ReactNode;
+  modal: React.ReactNode;
+  notifications: React.ReactNode;
+}
+
+export default function FeedLayout({ children, modal, notifications }: Props) {
+  return (
+    <div className="grid grid-cols-12 max-w-6xl mx-auto">
+      {/* Main timeline (children = page.tsx) */}
+      <main className="col-span-8 border-r min-h-screen">
+        {children}
+      </main>
+
+      {/* Notifications sidebar (parallel slot) */}
+      <aside className="col-span-4 p-4">
+        <h2 className="font-bold text-lg mb-3">Notifications</h2>
+        {notifications}
+      </aside>
+
+      {/* Modal overlay (intercepted route shows here) */}
+      {modal}
+    </div>
+  );
+}
+```
+
+#### Step 3 — Default Slot Fallbacks
+```typescript
+// src/app/feed/@notifications/default.tsx
+export default function NotificationsDefault() {
+  return <p className="text-sm text-gray-500">No new notifications</p>;
+}
+
+// src/app/feed/@modal/default.tsx
+// CRITICAL: this MUST exist or refresh breaks parallel routes
+export default function ModalDefault() {
+  return null;
+}
+
+// src/app/feed/@notifications/page.tsx
+async function getNotifications() {
+  await new Promise(r => setTimeout(r, 200));
+  return [
+    { id: 1, text: 'Ana followed you' },
+    { id: 2, text: 'Ben replied to your tweet' },
+  ];
+}
+
+export default async function NotificationsPage() {
+  const notifications = await getNotifications();
+  return (
+    <ul className="space-y-2">
+      {notifications.map(n => (
+        <li key={n.id} className="text-sm p-2 bg-blue-50 rounded">{n.text}</li>
+      ))}
+    </ul>
+  );
+}
+
+// src/app/feed/@notifications/loading.tsx — slot-specific loading
+export default function NotificationsLoading() {
+  return <div className="animate-pulse h-20 bg-gray-100 rounded" />;
+}
+```
+
+#### Step 4 — Intercepting Modal Route
+```typescript
+// src/app/feed/@modal/(..)tweet/[id]/page.tsx
+// (..) means "intercept route from one level up": /tweet/[id] in parent route
+import Link from 'next/link';
+import { getTweet } from '@/lib/tweets';
+
+interface Props { params: { id: string } }
+
+export default async function TweetModal({ params }: Props) {
+  const tweet = await getTweet(params.id);
+  if (!tweet) return null;
+
+  return (
+    <>
+      {/* Backdrop with link back to feed */}
+      <Link href="/feed" className="fixed inset-0 bg-black/50 z-40" />
+
+      {/* Modal content */}
+      <div className="fixed inset-0 flex items-center justify-center z-50 pointer-events-none">
+        <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 pointer-events-auto shadow-xl">
+          <div className="flex items-center justify-between mb-3">
+            <strong>{tweet.author}</strong>
+            <Link href="/feed" className="text-gray-500 hover:text-black">×</Link>
+          </div>
+          <p>{tweet.text}</p>
+          <p className="text-xs text-gray-400 mt-3">{tweet.createdAt}</p>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// src/app/feed/tweet/[id]/page.tsx — full page (hard navigation/refresh)
+import { getTweet } from '@/lib/tweets';
+
+export default async function TweetFullPage({ params }: { params: { id: string } }) {
+  const tweet = await getTweet(params.id);
+  return (
+    <article className="max-w-xl mx-auto p-8">
+      <h1 className="font-bold text-xl">{tweet?.author}</h1>
+      <p className="text-lg mt-4">{tweet?.text}</p>
+    </article>
+  );
+}
+```
+
+#### Step 5 — Feed Page With Tweet Links
+```typescript
+// src/app/feed/page.tsx
+import Link from 'next/link';
+import { getTweets } from '@/lib/tweets';
+
+export default async function FeedPage() {
+  const tweets = await getTweets();
+  return (
+    <div className="divide-y">
+      {tweets.map(tweet => (
+        <Link
+          key={tweet.id}
+          href={`/feed/tweet/${tweet.id}`}
+          className="block p-4 hover:bg-gray-50"
+        >
+          <strong>{tweet.author}</strong>
+          <p>{tweet.text}</p>
+          <p className="text-xs text-gray-400 mt-1">{tweet.createdAt}</p>
+        </Link>
+      ))}
+    </div>
+  );
+}
+
+// src/lib/tweets.ts
+const TWEETS = [
+  { id: '1', author: '@ana', text: 'Server Components are amazing!', createdAt: '2m ago' },
+  { id: '2', author: '@ben', text: 'Parallel routes finally clicked for me.', createdAt: '15m ago' },
+  { id: '3', author: '@cara', text: 'Next.js 15 ships today.', createdAt: '1h ago' },
+];
+export async function getTweets() { return TWEETS; }
+export async function getTweet(id: string) { return TWEETS.find(t => t.id === id); }
+```
+
+**Expected Output:**
+```
+/feed -> shows timeline + notifications sidebar
+Click a tweet -> URL becomes /feed/tweet/1, modal opens (intercepted)
+Refresh /feed/tweet/1 -> shows full page (interception only on soft nav)
+Click backdrop or × -> closes modal, URL returns to /feed
+Browser back -> closes modal (URL history works)
+@notifications slot loads independently with its own loading.tsx
+```
+
+**Stretch Challenges:**
+- [ ] Add a third parallel slot for trending topics
+- [ ] Add error.tsx to one slot and see independent error handling
+- [ ] Add conditional slot rendering based on auth (logged-in vs guest)
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the @folder syntax for?
+**Q2:** Why is default.tsx mandatory for parallel slots?
+**Q3:** Write a layout that receives two parallel slot props. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between parallel routes and conditional rendering?
+**Q5:** A PR's parallel route breaks on hard refresh — what's likely missing?
+**Q6:** How do (..) intercepting routes enable URL-addressable modals?
+
+### Day 7 — Application
+**Q7:** Build a photo gallery where clicking opens an intercepted modal route.
+**Q8:** A PR shares state between parallel slots via Context — explain why it doesn't work.
+**Q9:** How do you handle slot-specific loading and error states?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain parallel routes and intercepting routes — when do you use them in production?"
+**Q11:** Draw: file structure for a Twitter-clone with feed, modal, notifications, and trending slots.
+**Q12:** ★ System design: "Design a dashboard with 4 independent panels using parallel routes — auth, data isolation, real-time updates."

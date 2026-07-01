@@ -138,3 +138,211 @@ If your application logic *depends* on `WeakRef.deref()` returning undefined or 
 A: **The Current Event Loop Execution constraints.**
 JavaScript engine specifications guarantee that a `WeakRef` will *never* be cleared while the current synchronous execution context (the current task on the Event Loop) is still running. 
 Because you are calling `deref()` inside an infinite synchronous `while` loop (or constantly within the exact same Call Stack execution), you are preventing the Event Loop from finishing. The Garbage Collector is generally prevented from sweeping objects from under your feet while a single synchronous script is actively executing, to prevent race conditions. The GC will only sweep the object during idle time *between* tasks on the Event Loop!
+
+## FEYNMAN CHECK
+
+### Explain WeakRef & FinalizationRegistry Like I'm 10 Years Old
+> A WeakRef holds a WEAK pointer to an object — if nothing else holds it, the GC CAN free it. `ref.deref()` returns the object if alive, or undefined if collected. FinalizationRegistry runs a CALLBACK when an object is GC'd — useful for logging memory leaks or releasing non-JS resources. The critical caveat: GC timing is non-deterministic — your cleanup may run seconds later or never. NEVER rely on FinalizationRegistry for critical cleanup. Use explicit dispose() methods + try/finally for that.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When is WeakRef useful?**
+> **A:** Three scenarios: (1) Evictable caches where cached values should be GC'd under memory pressure — deref() returns undefined when evicted, you re-compute. (2) Observer patterns where listeners should not prevent the observed object from being GC'd. (3) Back-references in two-way relationships where one direction should avoid creating retention cycles.
+
+**Q2: Mental model for FinalizationRegistry?**
+> **A:** FinalizationRegistry is a GC hook — register(obj, token) schedules a callback with token when obj is collected. Use for: detecting leaked objects (if callback fires, the cleanup was implicit — log a warning), releasing OS file descriptors in native bindings (with a fallback). The callback must never resurrect the object or access GC'd data.
+
+**Q3: Most dangerous misconception?**
+> **A:** FinalizationRegistry is deterministic cleanup:
+> ```js
+> // ❌ GC may never run before process exits — resource leaks
+> class FileHandle {
+>   #fd;
+>   constructor(p) { this.#fd = open(p); registry.register(this, this.#fd); }
+> }
+>
+> // ✅ Always use explicit lifecycle
+> class FileHandle {
+>   #fd; #closed = false;
+>   constructor(p) { this.#fd = open(p); }
+>   close() { if (!this.#closed) { close(this.#fd); this.#closed = true; } }
+>   [Symbol.dispose]() { this.close(); }
+> }
+> using h = new FileHandle('/tmp/x');   // auto-closed on scope exit
+> ```
+
+**Q4: WeakRef vs WeakMap?**
+> **A:** WeakMap is KEYED — object key → value, both weakly held, great for "attach metadata to objects." WeakRef is a DIRECT weak pointer to one object you can store anywhere. WeakRef is lower-level; WeakMap is usually the right abstraction unless you specifically need to store a reference independently without preventing collection.
+
+**Q5: FAANG-grade definition?**
+> **A:** "WeakRef (ES2021) holds a non-owning reference to an object that doesn't prevent GC — deref() returning undefined after collection — paired with FinalizationRegistry scheduling cleanup callbacks after collection, subject to non-deterministic GC timing — enabling evictable caches, leak detection, and native resource tracking — while mandating explicit lifecycle management via Symbol.dispose and TC39 explicit-resource-management for critical cleanup."
+
+## BUILD
+
+### 🏗️ Mini Project: WeakRef Evictable Cache + Leak Detector
+
+**What you will build:** A cache that holds values via WeakRef (GC can evict them under memory pressure) with FinalizationRegistry logging evictions — compared empirically against a strong Map cache.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-weakref && cd js-weakref
+node --version   # needs Node 14.6+
+npm init -y && npm install -D vitest
+ni weakCache.js, weakCache.test.js -ItemType File
+```
+
+#### Step 2 — WeakRef Cache
+```js
+// weakCache.js
+const evictions = [];
+const registry = new FinalizationRegistry(({ key, stats }) => {
+  evictions.push({ key, at: Date.now() });
+  stats.evicted++;
+});
+
+export function createWeakCache() {
+  const store = new Map();
+  const stats = { hits: 0, misses: 0, evicted: 0 };
+
+  return {
+    set(key, value) {
+      store.set(key, new WeakRef(value));
+      registry.register(value, { key, stats }, value);
+    },
+    get(key) {
+      const ref = store.get(key);
+      if (!ref) { stats.misses++; return undefined; }
+      const v = ref.deref();
+      if (!v) { store.delete(key); stats.misses++; return undefined; }
+      stats.hits++;
+      return v;
+    },
+    has(key) { return this.get(key) !== undefined; },
+    get size() { return store.size; },
+    get stats() { return { ...stats }; },
+    get evictionLog() { return [...evictions]; },
+  };
+}
+```
+
+#### Step 3 — Demonstrate Eviction
+```js
+// demo.js — run with: node --expose-gc demo.js
+import { createWeakCache } from './weakCache.js';
+
+const wc = createWeakCache();
+const strong = new Map();
+
+for (let i = 0; i < 10; i++) {
+  const obj = { id: i, data: new Uint8Array(50_000) };
+  wc.set('k' + i, obj);
+  strong.set('k' + i, obj);
+}
+
+console.log('Before GC: weak=', wc.size, 'strong=', strong.size);
+
+if (global.gc) global.gc();
+await new Promise(r => setTimeout(r, 100));
+
+console.log('After GC: weak=', wc.size, 'strong=', strong.size);
+console.log('Stats:', wc.stats);
+```
+
+#### Step 4 — Symbol.dispose Explicit Lifecycle
+```js
+// dispose.js
+export class Connection {
+  #conn;
+  #closed = false;
+
+  constructor(url) {
+    this.#conn = { url, id: Math.random().toString(36).slice(2) };
+    console.log('opened:', this.#conn.id);
+  }
+
+  query(sql) {
+    if (this.#closed) throw new Error('Connection closed');
+    return 'result of: ' + sql;
+  }
+
+  close() {
+    if (!this.#closed) { console.log('closed:', this.#conn.id); this.#closed = true; }
+  }
+
+  [Symbol.dispose]() { this.close(); }
+}
+```
+
+#### Step 5 — Tests
+```js
+// weakCache.test.js
+import { describe, it, expect } from 'vitest';
+import { createWeakCache } from './weakCache.js';
+
+describe('WeakRef cache', () => {
+  it('stores and retrieves values', () => {
+    const c = createWeakCache();
+    const obj = { id: 1 };
+    c.set('k', obj);
+    expect(c.get('k')).toBe(obj);
+    expect(c.stats.hits).toBe(1);
+  });
+  it('returns undefined for missing keys', () => {
+    const c = createWeakCache();
+    expect(c.get('x')).toBeUndefined();
+    expect(c.stats.misses).toBe(1);
+  });
+  it('tracks count', () => {
+    const c = createWeakCache();
+    c.set('a', {}); c.set('b', {});
+    expect(c.size).toBe(2);
+  });
+  it('live strong ref keeps value accessible', () => {
+    const c = createWeakCache();
+    const obj = { x: 99 };
+    c.set('k', obj);
+    expect(c.get('k')).toBe(obj);   // obj still in scope — not GC'd
+  });
+});
+```
+
+**Expected Output:**
+```
+Before GC: weak= 10  strong= 10
+After GC:  weak= X   strong= 10   (X may be <10 if GC reclaimed some)
+Stats: { hits: 0, misses: 0, evicted: N }
+
+# All tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add TTL-based eviction alongside WeakRef eviction
+- [ ] Build a memory-pressure notifier using performance.measureUserAgentSpecificMemory
+- [ ] Implement using/await using with Symbol.dispose for a DB transaction
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does WeakRef.deref() return after the object is collected?
+**Q2:** When does FinalizationRegistry callback run?
+**Q3:** Name two real use cases for WeakRef. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why can't you rely on FinalizationRegistry for critical cleanup?
+**Q5:** A junior uses Map to cache DOM nodes — memory grows forever. Fix with WeakMap.
+**Q6:** Difference between WeakRef and WeakMap?
+
+### Day 7 — Application
+**Q7:** Build an observer where listeners auto-remove when GC'd via WeakRef.
+**Q8:** A PR uses FinalizationRegistry to close DB connections — explain the risk.
+**Q9:** When does WeakRef actually save memory vs a strong-ref cache?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every weak reference mechanism — WeakRef, WeakMap, WeakSet."
+**Q11:** Draw: lifecycle of a WeakRef-cached object — strong refs, GC eligibility, deref undefined.
+**Q12:** ★ System design: "Design a component debugger that tracks all live instances without preventing GC."

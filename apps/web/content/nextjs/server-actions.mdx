@@ -187,3 +187,306 @@ export async function deletePost(postId: string) {
 ```
 
 **Never trust client-provided user IDs** — always get the identity from the server-side session. The `session.user.id` comes from a signed, httpOnly cookie that the client cannot forge.
+
+## FEYNMAN CHECK
+
+### Explain Server Actions Like I'm 10 Years Old
+> Server Actions are functions that run ON THE SERVER but you call them DIRECTLY from your client code, as if they were regular JavaScript functions. Mark a function with 'use server' at the top — when the client calls it, Next.js automatically creates an RPC endpoint, sends the arguments to the server, runs the function (with DB access, secrets, etc.), and returns the result. No fetch(), no API route, no JSON.stringify(). You can attach them directly to a form's action attribute — the form submits to the Server Action without any JavaScript needed. The non-obvious depth: Server Actions work even WITHOUT JavaScript loaded — they progressively enhance forms. If JS fails to load, the form still submits as a normal POST and the page re-renders. This is a fundamental shift back to "the web works without JavaScript" while keeping the developer experience of modern React.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do Server Actions solve that API routes don't?**
+> **A:** Without Server Actions: write an API route → write client fetch() → handle JSON serialization → manage loading state → handle errors → invalidate cache. With Server Actions: write a 'use server' function → call it directly from a component. Server Actions eliminate the boilerplate: no API route file, no client fetch, no JSON handling. They also integrate natively with cache invalidation (revalidatePath, revalidateTag), support progressive enhancement (forms work without JS), and provide type-safe arguments end-to-end (no string-based JSON parsing).
+
+**Q2: Mental model for the form action progressive enhancement?**
+> **A:** With server actions: <form action={createPostAction}>. When JS is loaded: the form submission becomes a client-side React update (instant feedback, no page reload). When JS is NOT loaded (slow network, JS disabled, bot): the form POSTs to the server normally — the Server Action runs, the page re-renders server-side, the user sees the updated page. This dual behaviour means: works for everyone, fast UX when JS works, still functional when JS fails — the "no broken forms" guarantee that traditional SPAs cannot provide.
+
+**Q3: Most dangerous misconception about Server Actions?**
+> **A:** Server Actions are automatically secure:
+> ```typescript
+> // WRONG: trusting client-provided arguments
+> 'use server';
+> export async function deleteUserAction(userId: string) {
+>   // ANY user can call this and pass ANY userId!
+>   await db.delete(`DELETE FROM users WHERE id = ?`, userId);
+> }
+>
+> // CORRECT: ALWAYS verify auth and authorisation in Server Actions
+> 'use server';
+> export async function deleteUserAction(userId: string) {
+>   const session = await getSession();
+>   if (!session) throw new Error('Unauthorised');
+>   if (session.userId !== userId && session.role !== 'admin') {
+>     throw new Error('Forbidden');
+>   }
+>   await db.delete(`DELETE FROM users WHERE id = ?`, userId);
+> }
+>
+> // Server Actions are PUBLIC API endpoints — treat them like API routes for security
+> ```
+
+**Q4: How do you handle loading and error states with Server Actions?**
+> **A:** Use React 19's useFormStatus() inside the form for loading state: const { pending } = useFormStatus(); <button disabled={pending}>{pending ? 'Saving...' : 'Save'}</button>. For form state and validation errors: useFormState(action, initialState) returns [state, formAction]; the action receives previous state as first argument and FormData as second, returns new state. For mutations not in a form: wrap in useTransition() for non-blocking updates with isPending flag. Errors thrown in Server Actions are caught by the nearest error.tsx boundary.
+
+**Q5: FAANG-grade definition of Server Actions.**
+> **A:** "Next.js Server Actions are React Server Functions (RFC) — async functions marked with 'use server' directive that execute exclusively on the server but are callable from Client Components as direct function references — implemented as auto-generated POST endpoints with serialised arguments — supporting progressive enhancement via form action attribute (working without JavaScript via standard form submission), useFormState/useFormStatus for React-native pending and error states, automatic cache invalidation via revalidatePath/revalidateTag/revalidateTag, and end-to-end type safety from server to client — eliminating the need for explicit API routes for most mutation operations."
+
+## BUILD
+
+### 🏗️ Mini Project: Form Mutations With Server Actions — Validation, Optimistic UI, Progressive Enhancement
+
+**What you will build:** A comments system with: form-based Server Action for submission, useFormState for validation errors, useFormStatus for pending state, optimistic UI with useOptimistic, and works without JavaScript.
+**Why this project:** Forces every Server Action pattern — forms, validation, optimistic, progressive enhancement.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest sa-demo --typescript --tailwind --app
+npm install zod better-sqlite3 @types/better-sqlite3
+```
+
+#### Step 2 — Server Action With Validation
+```typescript
+// src/app/comments/actions.ts
+'use server';
+import { z } from 'zod';
+import { revalidatePath } from 'next/cache';
+import Database from 'better-sqlite3';
+import { cookies } from 'next/headers';
+
+const db = new Database('comments.db');
+db.exec(`CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  author TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`);
+
+const CommentSchema = z.object({
+  author: z.string().min(2, 'Name must be at least 2 characters').max(50),
+  text: z.string().min(5, 'Comment must be at least 5 characters').max(500),
+});
+
+export type ActionState = {
+  status: 'idle' | 'success' | 'error';
+  errors?: Record<string, string[]>;
+  message?: string;
+};
+
+export async function addCommentAction(
+  prevState: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  // Authorisation check — verify user session
+  const session = cookies().get('session');
+  // For demo we allow anonymous; in production: if (!session) return error
+
+  // Validate input with Zod
+  const result = CommentSchema.safeParse({
+    author: formData.get('author'),
+    text: formData.get('text'),
+  });
+
+  if (!result.success) {
+    return {
+      status: 'error',
+      errors: result.error.flatten().fieldErrors,
+      message: 'Please fix the validation errors',
+    };
+  }
+
+  try {
+    db.prepare('INSERT INTO comments (author, text) VALUES (?, ?)').run(
+      result.data.author, result.data.text,
+    );
+    revalidatePath('/comments');
+    return { status: 'success', message: 'Comment posted!' };
+  } catch (err) {
+    return { status: 'error', message: 'Failed to save comment' };
+  }
+}
+
+export async function deleteCommentAction(id: number) {
+  db.prepare('DELETE FROM comments WHERE id = ?').run(id);
+  revalidatePath('/comments');
+}
+```
+
+#### Step 3 — Comment Form (Client Component)
+```typescript
+// src/components/CommentForm.tsx
+'use client';
+import { useFormState, useFormStatus } from 'react-dom';
+import { addCommentAction, ActionState } from '@/app/comments/actions';
+
+const initialState: ActionState = { status: 'idle' };
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button
+      type="submit"
+      disabled={pending}
+      className="px-4 py-2 bg-blue-500 text-white rounded disabled:bg-gray-400"
+    >
+      {pending ? 'Posting...' : 'Post Comment'}
+    </button>
+  );
+}
+
+export function CommentForm() {
+  const [state, formAction] = useFormState(addCommentAction, initialState);
+
+  return (
+    <form action={formAction} className="space-y-3">
+      <div>
+        <input
+          name="author"
+          placeholder="Your name"
+          required
+          className="w-full px-3 py-2 border rounded"
+        />
+        {state.errors?.author && (
+          <p className="text-red-500 text-sm mt-1">{state.errors.author[0]}</p>
+        )}
+      </div>
+      <div>
+        <textarea
+          name="text"
+          placeholder="Your comment"
+          required
+          rows={3}
+          className="w-full px-3 py-2 border rounded"
+        />
+        {state.errors?.text && (
+          <p className="text-red-500 text-sm mt-1">{state.errors.text[0]}</p>
+        )}
+      </div>
+      <SubmitButton />
+      {state.status === 'success' && <p className="text-green-600">{state.message}</p>}
+      {state.status === 'error' && !state.errors && (
+        <p className="text-red-600">{state.message}</p>
+      )}
+    </form>
+  );
+}
+```
+
+#### Step 4 — Optimistic UI With useOptimistic
+```typescript
+// src/components/CommentList.tsx
+'use client';
+import { useOptimistic, useTransition } from 'react';
+import { deleteCommentAction } from '@/app/comments/actions';
+
+interface Comment { id: number; author: string; text: string; created_at: string; }
+
+export function CommentList({ initialComments }: { initialComments: Comment[] }) {
+  const [optimisticComments, removeOptimistic] = useOptimistic(
+    initialComments,
+    (state, deletedId: number) => state.filter(c => c.id !== deletedId),
+  );
+  const [isPending, startTransition] = useTransition();
+
+  const handleDelete = (id: number) => {
+    startTransition(async () => {
+      removeOptimistic(id);  // UI updates instantly
+      await deleteCommentAction(id);  // server confirms
+    });
+  };
+
+  return (
+    <ul className="space-y-3 mt-6">
+      {optimisticComments.map(c => (
+        <li key={c.id} className="p-3 border rounded">
+          <div className="flex justify-between items-start">
+            <div>
+              <strong>{c.author}</strong>
+              <p>{c.text}</p>
+            </div>
+            <button
+              onClick={() => handleDelete(c.id)}
+              disabled={isPending}
+              className="text-red-500 hover:text-red-700"
+            >
+              Delete
+            </button>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+#### Step 5 — Page Composition + Tests
+```typescript
+// src/app/comments/page.tsx
+import Database from 'better-sqlite3';
+import { CommentForm } from '@/components/CommentForm';
+import { CommentList } from '@/components/CommentList';
+
+const db = new Database('comments.db');
+
+export default function CommentsPage() {
+  const comments = db.prepare('SELECT * FROM comments ORDER BY id DESC').all() as any[];
+
+  return (
+    <main className="max-w-xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-6">Comments</h1>
+      <CommentForm />
+      <CommentList initialComments={comments} />
+    </main>
+  );
+}
+
+// Tests
+import { addCommentAction } from '@/app/comments/actions';
+it('rejects too-short comment', async () => {
+  const fd = new FormData();
+  fd.set('author', 'Ana');
+  fd.set('text', 'hi');  // too short
+  const result = await addCommentAction({ status: 'idle' }, fd);
+  expect(result.status).toBe('error');
+  expect(result.errors?.text).toBeDefined();
+});
+```
+
+**Expected Output:**
+```
+Submit form -> Server Action runs -> validation errors shown OR comment added
+Disable JS in DevTools -> form still submits as POST, page re-renders with new comment
+Delete button -> comment disappears instantly (optimistic), server confirms
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add rate limiting using cookies/IP tracking
+- [ ] Add CSRF protection via a token in the form
+- [ ] Replace useFormStatus with custom toast notifications
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does the 'use server' directive do?
+**Q2:** Difference between useFormState and useFormStatus?
+**Q3:** Write a basic Server Action with form action attribute. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why must Server Actions still validate input even from a trusted-looking form?
+**Q5:** A junior writes a Server Action that deletes records without auth check — explain the vulnerability.
+**Q6:** How does progressive enhancement work with Server Action forms?
+
+### Day 7 — Application
+**Q7:** Build an optimistic delete pattern with useOptimistic and useTransition.
+**Q8:** A PR uses Server Actions to call a third-party API — explain when API routes are better.
+**Q9:** How do Server Actions integrate with revalidatePath?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Server Actions — what they are, how they differ from API routes, and progressive enhancement."
+**Q11:** Draw: Server Action request flow — client form → RPC → server function → DB → revalidation → UI update.
+**Q12:** ★ System design: "Design a mutation system for a SaaS app — when do you use Server Actions, API routes, or external webhooks?"

@@ -118,3 +118,232 @@ A: **`localStorage` is accessible to all JavaScript on the page.**
 If a hacker manages to inject a single malicious JavaScript script into your website (e.g., via a compromised npm package, or an unescaped comment box), that script can simply execute `console.log(localStorage.getItem('auth_token'))`, steal the token, and send it to their own server.
 Because `localStorage` provides zero security against malicious JavaScript, it should never store highly sensitive data.
 *The Fix:* Authentication tokens should be stored in an `HttpOnly` Cookie. When a cookie is marked `HttpOnly` by the backend server, the browser locks it down. It is physically impossible for JavaScript to read it (meaning XSS scripts cannot steal it). The browser automatically and securely attaches it to outgoing HTTP requests!
+
+## FEYNMAN CHECK
+
+### Explain Web APIs Like I'm 10 Years Old
+> "Web APIs" are the EXTRA SUPERPOWERS the browser gives JavaScript beyond the core language. The language (ECMAScript) itself has: Math, Date, Promise, Map, Set, JSON — but no concept of a browser, URL, or user. The browser ADDS: DOM, fetch, localStorage, sessionStorage, IndexedDB, Notifications, Geolocation, WebSockets, WebWorkers, ServiceWorker, Intersection Observer, Resize Observer, Canvas, WebGL, WebCrypto, WebRTC, Web Animations API. These are defined by the W3C and WHATWG specs, NOT the ECMAScript spec. The non-obvious detail: Node.js and Deno/Bun also implement SOME web APIs (`fetch`, `URL`, `Request`, `Response`, `Blob`, `WebCrypto`, `structuredClone`) for cross-runtime compatibility — but NOT DOM, localStorage, Notifications, etc. (those need a browser).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does localStorage block the main thread but IndexedDB doesn't?**
+> **A:** localStorage reads/writes are SYNCHRONOUS — they access the underlying storage mechanism directly on the main thread. For small amounts of data (a few KB) the overhead is imperceptible, but for large amounts it can lag. IndexedDB is ASYNCHRONOUS — all operations return Promises (or historically callbacks). It runs I/O in background threads, never blocking the event loop. For anything over ~5MB or any data that needs to be queryable, IndexedDB is the right choice.
+
+**Q2: Mental model for Web Workers?**
+> **A:** Workers are REAL BACKGROUND THREADS with separate JS runtime contexts — no shared memory (except SharedArrayBuffer + Atomics), communication only via postMessage (structured clone). They're perfect for: CPU-heavy work (image processing, parsing, crypto), keeping the main thread free for 60fps UI. ServiceWorker is a special Worker that intercepts network requests for the origin — enabling offline-first PWAs.
+
+**Q3: Most dangerous misconception?**
+> **A:** localStorage is a safe key-value store:
+> ```js
+> // ❌ localStorage stores STRINGS — non-string values are coerced
+> localStorage.setItem('user', { id: 1, name: 'Ana' });
+> localStorage.getItem('user');   // '[object Object]' — toString() called!
+>
+> // ❌ localStorage is synchronous + quota-limited (~5-10MB) + NOT available in workers
+> // ❌ localStorage is PER ORIGIN — accessible to ALL scripts on that origin (XSS risk)
+>
+> // ✅ Always JSON.stringify/parse
+> localStorage.setItem('user', JSON.stringify({ id: 1, name: 'Ana' }));
+> const user = JSON.parse(localStorage.getItem('user') ?? 'null');
+> ```
+
+**Q4: How does IntersectionObserver improve performance over scroll listeners?**
+> **A:** Scroll listeners fire for EVERY PIXEL of scroll movement — potentially 60+/sec — requiring manual calculation of element positions via getBoundingClientRect() (which forces synchronous layout). IntersectionObserver runs at browser-determined optimal intervals (off main thread when possible), triggers ONLY when the intersection ratio crosses your threshold, and never forces layout. It's the canonical tool for: lazy-loading images, triggering animations on scroll, infinite scroll sentinels, ad viewability tracking.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Browser Web APIs are host-environment extensions to the ECMAScript language — provided by the browser, defined by W3C/WHATWG, covering storage (localStorage synchronous, IndexedDB async), communication (WebSocket, BroadcastChannel, MessageChannel), observation (IntersectionObserver, ResizeObserver, MutationObserver), workers (Worker, ServiceWorker, SharedWorker), media (Canvas 2D, WebGL, WebAudio), and security (WebCrypto, CSP) — with Node.js 18+ implementing a portable subset for cross-runtime code sharing."
+
+## BUILD
+
+### 🏗️ Mini Project: Offline-Capable Notes App Using localStorage + IndexedDB + Service Worker Concepts
+
+**What you will build:** A notes app that saves to localStorage (fast sync), syncs to IndexedDB (queryable offline store), and demonstrates Web Worker offloaded search.
+**Why this project:** Forces real use of storage APIs and the async vs sync distinction.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-webapis && cd js-webapis
+ni index.html, notes.js, db.js -ItemType File
+```
+
+#### Step 2 — IndexedDB Wrapper
+```js
+// db.js
+const DB_NAME = 'notes-app';
+const DB_VER  = 1;
+const STORE   = 'notes';
+
+export function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        db.createObjectStore(STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+export async function putNote(note) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const req = tx.objectStore(STORE).put(note);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+export async function getAllNotes() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE).objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+```
+
+#### Step 3 — App Logic With Both Storage Layers
+```js
+// notes.js
+import { putNote, getAllNotes } from './db.js';
+
+const LS_KEY = 'notes.recent';
+
+// Fast sync write to localStorage (limited cache)
+function cacheNote(note) {
+  const recent = JSON.parse(localStorage.getItem(LS_KEY) ?? '[]');
+  const idx = recent.findIndex(n => n.id === note.id);
+  if (idx >= 0) recent[idx] = note;
+  else recent.unshift(note);
+  localStorage.setItem(LS_KEY, JSON.stringify(recent.slice(0, 10)));
+}
+
+export async function saveNote(note) {
+  cacheNote(note);           // sync — instant UI update
+  await putNote(note);       // async — persisted to IndexedDB
+}
+
+export function getRecentNotes() {
+  return JSON.parse(localStorage.getItem(LS_KEY) ?? '[]');
+}
+
+export async function searchNotes(query) {
+  const all = await getAllNotes();
+  const q = query.toLowerCase();
+  return all.filter(n =>
+    n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
+}
+
+// Demo
+await saveNote({ id: crypto.randomUUID(), title: 'JS Notes', content: 'Event loop is key' });
+await saveNote({ id: crypto.randomUUID(), title: 'CSS Tips', content: 'Use custom properties' });
+
+const recent = getRecentNotes();
+console.log('Recent (localStorage):', recent.length, 'notes');
+
+const results = await searchNotes('event');
+console.log('Search results:', results.map(n => n.title));
+```
+
+#### Step 4 — Error Handling: Storage Quota + Worker
+```js
+// storageCheck.js
+export async function getStorageUsage() {
+  if (navigator.storage?.estimate) {
+    const { usage, quota } = await navigator.storage.estimate();
+    return { usageMB: (usage / 1e6).toFixed(2), quotaMB: (quota / 1e6).toFixed(2) };
+  }
+  return null;
+}
+
+// Web Worker for search (keeps main thread free)
+export function createSearchWorker() {
+  const blob = new Blob([`
+    self.onmessage = ({ data: { notes, query } }) => {
+      const q = query.toLowerCase();
+      const results = notes.filter(n =>
+        n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
+      self.postMessage(results);
+    };
+  `], { type: 'application/javascript' });
+  return new Worker(URL.createObjectURL(blob));
+}
+```
+
+#### Step 5 — Tests
+```js
+// webapis.test.js (Node doesn't have localStorage/IDB, test logic only)
+import { describe, it, expect, beforeEach } from 'vitest';
+
+// Mock localStorage
+const storage = {};
+global.localStorage = {
+  getItem: k => storage[k] ?? null,
+  setItem: (k, v) => { storage[k] = v; },
+};
+global.crypto = { randomUUID: () => Math.random().toString(36) };
+
+describe('localStorage note cache', () => {
+  beforeEach(() => Object.keys(storage).forEach(k => delete storage[k]));
+
+  it('stores notes as JSON', async () => {
+    const { saveNote, getRecentNotes } = await import('./notes.js');
+    const id = '1';
+    await saveNote({ id, title: 'T', content: 'C' });
+    const recent = getRecentNotes();
+    expect(recent.find(n => n.id === id)).toBeTruthy();
+  });
+
+  it('limits cache to 10 most recent', async () => {
+    const { saveNote, getRecentNotes } = await import('./notes.js');
+    for (let i = 0; i < 15; i++) {
+      await saveNote({ id: String(i), title: 'T' + i, content: '' });
+    }
+    expect(getRecentNotes().length).toBe(10);
+  });
+});
+```
+
+**Expected Output:**
+```
+Recent (localStorage): 2 notes
+Search results: ['JS Notes']
+Storage: { usageMB: '0.05', quotaMB: '2048.00' }
+```
+
+**Stretch Challenges:**
+- [ ] Add Service Worker to cache API responses for offline access
+- [ ] Replace IndexedDB wrapper with Dexie.js and compare DX
+- [ ] Add BroadcastChannel to sync notes across browser tabs
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three Web APIs that are NOT available in Web Workers.
+**Q2:** Difference between localStorage (sync) and IndexedDB (async)?
+**Q3:** Write code that saves an object to localStorage safely. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is IntersectionObserver better than scroll + getBoundingClientRect?
+**Q5:** A junior writes an infinite loop in a Web Worker — does it freeze the tab?
+**Q6:** What's the maximum localStorage quota? What happens when exceeded?
+
+### Day 7 — Application
+**Q7:** Build a lazy-image loader using IntersectionObserver.
+**Q8:** A PR reads localStorage on every render — explain the performance concern.
+**Q9:** How would you debug a Service Worker caching stale assets?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how a Service Worker enables offline-first — fetch interception, cache strategy."
+**Q11:** Draw: storage API comparison — localStorage vs sessionStorage vs cookie vs IndexedDB vs Cache API.
+**Q12:** ★ System design: "Architect offline-first sync for a notes app with conflict resolution when reconnecting."

@@ -5,149 +5,507 @@ level: 4
 ---
 
 ## WHY
-For 20 years, Java applications were packaged into `.jar` files and dumped onto the classpath. The classpath is essentially a massive, flat playground. Every class can see every other public class. 
-If a library developer created a class called `InternalPasswordHasher` and marked it `public` (so they could use it across their own packages), any developer using that library could accidentally (or maliciously) access it. Furthermore, if you built a tiny "Hello World" app, you were forced to bundle the entire 200MB Java Runtime Environment (JRE) because the JVM didn't know which parts of Java you actually needed.
 
-In Java 9, **Project Jigsaw (The Java Module System)** was introduced to solve these structural nightmares. It provides strict encapsulation, strong boundaries, and allows you to strip the JVM down to a tiny, customized footprint.
+Before Java 9, dependency management lived on the **classpath**. The classpath is flat and global: if class `A` is public, everybody can see it. There is no strong encapsulation at runtime.
+
+That created four major enterprise problems:
+
+1. **No real boundaries**: Internal implementation classes (`com.lib.internal.*`) leak into consumer code and become accidental APIs.
+2. **Classpath hell**: Two libraries requiring incompatible versions of the same dependency cause conflicts at runtime.
+3. **Weak security surface**: Reflection can access internals too easily unless manually blocked.
+4. **Fat runtime images**: Shipping a tiny CLI app still required a full JRE because Java couldn't know which parts were actually needed.
+
+Project Jigsaw (Java 9) introduced the **Java Platform Module System (JPMS)** to solve these with strong, explicit rules:
+
+- `requires`: what your module depends on
+- `exports`: what packages you expose
+- `opens`: what packages are reflective-accessible
+- `uses` / `provides`: service loader integration
+
+With modules, Java becomes closer to modern platform languages with real package boundaries and dependency graphs.
 
 ## THEORY
-### Modules vs. Packages
-A **Package** organizes classes (`java.util`). 
-A **Module** organizes packages. It is a group of related packages combined with a specific configuration file called `module-info.java`.
 
-The `module-info.java` file does two critical things:
-1. **Requires:** It explicitly lists which *other* modules this module depends on. (If you don't list it, the compiler blocks you).
-2. **Exports:** It explicitly lists which of its *own* packages are allowed to be seen by the outside world. (If you don't export a package, it is strictly sealed inside the module, even if the classes inside are `public`!).
+### Package vs Module
+
+| Concept | Purpose | Visibility |
+|---------|---------|------------|
+| `package` | Namespace of classes (`com.app.service`) | `public` classes visible unless module blocks them |
+| `module` | Group of packages + dependency rules | Only `exports` packages are visible outside |
+
+A `public` class inside a non-exported package is **still inaccessible** from other modules. This is the key difference from classpath behavior.
+
+### Module Descriptor: `module-info.java`
+
+The descriptor lives at module root and defines the contract.
+
+```java
+module com.example.orders {
+    requires java.sql;
+    requires transitive com.example.common;
+    requires static lombok;
+
+    exports com.example.orders.api;
+    exports com.example.orders.dto;
+
+    opens com.example.orders.entity to org.hibernate.orm.core;
+
+    uses com.example.orders.spi.PaymentProvider;
+    provides com.example.orders.spi.PaymentProvider
+        with com.example.orders.impl.StripeProvider;
+}
+```
+
+### Every JPMS Directive (What and When)
+
+| Directive | Meaning | Typical Use |
+|-----------|---------|-------------|
+| `requires X` | Compile + runtime dependency on module `X` | Normal dependencies |
+| `requires transitive X` | Consumers of your module automatically read `X` | API types expose `X` types |
+| `requires static X` | Needed at compile-time only, optional runtime | Annotations/lombok/testing helpers |
+| `exports pkg` | Package visible to all modules | Public API packages |
+| `exports pkg to A,B` | Package visible to specific modules only | Friend modules |
+| `opens pkg` | Package open for deep reflection to all | Jackson/Hibernate reflection |
+| `opens pkg to A,B` | Reflective access for specific frameworks | Targeted opens |
+| `open module M` | Opens all packages for reflection | Migration convenience, avoid long-term |
+| `uses iface` | Declares service consumption | SPI clients |
+| `provides iface with impl` | Declares service implementation | SPI providers |
+
+### Readability Graph and Encapsulation
+
+```
+com.shop.app  ──requires──► com.shop.payment
+com.shop.payment ──requires──► java.net.http
+
+By default:
+- app can read payment
+- payment can read java.net.http
+- app CANNOT read java.net.http unless:
+  - app requires java.net.http directly, OR
+  - payment declares requires transitive java.net.http
+```
+
+### Named, Automatic, and Unnamed Modules
+
+| Type | How created | Strong encapsulation? | Typical scenario |
+|------|-------------|------------------------|------------------|
+| **Named module** | Has `module-info.java` | Yes | Proper JPMS code |
+| **Automatic module** | Plain JAR on module-path | Partial | Third-party JAR during migration |
+| **Unnamed module** | Anything on classpath | No (classpath behavior) | Legacy Spring Boot apps |
+
+Automatic module name is derived from JAR file unless `Automatic-Module-Name` manifest attribute exists.
+
+### Split Package Rule
+
+JPMS disallows two modules containing the same package name.
+
+```
+module A has package com.example.util
+module B has package com.example.util
+→ java.lang.LayerInstantiationException: Package is present in both modules
+```
+
+This catches architecture smells early but requires refactoring legacy multi-jar projects.
+
+### Reflection and Illegal Access
+
+On classpath, frameworks freely did deep reflection. With modules:
+
+- non-exported and non-opened packages are inaccessible to reflective frameworks
+- runtime error: `InaccessibleObjectException`
+
+Temporary runtime escape hatch (for migration):
+
+```text
+--add-opens com.example.models/com.example.models.entity=ALL-UNNAMED
+```
+
+Long-term fix: explicit `opens ... to ...` in `module-info.java`.
+
+### Toolchain
+
+| Tool | Purpose |
+|------|---------|
+| `javac --module-path` | Compile modules |
+| `java --module-path --module` | Run module main class |
+| `jar --create --main-class` | Build modular JAR |
+| `jdeps` | Analyze dependencies / generate descriptor hints |
+| `jlink` | Build custom minimal runtime image |
+| `jmod` | Package modules for runtime image generation |
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "java-modules" }
+{ "type": "none" }
 ```
 
 ## CODE
 
-### Level 1 — Beginner (Creating a Module)
-Imagine we are building a payment processing library. We want developers to use our `PaymentProcessor`, but we absolutely do not want them touching our `PaymentValidator` or `CryptoUtils`.
+### Level 1 — Beginner
 
-Our directory structure:
 ```text
-src/
-└── com.mycompany.payment/
-    ├── module-info.java
-    ├── com/mycompany/payment/api/
-    │   └── PaymentProcessor.java
-    └── com/mycompany/payment/internal/
-        ├── PaymentValidator.java
-        └── CryptoUtils.java
+project/
+  src/
+    com.example.payment/
+      module-info.java
+      com/example/payment/api/PaymentProcessor.java
+      com/example/payment/internal/CryptoUtils.java
 ```
 
-The `module-info.java` file:
 ```java
-module com.mycompany.payment {
-    // We EXPORT the api package. 
-    // Anyone using this module can import PaymentProcessor.
-    exports com.mycompany.payment.api;
-    
-    // We DO NOT export the internal package.
-    // CryptoUtils is strictly invisible to the outside world, 
-    // even if the class is marked 'public'!
+// src/com.example.payment/module-info.java
+module com.example.payment {
+    exports com.example.payment.api;
+    // com.example.payment.internal is NOT exported
 }
 ```
 
-### Level 2 — Building Blocks (Consuming a Module)
-Now, imagine an e-commerce application that wants to use our payment module.
-
-Their directory structure:
-```text
-src/
-└── com.mycompany.store/
-    ├── module-info.java
-    └── com/mycompany/store/
-        └── Main.java
-```
-
-Their `module-info.java` file:
 ```java
-module com.mycompany.store {
-    // We declare a STRICT DEPENDENCY on the payment module.
-    // Without this line, the compiler will error out if we try to import it!
-    requires com.mycompany.payment;
-}
-```
+// src/com.example.payment/com/example/payment/api/PaymentProcessor.java
+package com.example.payment.api;
 
-Their `Main.java` file:
-```java
-package com.mycompany.store;
-
-// This works perfectly because the payment module 'exports' the api package!
-import com.mycompany.payment.api.PaymentProcessor;
-
-// ERROR! The compiler strictly blocks this! 
-// "package com.mycompany.payment.internal is not visible"
-// import com.mycompany.payment.internal.CryptoUtils;
-
-public class Main {
-    public static void main(String[] args) {
-        PaymentProcessor processor = new PaymentProcessor();
-        processor.process();
+public class PaymentProcessor {
+    public String process(double amount) {
+        return "Processed $" + amount;
     }
 }
 ```
 
-### Level 3 — Intermediate (Transitive Dependencies)
-What if Module A requires Module B, and Module B requires Module C? Does A automatically get access to C?
-**No.** By default, dependencies are strictly isolated. If A wants to use C, A must explicitly `require` C in its own `module-info.java`.
-
-However, if Module B's public API *returns* objects from Module C, Module B can declare a **Transitive** dependency to gracefully pass the access along!
-
 ```java
-module com.mycompany.database {
-    // The 'transitive' keyword means: 
-    // "Anyone who requires ME, automatically gets access to java.sql as well!"
-    requires transitive java.sql;
-    
-    exports com.mycompany.database.api;
+// src/com.example.payment/com/example/payment/internal/CryptoUtils.java
+package com.example.payment.internal;
+
+public class CryptoUtils {
+    public static String hash(String in) {
+        return Integer.toHexString(in.hashCode());
+    }
 }
 ```
 
-### Level 4 — Advanced (jlink - Custom JVM Runtimes)
-The true superpower of the Module System is `jlink`. 
-Because the Java standard library itself was broken into modules (e.g., `java.base`, `java.sql`, `java.desktop`), the JVM now knows exactly what parts of Java you actually use!
+```powershell
+# Compile module
+javac -d out --module-source-path src $(Get-ChildItem -Recurse src -Filter *.java | ForEach-Object { $_.FullName })
 
-You can run the `jlink` command-line tool to strip away 90% of the Java Runtime Environment, generating a hyper-optimized, tiny custom JVM just for your app.
-
-```bash
-# We tell jlink to look at our compiled modules and the JDK modules
-# It generates a custom runtime image in the "my-custom-jre" folder
-jlink \
-  --module-path compiled_mods/:$JAVA_HOME/jmods \
-  --add-modules com.mycompany.store \
-  --output my-custom-jre \
-  --strip-debug \
-  --compress 2 \
-  --no-header-files \
-  --no-man-pages
+# Run module main (if exists)
+java --module-path out --module com.example.payment/com.example.payment.api.PaymentProcessor
 ```
 
-*Result:* Instead of forcing users to install a 200MB JVM, you can ship your application bundled with a custom 25MB JVM that contains *only* `java.base` and your specific code. This is revolutionary for Docker containers and cloud microservices!
+### Level 2 — Building Blocks
+
+```text
+project/
+  src/
+    com.example.store/
+      module-info.java
+      com/example/store/Main.java
+```
+
+```java
+// src/com.example.store/module-info.java
+module com.example.store {
+    requires com.example.payment;
+}
+```
+
+```java
+// src/com.example.store/com/example/store/Main.java
+package com.example.store;
+
+import com.example.payment.api.PaymentProcessor;
+
+public class Main {
+    public static void main(String[] args) {
+        PaymentProcessor processor = new PaymentProcessor();
+        System.out.println(processor.process(49.99));
+
+        // Compile-time failure (expected):
+        // import com.example.payment.internal.CryptoUtils;
+        // error: package com.example.payment.internal is not visible
+    }
+}
+```
+
+```powershell
+# Compile both modules
+javac -d out --module-source-path src $(Get-ChildItem -Recurse src -Filter *.java | ForEach-Object { $_.FullName })
+
+# Run store module
+java --module-path out --module com.example.store/com.example.store.Main
+```
+
+### Level 3 — Intermediate
+
+Service Provider Interface (SPI) with `uses` / `provides`.
+
+```text
+src/
+  com.example.payments.spi/
+    module-info.java
+    com/example/payments/spi/PaymentProvider.java
+  com.example.payments.stripe/
+    module-info.java
+    com/example/payments/stripe/StripeProvider.java
+  com.example.checkout.app/
+    module-info.java
+    com/example/checkout/app/CheckoutMain.java
+```
+
+```java
+// com.example.payments.spi/module-info.java
+module com.example.payments.spi {
+    exports com.example.payments.spi;
+}
+```
+
+```java
+// com.example.payments.spi/com/example/payments/spi/PaymentProvider.java
+package com.example.payments.spi;
+
+public interface PaymentProvider {
+    String name();
+    boolean supports(String currency);
+    String charge(double amount, String currency);
+}
+```
+
+```java
+// com.example.payments.stripe/module-info.java
+module com.example.payments.stripe {
+    requires com.example.payments.spi;
+    provides com.example.payments.spi.PaymentProvider
+        with com.example.payments.stripe.StripeProvider;
+}
+```
+
+```java
+// com.example.payments.stripe/com/example/payments/stripe/StripeProvider.java
+package com.example.payments.stripe;
+
+import com.example.payments.spi.PaymentProvider;
+
+public class StripeProvider implements PaymentProvider {
+    public String name() { return "stripe"; }
+    public boolean supports(String currency) { return "USD".equals(currency) || "EUR".equals(currency); }
+    public String charge(double amount, String currency) {
+        return "Stripe charged " + amount + " " + currency;
+    }
+}
+```
+
+```java
+// com.example.checkout.app/module-info.java
+module com.example.checkout.app {
+    requires com.example.payments.spi;
+    uses com.example.payments.spi.PaymentProvider;
+}
+```
+
+```java
+// com.example.checkout.app/com/example/checkout/app/CheckoutMain.java
+package com.example.checkout.app;
+
+import com.example.payments.spi.PaymentProvider;
+
+import java.util.ServiceLoader;
+
+public class CheckoutMain {
+    public static void main(String[] args) {
+        ServiceLoader<PaymentProvider> loader = ServiceLoader.load(PaymentProvider.class);
+        for (PaymentProvider provider : loader) {
+            if (provider.supports("USD")) {
+                System.out.println(provider.charge(19.99, "USD"));
+            }
+        }
+    }
+}
+```
+
+### Level 4 — Advanced
+
+Reflection + frameworks (Jackson/Hibernate) with explicit `opens`.
+
+```java
+// module com.example.domain
+module com.example.domain {
+    exports com.example.domain.api;
+
+    // Allow deep reflection only for Jackson and Hibernate
+    opens com.example.domain.model to
+        com.fasterxml.jackson.databind,
+        org.hibernate.orm.core;
+}
+```
+
+```java
+package com.example.domain.model;
+
+public class UserEntity {
+    private String id;
+    private String email;
+
+    public UserEntity() {}
+    public UserEntity(String id, String email) {
+        this.id = id;
+        this.email = email;
+    }
+
+    public String getId() { return id; }
+    public String getEmail() { return email; }
+}
+```
+
+```java
+// Without opens:
+// com.fasterxml.jackson.databind.exc.InvalidDefinitionException:
+// Cannot construct instance ... no Creators, like default constructor, exist
+// OR InaccessibleObjectException when reflection to private members is blocked
+
+// With opens to jackson module:
+// serialization/deserialization works while keeping package non-exported
+```
+
+Migration-time runtime override (avoid long-term):
+
+```powershell
+java --add-opens com.example.domain/com.example.domain.model=com.fasterxml.jackson.databind `
+     --module-path out --module com.example.app/com.example.app.Main
+```
+
+### Level 5 — Expert
+
+End-to-end: `jdeps` -> `jlink` -> tiny runtime image.
+
+```powershell
+# 1) Analyze dependencies and generate module hints
+jdeps --multi-release 21 --print-module-deps app.jar
+
+# Example output:
+# java.base,java.net.http,java.sql
+
+# 2) Build a custom runtime image with only required modules
+jlink --module-path "$env:JAVA_HOME\jmods;mods" `
+      --add-modules com.example.store,java.base,java.net.http,java.sql `
+      --output runtime-image `
+      --strip-debug `
+      --compress=2 `
+      --no-header-files `
+      --no-man-pages
+
+# 3) Run app from custom runtime
+runtime-image\bin\java --module-path mods --module com.example.store/com.example.store.Main
+```
+
+```text
+Typical result:
+- Full JRE/JDK image in container: 200MB+
+- jlink custom runtime: 30-60MB
+- Faster cold start and smaller Docker pull times
+```
+
+Optional packaging:
+
+```powershell
+jpackage --name StoreApp `
+         --runtime-image runtime-image `
+         --module com.example.store/com.example.store.Main `
+         --dest dist
+```
 
 ## REAL_WORLD
-**Spring Boot and The Unnamed Module**
-If modules are so powerful, why do so many modern Spring Boot applications ignore them?
-When you put a standard `.jar` file on the classpath (the old way) instead of the module-path (the new way), Java automatically drops it into the "Unnamed Module". The Unnamed Module acts exactly like Java 8: it exports everything and can read everything.
-Because enterprise apps depend on hundreds of third-party libraries (many of which haven't been updated to support `module-info.java`), adopting strict Modules requires a massive refactoring effort. Most developers rely on build tools (Maven/Gradle) to handle dependencies, and completely ignore Java Modules unless they are building strict low-level libraries or optimizing Docker footprints with `jlink`.
+
+### Why most Spring Boot apps still run on classpath
+
+- Many libraries still publish non-modular jars
+- Framework ecosystems rely heavily on reflection and dynamic proxies
+- Migration of large monoliths to strict JPMS boundaries is expensive
+
+So in practice:
+
+1. Teams keep app on classpath (Unnamed Module behavior)
+2. Use `jdeps` to audit dependencies
+3. Introduce modules gradually for internal libraries
+4. Use `jlink` mainly for CLI/microservice runtime optimization
+
+### Gradual Migration Strategy
+
+```text
+Step 1: Add Automatic-Module-Name in MANIFEST of internal libs
+Step 2: Remove split packages and cyclic dependencies
+Step 3: Create module-info.java for core modules
+Step 4: Keep edge modules on classpath if needed
+Step 5: Add explicit opens for reflection frameworks only where necessary
+Step 6: Use jdeps + jlink in CI for runtime-size optimization
+```
+
+### Common Production Failures
+
+| Symptom | Root Cause | Fix |
+|--------|------------|-----|
+| `InaccessibleObjectException` | Missing `opens` for reflective framework | Add `opens pkg to framework.module` |
+| `FindException: Module X not found` | Module missing from module-path | Add jar/module to module-path |
+| `LayerInstantiationException` | Split package across modules | Refactor package names |
+| `NoClassDefFoundError` at runtime | Compiled against classpath but running as modules | Align compile/run mode |
 
 ## INTERVIEW
-**Q: My class `User` has `private` fields. A third-party library uses Reflection (`Field.setAccessible(true)`) to forcibly change the private fields. Does the Java Module System prevent this?**
-A: **Yes, absolutely!** This is called "Deep Reflection." 
-Before Java 9, Reflection could easily bypass `private` modifiers. With the Module System, strict encapsulation prevents modules from using Deep Reflection on other modules by default. 
-If you want to allow a framework (like Hibernate or Jackson) to use Reflection on your private fields, you must explicitly "open" your module to them in the `module-info.java`:
-```java
-module com.mycompany.models {
-    // Open the entire module to everyone for reflection
-    opens com.mycompany.models;
-    
-    // OR, selectively open it ONLY to Jackson!
-    opens com.mycompany.models to com.fasterxml.jackson.databind;
-}
-```
+
+### Q1: What problem does JPMS solve that packages alone cannot?
+
+**Weak:** "Modules organize code better than packages."
+
+**Strong:** Packages are naming constructs; modules are boundary constructs. Packages cannot express dependency graphs or strong encapsulation across jars. Before Java 9, any `public` type in any classpath jar was globally visible. JPMS enforces explicit readability (`requires`) and visibility (`exports`), preventing accidental API leakage and classpath conflicts. It also enables custom runtime images with `jlink`, impossible with plain packages.
+
+---
+
+### Q2: Difference between `exports` and `opens`?
+
+**Weak:** "Both expose packages."
+
+**Strong:** `exports` exposes public types at compile-time and runtime to other modules for normal access. It does NOT allow deep reflection into non-public members. `opens` enables runtime deep reflection (private field/method access) for frameworks like Jackson/Hibernate, but does not make types importable at compile-time. Use `exports` for API, `opens` for reflective frameworks.
+
+---
+
+### Q3: What is `requires transitive` and when should you use it?
+
+**Weak:** "It passes dependencies to children."
+
+**Strong:** If module A `requires transitive B`, then any module that requires A automatically reads B. Use it when A's public API contains B's types (e.g., return types, parameter types). Without transitive, consumers of A must also explicitly require B, causing friction and leakage of internal dependency wiring.
+
+---
+
+### Q4: Named vs automatic vs unnamed module?
+
+**Weak:** "Named has module-info, others don't."
+
+**Strong:** Named module: explicit descriptor, strong encapsulation. Automatic module: plain jar on module-path, gets inferred name, exports all packages, reads all modules; useful for migration but weaker guarantees. Unnamed module: anything on classpath; has full classpath-era permissiveness, reads all named modules but named modules cannot explicitly require it. Most legacy Spring apps run in unnamed module mode.
+
+---
+
+### Q5: Why can two classes with same fully qualified name be different types?
+
+**Weak:** "Different classloaders."
+
+**Strong:** In JVM type identity = `(ClassLoader, fullyQualifiedName)`. If `com.app.User` is loaded by ClassLoader A and B, they are distinct runtime types, even if bytecode is identical. JPMS often surfaces this in plugin systems and layered classloaders. You can get `ClassCastException` saying `com.app.User cannot be cast to com.app.User` when loaders differ.
+
+## FEYNMAN CHECK
+
+Think of modules like apartment buildings with security doors. Packages are rooms inside a building. In classpath world, all building doors are open and everyone can walk into every room marked "public." In JPMS, each building has a gate list:
+
+- `requires` = which other buildings residents can visit
+- `exports` = which rooms visitors may enter
+- `opens` = which rooms maintenance staff (reflection frameworks) may unlock
+
+If a room is public but not exported, it's like a room with an internal key only. Outsiders still can't enter.
+
+## BUILD
+
+1. Create three modules: `com.example.payments.spi`, `com.example.payments.stripe`, `com.example.checkout.app` using `uses`/`provides`. Verify `ServiceLoader` discovers provider.
+2. Add a JPA entity module and make Hibernate work by adding targeted `opens ... to org.hibernate.orm.core` (not `open module`).
+3. Run `jdeps` on your app jar, then build a `jlink` runtime image and compare directory size with full JRE.
+
+## SPACED REVIEW
+
+- Day 1: List all JPMS directives and one use case each.
+- Day 3: Explain `exports` vs `opens` with a Jackson example.
+- Day 7: What is an automatic module and why is it useful in migration?
+- Day 14: Explain why split packages fail in JPMS and how to fix them.
+- Day 30: Design a migration plan from classpath monolith to modularized runtime with jlink.
+

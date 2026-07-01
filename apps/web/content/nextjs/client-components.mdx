@@ -119,3 +119,242 @@ Server Components run on the server. Client Components run in the browser. You c
 
 **How to fix:**
 Move the state and the event handler *into* the Client Component itself. The Server Component should only pass serializable data (strings, numbers, simple objects) as props to Client Components.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Client Components Like I'm 10 Years Old
+> Client Components are regular React components that run IN THE BROWSER — they can use hooks (useState, useEffect, useRef), handle events (onClick, onSubmit), access browser APIs (localStorage, window), and use any third-party React library. You mark them with 'use client' at the TOP of the file. Without 'use client', Next.js assumes the component is a Server Component. The non-obvious rule: 'use client' creates a MODULE BOUNDARY — every component imported by a 'use client' file is automatically a Client Component too, even without their own 'use client' directive. So put 'use client' as LOW in the component tree as possible — only on the specific interactive component, not on a parent that wraps everything.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When MUST you use 'use client'?**
+> **A:** You need 'use client' when a component: (1) Uses React hooks (useState, useEffect, useContext, useRef, etc.). (2) Attaches event handlers (onClick, onChange, onSubmit). (3) Accesses browser-only APIs (window, document, localStorage, navigator, IntersectionObserver). (4) Uses third-party libraries that themselves use any of the above. The goal: use 'use client' as sparingly as possible — only on the leaf components that actually need interactivity, not on wrappers or pages.
+
+**Q2: Mental model for SSR of Client Components?**
+> **A:** Despite the name, Client Components are ALSO rendered on the server for the initial HTML (unless you use dynamic('no-ssr')). They're called "Client Components" because they ship their JavaScript to the browser and can be interactive there. The lifecycle: server renders the initial HTML → sends to browser → browser downloads JS → React hydrates (attaches event listeners to server HTML). This means useState/useEffect still have access to server-generated HTML initially — the component STARTS as static HTML and becomes interactive after hydration.
+
+**Q3: Most dangerous misconception about Client Components?**
+> **A:** Server Components can be children of Client Components:
+> ```typescript
+> // WRONG: passing Server Component as JSX inside Client Component
+> 'use client';
+> export function ClientWrapper() {
+>   return (
+>     <div>
+>       <ServerOnlyComponent />  // ERROR: can't import Server Component into Client Component
+>     </div>
+>   );
+> }
+>
+> // CORRECT: pass Server Component as children (composition pattern)
+> 'use client';
+> export function ClientWrapper({ children }: { children: React.ReactNode }) {
+>   return <div>{children}</div>;  // children can be Server Component output
+> }
+>
+> // Parent Server Component composes them:
+> import { ClientWrapper } from './ClientWrapper';
+> import { ServerOnlyComponent } from './ServerOnlyComponent';
+> export default function Page() {
+>   return (
+>     <ClientWrapper>
+>       <ServerOnlyComponent />  // Server Component passed as children prop to Client
+>     </ClientWrapper>
+>   );
+> }
+> ```
+
+**Q4: How does hydration work for Client Components?**
+> **A:** Next.js sends server-rendered HTML (including Client Component HTML) to the browser. The browser displays this static HTML immediately (fast First Contentful Paint). Then React downloads the Client Component JavaScript, compares the expected HTML to the existing DOM (reconciliation), and attaches event listeners without re-rendering (hydration). Hydration errors occur when the server HTML doesn't match the expected client HTML — common cause: rendering based on window, Date.now(), or Math.random() in render (server value differs from client value on hydration).
+
+**Q5: FAANG-grade definition of Next.js Client Components.**
+> **A:** "Next.js Client Components are React components marked with 'use client' — designating them as the module boundary where server rendering ends and client JavaScript begins — rendered on the server for initial HTML (SSR/hydration) then shipped as JavaScript to the browser for interactivity — enabling React hooks, event handlers, browser API access, and third-party interactive libraries — with the recommendation to push 'use client' as deep as possible in the component tree to minimise client bundle size while maintaining the ability to pass Server Component output as children props to Client Components."
+
+## BUILD
+
+### 🏗️ Mini Project: Interactive Dashboard Widget — Client Component With Server Data
+
+**What you will build:** A real-time search widget: Server Component fetches initial data, Client Component handles search input (useState + debounce), and a shared state pattern using URL search params — demonstrating the optimal Client Component placement.
+**Why this project:** Forces the "push client as low as possible" pattern with real debounced search.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest client-demo --typescript --tailwind --app
+```
+
+#### Step 2 — Debounce Hook (reusable client utility)
+```typescript
+// src/hooks/useDebounce.ts
+'use client';
+import { useState, useEffect } from 'react';
+
+export function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(timer);  // cleanup: cancel timer if value changes before delay
+  }, [value, delay]);
+
+  return debouncedValue;
+}
+```
+
+#### Step 3 — Search Input (Client Component — leaves only)
+```typescript
+// src/components/SearchInput.tsx
+'use client';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useState, useTransition } from 'react';
+import { useDebounce } from '@/hooks/useDebounce';
+
+interface Props { placeholder?: string; }
+
+export function SearchInput({ placeholder = 'Search...' }: Props) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [query, setQuery] = useState(searchParams.get('q') ?? '');
+  const [isPending, startTransition] = useTransition();
+  const debouncedQuery = useDebounce(query, 300);
+
+  // Update URL when debounced query changes
+  useEffect(() => {
+    startTransition(() => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (debouncedQuery) params.set('q', debouncedQuery);
+      else params.delete('q');
+      router.push(`?${params.toString()}`);
+    });
+  }, [debouncedQuery]);
+
+  return (
+    <div className="relative">
+      <input
+        value={query}
+        onChange={e => setQuery(e.target.value)}
+        placeholder={placeholder}
+        className="w-full px-4 py-2 border rounded-lg"
+      />
+      {isPending && <span className="absolute right-3 top-2 text-gray-400">...</span>}
+    </div>
+  );
+}
+```
+
+#### Step 4 — Server Component Page (data fetching + SearchInput composition)
+```typescript
+// src/app/search/page.tsx  -- Server Component
+import { SearchInput } from '@/components/SearchInput';  // Client Component
+import { Suspense } from 'react';
+
+async function Results({ query }: { query: string }) {
+  // Simulate DB search — this runs on the server
+  await new Promise(r => setTimeout(r, 100));
+  const allUsers = [
+    { id: 1, name: 'Ana Dev', role: 'engineer' },
+    { id: 2, name: 'Ben Ops', role: 'devops' },
+    { id: 3, name: 'Carmen PM', role: 'manager' },
+  ];
+  const filtered = query
+    ? allUsers.filter(u => u.name.toLowerCase().includes(query.toLowerCase()))
+    : allUsers;
+
+  return (
+    <ul className="mt-4 space-y-2">
+      {filtered.length === 0 && <li className="text-gray-500">No results for "{query}"</li>}
+      {filtered.map(u => (
+        <li key={u.id} className="p-3 border rounded">
+          <strong>{u.name}</strong> — {u.role}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+interface Props { searchParams: { q?: string } }
+
+export default function SearchPage({ searchParams }: Props) {
+  const query = searchParams.q ?? '';
+  return (
+    <main className="max-w-xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-4">User Search</h1>
+      {/* Client Component for input interactivity */}
+      <Suspense>
+        <SearchInput placeholder="Search users..." />
+      </Suspense>
+      {/* Server Component for results — re-renders when URL changes */}
+      <Suspense fallback={<div className="mt-4 animate-pulse h-20 bg-gray-100 rounded" />}>
+        <Results query={query} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+#### Step 5 — Tests
+```typescript
+// useDebounce.test.ts
+import { renderHook, act } from '@testing-library/react';
+import { useDebounce } from '@/hooks/useDebounce';
+
+describe('useDebounce', () => {
+  beforeAll(() => jest.useFakeTimers());
+  afterAll(() => jest.useRealTimers());
+
+  it('returns initial value immediately', () => {
+    const { result } = renderHook(() => useDebounce('initial', 300));
+    expect(result.current).toBe('initial');
+  });
+
+  it('debounces value change', () => {
+    const { result, rerender } = renderHook(({ val }) => useDebounce(val, 300), {
+      initialProps: { val: 'a' },
+    });
+    rerender({ val: 'ab' });
+    expect(result.current).toBe('a');  // not updated yet
+    act(() => jest.advanceTimersByTime(300));
+    expect(result.current).toBe('ab');  // now updated
+  });
+});
+```
+
+**Expected Output:**
+```
+/search -> all 3 users shown (server rendered)
+Type "Ana" -> debounce 300ms -> URL updates -> Server Component re-fetches
+?q=Ana -> only Ana Dev shown
+Type fast "a", "an", "ana" -> only one DB query (debounced)
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add React Query for client-side data that must stay fresh
+- [ ] Add an optimistic UI update that shows results immediately before server confirms
+- [ ] Measure bundle size difference with 'use client' on page vs on SearchInput only
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When must you add 'use client' to a component?
+**Q2:** Can Server Components be children of Client Components?
+**Q3:** Write a Client Component search input with useState. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is a hydration error and what causes it?
+**Q5:** A junior adds 'use client' to the root layout — explain the consequence.
+**Q6:** How do you pass Server Component output to a Client Component?
+
+### Day 7 — Application
+**Q7:** Build an add-to-cart button as a Client Component that receives product ID from Server Component.
+**Q8:** A PR wraps the entire page in 'use client' because it has one interactive button — refactor.
+**Q9:** When would you use dynamic('no-ssr') instead of 'use client'?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain the 'use client' boundary — what it means for rendering, bundling, and the composition pattern."
+**Q11:** Draw: RSC/Client Component tree showing data flow and bundle boundaries.
+**Q12:** ★ System design: "Design a real-time analytics dashboard in Next.js — which parts use Server Components, which use Client Components with WebSocket, and how do they compose?"

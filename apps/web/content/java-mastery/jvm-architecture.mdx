@@ -1,137 +1,516 @@
 ---
-slug: "jvm-architecture"
-title: "JVM Architecture"
-level: 5
+slug: jvm-architecture
+title: JVM Architecture — Deep Dive
+level: intermediate
 ---
 
 ## WHY
-When you write a C++ program and compile it on a Windows machine, the compiler converts your code directly into Windows-specific CPU Machine Code (`.exe`). If you send that file to a friend on a Mac, it physically cannot run because the Mac CPU speaks a different language. 
-Java was created with the famous slogan: **"Write Once, Run Anywhere" (WORA)**.
 
-To achieve this, the Java Compiler (`javac`) does NOT compile your code into Machine Code. It compiles it into a universal intermediate language called **Bytecode** (`.class` files). 
-You then install a Java Virtual Machine (JVM) on your computer. The JVM acts as a translator. It reads the universal Bytecode and translates it into the specific Machine Code required by your exact OS and CPU in real-time. Understanding the internal components of this Virtual Machine is the absolute pinnacle of Java mastery.
+Understanding JVM architecture is the difference between writing code that works and writing code that performs. Every Java developer must know:
+
+1. **Why Java is platform-independent** — "Write Once, Run Anywhere" is not magic; it's the JVM contract
+2. **Where memory goes** — Stack overflow, OutOfMemoryError, GC pauses all trace back to JVM memory areas
+3. **How classes are loaded** — ClassNotFoundException, ClassCastException, duplicate class issues are JVM classloader problems
+4. **How the JIT compiler works** — Understanding why Java warms up slowly but then flies fast
+5. **Interview survival** — JVM internals is asked in every senior Java interview at FAANG, banking, fintech
+
+---
 
 ## THEORY
-### 1. The ClassLoader Subsystem
-When you run `java MyApp`, the JVM doesn't load every single class in your project instantly. It uses **Dynamic Class Loading**. 
-The ClassLoader finds the `.class` files on your hard drive, verifies that the Bytecode hasn't been maliciously tampered with (Bytecode Verifier), and then loads the binary data into the Metaspace memory area.
 
-### 2. The Runtime Data Areas (Memory)
-- **Method Area (Metaspace)**: Stores the class blueprints, static variables, and the JIT compiled code. Shared across all threads.
-- **Heap**: Stores all instantiated objects (e.g., `new User()`). Managed by the Garbage Collector. Shared across all threads.
-- **Stack**: Every time a Thread is created, it gets its own private Memory Stack. Every time a method is called, a "Stack Frame" is pushed onto the stack, containing local variables and the method's state. 
-- **PC Register**: A private pointer for each thread indicating the exact line of bytecode it is currently executing.
+### The Big Picture
 
-### 3. The Execution Engine
-This is the heart of the JVM that actually runs the code.
-- **Interpreter**: Reads the bytecode line-by-line and translates it to machine code. It starts incredibly fast, but running the same loop 10,000 times means interpreting the same line 10,000 times, which is slow.
-- **JIT Compiler (Just-In-Time)**: The JVM secretly profiles your code as it runs. If it notices a method is executed thousands of times (a "Hot Spot"), the JIT Compiler takes over. It compiles that entire method directly into blazing-fast native Machine Code and stores it in the cache. The next time the method is called, the JVM bypasses the interpreter and executes the raw Machine Code directly. 
+```
+Your Java Source Code (.java)
+        ↓  javac (compiler)
+Java Bytecode (.class)
+        ↓  java (JVM launcher)
+JVM reads bytecode → interprets / JIT compiles → Native Machine Code
+        ↓
+CPU executes
+```
+
+The JVM is a **specification** (not an implementation). Popular implementations:
+- **HotSpot** — Oracle/OpenJDK (most common)
+- **GraalVM** — polyglot, ahead-of-time compilation
+- **OpenJ9** — IBM, low footprint
+
+---
+
+### JVM Architecture — 3 Main Subsystems
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         JVM                                      │
+│  ┌──────────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  Class Loader    │  │ Runtime Data │  │ Execution Engine │  │
+│  │  Subsystem       │  │    Areas     │  │                  │  │
+│  │                  │  │              │  │  ┌─────────────┐ │  │
+│  │ • Bootstrap CL   │  │ • Method Area│  │  │ Interpreter │ │  │
+│  │ • Extension CL   │  │ • Heap       │  │  └─────────────┘ │  │
+│  │ • Application CL │  │ • Stack      │  │  ┌─────────────┐ │  │
+│  │                  │  │ • PC Register│  │  │ JIT Compiler│ │  │
+│  │  Loading         │  │ • Native     │  │  └─────────────┘ │  │
+│  │  Linking         │  │   Method     │  │  ┌─────────────┐ │  │
+│  │  Initialization  │  │   Stack      │  │  │     GC      │ │  │
+│  └──────────────────┘  └──────────────┘  │  └─────────────┘ │  │
+│                                          └──────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    Native Interface (JNI)                  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 1. Class Loader Subsystem
+
+**Three phases:**
+
+| Phase | What Happens |
+|-------|-------------|
+| **Loading** | Reads `.class` bytecode into memory, creates `Class` object in Method Area |
+| **Linking** | Verification (bytecode valid?), Preparation (static fields = defaults), Resolution (symbolic refs → direct refs) |
+| **Initialization** | Runs static initializers and static blocks |
+
+**Class Loader Hierarchy (Parent Delegation Model):**
+
+```
+Bootstrap ClassLoader (C/C++, built into JVM)
+    └── loads: rt.jar / java.lang, java.util, etc.
+Extension ClassLoader (Java)
+    └── loads: jre/lib/ext/*.jar
+Application ClassLoader (Java)
+    └── loads: classpath (your code, third-party jars)
+        └── Custom ClassLoaders (your own, e.g., Spring, OSGi)
+```
+
+**Parent Delegation Rule:** Before loading a class, always ask parent first. This prevents user code from overriding `java.lang.String`.
+
+---
+
+### 2. Runtime Data Areas (JVM Memory)
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    HEAP (shared)                      │
+│  ┌────────────────┐    ┌──────────────────────────┐  │
+│  │  Young Gen     │    │        Old Gen            │  │
+│  │  ┌──────────┐  │    │   (Tenured Space)         │  │
+│  │  │  Eden    │  │    │   Long-lived objects      │  │
+│  │  │  Space   │  │    │                          │  │
+│  │  └──────────┘  │    └──────────────────────────┘  │
+│  │  ┌──┐  ┌──┐   │                                   │
+│  │  │S0│  │S1│   │                                   │
+│  │  └──┘  └──┘   │                                   │
+│  └────────────────┘                                   │
+└──────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│                METHOD AREA (shared)                   │
+│   Class metadata, static fields, method bytecode,    │
+│   runtime constant pool                               │
+│   (PermGen in Java 7 → Metaspace in Java 8+)         │
+└──────────────────────────────────────────────────────┘
+
+Per-Thread Areas:
+┌─────────────┐   ┌──────────────┐   ┌────────────────┐
+│  JVM Stack  │   │  PC Register │   │  Native Method │
+│  (frames)   │   │  (current    │   │  Stack         │
+│             │   │   bytecode   │   │  (for JNI)     │
+│  local vars │   │   instr ptr) │   │                │
+│  operand    │   └──────────────┘   └────────────────┘
+│  stack      │
+│  frame data │
+└─────────────┘
+```
+
+**Key Memory Areas Explained:**
+
+| Area | Scope | Stores | Error |
+|------|-------|--------|-------|
+| **Heap** | Shared (all threads) | All objects, arrays | `OutOfMemoryError` |
+| **Method Area** | Shared | Class data, static vars, method code | `OutOfMemoryError` |
+| **JVM Stack** | Per thread | Stack frames (local vars, operand stack) | `StackOverflowError` |
+| **PC Register** | Per thread | Address of current instruction | — |
+| **Native Stack** | Per thread | Native (C/C++) method calls | `StackOverflowError` |
+
+---
+
+### 3. Stack Frame Structure
+
+Every method call creates a **stack frame**:
+
+```
+Stack Frame for methodA():
+┌──────────────────────────────┐
+│  Local Variable Array        │  → this, params, local vars
+│  [0]=this [1]=x [2]=y ...    │
+├──────────────────────────────┤
+│  Operand Stack               │  → JVM's scratch pad
+│  (push/pop for calculations) │
+├──────────────────────────────┤
+│  Frame Data                  │  → constant pool ref,
+│  (reference to method meta)  │     exception table
+└──────────────────────────────┘
+```
+
+---
+
+### 4. Execution Engine
+
+**Interpreter:** Reads and executes bytecode instruction by instruction. Simple but slow.
+
+**JIT (Just-In-Time) Compiler:** HotSpot identifies "hot" methods (called frequently) and compiles them to native machine code. Result is cached.
+
+**Tiered Compilation (Java 8+):**
+
+```
+Level 0: Interpreter
+Level 1: C1 (simple JIT, fast compile)
+Level 2: C1 with basic profiling
+Level 3: C1 with full profiling
+Level 4: C2 (aggressive optimizations, slow compile but fastest runtime)
+```
+
+**JIT Optimizations:**
+- **Inlining** — replaces method call with actual code
+- **Loop unrolling** — reduces loop overhead
+- **Escape analysis** — allocates objects on stack instead of heap if they don't escape
+- **Dead code elimination**
+
+---
+
+### 5. Metaspace (Java 8+) vs PermGen (Java 7)
+
+| | PermGen (≤Java 7) | Metaspace (Java 8+) |
+|-|------|------|
+| Location | JVM heap | Native memory (OS) |
+| Size | Fixed (`-XX:MaxPermSize`) | Dynamic (grows as needed) |
+| Error | `OutOfMemoryError: PermGen` | `OutOfMemoryError: Metaspace` |
+| Tuning | `-XX:MaxPermSize=256m` | `-XX:MaxMetaspaceSize=256m` |
+
+---
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureDiagram", "type": "jvm-internal-architecture" }
+{
+  "type": "none"
+}
 ```
+
+---
 
 ## CODE
 
-### Level 1 — Beginner (Triggering ClassLoaders)
+### Level 1 — Beginner: Observing Class Loading
+
 ```java
-public class ClassLoading {
+// ShowClassLoader.java
+public class ShowClassLoader {
     public static void main(String[] args) {
-        // Classes are loaded LAZILY. 
-        // The Database class is not loaded into JVM memory until this exact line executes.
-        Database db = new Database();
-        
-        // You can inspect which ClassLoader loaded a specific class
-        System.out.println(Database.class.getClassLoader()); 
-        
-        // Core Java classes (like String) are loaded by the Bootstrap ClassLoader,
-        // which is written in native C++ code, so it returns 'null' in Java!
-        System.out.println(String.class.getClassLoader()); // null
+        // Who loaded String? (Bootstrap → returns null in Java)
+        ClassLoader stringLoader = String.class.getClassLoader();
+        System.out.println("String ClassLoader: " + stringLoader); // null = Bootstrap
+
+        // Who loaded our class? (Application ClassLoader)
+        ClassLoader myLoader = ShowClassLoader.class.getClassLoader();
+        System.out.println("MyClass ClassLoader: " + myLoader);
+
+        // Parent chain
+        ClassLoader parent = myLoader.getParent();
+        System.out.println("Parent: " + parent);
+
+        ClassLoader grandParent = parent.getParent();
+        System.out.println("Grandparent: " + grandParent); // null = Bootstrap
     }
 }
-class Database {}
+// Output:
+// String ClassLoader: null
+// MyClass ClassLoader: sun.misc.Launcher$AppClassLoader@18b4aac2
+// Parent: sun.misc.Launcher$ExtClassLoader@1b6d3586
+// Grandparent: null
 ```
 
-### Level 2 — Building Blocks (The Stack)
+---
+
+### Level 2 — Elementary: Stack vs Heap Demonstration
+
 ```java
-public class StackOverflow {
-    // 1. Thread starts. JVM creates a private Stack for this Thread.
-    public static void main(String[] args) {
-        // 2. JVM pushes the main() Stack Frame onto the Stack.
-        recursiveCall(); 
+// StackHeapDemo.java
+public class StackHeapDemo {
+
+    static int instanceCount = 0;  // Method Area (static)
+    String name;                   // Heap (inside object)
+    int age;                       // Heap (inside object)
+
+    public StackHeapDemo(String name, int age) {
+        this.name = name;
+        this.age = age;
+        instanceCount++;
     }
-    
-    public static void recursiveCall() {
-        // 3. JVM pushes the recursiveCall() Stack Frame onto the Stack.
-        // Because there is no base case, it pushes infinite frames...
-        // 4. The Stack hits its maximum memory limit (usually 1MB).
-        // 5. JVM violently throws a StackOverflowError and crashes the thread!
-        recursiveCall(); 
+
+    public static void main(String[] args) {
+        // 'p1' reference → Stack; object itself → Heap
+        StackHeapDemo p1 = new StackHeapDemo("Alice", 30);
+        StackHeapDemo p2 = new StackHeapDemo("Bob", 25);
+
+        System.out.println(p1.name + ", " + p2.name);
+        System.out.println("Instances: " + instanceCount);
+
+        // String Pool (Heap)
+        String s1 = "hello";
+        String s2 = "hello";
+        String s3 = new String("hello");
+
+        System.out.println(s1 == s2);      // true  — same pool object
+        System.out.println(s1 == s3);      // false — new heap object
+        System.out.println(s1.equals(s3)); // true  — same content
     }
 }
 ```
 
-### Level 3 — Intermediate (The Heap)
-```java
-import java.util.List;
-import java.util.ArrayList;
+---
 
-public class HeapExhaustion {
-    public static void main(String[] args) {
-        // The 'list' reference variable lives on the Thread Stack.
-        // But the actual ArrayList object, and all the byte[] arrays, live on the shared Heap!
+### Level 3 — Intermediate: Stack Overflow and OOM Simulation
+
+```java
+// MemoryErrorDemo.java
+import java.util.*;
+
+public class MemoryErrorDemo {
+
+    // Infinite recursion → StackOverflowError
+    public static void infiniteRecursion(int depth) {
+        infiniteRecursion(depth + 1);
+    }
+
+    // Fill heap → OutOfMemoryError
+    public static void fillHeap() {
         List<byte[]> list = new ArrayList<>();
-        
-        // We continuously fill the Heap with 1MB objects.
-        // Eventually, the Garbage Collector cannot find any free space.
-        // The JVM violently throws an OutOfMemoryError: Java heap space!
         while (true) {
-            list.add(new byte[1024 * 1024]);
+            list.add(new byte[1024 * 1024]); // 1MB chunks
         }
+    }
+
+    public static void main(String[] args) {
+        try {
+            infiniteRecursion(0);
+        } catch (StackOverflowError e) {
+            System.out.println("Caught StackOverflowError!");
+        }
+
+        // Run with: java -Xmx64m MemoryErrorDemo
+        try {
+            fillHeap();
+        } catch (OutOfMemoryError e) {
+            System.out.println("Caught OutOfMemoryError: " + e.getMessage());
+        }
+    }
+}
+
+// JVM flags:
+// java -Xms256m -Xmx512m -XX:+PrintGCDetails MemoryErrorDemo
+// -Xms = initial heap | -Xmx = max heap | -Xss = thread stack size
+```
+
+---
+
+### Level 4 — Advanced: Custom ClassLoader
+
+```java
+// CustomClassLoader.java
+import java.io.*;
+import java.nio.file.*;
+
+public class CustomClassLoader extends ClassLoader {
+
+    private final String classDirectory;
+
+    public CustomClassLoader(String classDirectory) {
+        super(ClassLoader.getSystemClassLoader()); // parent delegation
+        this.classDirectory = classDirectory;
+    }
+
+    @Override
+    protected Class<?> findClass(String className) throws ClassNotFoundException {
+        byte[] classBytes = loadClassBytes(className);
+        if (classBytes == null) {
+            throw new ClassNotFoundException("Cannot find: " + className);
+        }
+        return defineClass(className, classBytes, 0, classBytes.length);
+    }
+
+    private byte[] loadClassBytes(String className) {
+        String path = classDirectory + File.separator
+                + className.replace('.', File.separatorChar) + ".class";
+        try {
+            return Files.readAllBytes(Path.of(path));
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        CustomClassLoader loader1 = new CustomClassLoader("/tmp/plugins");
+        CustomClassLoader loader2 = new CustomClassLoader("/tmp/plugins");
+
+        Class<?> class1 = loader1.loadClass("com.plugin.MyPlugin");
+        Class<?> class2 = loader2.loadClass("com.plugin.MyPlugin");
+
+        System.out.println("Same class object? " + (class1 == class2));
+        // false! Same .class file, different ClassLoader = different type
+        // This causes ClassCastException across classloader boundaries
     }
 }
 ```
 
-### Level 4 — Advanced (JIT Compilation)
+---
+
+### Level 5 — Expert: JVM Introspection with MXBeans
+
 ```java
-public class JitOptimization {
+// JvmInspector.java
+import java.lang.management.*;
+
+public class JvmInspector {
+
     public static void main(String[] args) {
-        long start = System.nanoTime();
-        
-        // The JVM Interpreter runs this loop. It is relatively slow.
-        // However, the JVM Profiler notices this loop is a "Hot Spot".
-        for (int i = 0; i < 100_000; i++) {
-            calculateMath(); 
+        // Heap memory
+        MemoryMXBean memBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heap = memBean.getHeapMemoryUsage();
+        System.out.printf("Heap: used=%,d max=%,d%n", heap.getUsed(), heap.getMax());
+
+        // Memory pools (Eden, Survivor, Old Gen, Metaspace)
+        for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+            MemoryUsage u = pool.getUsage();
+            System.out.printf("  Pool %-30s used=%,d%n", pool.getName(), u.getUsed());
         }
-        
-        // The JIT Compiler kicks in, compiles calculateMath() into native CPU instructions,
-        // and performs "Method Inlining" (replacing the method call with the actual code body).
-        
-        // If you run a second loop of 100_000 iterations here, it will execute 
-        // 10x to 50x faster than the first loop because it's running raw machine code!
-    }
-    
-    public static int calculateMath() {
-        return 5 * 5;
+
+        // GC stats
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            System.out.printf("GC %-20s count=%-5d time=%d ms%n",
+                    gc.getName(), gc.getCollectionCount(), gc.getCollectionTime());
+        }
+
+        // Thread stats
+        ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+        System.out.println("Live threads: " + threadBean.getThreadCount());
+        long[] deadlocked = threadBean.findDeadlockedThreads();
+        System.out.println("Deadlocks: " + (deadlocked == null ? "none" : deadlocked.length));
+
+        // JIT compilation
+        CompilationMXBean comp = ManagementFactory.getCompilationMXBean();
+        System.out.println("JIT: " + comp.getName() + ", time=" + comp.getTotalCompilationTime() + "ms");
+
+        // Class loading
+        ClassLoadingMXBean cl = ManagementFactory.getClassLoadingMXBean();
+        System.out.println("Classes loaded: " + cl.getLoadedClassCount());
     }
 }
+
+/*
+ * Key JVM Flags Cheat Sheet:
+ *
+ * -Xms512m                    initial heap
+ * -Xmx2g                      max heap
+ * -Xss512k                    thread stack size
+ * -XX:+UseG1GC                G1 garbage collector (Java 9+ default)
+ * -XX:+UseZGC                 ZGC (Java 15+, sub-millisecond pauses)
+ * -XX:MaxMetaspaceSize=256m   cap Metaspace
+ * -XX:+HeapDumpOnOutOfMemoryError  dump heap on OOM
+ * -XX:HeapDumpPath=/tmp/heap.hprof
+ * -XX:+PrintGCDetails
+ * -XX:+PrintCompilation       see JIT compilation in action
+ */
 ```
+
+---
 
 ## REAL_WORLD
-Because of the JIT Compiler, Java applications suffer from a phenomenon known as "Cold Starts".
-When a Spring Boot application first boots up, it is running 100% in the slow Interpreter mode. The first few HTTP requests that hit your REST API might take 500ms to process. However, as more traffic hits the server, the JVM profiles the code, the JIT Compiler fires up, and within a few minutes, those exact same HTTP requests will be processed in 5ms. 
-**Java gets faster the longer it runs.**
 
-This is a massive problem for Serverless environments like AWS Lambda, where instances are created and destroyed in seconds. The application never lives long enough to get warm!
-To solve this, modern frameworks like Spring Boot 3 introduced **GraalVM Native Image**. GraalVM is an Ahead-Of-Time (AOT) compiler. It analyzes your entire project during the CI/CD build phase and compiles it directly into a standalone Windows `.exe` or Linux Binary. It completely deletes the JVM, the Interpreter, and the JIT Compiler! The result? Your Spring Boot application boots in 50 milliseconds and executes at maximum speed instantly, revolutionizing Java for the Cloud era.
+### Production JVM Tuning (Kubernetes + Spring Boot)
+
+```yaml
+# k8s deployment — JVM settings
+env:
+  - name: JAVA_OPTS
+    value: >
+      -Xms256m -Xmx768m
+      -XX:+UseG1GC
+      -XX:MaxGCPauseMillis=200
+      -XX:+HeapDumpOnOutOfMemoryError
+      -XX:HeapDumpPath=/dumps/heap.hprof
+      -Djava.security.egd=file:/dev/./urandom
+```
+
+### Spring Boot Actuator JVM Metrics
+
+```
+GET /actuator/metrics/jvm.memory.used
+GET /actuator/metrics/jvm.gc.pause
+GET /actuator/metrics/jvm.threads.live
+GET /actuator/metrics/jvm.classes.loaded
+```
+
+### GraalVM Native Image (eliminates warmup)
+
+```bash
+# Compile to native binary (no JVM needed at runtime)
+native-image -jar myapp.jar myapp
+./myapp   # starts in <50ms vs 2s for JVM
+```
+
+---
 
 ## INTERVIEW
-**Q: What is the difference between the Stack and the Heap?**
-A: The Heap is a massive, shared memory space where all Objects (`new User()`) are stored and is managed by the Garbage Collector. The Stack is a tiny, private memory space assigned to each individual Thread. It stores primitive local variables and method execution frames. When a method finishes, its Stack Frame is instantly popped off the stack and destroyed without needing Garbage Collection.
 
-**Q: Can you have a Memory Leak on the Stack?**
-A: No. Stack memory is perfectly deterministic. It grows exactly when a method is called, and shrinks exactly when the method returns. The only error you can get is a `StackOverflowError` if you call too many methods (usually via infinite recursion) and exceed the strict physical size limit of the stack.
+**Q1: What is the difference between JDK, JRE, and JVM?**
 
-**Q: Why doesn't Java just compile everything to Machine Code Ahead-Of-Time (AOT) to begin with?**
-A: AOT compilation forces you to target a specific OS/CPU architecture, losing the "Write Once, Run Anywhere" portability. More importantly, the JVM's JIT Compiler is often *faster* than AOT C++ code! Because the JIT compiles the code *while* the program is running, it can analyze real-time traffic patterns and perform hyper-aggressive runtime optimizations (like branch prediction and dynamic unrolling) that an AOT compiler simply cannot predict.
+> **Strong answer:** JVM is the abstract specification that executes bytecode. JRE = JVM + standard libraries — everything needed to run Java. JDK = JRE + development tools (javac, javadoc, jdb). In Java 9+ with modules you can use `jlink` to create custom minimal runtimes.
+
+**Q2: What causes StackOverflowError vs OutOfMemoryError?**
+
+> **Strong answer:** StackOverflowError happens when the JVM stack is exhausted — each recursive call adds a stack frame; with infinite recursion, frames fill up (`-Xss` controls stack size). OutOfMemoryError happens when heap space is exhausted or Metaspace fills (common with excessive dynamic proxies like Spring AOP generating many classes).
+
+**Q3: Explain the Parent Delegation Model.**
+
+> **Strong answer:** When asked to load a class, a ClassLoader first delegates to its parent. Only if the parent fails does it try itself. Hierarchy: Bootstrap → Platform/Extension → Application. This ensures core JDK classes (java.lang.String) are always loaded by Bootstrap, preventing malicious override. Two ClassLoaders loading the same class produce different types — source of ClassCastException in OSGi/plugin systems.
+
+**Q4: What is JIT compilation and what is warmup?**
+
+> **Strong answer:** JIT = Just-In-Time. JVM initially interprets bytecode. HotSpot monitors hot methods and progressively optimizes them through 5 tiers (L0=interpreter → L4=C2 aggressive optimizations). During warmup, the app runs slower. After warmup, JIT-compiled code can rival C++ performance. GraalVM native-image solves warmup via AOT compilation at build time.
+
+**Q5: What is escape analysis?**
+
+> **Strong answer:** JIT optimization that determines if an object escapes its creating scope — returned, stored in field, or passed to another thread. If it doesn't escape, JVM can allocate it on the stack (free!) instead of heap (GC overhead). Enabled by default since Java 6. Use `-XX:+PrintEscapeAnalysis` to observe.
+
+---
+
+## FEYNMAN CHECK
+
+The JVM is like a universal translator. Your Java code compiles to a "middle language" (bytecode) that no real computer understands natively. The JVM reads that middle language and translates it on the fly to whatever language your specific machine speaks — Windows, Mac, or Linux. That's "write once, run anywhere."
+
+---
+
+## BUILD
+
+Build a JVM health monitor that polls every 5 seconds, alerts when heap > 80%, and prints GC pause trends to console.
+
+```java
+ScheduledExecutorService s = Executors.newScheduledThreadPool(1);
+s.scheduleAtFixedRate(() -> {
+    MemoryUsage h = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+    double pct = (double) h.getUsed() / h.getMax() * 100;
+    if (pct > 80) System.out.printf("⚠ HEAP %.1f%%%n", pct);
+}, 0, 5, TimeUnit.SECONDS);
+```
+
+---
+
+## SPACED REVIEW
+
+- Day 1: Draw the 3 JVM subsystems and 5 runtime data areas from memory
+- Day 3: Explain ClassLoader parent delegation without notes
+- Day 7: Write code that triggers StackOverflowError and handles it
+- Day 14: Explain JIT tiered compilation levels 0-4 and escape analysis

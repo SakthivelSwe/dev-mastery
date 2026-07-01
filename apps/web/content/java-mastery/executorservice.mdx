@@ -1,69 +1,445 @@
 ---
-title: executorservice
-slug: executorservice
+slug: "executorservice"
+title: "ExecutorService and Thread Pools"
+level: 4
 ---
 
-# ExecutorService, ThreadPools, and CompletableFuture
+## WHY
 
-Manually managing platform threads is an anti-pattern. Java provides the `ExecutorService` framework to decouple task submission from task execution, and `CompletableFuture` to coordinate asynchronous pipelines.
+Creating a new platform thread per task is an anti-pattern for server code.
+
+- thread creation is expensive (OS call + stack allocation)
+- unbounded thread counts destroy memory and scheduler fairness
+- request bursts become process crashes instead of controlled backpressure
+
+`ExecutorService` solves this by separating:
+
+1. task submission
+2. execution policy
+3. lifecycle management
+
+With a well-sized pool, you get predictable latency and stable resource usage.
+
+## THEORY
+
+### Core Abstractions
+
+| Type | Role |
+|------|------|
+| `Executor` | fire-and-forget execution |
+| `ExecutorService` | execution + lifecycle (`shutdown`) + result-bearing submit |
+| `ScheduledExecutorService` | delayed/periodic task scheduling |
+| `ThreadPoolExecutor` | configurable implementation for most thread pools |
+
+### ThreadPoolExecutor Parameters
+
+| Parameter | Meaning |
+|-----------|---------|
+| `corePoolSize` | baseline workers kept alive |
+| `maximumPoolSize` | max workers if queue is saturated |
+| `keepAliveTime` | idle timeout for non-core workers |
+| `workQueue` | where tasks wait |
+| `threadFactory` | naming, priority, uncaught handler |
+| `rejectedExecutionHandler` | policy when no capacity remains |
+
+### Submission Decision Tree
+
+```
+submit(task)
+  -> workerCount < core? create worker
+  -> else queue.offer(task)
+  -> if queue full and workerCount < max? create worker
+  -> else reject(task)
+```
+
+### Queue Type Matters
+
+| Queue | Behavior | Typical Outcome |
+|-------|----------|-----------------|
+| `SynchronousQueue` | zero-capacity handoff | high scaling, can explode thread count if max too high |
+| `ArrayBlockingQueue(n)` | fixed capacity | bounded memory, predictable backpressure |
+| `LinkedBlockingQueue` (unbounded default) | task accumulation | possible OOM under producer burst |
+
+### Rejection Policies
+
+| Policy | Behavior | When to Use |
+|--------|----------|-------------|
+| `AbortPolicy` | throw `RejectedExecutionException` | strict fail-fast APIs |
+| `CallerRunsPolicy` | caller executes task | natural backpressure |
+| `DiscardPolicy` | silently drop task | telemetry/non-critical fire-and-forget |
+| `DiscardOldestPolicy` | drop queue head then retry | latest-value-wins workloads |
+
+### Built-in Executors Factory Traps
+
+| Factory | Hidden Risk |
+|---------|-------------|
+| `newFixedThreadPool(n)` | unbounded queue by default |
+| `newCachedThreadPool()` | unbounded threads |
+| `newSingleThreadExecutor()` | unbounded queue |
+
+For production services, prefer explicit `ThreadPoolExecutor` constructor with bounded queue.
+
+### Pool Sizing Heuristic
+
+Brian Goetz heuristic:
+
+```
+threads = cores * (1 + waitTime / computeTime)
+```
+
+- CPU-bound (`wait/compute ~ 0`) -> threads ~= cores
+- IO-bound (`wait/compute ~ 9`) -> threads ~= cores * 10
+
+### Futures and CompletableFuture
+
+`Future<T>`:
+- blocking `get()`
+- cancellation support
+- no composition primitives
+
+`CompletableFuture<T>`:
+- composition (`thenApply`, `thenCompose`, `thenCombine`)
+- fan-in (`allOf`) and race (`anyOf`)
+- timeout (`orTimeout`, `completeOnTimeout`)
+- exception recovery (`exceptionally`, `handle`)
+
+Always pass explicit executor for server-side async chains; avoid default common pool unless intentional.
+
+### Virtual Threads (Java 21)
+
+`Executors.newVirtualThreadPerTaskExecutor()` is excellent for IO-heavy workloads.
+
+- cheap to create many tasks
+- blocking calls are usually fine
+- still avoid CPU-bound over-subscription
+- beware pinning scenarios (native calls, synchronized blocks around blocking IO)
+
+## VISUALIZATION_CONFIG
+```json
+{ "type": "none" }
+```
+
+## CODE
+
+### Level 1 - Beginner
+
+```java
+import java.util.concurrent.*;
+
+public class ExecutorBasics {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+
+        for (int i = 1; i <= 10; i++) {
+            final int id = i;
+            pool.execute(() -> {
+                System.out.println("task " + id + " on " + Thread.currentThread().getName());
+                try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+        }
+
+        pool.shutdown();
+        if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+            pool.shutdownNow();
+        }
+    }
+}
+```
+
+### Level 2 - Building Blocks
+
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class BoundedPoolDemo {
+    public static void main(String[] args) {
+        AtomicInteger seq = new AtomicInteger(0);
+
+        ThreadFactory factory = r -> {
+            Thread t = new Thread(r);
+            t.setName("api-worker-" + seq.incrementAndGet());
+            t.setUncaughtExceptionHandler((th, ex) ->
+                System.err.println("Uncaught " + th.getName() + ": " + ex));
+            return t;
+        };
+
+        RejectedExecutionHandler reject = new ThreadPoolExecutor.CallerRunsPolicy();
+
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+            8, 16,
+            30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1000),
+            factory,
+            reject
+        );
+
+        pool.prestartAllCoreThreads();
+
+        for (int i = 0; i < 5000; i++) {
+            int id = i;
+            pool.execute(() -> {
+                // simulate request handling
+                busyWork(2_000);
+                if (id % 1000 == 0) {
+                    System.out.println("processed " + id);
+                }
+            });
+        }
+
+        pool.shutdown();
+    }
+
+    static void busyWork(int loops) {
+        long x = 0;
+        for (int i = 0; i < loops; i++) x += i;
+        if (x == -1) System.out.println(x);
+    }
+}
+```
+
+### Level 3 - Intermediate
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+public class FutureAndCompletionService {
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+
+        // 1) Future timeout and cancellation
+        Future<String> f = pool.submit(() -> {
+            Thread.sleep(3000);
+            return "done";
+        });
+
+        try {
+            System.out.println(f.get(500, TimeUnit.MILLISECONDS));
+        } catch (TimeoutException te) {
+            System.out.println("timed out -> cancel");
+            f.cancel(true);
+        }
+
+        // 2) CompletionService: consume results in completion order, not submit order
+        CompletionService<String> cs = new ExecutorCompletionService<>(pool);
+        List<Integer> delays = List.of(900, 200, 500, 100);
+        for (int d : delays) {
+            cs.submit(() -> {
+                Thread.sleep(d);
+                return "delay=" + d;
+            });
+        }
+
+        for (int i = 0; i < delays.size(); i++) {
+            System.out.println("completed: " + cs.take().get());
+        }
+
+        pool.shutdown();
+    }
+}
+```
+
+### Level 4 - Advanced
+
+```java
+import java.util.concurrent.*;
+import java.util.*;
+
+public class CompletableFuturePatterns {
+    private static final ExecutorService ioPool = new ThreadPoolExecutor(
+        20, 100,
+        60, TimeUnit.SECONDS,
+        new ArrayBlockingQueue<>(10_000),
+        Executors.defaultThreadFactory(),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+
+    static CompletableFuture<String> fetchUser(int id) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(80);
+            return "user-" + id;
+        }, ioPool);
+    }
+
+    static CompletableFuture<List<String>> fetchOrders(String user) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(120);
+            return List.of("o1", "o2", "o3");
+        }, ioPool);
+    }
+
+    static CompletableFuture<Integer> fetchCreditScore(String user) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(50);
+            return 780;
+        }, ioPool);
+    }
+
+    public static void main(String[] args) {
+        CompletableFuture<String> flow = fetchUser(42)
+            .thenCompose(user -> {
+                CompletableFuture<List<String>> orders = fetchOrders(user);
+                CompletableFuture<Integer> credit = fetchCreditScore(user);
+
+                return orders.thenCombine(credit,
+                    (o, c) -> "user=" + user + " orders=" + o.size() + " credit=" + c);
+            })
+            .orTimeout(1, TimeUnit.SECONDS)
+            .exceptionally(ex -> "fallback: " + ex.getClass().getSimpleName());
+
+        System.out.println(flow.join());
+        ioPool.shutdown();
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+### Level 5 - Expert
+
+```java
+import java.util.concurrent.*;
+import java.net.http.*;
+import java.net.URI;
+
+public class VirtualThreadExecutorDemo {
+    public static void main(String[] args) throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+
+        try (ExecutorService vexec = Executors.newVirtualThreadPerTaskExecutor()) {
+            CompletableFuture<?>[] all = new CompletableFuture[5000];
+
+            for (int i = 0; i < all.length; i++) {
+                int id = i;
+                all[i] = CompletableFuture.runAsync(() -> {
+                    try {
+                        HttpRequest req = HttpRequest.newBuilder()
+                            .uri(URI.create("https://httpbin.org/get?id=" + id))
+                            .GET().build();
+
+                        HttpResponse<String> res = client.send(req, HttpResponse.BodyHandlers.ofString());
+                        if (res.statusCode() != 200) {
+                            throw new IllegalStateException("status " + res.statusCode());
+                        }
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }, vexec);
+            }
+
+            CompletableFuture.allOf(all).join();
+            System.out.println("All requests done");
+        }
+    }
+}
+```
+
+## REAL_WORLD
+
+### Spring Boot Async Configuration
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("mailExecutor")
+    public Executor mailExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(10);
+        ex.setMaxPoolSize(40);
+        ex.setQueueCapacity(500);
+        ex.setThreadNamePrefix("mail-");
+        ex.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        ex.initialize();
+        return ex;
+    }
+}
+
+@Service
+public class MailService {
+    @Async("mailExecutor")
+    public CompletableFuture<Void> sendWelcome(String email) {
+        // background send
+        return CompletableFuture.completedFuture(null);
+    }
+}
+```
+
+### Production Guardrails
+
+- bounded queue always
+- explicit rejection policy with metrics
+- MDC/log context propagation if async logging required
+- graceful shutdown with timeout
+- alert on queue depth and active thread saturation
+
+## INTERVIEW
+
+### Q1: `execute()` vs `submit()`?
+
+Weak: submit returns future.
+
+Strong: `execute(Runnable)` is fire-and-forget and propagates uncaught runtime exceptions to thread uncaught handler. `submit(...)` wraps tasks and returns `Future`; exceptions are captured and rethrown via `future.get()` as `ExecutionException`.
 
 ---
 
-## 1. Deep Internals of ThreadPoolExecutor
+### Q2: What happens when queue and max threads are full?
 
-The core engine of the Java Executor framework is `ThreadPoolExecutor`. It uses a highly optimized state-tracking variable and a structured task submission pipeline.
+Weak: task fails.
 
-### The State Control Variable (`ctl`)
-Inside `ThreadPoolExecutor`, a single `AtomicInteger` called `ctl` packs two pieces of information to minimize synchronization overhead:
-*   **workerCount:** The active number of threads (using the low 29 bits).
-*   **runState:** The lifecycle state of the pool (using the high 3 bits):
-    *   `RUNNING`: Accepts new tasks and processes queued tasks.
-    *   `SHUTDOWN`: Rejects new tasks but processes queued tasks.
-    *   `STOP`: Rejects new tasks, purges queued tasks, and interrupts active tasks.
-    *   `TIDYING`: All tasks terminated, worker count is zero; runs the `terminated()` hook.
-    *   `TERMINATED`: `terminated()` execution completed.
+Strong: `RejectedExecutionHandler` is invoked. Behavior depends on policy (`Abort`, `CallerRuns`, `Discard`, `DiscardOldest`). `CallerRuns` is often preferred for backpressure in synchronous request flows.
 
-```
-ctl (32-bit AtomicInteger)
-+-------------------------+-------------------------------------------------+
-| runState (3 bits)       | workerCount (29 bits)                           |
-| e.g., 111 (RUNNING)     | e.g., 00000000000000000000000001000 (8 threads) |
-+-------------------------+-------------------------------------------------+
-```
+---
 
-### Task Submission Lifecycle Flow
+### Q3: Why are `Executors.newFixedThreadPool` and `newCachedThreadPool` risky?
 
-When a task is submitted via `execute(Runnable)`, the executor follows a strict hierarchical decision tree:
+Weak: not production-safe.
 
-```
-                  [ Submit Task ]
-                         |
-                         v
-            +-------------------------+
-            |  Current Pool Size <    | --( Yes )--> [ Create Worker Thread ]
-            |      corePoolSize?      |
-            +-------------------------+
-                         | ( No )
-                         v
-            +-------------------------+
-            |   Can task be added     | --( Yes )--> [ Queue Task ]
-            |     to workQueue?       |
-            +-------------------------+
-                         | ( No )
-                         v
-            +-------------------------+
-            |  Current Pool Size <    | --( Yes )--> [ Create Worker Thread ]
-            |    maximumPoolSize?     |
-            +-------------------------+
-                         | ( No )
-                         v
-            [ Trigger RejectedExecutionHandler ]
-```
+Strong: fixed pool factory uses unbounded queue -> latent OOM risk under producer bursts. Cached pool uses unbounded thread growth with `SynchronousQueue` -> thread explosion risk under blocking tasks. Explicit bounded configuration is safer.
 
-1.  **Core Pool Check:** If fewer than `corePoolSize` threads are running, a new worker thread is created to run the task immediately, even if other worker threads are idle.
-2.  **Work Queue Enqueue:** If `corePoolSize` is reached, the executor attempts to offer the task to the configured `workQueue`.
-3.  **Maximum Pool Check:** If the `workQueue` is full, the executor attempts to spawn a new worker thread, up to the limit of `maximumPoolSize`.
-4.  **Rejection:** If the pool size is at `maximumPoolSize` and the queue is full, the task is rejected using the configured `RejectedExecutionHandler`.
+---
 
-### Unbounded Queues and OOM Risk
-Using `Executors.newFixedThreadPool
+### Q4: `thenApply` vs `thenCompose`?
+
+Weak: one maps, one flatmaps.
+
+Strong: `thenApply(T->R)` transforms value synchronously and wraps into same future chain. `thenCompose(T->CompletableFuture<R>)` flattens nested async computations (`Future<Future<R>>` -> `Future<R>`) and is required for dependent asynchronous steps.
+
+---
+
+### Q5: When should you use virtual threads instead of classic pools?
+
+Weak: for many concurrent tasks.
+
+Strong: use virtual threads for high-concurrency IO-bound workloads where tasks frequently block on network/disk/database. Keep classic bounded pools for CPU-bound workloads and places requiring strict queueing/backpressure control. Virtual threads reduce thread management overhead but do not make CPU infinite.
+
+## FEYNMAN CHECK
+
+Imagine a restaurant:
+
+- each order = task
+- chefs = worker threads
+- kitchen manager = executor
+- waiting rail = work queue
+
+Without pool: hire a new chef per order (chaos).
+With pool: fixed chef team + queue. If queue overflows, manager policy decides: reject order, make cashier cook (`CallerRuns`), or drop oldest ticket.
+
+## BUILD
+
+1. Build a bounded `ThreadPoolExecutor` (core 8, max 32, queue 1000) with custom thread names and `CallerRunsPolicy`.
+2. Implement fan-out HTTP aggregator using `CompletableFuture` and per-request timeout.
+3. Add metrics: active threads, queue depth, completed tasks, rejection count.
+4. Add graceful shutdown sequence with timeout + forced shutdown fallback.
+
+## SPACED REVIEW
+
+- Day 1: Draw submit decision tree for ThreadPoolExecutor.
+- Day 3: Explain queue type impact on behavior and failure modes.
+- Day 7: Implement `thenCompose` chain and compare to nested futures.
+- Day 14: Compare virtual threads vs platform thread pools by workload type.
+- Day 30: Tune pool size for IO-heavy service using wait/compute ratio heuristic.

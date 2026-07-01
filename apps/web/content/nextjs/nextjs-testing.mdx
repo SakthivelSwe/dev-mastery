@@ -108,3 +108,354 @@ Server Components rely on the Next.js server environment (Webpack, request conte
 
 **The correct approach:**
 Use an E2E testing framework like Playwright or Cypress. These tools hit the actual running application, meaning the `cookies()` function will behave exactly as it does in production, reading the actual HTTP headers sent by the browser during the test.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Testing Like I'm 10 Years Old
+> Next.js testing uses three layers: (1) UNIT TESTS with Vitest/Jest — test pure functions, utilities, and individual components in isolation (fastest, run on every save). (2) INTEGRATION TESTS with React Testing Library — render components with realistic props, simulate user interactions, verify DOM (moderate speed). (3) E2E TESTS with Playwright — drive a real browser, navigate routes, click buttons, fill forms, verify entire flows work (slowest, most confidence). The non-obvious depth: testing Server Components is different from testing Client Components. Server Components are async functions — you can test them by calling them directly and asserting on the returned JSX. They don't need a browser environment because they don't use hooks or events. Client Components need RTL's render() inside a DOM environment (jsdom or happy-dom). Always co-locate tests next to source files (Component.tsx + Component.test.tsx) — easier to find, more likely to be maintained.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How do you test Server Components?**
+> **A:** Server Components are async functions returning JSX — test them like any async function: call them, await the result, assert on the returned React tree. Example: const result = await PostsPage({ searchParams: { category: 'books' } }); — result is a React element. Assertions: expect(result.props.children[0].type).toBe('h1'). For more readable tests, use React Testing Library's render() with the awaited result — works because RTL renders any React element. For data fetching mocks, use Vitest's vi.mock or Jest's jest.mock to stub the DB/API layer the Server Component imports.
+
+**Q2: Mental model for testing pyramid in Next.js?**
+> **A:** UNIT (70%): pure functions, utility libraries, individual components without DB/API. Fast (<10ms each), no setup, run continuously during development. INTEGRATION (25%): Server Components with mocked DB, Server Actions with mocked DB, multi-component flows. Moderate (50-500ms each), some setup, run on commit. E2E (5%): critical user journeys (login → buy → checkout) in a real browser against a real DB. Slow (5-30s each), expensive setup, run in CI. Most bugs come from integration — UNDER-investing in integration tests is the most common mistake. Test the SEAMS between units, not just the units themselves.
+
+**Q3: Most dangerous misconception about testing?**
+> **A:** Tests can use the same mock as the implementation:
+> ```typescript
+> // WRONG: test that just checks the mock is called
+> import { sendEmail } from '@/lib/email';
+> vi.mock('@/lib/email');
+>
+> it('sends welcome email on signup', async () => {
+>   await signupAction(formData);
+>   expect(sendEmail).toHaveBeenCalledWith('welcome@user.com', 'Welcome');
+> });
+> // This tests NOTHING — the mock is the test
+> // If the implementation calls sendEmail wrong, the test still passes
+> // because the mock doesn't enforce the email is valid
+>
+> // CORRECT: use a fake implementation OR test against real-ish infrastructure
+> vi.mock('@/lib/email', () => ({
+>   sendEmail: vi.fn().mockImplementation((to, subject) => {
+>     if (!to.includes('@')) throw new Error('Invalid email');  // validates inputs
+>     emails.push({ to, subject });  // records calls in a way you can verify
+>     return Promise.resolve({ id: 'msg_123' });
+>   }),
+> }));
+>
+> // Even better: integration test with a fake SMTP server (MailHog) or test mode
+> ```
+
+**Q4: How do you test Server Actions?**
+> **A:** Server Actions are async functions — test them directly. For form-action signature: const result = await updateAction({ status: 'idle' }, formData);. Mock the DB layer (e.g., Prisma) via vi.mock. Test: validation errors return { status: 'error', errors: {...} }, success returns { status: 'success' }, authorisation throws on invalid user. For end-to-end: use Playwright to fill the form in a browser, submit, verify the server-rendered response. Both approaches are valuable: unit tests for logic, E2E for the full flow.
+
+**Q5: FAANG-grade definition of Next.js testing strategy.**
+> **A:** "Next.js testing combines Vitest/Jest for unit and integration tests (fast iteration, jsdom/happy-dom environment, vi.mock for module-level stubs), React Testing Library for user-centric DOM assertions on Client Components, direct async invocation for Server Component testing (await Component(props) returns React elements), Server Action testing with mocked database layer (Prisma, Drizzle), Playwright for E2E browser automation (real DB, real auth flow, multiple browsers), MSW (Mock Service Worker) for API mocking at network level, Lighthouse CI for performance regression detection in pipeline, and visual regression via Playwright screenshots — with co-located test files (Component.tsx + Component.test.tsx) following the 70/25/5 testing pyramid distribution to balance feedback speed against confidence depth."
+
+## BUILD
+
+### 🏗️ Mini Project: Full Test Suite — Unit + Server Component + Server Action + E2E
+
+**What you will build:** A todos app with: Vitest unit tests for utilities, RTL integration tests for Client Components, direct invocation tests for Server Components, Server Action tests, and Playwright E2E tests covering the full happy path.
+**Why this project:** Forces every Next.js testing pattern in one suite.
+**Time estimate:** 50 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest test-demo --typescript --tailwind --app
+npm install -D vitest @vitejs/plugin-react jsdom @testing-library/react @testing-library/jest-dom @testing-library/user-event
+npm install -D @playwright/test
+npx playwright install chromium
+```
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./vitest.setup.ts'],
+  },
+  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
+});
+
+// vitest.setup.ts
+import '@testing-library/jest-dom/vitest';
+```
+
+#### Step 2 — Unit Test (Utility Function)
+```typescript
+// src/lib/todos.ts
+export interface Todo { id: number; text: string; done: boolean; }
+
+export function filterTodos(todos: Todo[], filter: 'all' | 'active' | 'done'): Todo[] {
+  if (filter === 'active') return todos.filter(t => !t.done);
+  if (filter === 'done') return todos.filter(t => t.done);
+  return todos;
+}
+
+// src/lib/todos.test.ts
+import { describe, it, expect } from 'vitest';
+import { filterTodos } from './todos';
+
+describe('filterTodos', () => {
+  const todos = [
+    { id: 1, text: 'A', done: false },
+    { id: 2, text: 'B', done: true },
+    { id: 3, text: 'C', done: false },
+  ];
+
+  it('returns all by default', () => {
+    expect(filterTodos(todos, 'all')).toHaveLength(3);
+  });
+
+  it('returns only active', () => {
+    const active = filterTodos(todos, 'active');
+    expect(active).toHaveLength(2);
+    expect(active.every(t => !t.done)).toBe(true);
+  });
+
+  it('returns only done', () => {
+    const done = filterTodos(todos, 'done');
+    expect(done).toHaveLength(1);
+    expect(done[0].id).toBe(2);
+  });
+});
+```
+
+#### Step 3 — Integration Test (Client Component With User Interaction)
+```typescript
+// src/components/TodoInput.tsx
+'use client';
+import { useState } from 'react';
+
+interface Props { onAdd: (text: string) => void; }
+
+export function TodoInput({ onAdd }: Props) {
+  const [text, setText] = useState('');
+
+  const submit = () => {
+    if (!text.trim()) return;
+    onAdd(text);
+    setText('');
+  };
+
+  return (
+    <div className="flex gap-2">
+      <input
+        value={text}
+        onChange={e => setText(e.target.value)}
+        onKeyDown={e => e.key === 'Enter' && submit()}
+        placeholder="What needs to be done?"
+        className="flex-1 px-3 py-2 border rounded"
+      />
+      <button onClick={submit} className="px-4 py-2 bg-blue-500 text-white rounded">
+        Add
+      </button>
+    </div>
+  );
+}
+
+// src/components/TodoInput.test.tsx
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { TodoInput } from './TodoInput';
+
+describe('TodoInput', () => {
+  it('calls onAdd when button clicked', async () => {
+    const onAdd = vi.fn();
+    const user = userEvent.setup();
+    render(<TodoInput onAdd={onAdd} />);
+
+    await user.type(screen.getByPlaceholderText(/what needs to be done/i), 'Buy milk');
+    await user.click(screen.getByText('Add'));
+
+    expect(onAdd).toHaveBeenCalledWith('Buy milk');
+  });
+
+  it('clears input after submit', async () => {
+    const user = userEvent.setup();
+    render(<TodoInput onAdd={vi.fn()} />);
+    const input = screen.getByPlaceholderText(/what needs to be done/i) as HTMLInputElement;
+    await user.type(input, 'Test');
+    await user.keyboard('{Enter}');
+    expect(input.value).toBe('');
+  });
+
+  it('does not call onAdd for empty input', async () => {
+    const onAdd = vi.fn();
+    const user = userEvent.setup();
+    render(<TodoInput onAdd={onAdd} />);
+    await user.click(screen.getByText('Add'));
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+});
+```
+
+#### Step 4 — Server Component + Server Action Tests
+```typescript
+// src/app/todos/page.tsx
+import { getAllTodos } from '@/lib/db';
+
+export default async function TodosPage() {
+  const todos = await getAllTodos();
+  return (
+    <main>
+      <h1>Todos ({todos.length})</h1>
+      <ul>
+        {todos.map(t => <li key={t.id}>{t.text}</li>)}
+      </ul>
+    </main>
+  );
+}
+
+// src/app/todos/page.test.tsx
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import TodosPage from './page';
+
+vi.mock('@/lib/db', () => ({
+  getAllTodos: vi.fn().mockResolvedValue([
+    { id: 1, text: 'Test todo', done: false },
+    { id: 2, text: 'Another', done: true },
+  ]),
+}));
+
+describe('TodosPage (Server Component)', () => {
+  it('renders todos from DB', async () => {
+    // Server Components return JSX directly — await the async component
+    const result = await TodosPage();
+    render(result);
+
+    expect(screen.getByText('Todos (2)')).toBeInTheDocument();
+    expect(screen.getByText('Test todo')).toBeInTheDocument();
+    expect(screen.getByText('Another')).toBeInTheDocument();
+  });
+});
+
+// src/app/todos/actions.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { addTodoAction } from './actions';
+
+vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
+
+const dbStub = { insert: vi.fn() };
+vi.mock('@/lib/db', () => ({
+  db: { prepare: (sql: string) => ({ run: dbStub.insert }) },
+}));
+
+describe('addTodoAction', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('rejects empty text', async () => {
+    const fd = new FormData();
+    fd.set('text', '');
+    const result = await addTodoAction({ status: 'idle' }, fd);
+    expect(result.status).toBe('error');
+    expect(dbStub.insert).not.toHaveBeenCalled();
+  });
+
+  it('inserts valid text', async () => {
+    const fd = new FormData();
+    fd.set('text', 'Valid todo');
+    const result = await addTodoAction({ status: 'idle' }, fd);
+    expect(result.status).toBe('success');
+    expect(dbStub.insert).toHaveBeenCalledWith('Valid todo');
+  });
+});
+```
+
+#### Step 5 — E2E Playwright Test
+```typescript
+// playwright.config.ts
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './e2e',
+  webServer: {
+    command: 'npm run build && npm start',
+    port: 3000,
+    timeout: 60_000,
+  },
+  use: {
+    baseURL: 'http://localhost:3000',
+    screenshot: 'only-on-failure',
+  },
+});
+
+// e2e/todos.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('full todo flow — add, complete, delete', async ({ page }) => {
+  await page.goto('/todos');
+
+  // Verify initial state
+  await expect(page.locator('h1')).toContainText('Todos');
+
+  // Add a new todo
+  await page.fill('input[placeholder*="What needs"]', 'E2E test todo');
+  await page.click('button:has-text("Add")');
+
+  // Verify it appears
+  await expect(page.locator('text=E2E test todo')).toBeVisible();
+
+  // Mark complete
+  await page.locator('text=E2E test todo').locator('..').locator('input[type=checkbox]').check();
+
+  // Verify checked
+  await expect(page.locator('text=E2E test todo').locator('..').locator('input[type=checkbox]'))
+    .toBeChecked();
+
+  // Delete
+  await page.locator('text=E2E test todo').locator('..').locator('button:has-text("×")').click();
+  await expect(page.locator('text=E2E test todo')).not.toBeVisible();
+});
+```
+
+**Expected Output:**
+```
+npm test                  -> 9 unit/integration tests pass in <1s
+npx playwright test       -> 1 E2E test passes in ~5s
+Coverage: 90%+ for components, 100% for utilities
+CI/CD: all tests gate the deployment
+```
+
+**Stretch Challenges:**
+- [ ] Add MSW for mocking external API calls
+- [ ] Add visual regression tests with Playwright screenshots
+- [ ] Add Lighthouse CI to catch performance regressions
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Three testing layers and their approximate distribution?
+**Q2:** How do you test a Server Component?
+**Q3:** Write a Vitest test for a pure function. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why are mocks dangerous in tests?
+**Q5:** A PR has 100 unit tests and 0 integration tests — diagnose the testing gap.
+**Q6:** How do you test a Server Action with form-action signature?
+
+### Day 7 — Application
+**Q7:** Write a Playwright E2E test for a login → dashboard flow.
+**Q8:** A flaky E2E test passes 50% of the time — diagnose root causes.
+**Q9:** When should you use MSW vs vi.mock?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Design a testing strategy for a Next.js production app — pyramid, tools, CI/CD integration."
+**Q11:** Draw: testing pyramid — Unit → Integration → E2E with example tests at each level.
+**Q12:** ★ System design: "Set up the testing infrastructure for a 50-developer Next.js monorepo — speed, coverage, deployment gates, flaky test management."

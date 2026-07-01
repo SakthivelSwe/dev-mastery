@@ -105,3 +105,120 @@ A: **The entire server instantly dies for every single user.**
 Because Node.js is fundamentally single-threaded, all JavaScript code executes sequentially on that single thread. 
 If you accidentally write an infinite `while` loop (or perform an incredibly heavy synchronous calculation), the Event Loop becomes physically trapped. It will never reach the next line of code. It will never return to the event queue to process incoming HTTP requests. 
 A single user triggering that infinite loop will cause the entire Node.js server to hang indefinitely, blocking thousands of other innocent users from accessing the API until the server process is forcefully restarted by the system administrator!
+
+## FEYNMAN CHECK
+
+### Explain Node.js Like I'm 10 Years Old
+> Node.js is JavaScript running outside the browser — on a server. It uses Google's V8 engine plus a system layer (libuv) that does async I/O. The non-obvious part: Node runs ONE thread for your JavaScript but a thread pool for file/network I/O. This is why Node is fast for I/O-heavy apps (web servers, APIs) and slow for CPU-heavy work (image processing) — a long CPU loop blocks every other request.
+
+---
+
+### 5 Deep Questions
+**Q1: Why is Node single-threaded but capable of high throughput?**
+> **A:** JavaScript runs single-threaded, but I/O (disk, network) is delegated to libuv's thread pool. While 100 connections wait for DB responses, the JS thread is free to handle new requests. This works because typical web requests spend 95% of time waiting, not computing.
+
+**Q2: ONE model.**
+> **A:** "Event loop processes JS tasks one at a time. I/O is async via callbacks/promises. CPU-bound work blocks everything — offload to worker_threads or external services."
+
+**Q3: Misconception with code.**
+> **A:** ```js
+> // ❌ Sync CPU work blocks all requests
+> app.get('/hash', (req, res) => {
+>   const h = crypto.pbkdf2Sync(req.body.pw, 'salt', 100000, 64, 'sha512');
+>   res.json({ h });
+> }); // 200ms per request — server handles 5 req/s
+> // ✅ Async with worker thread or async API
+> app.get('/hash', async (req, res) => {
+>   const h = await pbkdf2Async(req.body.pw, 'salt', 100000, 64, 'sha512');
+>   res.json({ h });
+> }); // event loop free during work — 500+ req/s
+> ```
+
+**Q4: CommonJS vs ESM in Node?**
+> **A:** CommonJS (`require`/`module.exports`): older, synchronous, allowed in .js by default. ESM (`import`/`export`): standard, async, requires .mjs or `"type":"module"`. ESM is the future; many libs still publish CJS for compatibility.
+
+**Q5: Senior one-liner.**
+> **A:** "Node.js is a single-threaded event-loop runtime over V8 with libuv-managed async I/O — its concurrency model excels at I/O-bound workloads and collapses under CPU-bound ones, which is why production Node systems offload computation to worker_threads, services, or external runtimes."
+
+## BUILD
+
+### 🏗️ Mini Project: Express API with Health Check and Graceful Shutdown
+**Time:** 30 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir node-api && cd node-api
+npm init -y && npm i express
+touch server.js
+```
+
+#### Step 2 — Core
+```js
+// server.js
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+let ready = true;
+app.get('/healthz', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+app.get('/readyz',  (req, res) => res.status(ready ? 200 : 503).json({ ready }));
+app.get('/api/users', (req, res) => res.json([{ id: 1, name: 'Alice' }]));
+
+const server = app.listen(3000, () => console.log('on :3000'));
+
+// Graceful shutdown — drain in-flight requests
+function shutdown(signal) {
+  console.log(`${signal} received, draining…`);
+  ready = false;  // Fail readiness so LB stops sending traffic
+  server.close(err => {
+    if (err) { console.error(err); process.exit(1); }
+    console.log('Drained, exiting');
+    process.exit(0);
+  });
+  setTimeout(() => { console.error('Forced exit'); process.exit(1); }, 10_000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+```
+
+#### Step 4 — Error Handling
+```js
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+process.on('unhandledRejection', (r) => console.error('unhandled', r));
+process.on('uncaughtException', (e) => { console.error(e); process.exit(1); });
+```
+
+#### Step 5 — Test
+```bash
+node server.js &
+curl http://localhost:3000/healthz
+curl http://localhost:3000/readyz
+kill -TERM $!  # should drain gracefully
+```
+
+**Expected Output:** Health/ready respond, SIGTERM drains in <10s.
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** What is the event loop and why is Node single-threaded?
+**Q2:** CommonJS vs ESM — when each?
+**Q3:** Write a 10-line Express server with one GET endpoint.
+
+### Day 3
+**Q4:** Why are CPU-bound operations dangerous in Node?
+**Q5:** Show sync-crypto bug and async fix.
+**Q6:** What is graceful shutdown and why does it matter for K8s?
+
+### Day 7
+**Q7:** Use worker_threads to offload a CPU task without blocking the event loop.
+**Q8:** PR ships a sync bcrypt call. Quantify throughput collapse.
+**Q9:** What is the difference between process and cluster?
+
+### Day 14
+**Q10:** ★ "Design a Node API for 10k req/s — how do you scale beyond one process?"
+**Q11:** Link Node → event-loop → I/O → backpressure.
+**Q12:** ★ "Your Node server's p99 latency tripled after deploying a new feature. Diagnose."

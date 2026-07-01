@@ -137,3 +137,199 @@ If you type a function as returning `undefined`, you are strictly enforcing that
 If you type a return as `void`, it means "I don't care what this function returns, the caller should ignore it."
 This is crucial for Callbacks. 
 If an API expects a callback `(data: string) => void`, you are allowed to pass an arrow function that returns a value (e.g., `(data) => data.toUpperCase()`). TypeScript allows this because `void` tells the API to simply ignore the returned value. If the API expected `(data: string) => undefined`, passing that same arrow function would trigger a compiler error because it returns a string, not undefined!
+
+## FEYNMAN CHECK
+
+### Explain TS Functions Like I'm 10 Years Old
+> A function type captures three things: PARAMETER types, RETURN type, and (sometimes) THIS type. `(x: number, y: number) => number` is a function type. TS supports OVERLOADS — multiple signatures for the same function — when one body handles several call patterns (`document.createElement('div')` returns HTMLDivElement, while `document.createElement('a')` returns HTMLAnchorElement). Variance matters: parameter types are CONTRAVARIANT (a function accepting `Animal` can be used where `Dog` is expected, NOT the other way), and return types are COVARIANT (a function returning `Dog` can be used where `Animal` is expected). The non-obvious detail: with `strictFunctionTypes: false` (default in non-strict), parameter variance becomes bivariant — a major source of subtle bugs.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do function overloads solve?**
+> **A:** A single function signature can't express "if input is A, output is X; if input is B, output is Y." Overloads let you declare multiple input→output relationships, then write ONE implementation that handles all cases. DOM `createElement`, array `reduce`, and Lodash's `_.get` rely heavily on overloads. The 2024 alternative is to use CONDITIONAL types or function-generic constraints, which are often cleaner but harder to read for juniors.
+
+**Q2: Mental model for parameter variance?**
+> **A:** A function is "more permissive" (subtype) when it ACCEPTS MORE inputs and RETURNS LESS. `(a: Animal) => Animal` is a subtype of `(a: Dog) => Mammal` because Animal-accepting is broader than Dog-accepting (any caller passing a Dog is satisfied), and Mammal-returning is narrower than Animal-returning (any caller expecting Animal is satisfied). This is contravariance in parameters + covariance in returns = the Liskov Substitution Principle for functions.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing optional parameters are the same as defaults:
+> ```ts
+> // ❌ Optional: type includes undefined
+> function greet(name?: string) { return `Hi, ${name.toUpperCase()}`; }   // 💥 if undefined
+>
+> // ✅ Default: type does NOT include undefined inside body
+> function greet(name: string = 'guest') { return `Hi, ${name.toUpperCase()}`; }
+>
+> // ❌ Optional with default is still optional at call site, but inside the body it's defined
+> function greet(name?: string = 'guest') { /* SyntaxError */ }
+> ```
+
+**Q4: How do generic functions infer types from arguments?**
+> **A:** TS runs an INFERENCE algorithm: for each generic param, it looks at all places that param is used, gathers candidates from actual arguments, and unifies them. `function pick<K extends keyof T, T>(obj: T, key: K)` — when you call `pick({a:1, b:2}, 'a')`, TS infers T from obj's shape, K from the literal 'a' (narrowed to 'a' because the literal type was inferred). This is why type-parameter ORDER matters and why `extends` clauses act as both constraint and inference hint.
+
+**Q5: FAANG-grade definition?**
+> **A:** "A TypeScript function type is a signature `(params) => return` with contravariant parameter assignability and covariant return assignability under strictFunctionTypes — supporting overloads via multiple signatures + single implementation, generic inference via call-site argument unification, and rest/spread typed via tuple types — collectively enabling polymorphic APIs without runtime cost."
+
+## BUILD
+
+### 🏗️ Mini Project: Type-Safe Event Emitter With Inferred Payload Types
+
+**What you will build:** A generic EventEmitter where `.emit('user:login', payload)` and `.on('user:login', handler)` are type-checked — wrong event name fails to compile, wrong payload shape fails to compile, handler receives correctly-typed payload.
+**Why this project:** Forces generics with constraints, function types with inference, conditional types, and overloads.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-functions && cd ts-functions
+npm init -y && npm install -D typescript
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/emitter.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Typed EventEmitter
+```ts
+// src/emitter.ts
+export type EventMap = Record<string, unknown>;
+
+export class TypedEmitter<E extends EventMap> {
+  private listeners = new Map<keyof E, Array<(payload: any) => void>>();
+
+  on<K extends keyof E>(event: K, handler: (payload: E[K]) => void): () => void {
+    const list = this.listeners.get(event) ?? [];
+    list.push(handler);
+    this.listeners.set(event, list);
+    // Returns a disposer — call to unsubscribe
+    return () => {
+      const next = (this.listeners.get(event) ?? []).filter(h => h !== handler);
+      this.listeners.set(event, next);
+    };
+  }
+
+  emit<K extends keyof E>(event: K, payload: E[K]): void {
+    for (const h of this.listeners.get(event) ?? []) h(payload);
+  }
+}
+```
+
+#### Step 3 — Define App Events
+```ts
+// src/main.ts
+import { TypedEmitter } from './emitter.js';
+
+interface AppEvents {
+  'user:login':  { userId: number; ts: number };
+  'user:logout': { userId: number };
+  'order:paid':  { orderId: string; amount: number; currency: 'USD' | 'EUR' };
+}
+
+const bus = new TypedEmitter<AppEvents>();
+
+// Handler payload type is INFERRED from the event name literal
+bus.on('user:login', (p) => {
+  console.log(`User ${p.userId} logged in at ${new Date(p.ts).toISOString()}`);
+});
+
+bus.on('order:paid', (p) => {
+  console.log(`Order ${p.orderId}: ${p.amount} ${p.currency}`);
+});
+
+bus.emit('user:login', { userId: 42, ts: Date.now() });
+bus.emit('order:paid', { orderId: 'ORD-1', amount: 99, currency: 'USD' });
+```
+
+#### Step 4 — Error Handling: Compile-Time Guard-Rails
+```ts
+// ❌ Wrong event name
+// bus.emit('user:foo', {} as any);    // TS2345: not assignable to '"user:login"|"user:logout"|"order:paid"'
+
+// ❌ Wrong payload shape
+// bus.emit('user:login', { userId: 'oops' });   // userId must be number
+
+// ❌ Wrong currency literal
+// bus.emit('order:paid', { orderId: 'X', amount: 1, currency: 'GBP' });   // 'GBP' not in 'USD'|'EUR'
+
+// ✅ Disposers
+const off = bus.on('user:logout', (p) => console.log('bye', p.userId));
+off();   // unsubscribed
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect, vi } from 'vitest';
+import { TypedEmitter } from './emitter.js';
+
+interface E { ping: { n: number } }
+
+describe('TypedEmitter', () => {
+  it('delivers payloads to handlers', () => {
+    const bus = new TypedEmitter<E>();
+    const spy = vi.fn();
+    bus.on('ping', spy);
+    bus.emit('ping', { n: 7 });
+    expect(spy).toHaveBeenCalledWith({ n: 7 });
+  });
+  it('disposer removes the handler', () => {
+    const bus = new TypedEmitter<E>();
+    const spy = vi.fn();
+    const off = bus.on('ping', spy);
+    off();
+    bus.emit('ping', { n: 1 });
+    expect(spy).not.toHaveBeenCalled();
+  });
+  it('multiple handlers fire in registration order', () => {
+    const bus = new TypedEmitter<E>();
+    const calls: number[] = [];
+    bus.on('ping', () => calls.push(1));
+    bus.on('ping', () => calls.push(2));
+    bus.emit('ping', { n: 0 });
+    expect(calls).toEqual([1, 2]);
+  });
+});
+```
+
+**Expected Output:**
+```
+User 42 logged in at 2026-06-26T08:15:00.000Z
+Order ORD-1: 99 USD
+
+# tsc rejects misuse:
+src/main.ts:18:11 - error TS2345: '"user:foo"' is not assignable to keyof AppEvents.
+src/main.ts:21:33 - error TS2322: Type 'string' is not assignable to 'number'.
+src/main.ts:23:64 - error TS2322: '"GBP"' is not assignable to '"USD" | "EUR"'.
+```
+
+**Stretch Challenges:**
+- [ ] Add an `once` method that auto-disposes after the first emit
+- [ ] Add wildcard listener `on('*', handler)` typed as a union of all payloads
+- [ ] Add async emit that awaits all handlers and aggregates errors
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between optional parameter (`x?: T`) and default parameter (`x: T = ...`)?
+**Q2:** What does `strictFunctionTypes` change about parameter assignability?
+**Q3:** Write a generic identity function `identity<T>(x: T): T`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Explain covariance and contravariance with a Dog/Animal example.
+**Q5:** A function overload silently picks the wrong signature — diagnose with an example.
+**Q6:** Refactor to a single generic instead of overloads:
+```ts
+function wrap(x: string): { value: string };
+function wrap(x: number): { value: number };
+function wrap(x: any): any { return { value: x }; }
+```
+
+### Day 7 — Application
+**Q7:** Build a typed routing API where path params are inferred from path string literal (`'/users/:id'` infers `{ id: string }`).
+**Q8:** A PR uses `Function` as a type — explain why it's almost always wrong and what to use instead.
+**Q9:** How does TS infer a generic when you DON'T pass type arguments? When does inference fail?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through how Express's Request type is augmented by middleware in TypeScript."
+**Q11:** Draw: how do overloads, generics, and conditional types relate as alternatives for polymorphism?
+**Q12:** ★ System design: "Type the public API of a serverless function framework where handlers describe their event source, input schema, and output schema as types."

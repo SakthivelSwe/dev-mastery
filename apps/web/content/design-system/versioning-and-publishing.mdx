@@ -112,3 +112,348 @@ If the Design team changes a color token (triggering a Patch release for `tokens
 ### Pre-Releases and Canaries
 Before publishing a breaking `v3.0.0` to the entire company, you must test it. Changesets allows you to publish a "snapshot" or "canary" release from any Pull Request.
 When a developer opens a PR, a GitHub Action publishes `@my-system/react-components@0.0.0-snapshot-pr123`. The consuming application developers can install this exact PR version into their apps to test the changes before they are ever merged to `main`!
+
+
+## CODE
+
+### Level 1 — Beginner: Semantic Versioning & package.json
+```json
+{
+  "name": "@company/design-system",
+  "version": "2.4.1",
+  "description": "Company Design System component library",
+  "main":    "dist/cjs/index.js",
+  "module":  "dist/esm/index.js",
+  "types":   "dist/types/index.d.ts",
+  "exports": {
+    ".":              { "import": "./dist/esm/index.js", "require": "./dist/cjs/index.js" },
+    "./styles":       "./dist/styles.css",
+    "./tokens":       "./dist/tokens/index.js"
+  },
+  "files": ["dist"],
+  "sideEffects": ["**/*.css"],
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "scripts": {
+    "build":   "tsup src/index.ts --format cjs,esm --dts",
+    "release": "changeset publish"
+  }
+}
+```
+
+### Level 2 — Intermediate: Changesets Workflow
+```bash
+# Install changesets: npm install -D @changesets/cli
+# Initialize: npx changeset init → creates .changeset/ folder
+
+# Developer flow: after making a change, create a changeset
+npx changeset add
+# Interactive prompt:
+#   - Which packages are affected? → @company/design-system
+#   - Is it major/minor/patch? → patch
+#   - Summary: "Fix Button focus ring in Safari"
+# Creates: .changeset/happy-dogs-dance.md
+
+# .changeset/happy-dogs-dance.md content:
+# ---
+# "@company/design-system": patch
+# ---
+# Fix Button focus ring in Safari
+```
+
+```javascript
+// .changeset/config.json — changeset configuration
+{
+  "$schema": "https://unpkg.com/@changesets/config@2.0.0/schema.json",
+  "changelog":    "@changesets/cli/changelog",
+  "commit":       false,
+  "linked":       [],
+  "access":       "public",
+  "baseBranch":   "main",
+  "updateInternalDependencies": "patch",
+  "ignore":       []
+}
+```
+
+### Level 3 — Advanced: CI/CD Release Pipeline
+```yaml
+# .github/workflows/release.yml — automated release on merge to main
+name: Release
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # Full history needed for changeset detection
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Create Release PR or Publish
+        uses: changesets/action@v1
+        with:
+          publish: npm run release
+          title:   "chore: release packages"
+          commit:  "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN:    ${{ secrets.NPM_TOKEN }}
+```
+
+### Level 4 — Expert / Production: Monorepo Multi-Package Publishing
+```javascript
+// scripts/publish.js — custom publish script with pre-publish validation
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const PACKAGES_DIR = path.join(__dirname, '../packages');
+
+async function validateBeforePublish(pkgPath) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(pkgPath, 'package.json'), 'utf8'));
+
+  // 1. Ensure dist exists
+  const distPath = path.join(pkgPath, 'dist');
+  if (!fs.existsSync(distPath)) {
+    throw new Error(`${pkg.name}: dist/ missing — run npm run build first`);
+  }
+
+  // 2. Ensure all exported files exist
+  const exports = pkg.exports ?? {};
+  for (const [key, value] of Object.entries(exports)) {
+    const files = typeof value === 'string' ? [value] : Object.values(value);
+    for (const file of files) {
+      const filePath = path.join(pkgPath, file);
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`${pkg.name}: exported file missing: ${file}`);
+      }
+    }
+  }
+
+  // 3. Ensure types are generated
+  const typesPath = path.join(pkgPath, pkg.types ?? 'dist/types/index.d.ts');
+  if (!fs.existsSync(typesPath)) {
+    throw new Error(`${pkg.name}: types missing at ${typesPath}`);
+  }
+
+  console.log(`✅ ${pkg.name}@${pkg.version} — validation passed`);
+}
+
+async function publishPackages() {
+  const packages = fs.readdirSync(PACKAGES_DIR)
+    .filter(name => fs.existsSync(path.join(PACKAGES_DIR, name, 'package.json')));
+
+  for (const pkgName of packages) {
+    const pkgPath = path.join(PACKAGES_DIR, pkgName);
+    try {
+      await validateBeforePublish(pkgPath);
+      execSync('npm publish --access public', { cwd: pkgPath, stdio: 'inherit' });
+      console.log(`📦 Published: ${pkgName}`);
+    } catch (err) {
+      console.error(`❌ Failed: ${pkgName} — ${err.message}`);
+      process.exit(1);
+    }
+  }
+}
+
+publishPackages().catch(console.error);
+```
+## REAL_WORLD
+
+### How Shopify Polaris Manages Versioning Across 400 App Partners
+
+Polaris has 400+ apps on the Shopify App Store consuming it. Breaking changes to a design system component can silently break every app. Their published breaking-change policy: major version only for breaking changes, with a migration guide + codemod; deprecation warnings 2 major versions before removal; a public changelog entry for every change. They use Changesets (open-source) for monorepo versioning and publish to npm from CI.
+
+```js
+// Production pattern — Changesets + npm publish pipeline
+// .changeset/new-change.md (created by: npx changeset)
+---
+"@polaris/react": minor
+---
+Added `loading` prop to Button component for async actions.
+Follows ARIA best practices with aria-busy and spinner slot.
+
+// package.json
+{
+  "name": "@your-ds/react",
+  "version": "4.7.0",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import":  "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types":   "./dist/index.d.ts"
+    }
+  },
+  "sideEffects": ["./dist/styles.css"]
+}
+
+// CI pipeline — .github/workflows/release.yml
+// 1. changeset version → bumps package.json + CHANGELOG.md
+// 2. npm publish --access public
+// 3. Bot opens upgrade PRs in consuming repos (optional: Renovate)
+```
+
+### Production Gotcha: Breaking Change Without Major Bump
+```bash
+# ❌ Renamed prop without major version — breaks all consumers silently
+# v3.7.0: Button "isLoading" renamed to "loading"
+# consumers: <Button isLoading> still compiles but prop silently ignored
+
+# ✅ Keep both props for one major version with deprecation warning
+# v3.7.0: add "loading" prop, keep "isLoading" with console.warn
+# v4.0.0: remove "isLoading"
+```
+**Why it happens:** Engineers treat prop renames as "non-breaking" because the old code still compiles. The component silently ignores the old prop, producing invisible bugs.
+
+| Version bump | When |
+|-------------|------|
+| Patch | Bug fix, no API change |
+| Minor | New prop with default, new component |
+| Major | Remove/rename prop, change behaviour |
+
+## INTERVIEW
+
+**Q1 (Junior): What is semantic versioning (semver) and how does it apply to a design system?**
+A: Semver uses MAJOR.MINOR.PATCH. MAJOR: breaking change (removing a prop, changing component behaviour). MINOR: additive change (new prop with default, new component). PATCH: bug fix that doesn't change the public API. For a design system, the key discipline: adding a prop with a safe default is always MINOR (existing consumers unaffected); removing or renaming a prop is always MAJOR (all consumers must update). Violating this breaks apps that have pinned versions.
+
+**Q2 (Junior): What is a changelog and why is it required for a design system?**
+A: A changelog (CHANGELOG.md) records every version's changes with categories (Added, Changed, Fixed, Removed, Deprecated). For a design system, it is the migration guide that 200 teams consult when upgrading. Without it, teams can't assess the upgrade risk, can't identify what to test after upgrading, and can't write migration scripts. Changesets (the tool) generates changelog entries from developer-authored markdown files, ensuring every PR documents its intent.
+
+**Q3 (Mid): How do you handle a breaking change that must ship urgently?**
+A: If a breaking change is unavoidable (security fix, fundamental API correction): (1) bump MAJOR, (2) publish a detailed migration guide with before/after code, (3) publish a codemod (jscodeshift transform) that automates the migration where possible, (4) keep the old version in LTS (long-term support) with security patches for 6 months. For design systems serving hundreds of teams, even an "urgent" breaking change needs 2 weeks lead time — announce in advance, give teams time to plan.
+
+**Q4 (Mid): What is the difference between peer dependencies and regular dependencies for a design system package?**
+A: React and React-DOM should be peerDependencies — the consuming app provides React, and the design system uses the app's instance. If React were a regular dependency, the design system would bundle its own React copy, causing two React instances (which breaks hooks and context). The correct package.json: `"peerDependencies": { "react": "^18.0.0" }`. This also lets the design system support React 17 and 18 simultaneously by widening the peer range.
+
+**Q5 (Senior): How do you migrate 400 consuming apps to a major version without a "big bang" upgrade?**
+A: Use a bridge release: v3.10 adds the new API alongside the old, deprecating the old with console.warn. This gives teams time to migrate while still on v3. v4.0 then removes the deprecated API — teams that migrated ahead of time do a simple version bump with zero code changes. Automation: publish a codemod as a standalone package (`npx @your-ds/migrate v3-to-v4`) that handles mechanical renames. Track adoption via telemetry: what percentage of consumers have upgraded within 30, 60, 90 days.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "FlowChart", "state": "design-system-versioning" }
+```
+
+## FEYNMAN CHECK
+
+### Explain Versioning Like I'm 10 Years Old
+> Publishing a design system is like releasing a new edition of a textbook. Patch (v1.0.1) fixes a typo — same content, just corrected. Minor (v1.1.0) adds a new chapter — everything old is still there. Major (v2.0.0) reorganises the whole book — old students must learn the new structure. The non-obvious part: a prop rename IS a major change even if the code still compiles — the old prop is silently ignored, and the UI breaks invisibly. This is why "it's just a rename, not a big deal" costs every consuming team hours of debugging.
+
+---
+
+### 5 Deep Questions
+**Q1: Why is a prop rename a MAJOR breaking change even when code compiles?**
+> **A:** TypeScript may not catch a renamed prop if the old prop becomes an unrecognised extra prop (React ignores unknown props silently). The component renders without error but with wrong behaviour — the feature is invisibly broken. Since the app builds and tests pass, the breakage goes to production undetected.
+
+**Q2: ONE model.**
+> **A:** "Patch = safe. Minor = additive safe. Major = requires migration. Never do breaking changes in minor/patch."
+
+**Q3: Misconception with code.**
+> **A:** Breaking change shipped as minor:
+> ```tsx
+> // v3.7.0 (minor) — renames isLoading to loading
+> // ❌ Old code silently broken
+> <Button isLoading>Save</Button>  // isLoading ignored — no spinner
+> // ✅ Add "loading" in minor, remove "isLoading" in major (v4.0.0)
+> ```
+
+**Q4: How do Changesets integrate with a monorepo CI/CD workflow?**
+> **A:** A changeset file (authored on PR) describes the change type (patch/minor/major) and summary. On merge to main, `changeset version` bumps package.json and CHANGELOG.md. `changeset publish` publishes to npm. The key: every PR must include a changeset file — CI fails if one is missing, enforcing that no change ships without documentation.
+
+**Q5: Senior one-liner.**
+> **A:** "Design system versioning is a social contract — semver signals migration cost, the changelog is the migration guide, and codemods are the migration tool — which is why silent breaking changes in minor versions are the single most trust-destroying mistake a design system team makes."
+
+## BUILD
+
+### 🏗️ Mini Project: Versioned Component Library Package
+
+**What you will build:** A minimal npm-publishable component library with Changesets, TypeScript, dual CJS/ESM output, and automated CHANGELOG.
+**Time estimate:** 45 minutes
+
+#### Step 1 — Setup
+```bash
+mkdir ds-publish && cd ds-publish
+npm init -y
+npm install -D typescript tsup @changesets/cli react react-dom @types/react
+npx changeset init
+touch src/index.ts src/Button.tsx tsup.config.ts
+```
+
+#### Step 2 — Component
+```tsx
+// src/Button.tsx
+export interface ButtonProps { children: React.ReactNode; variant?: 'primary' | 'secondary'; }
+export function Button({ children, variant = 'secondary' }: ButtonProps) {
+  return <button className={`btn btn--${variant}`}>{children}</button>;
+}
+```
+
+#### Step 3 — Build Config
+```ts
+// tsup.config.ts
+import { defineConfig } from 'tsup';
+export default defineConfig({
+  entry: ['src/index.ts'],
+  format: ['cjs', 'esm'],      // Dual output — works in CJS and ESM consumers
+  dts: true,                   // Generate .d.ts for TypeScript consumers
+  external: ['react'],         // Don't bundle React — peer dep
+  clean: true,
+});
+```
+
+#### Step 4 — Add Changeset
+```bash
+npx changeset
+# Select: minor
+# Summary: "Add Button component with primary/secondary variants"
+npx changeset version    # Bumps version + CHANGELOG
+npx changeset publish    # npm publish (needs npm login)
+```
+
+**Expected Output:**
+```
+🦋  info  @your-ds/react@0.1.0 published
+```
+
+## SPACED REVIEW
+
+### Day 1
+**Q1:** MAJOR/MINOR/PATCH — give a design system example of each.
+**Q2:** Why is a prop rename a breaking change even when it compiles?
+**Q3:** Write a package.json with correct peerDependencies for a React component library.
+
+### Day 3
+**Q4:** Changesets workflow — what does each step do?
+**Q5:** Breaking change in minor — show the invisible bug.
+**Q6:** Write a CHANGELOG entry for a new loading prop on Button.
+
+### Day 7
+**Q7:** Set up tsup to output CJS + ESM + type declarations for a component library.
+**Q8:** PR renames a prop and ships as minor. 400 consuming apps affected. Describe the incident.
+**Q9:** How do you track version adoption across 400 consuming teams?
+
+### Day 14
+**Q10:** ★ "A design system needs to remove 10 deprecated props in v5.0.0. Design the migration strategy for 400 consuming apps."
+**Q11:** Link versioning → changesets → npm → consuming-apps.
+**Q12:** ★ "Your design system is at v3.9. A critical security fix requires a breaking API change. How do you ship it while minimising consumer disruption?"

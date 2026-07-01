@@ -147,3 +147,186 @@ When you move API fetching to React Query, your Redux store suddenly becomes alm
 A: **No.**
 This is the core power of React Query's deduplication. If multiple components call `useQuery` with the exact same `queryKey` at the exact same time, React Query merges them into a single network request. When the API responds, it hands the data to both components simultaneously. 
 You never need to fetch data in a parent and pass it down via props again. Any component that needs the data simply calls `useQuery` with the correct key, and the cache handles the rest!
+
+## FEYNMAN CHECK
+
+### Explain TanStack Query Like I'm 10 Years Old
+> TanStack Query manages server state. `useQuery({ queryKey: ['user', id], queryFn: () => fetchUser(id) })` returns `{ data, isLoading, error }`. React Query caches by `queryKey`. 10 components requesting same key = 1 network call. Cache has `staleTime` — after expiry, background refetch silently updates. `useMutation` handles writes. It solves: loading states, deduplication, caching, background updates, optimistic updates, refetch on window focus — all declaratively, eliminating 90% of useEffect data fetching.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does queryKey determine caching?**
+> **A:** queryKey is the cache key — a serialisable array. `['user', 1]` and `['user', 2]` are separate entries. Changing any key element causes a new fetch. Must contain ALL variables queryFn depends on (same as useEffect deps). Hierarchical: `queryClient.invalidateQueries({ queryKey: ['user'] })` invalidates ALL user queries.
+
+**Q2: staleTime vs gcTime?**
+> **A:** STALETIME: how long data is FRESH — no background refetch during this window. After: STALE — refetch runs in background on next access, user sees old data first. GCTIME (formerly cacheTime): how long UNUSED cache entries stay in memory. Default gcTime=5min. Pattern: `staleTime: 60_000` (1min fresh), `gcTime: 300_000` (5min in memory). Navigate away and back within 1min → no refetch.
+
+**Q3: Most dangerous misconception?**
+> **A:** Mutation automatically updates cache:
+> ```tsx
+> // ❌ Mutation fires but stale data stays — no cache update
+> const { mutate } = useMutation({ mutationFn: updateUser });
+> // List still shows old name until page refresh
+>
+> // ✅ Invalidate after success
+> const qc = useQueryClient();
+> const { mutate } = useMutation({
+>   mutationFn: updateUser,
+>   onSuccess: () => qc.invalidateQueries({ queryKey: ['users'] }),
+> });
+>
+> // ✅ Optimistic update with rollback
+> const { mutate } = useMutation({
+>   mutationFn: updateUser,
+>   onMutate: async (newUser) => {
+>     await qc.cancelQueries({ queryKey: ['users'] });
+>     const snapshot = qc.getQueryData<User[]>(['users']);
+>     qc.setQueryData<User[]>(['users'], prev => prev!.map(u => u.id === newUser.id ? newUser : u));
+>     return { snapshot };
+>   },
+>   onError: (_, __, ctx) => qc.setQueryData(['users'], ctx?.snapshot),
+>   onSettled: () => qc.invalidateQueries({ queryKey: ['users'] }),
+> });
+> ```
+
+**Q4: How do you implement infinite scroll?**
+> **A:** `useInfiniteQuery` with `initialPageParam`, `getNextPageParam` (extracts next cursor from each page), `fetchNextPage()` triggered by IntersectionObserver at the bottom. React Query manages the pages array; navigating away and back restores all pages without refetch.
+
+**Q5: FAANG-grade definition.**
+> **A:** "TanStack Query: server-state library with declarative data fetching — queryKey as cache ID, staleTime controls refetch trigger, gcTime controls garbage collection, deduplication (single request per key), automatic refetch on window focus/reconnect/invalidation — useMutation with onMutate optimistic update + rollback pattern — eliminating useEffect boilerplate for loading/error/caching/sync — and extending to infinite scroll via useInfiniteQuery and suspense via useSuspenseQuery."
+
+## BUILD
+
+### 🏗️ Mini Project: Users CRUD — useQuery, useMutation, Optimistic Updates
+
+**What you will build:** Users list with cached fetch, add/delete with optimistic updates, cache invalidation, React Query DevTools.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1
+```bash
+npm create vite@latest rq-demo -- --template react-ts
+cd rq-demo && npm install @tanstack/react-query @tanstack/react-query-devtools
+```
+
+#### Step 2 — Setup + API
+```tsx
+// src/main.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 30_000 } } });
+createRoot(document.getElementById('root')!).render(
+  <QueryClientProvider client={qc}><App /><ReactQueryDevtools /></QueryClientProvider>
+);
+
+// src/api.ts
+export interface User { id: number; name: string; email: string; }
+const BASE = 'https://jsonplaceholder.typicode.com';
+export const getUsers = (): Promise<User[]> => fetch(BASE+'/users').then(r => r.json());
+export const createUser = (d: Omit<User,'id'>): Promise<User> =>
+  fetch(BASE+'/users', { method:'POST', body: JSON.stringify(d), headers: {'Content-Type':'application/json'} }).then(r => r.json());
+export const deleteUser = (id: number) =>
+  fetch(BASE+'/users/'+id, { method:'DELETE' }).then(() => {});
+```
+
+#### Step 3 — App
+```tsx
+// src/App.tsx
+import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { getUsers, createUser, deleteUser, User } from './api';
+
+const KEYS = { users: () => ['users'] as const };
+
+export default function App() {
+  const qc = useQueryClient();
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+
+  const { data: users, isLoading, isFetching } = useQuery({ queryKey: KEYS.users(), queryFn: getUsers });
+
+  const addMutation = useMutation({
+    mutationFn: createUser,
+    onMutate: async (newUser) => {
+      await qc.cancelQueries({ queryKey: KEYS.users() });
+      const snap = qc.getQueryData<User[]>(KEYS.users());
+      qc.setQueryData<User[]>(KEYS.users(), p => [...(p??[]), { ...newUser, id: -Date.now() }]);
+      return { snap };
+    },
+    onError: (_, __, ctx) => qc.setQueryData(KEYS.users(), ctx?.snap),
+    onSettled: () => qc.invalidateQueries({ queryKey: KEYS.users() }),
+  });
+
+  const delMutation = useMutation({
+    mutationFn: deleteUser,
+    onMutate: async (id) => {
+      await qc.cancelQueries({ queryKey: KEYS.users() });
+      const snap = qc.getQueryData<User[]>(KEYS.users());
+      qc.setQueryData<User[]>(KEYS.users(), p => p?.filter(u => u.id !== id));
+      return { snap };
+    },
+    onError: (_, __, ctx) => qc.setQueryData(KEYS.users(), ctx?.snap),
+    onSettled: () => qc.invalidateQueries({ queryKey: KEYS.users() }),
+  });
+
+  if (isLoading) return <div className="p-4">Loading...</div>;
+
+  return (
+    <main className="max-w-xl mx-auto p-8">
+      <h1 className="text-2xl font-bold mb-2">Users {isFetching && <span className="text-xs text-gray-400">(syncing...)</span>}</h1>
+      <div className="flex gap-2 mb-4">
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name" className="flex-1 border px-2 py-1 rounded" />
+        <input value={email} onChange={e => setEmail(e.target.value)} placeholder="Email" className="flex-1 border px-2 py-1 rounded" />
+        <button onClick={() => { addMutation.mutate({ name, email }); setName(''); setEmail(''); }}
+          disabled={addMutation.isPending} className="px-3 py-1 bg-blue-500 text-white rounded disabled:opacity-50">
+          {addMutation.isPending ? '...' : 'Add'}
+        </button>
+      </div>
+      <ul className="border rounded">
+        {users?.map(u => (
+          <li key={u.id} className={`flex justify-between p-3 border-b ${u.id < 0 ? 'opacity-50' : ''}`}>
+            <div><p className="font-medium">{u.name}</p><p className="text-sm text-gray-500">{u.email}</p></div>
+            <button onClick={() => delMutation.mutate(u.id)} className="text-red-500">Delete</button>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+**Expected Output:**
+```
+Users load from API, cached for 30s
+Add: appears instantly (optimistic, grayed), then syncs
+Delete: disappears instantly, syncs in background
+React Query DevTools: see cache, staleTime, observer count
+Tests via renderHook with custom QueryClient wrapper
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is queryKey?
+**Q2:** staleTime vs gcTime?
+**Q3:** Write useQuery with loading/error. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do you invalidate cache after mutation?
+**Q5:** Mutation fires but list doesn't update — diagnose.
+**Q6:** When does React Query auto-refetch?
+
+### Day 7 — Application
+**Q7:** Implement optimistic like button (instant +1, rollback on error).
+**Q8:** PR fetches in useEffect — migrate to React Query.
+**Q9:** How does deduplication work with 10 components sharing a query key?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "What is server state and why does React Query handle it better than useState+useEffect?"
+**Q11:** Draw: cache lifecycle — fresh → stale → background refetch → gcTime expiry.
+**Q12:** ★ System design: "Dashboard updating every 5s — staleTime, refetchInterval, background updates."

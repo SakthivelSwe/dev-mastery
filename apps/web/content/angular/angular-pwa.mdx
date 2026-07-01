@@ -146,3 +146,212 @@ A: **Service Workers do not run in Development Mode!**
 By design, the Angular CLI completely disables the Service Worker when running `ng serve`. 
 If the Service Worker was active during development, it would aggressively cache your JavaScript. Every time you modified a Component and saved, the browser would ignore the changes and serve the cached version, completely breaking the development experience!
 *The Fix:* To test a PWA locally, you must create a production build (`ng build`), and then use a simple static HTTP server (like `http-server`) to serve the `dist/` folder. Only the production build includes the compiled `ngsw.json` manifest and activates the Service Worker!
+
+## FEYNMAN CHECK
+
+### Explain Angular PWA Like I'm 10 Years Old
+> A Progressive Web App (PWA) is a website that behaves like a native app — it can be installed on your phone's home screen, work OFFLINE (even without internet), send push notifications, and load instantly on repeat visits. Angular makes this easy with ng add @angular/pwa, which generates a Service Worker (sw-worker.js) — a JavaScript file that runs in the background and acts as a PROXY for all network requests. The non-obvious depth: the service worker pre-caches your Angular app's static assets (JavaScript, CSS, fonts) during installation, so the app loads instantly from cache on repeat visits. It uses a CACHE-FIRST strategy for static assets and NETWORK-FIRST for API calls — configurable in ngsw-config.json.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does Angular's service worker cache strategy work?**
+> **A:** ngsw-config.json defines two cache groups: (1) "freshness" (network-first, falls back to cache) for API data, (2) "performance" (cache-first) for static assets (JS/CSS/images). Angular's service worker (ngsw-worker.js) registers as the browser's fetch event handler. For cache-first resources: check cache → if found, return immediately → background refresh. For freshness: try network → if response in 3s, return → otherwise return cache. The service worker handles updates automatically — when a new version is deployed, the service worker detects it and can prompt the user to reload.
+
+**Q2: Mental model for the install/activate/fetch lifecycle?**
+> **A:** Install: browser downloads and runs the service worker — pre-caches all files listed in ngsw.json (Angular's generated cache manifest). Activate: the new service worker takes control (old one had to be idle) — deletes old caches. Fetch: every network request is intercepted — the service worker decides: return from cache or go to network based on the strategy in ngsw-config.json. The SwUpdate service lets your Angular app check for updates and prompt the user to activate a new version.
+
+**Q3: Most dangerous misconception about Angular PWAs?**
+> **A:** Service workers work in development with ng serve:
+> ```bash
+> # WRONG: ng serve does NOT activate service workers by default
+> ng serve    # service worker is disabled in dev mode
+>
+> # CORRECT: build and serve the production build to test service workers
+> ng build
+> npx http-server dist/my-app -p 8080
+> # Open http://localhost:8080 — service worker now active
+>
+> # Or use http-server-spa for HTML5 routing:
+> npx http-server dist/my-app -p 8080 -c-1 --proxy http://localhost:8080?
+>
+> # In production: service worker only activates over HTTPS (except localhost)
+> ```
+
+**Q4: How do you handle background sync and push notifications in Angular PWA?**
+> **A:** SwPush from @angular/service-worker handles Push Notifications — requestSubscription() asks for permission and returns a PushSubscription object. Send it to your server; the server uses the Web Push protocol to deliver messages. Background Sync is more manual — you register a sync tag via navigator.serviceWorker.ready.then(sw => sw.sync.register('sync-queue')) and the service worker receives the 'sync' event when the user is back online. Angular's ngsw-config.json doesn't configure background sync natively — you need a custom service worker extension.
+
+**Q5: FAANG-grade definition of Angular PWA.**
+> **A:** "An Angular PWA uses @angular/service-worker's ngsw-worker.js to register a service worker that intercepts fetch events — pre-caching static assets (index.html, JS/CSS chunks, assets) per a version-hashed ngsw.json manifest, serving them cache-first for performance — while using network-first for data APIs — with SwUpdate for programmatic version management, SwPush for Web Push Notification subscription, offline fallback pages, and ngsw-config.json for cache strategy configuration — enabling installable, offline-capable apps with native-like performance on repeat visits."
+
+## BUILD
+
+### 🏗️ Mini Project: Angular PWA With Offline Support and Update Prompts
+
+**What you will build:** An Angular PWA that: loads offline after first visit, shows an "Update available" banner when a new version is deployed, caches product images, and handles push notification subscription.
+**Why this project:** Forces service worker integration, SwUpdate, and offline strategy configuration.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new pwa-demo --standalone --routing
+cd pwa-demo
+ng add @angular/pwa
+# This adds: ngsw-worker.js, ngsw-config.json, manifest.webmanifest, sw registration in app.config.ts
+```
+
+#### Step 2 — Configure ngsw-config.json
+```json
+{
+  "$schema": "./node_modules/@angular/service-worker/config/schema.json",
+  "index": "/index.html",
+  "assetGroups": [
+    {
+      "name": "app",
+      "installMode": "prefetch",
+      "resources": {
+        "files": ["/favicon.ico", "/index.html", "/*.css", "/*.js"]
+      }
+    },
+    {
+      "name": "assets",
+      "installMode": "lazy",
+      "updateMode": "prefetch",
+      "resources": {
+        "files": ["/assets/**"],
+        "urls": ["https://fonts.googleapis.com/**", "https://fonts.gstatic.com/**"]
+      }
+    }
+  ],
+  "dataGroups": [
+    {
+      "name": "products-api",
+      "urls": ["https://fakestoreapi.com/**"],
+      "cacheConfig": {
+        "maxSize": 100,
+        "maxAge": "1h",
+        "timeout": "10s",
+        "strategy": "freshness"
+      }
+    }
+  ]
+}
+```
+
+#### Step 3 — Update Banner Component
+```typescript
+// update-banner.component.ts
+import { Component, inject, OnInit } from '@angular/core';
+import { SwUpdate } from '@angular/service-worker';
+import { NgIf } from '@angular/common';
+
+@Component({
+  standalone: true, imports: [NgIf],
+  selector: 'app-update-banner',
+  template: `
+    <div *ngIf="updateAvailable" class="update-banner">
+      A new version is available!
+      <button (click)="activateUpdate()">Reload</button>
+    </div>
+  `,
+})
+export class UpdateBannerComponent implements OnInit {
+  private swUpdate = inject(SwUpdate);
+  updateAvailable = false;
+
+  ngOnInit() {
+    if (!this.swUpdate.isEnabled) return;
+    this.swUpdate.versionUpdates.subscribe(event => {
+      if (event.type === 'VERSION_READY') {
+        this.updateAvailable = true;
+      }
+    });
+    this.swUpdate.checkForUpdate();
+  }
+
+  activateUpdate() {
+    this.swUpdate.activateUpdate().then(() => document.location.reload());
+  }
+}
+```
+
+#### Step 4 — Push Notification Service
+```typescript
+// push.service.ts
+import { Injectable, inject } from '@angular/core';
+import { SwPush } from '@angular/service-worker';
+
+const VAPID_PUBLIC_KEY = 'YOUR_PUBLIC_KEY_HERE';
+
+@Injectable({ providedIn: 'root' })
+export class PushService {
+  private swPush = inject(SwPush);
+
+  async subscribeToPush(): Promise<PushSubscription | null> {
+    if (!this.swPush.isEnabled) return null;
+    return this.swPush.requestSubscription({ serverPublicKey: VAPID_PUBLIC_KEY });
+  }
+
+  listenToMessages() {
+    return this.swPush.messages;
+  }
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('UpdateBannerComponent', () => {
+  it('shows banner on VERSION_READY event', () => {
+    const subject = new Subject<any>();
+    TestBed.configureTestingModule({
+      imports: [UpdateBannerComponent],
+      providers: [{ provide: SwUpdate, useValue: { isEnabled: true, versionUpdates: subject, checkForUpdate: () => Promise.resolve(false) } }],
+    });
+    const fixture = TestBed.createComponent(UpdateBannerComponent);
+    fixture.detectChanges();
+    subject.next({ type: 'VERSION_READY' });
+    fixture.detectChanges();
+    expect(fixture.nativeElement.textContent).toContain('new version');
+  });
+});
+```
+
+**Expected Output:**
+```
+ng build && npx http-server dist/pwa-demo -p 8080
+First load: caches all assets
+Go offline: app still loads from cache
+API calls: served from cache with 1h TTL
+Deploy new version: service worker detects, banner appears
+Click Reload: new version activated
+```
+
+**Stretch Challenges:**
+- [ ] Add a background sync queue for form submissions while offline
+- [ ] Add an install prompt component that shows the browser install banner
+- [ ] Test offline behaviour using Chrome DevTools > Network > Offline
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does ng add @angular/pwa generate?
+**Q2:** What is the difference between cache-first and network-first strategies?
+**Q3:** How do you check for a new app version programmatically? From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why do service workers not work with ng serve?
+**Q5:** A user complains they're seeing stale content after a deployment — diagnose.
+**Q6:** What is the service worker install/activate/fetch lifecycle?
+
+### Day 7 — Application
+**Q7:** Configure ngsw-config.json to cache API responses for 24h.
+**Q8:** A PR deploys new code but users don't see it for days — why?
+**Q9:** How would you implement offline form submission with background sync?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain how Angular's service worker handles app updates — version detection, activation, and user experience."
+**Q11:** Draw: service worker install/activate/fetch lifecycle diagram.
+**Q12:** ★ System design: "Design an offline-first Angular app for field workers with no reliable connectivity — sync strategy, conflict resolution, UX."

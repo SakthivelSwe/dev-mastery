@@ -153,3 +153,183 @@ When the Router encounters an asynchronous Guard or a `Resolve` guard, it intent
 *The Fix:* You must listen to the Angular Router's global event stream in your `app.component.ts`.
 When the router emits the `NavigationStart` event, you instantly display a global Loading Spinner on the screen.
 When the router emits `NavigationEnd`, `NavigationCancel` (if the guard rejected them), or `NavigationError`, you hide the Loading Spinner. This provides immediate visual feedback to the user that their click was registered and the application is "thinking"!
+
+## FEYNMAN CHECK
+
+### Explain Angular Guards Like I'm 10 Years Old
+> Guards are GATEKEEPERS for routes — they decide whether a navigation is allowed to proceed. CanActivate runs before a route is activated: return true to allow, false or a UrlTree to redirect. CanDeactivate runs when LEAVING a route: "are you sure you want to leave? You have unsaved changes." CanMatch determines whether a route configuration even MATCHES the current URL (useful for showing different routes to admin vs regular users without the user knowing). Resolve pre-fetches data before the component activates — the component receives ready data via ActivatedRoute instead of loading in ngOnInit. The non-obvious point: guards are just functions that return boolean, Observable<boolean>, or UrlTree — Angular 15+ makes them plain inject()-using functions, no class or interface required.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the execution order of multiple guards?**
+> **A:** (1) CanMatch guards run first (route matching phase). (2) CanActivate guards run in the order registered. (3) CanActivateChild runs for child routes. (4) Resolve runs after all CanActivate pass. (5) Component activates. (6) CanDeactivate runs when navigating away. CanActivate guards run in PARALLEL by default — if any returns false, navigation is cancelled. Resolve guards also run in parallel. This means long data fetches in multiple resolvers don't serialize — they run concurrently, completing when ALL finish.
+
+**Q2: Mental model for CanMatch vs CanActivate?**
+> **A:** CanMatch determines if a ROUTE DEFINITION even applies to the URL. If it returns false, Angular continues trying the next route definition — it's like route conditions. Use case: routes: [{ path: 'dashboard', canMatch: [adminMatch], component: AdminDashboard }, { path: 'dashboard', component: UserDashboard }] — admin gets admin dashboard, others get user dashboard, both at the same URL path. CanActivate, by contrast, runs AFTER the route matches — it blocks or redirects navigation to an already-matched route.
+
+**Q3: Most dangerous misconception about guards?**
+> **A:** Guards are the security layer for your API:
+> ```typescript
+> // WRONG: Guards only protect the UI — they do NOT protect your API
+> // A determined user can call your API directly bypassing all Angular guards
+>
+> export const adminGuard = () => inject(AuthService).isAdmin() ? true : redirect('/login');
+> // This only prevents navigation to /admin in the browser
+> // The actual API endpoints MUST have server-side authorization
+>
+> // CORRECT mental model:
+> // Guards = UX convenience (redirect to login instead of 403 page)
+> // Server-side auth = actual security
+> ```
+
+**Q4: How do Resolve guards improve UX vs loading in ngOnInit?**
+> **A:** Without Resolve: component renders → ngOnInit fires → HTTP call → loading spinner → data arrives → re-render. The user sees a blank or skeleton screen. With Resolve: router waits for data → component receives populated data immediately → renders once with real content. Trade-off: Resolve adds navigation LATENCY (user waits on the URL change), but eliminates the loading state inside the component. For perceived performance, Resolve is better for fast APIs; skeleton/loading is better for slow APIs where instant URL change feels more responsive.
+
+**Q5: FAANG-grade definition of Angular guards.**
+> **A:** "Angular route guards are functions (or classes implementing CanActivateFn/CanDeactivateFn/CanMatchFn/ResolveFn interfaces) that intercept router navigation — CanMatch for route-definition eligibility, CanActivate for navigation permission, CanActivateChild for child-route permission, Resolve for pre-navigation data fetching, and CanDeactivate for confirming navigation away from dirty forms — returning boolean/UrlTree/Observable<boolean>/Observable<UrlTree> — running in parallel when multiple guards are registered and short-circuiting navigation on any false/UrlTree return."
+
+## BUILD
+
+### 🏗️ Mini Project: Auth Guard + UnsavedChanges Guard + Prefetch Resolver
+
+**What you will build:** (1) authGuard — redirect to login if not authenticated, (2) roleGuard — check user role, redirect to /forbidden, (3) unsavedChangesGuard — confirm before leaving a dirty form, (4) productResolver — pre-fetch product data before component activates.
+**Why this project:** Covers the three most common production guard patterns in one app.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new guards-demo --standalone --routing
+cd guards-demo
+ng generate service auth
+ng generate service product
+ng generate component product-edit --standalone
+```
+
+#### Step 2 — Auth and Role Guards
+```typescript
+// guards.ts
+import { inject } from '@angular/core';
+import { Router, ActivatedRouteSnapshot } from '@angular/router';
+import { AuthService } from './auth.service';
+
+export const authGuard = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+  if (auth.isLoggedIn()) return true;
+  return router.createUrlTree(['/login'], { queryParams: { returnUrl: router.url } });
+};
+
+export const roleGuard = (route: ActivatedRouteSnapshot) => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+  const requiredRole = route.data['role'] as string;
+  if (auth.hasRole(requiredRole)) return true;
+  return router.createUrlTree(['/forbidden']);
+};
+```
+
+#### Step 3 — UnsavedChanges Guard
+```typescript
+// unsaved-changes.guard.ts
+import { CanDeactivateFn } from '@angular/router';
+
+export interface CanDeactivateComponent { hasUnsavedChanges(): boolean; }
+
+export const unsavedChangesGuard: CanDeactivateFn<CanDeactivateComponent> =
+  (component) => {
+    if (!component.hasUnsavedChanges()) return true;
+    return confirm('You have unsaved changes. Are you sure you want to leave?');
+  };
+```
+
+#### Step 4 — Resolver and Routes
+```typescript
+// product.resolver.ts
+import { inject } from '@angular/core';
+import { ActivatedRouteSnapshot } from '@angular/router';
+import { ProductService } from './product.service';
+
+export const productResolver = (route: ActivatedRouteSnapshot) =>
+  inject(ProductService).getProduct(Number(route.paramMap.get('id')));
+
+// app.routes.ts
+export const routes: Routes = [
+  { path: 'login', loadComponent: () => import('./login.component').then(m => m.LoginComponent) },
+  { path: 'forbidden', loadComponent: () => import('./forbidden.component').then(m => m.ForbiddenComponent) },
+  {
+    path: 'admin',
+    canActivate: [authGuard, roleGuard],
+    data: { role: 'admin' },
+    loadComponent: () => import('./admin.component').then(m => m.AdminComponent),
+  },
+  {
+    path: 'products/:id/edit',
+    canActivate: [authGuard],
+    canDeactivate: [unsavedChangesGuard],
+    resolve: { product: productResolver },
+    loadComponent: () => import('./product-edit/product-edit.component').then(m => m.ProductEditComponent),
+  },
+];
+```
+
+#### Step 5 — Tests
+```typescript
+describe('authGuard', () => {
+  it('allows navigation when logged in', () => {
+    TestBed.configureTestingModule({ providers: [
+      { provide: AuthService, useValue: { isLoggedIn: () => true } },
+      { provide: Router, useValue: {} },
+    ]});
+    expect(TestBed.runInInjectionContext(() => authGuard())).toBe(true);
+  });
+
+  it('redirects to login when not authenticated', () => {
+    const mockRouter = { url: '/products', createUrlTree: (p: any[]) => p };
+    TestBed.configureTestingModule({ providers: [
+      { provide: AuthService, useValue: { isLoggedIn: () => false } },
+      { provide: Router, useValue: mockRouter },
+    ]});
+    expect(TestBed.runInInjectionContext(() => authGuard())).toEqual(['/login']);
+  });
+});
+```
+
+**Expected Output:**
+```
+/admin (not logged in) -> redirect to /login?returnUrl=/admin
+/admin (logged in, wrong role) -> redirect to /forbidden
+/products/1/edit -> resolver fetches product, component has data immediately
+Leave dirty form -> confirmation dialog
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a CanMatch guard that shows different home pages for admin vs user at the same path
+- [ ] Add a permissions-based guard using a permission service with bit flags
+- [ ] Replace confirm() in unsavedChangesGuard with a custom modal Observable
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Five types of Angular route guards.
+**Q2:** What can a guard return to redirect instead of blocking?
+**Q3:** Write a functional authGuard. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Difference between CanActivate and CanMatch?
+**Q5:** A junior uses a guard to protect an API endpoint — explain the misunderstanding.
+**Q6:** How does Resolve improve UX compared to loading in ngOnInit?
+
+### Day 7 — Application
+**Q7:** Build a guard that checks subscription tier and shows an upgrade page.
+**Q8:** Do multiple CanActivate guards run in series or parallel?
+**Q9:** How do you test a guard that depends on an authenticated service?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every route guard type and give a real-world use case for each."
+**Q11:** Draw: router navigation state machine — all guard types in execution order.
+**Q12:** ★ System design: "Design a permission system for an Angular SPA with 10 roles and 50+ route-level permissions."

@@ -100,3 +100,121 @@ DNS doesn't actually "propagate" or push data across the internet. The delay is 
 A: You must use a CNAME for subdomains (`www.my-app.com` -> CNAME -> `my-app.herokuapp.com`), because Heroku's IP addresses change dynamically and you don't own them. 
 However, **the DNS specification forbids placing a CNAME at the root domain level (the apex)**. You cannot put a CNAME on `my-app.com`! 
 To solve this, modern DNS providers (like Cloudflare or Route53) invented proprietary records (called ALIAS or CNAME-flattening). You configure it like a CNAME, but when a client queries it, the DNS provider resolves the target domain internally and returns a standard A Record (IP address) to the client, perfectly satisfying the DNS specification.
+
+## FEYNMAN CHECK
+
+### Explain DNS Like I'm 10 Years Old
+> DNS is the internet's phone book. When your phone wants to call "google.com", it asks DNS "what's the number?" and DNS replies with an IP like 142.250.80.46. The book is split into branches (.com, .org, .uk) each maintained by different teams, and your local resolver caches answers so it doesn't ask the master books every time. The non-obvious part: a single DNS query can trigger 4 separate lookups (root → TLD → authoritative → answer) on a cold cache, and each is a UDP round-trip that adds latency to your page load.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the difference between recursive and authoritative DNS resolvers?**
+> **A:** A recursive resolver (your ISP, 8.8.8.8, 1.1.1.1) does the work of walking the DNS tree for you and caches the result. An authoritative resolver owns a specific zone and answers definitively for it (e.g., `ns-1.awsdns.com` is authoritative for many AWS-hosted domains). Your computer talks to recursive; recursive talks to authoritative.
+
+**Q2: ONE mental model.**
+> **A:** "DNS = recursive resolver does the legwork by walking root → TLD → authoritative, caching each answer for its TTL. Cold lookup = 4 RTTs; warm = local cache, 0 RTTs."
+
+**Q3: Misconception with code.**
+> **A:** Trusting DNS to be instantly consistent globally.
+> ```bash
+> # ❌ Just changed DNS A record, expect immediate switch
+> # Cached resolvers still serve old IP for up to TTL seconds
+> # ✅ Lower TTL BEFORE the change, then change, then raise TTL back
+> # 24h before change: TTL 60s
+> # At change time: update A record
+> # 1h after change confirmed: TTL back to 3600s
+> ```
+
+**Q4: How does DNS-based load balancing work, and what are its limits?**
+> **A:** Return different IPs to different clients (round-robin, geo-based, or weighted). Limit: client-side caching means you can't pull traffic off a bad server faster than the TTL. Real load balancing happens at L4/L7 (AWS ALB, Cloudflare) where servers can be drained in seconds rather than minutes.
+
+**Q5: Senior one-liner.**
+> **A:** "DNS is a hierarchical, eventually-consistent, cache-heavy mapping protocol from names to records — its strengths (cache speed, decentralisation) are also its weaknesses (slow propagation, cache poisoning risk), which is why production systems use short TTLs only during migration windows."
+
+## BUILD
+
+### 🏗️ Mini Project: DNS Caching Behaviour Analyser
+
+**What you will build:** A script that times repeated DNS lookups to show cache effects, plus tests against different public resolvers.
+**Time estimate:** 25 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir dns-cache && cd dns-cache
+npm init -y && touch analyse.js
+```
+
+#### Step 2 — Core
+```js
+// analyse.js — measure cold vs warm lookup time
+const dns = require('dns').promises;
+const { performance } = require('perf_hooks');
+async function timeLookup(domain) {
+  const t0 = performance.now();
+  await dns.resolve4(domain);
+  return performance.now() - t0;
+}
+async function main(domain) {
+  console.log(`${domain}: cold = ${(await timeLookup(domain)).toFixed(1)}ms`);
+  console.log(`${domain}: warm = ${(await timeLookup(domain)).toFixed(1)}ms`);
+  console.log(`${domain}: warm = ${(await timeLookup(domain)).toFixed(1)}ms`);
+}
+main(process.argv[2] || 'github.com');
+```
+
+#### Step 3 — Test Different Resolvers
+```bash
+# Switch resolver
+dns.setServers(['8.8.8.8']);     // Google
+dns.setServers(['1.1.1.1']);     // Cloudflare
+dns.setServers(['9.9.9.9']);     // Quad9
+# Run timing across all three
+```
+
+#### Step 4 — Handle Errors
+```js
+try { await dns.resolve4(domain); }
+catch (e) {
+  if (e.code === 'ENOTFOUND') console.error('No A record');
+  else if (e.code === 'ETIMEOUT') console.error('Resolver timeout');
+}
+```
+
+#### Step 5 — Tests
+```bash
+node analyse.js github.com
+# Expected: cold ~30-100ms, warm ~1-5ms (resolver cache)
+```
+
+**Expected Output:**
+```
+github.com: cold = 47.2ms
+github.com: warm = 1.8ms
+github.com: warm = 1.6ms
+```
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Recursive vs authoritative resolver — who calls whom?
+**Q2:** What is TTL and what does it control?
+**Q3:** Write 10 lines timing a DNS lookup in Node.
+
+### Day 3 — Comprehension
+**Q4:** Cold vs warm DNS lookup — typical times?
+**Q5:** Show the "change A record, expect instant" bug and the lower-TTL-first fix.
+**Q6:** What is DNS-based load balancing, and what is its limit vs L7 LB?
+
+### Day 7 — Application
+**Q7:** Implement DNS failover with healthcheck — fall through to backup IP if primary unreachable.
+**Q8:** A PR sets all production DNS to 5s TTL "for resilience". Quantify the resolver load impact.
+**Q9:** What is DNSSEC and what attack does it prevent?
+
+### Day 14 — Synthesis & Interview Prep
+**Q10:** ★ "Diagram every DNS step from cold cache when visiting a new domain."
+**Q11:** Link DNS → TLS → CDN → load-balancing.
+**Q12:** ★ "A region is unreachable. Walk me through using DNS to fail traffic to another region — what breaks at 10M users?"

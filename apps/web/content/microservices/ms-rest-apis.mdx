@@ -1,0 +1,821 @@
+---
+slug: "ms-rest-apis"
+title: "REST APIs for Microservices"
+level: 3
+---
+
+## WHY
+
+REST (Representational State Transfer) is the dominant communication style for microservices, yet it is routinely misapplied. The most common patterns seen in "REST APIs" at enterprises include: using POST for every operation regardless of semantics (not REST — it's just HTTP-tunnelled RPC), returning 200 OK for errors (not REST — the whole point of HTTP status codes is to communicate outcomes), designing endpoints around actions rather than resources (`/placeOrder` instead of `POST /orders`), and ignoring idempotency (every retry creates a duplicate record). These mistakes produce APIs that are hard to cache, hard to debug, hard to evolve, and prone to data duplication on network retries.
+
+The specific pain that proper REST design prevents: **retry-induced duplication**. In microservices, network calls are unreliable — a POST request can succeed on the server but the response is lost in the network, causing the client to retry and create two identical records. Without idempotency keys, a user clicking "place order" on a slow network creates two orders. Without proper HTTP status codes, a 500 error from a database outage looks identical to a 500 error from a validation failure — clients can't distinguish "retry" from "fix your request." Proper REST design makes these problems preventable.
+
+The production failure mode from REST misuse is **HTTP 200 blindness**: services that return 200 OK for both success and business errors (`{ "status": "error", "message": "payment failed" }` with HTTP 200). Client code that checks the HTTP status code to determine success ignores these errors; client code that parses the JSON body is correct but non-standard. Load balancers, circuit breakers, and monitoring tools all interpret HTTP status codes — they have no knowledge of your custom error envelope. A circuit breaker opens at 50% 5xx errors; if all errors return 200, the circuit never opens, and cascade failure proceeds unchecked.
+
+Senior engineers must understand: the six REST constraints (uniform interface, statelessness, cacheability, client-server, layered system, code on demand), HTTP semantic correctness (methods, status codes, headers), resource naming, idempotency patterns, and when REST is not the right choice (high-frequency internal calls → gRPC, real-time → WebSockets, fire-and-forget → messaging).
+
+## THEORY
+
+### REST API Lifecycle for a Single Resource
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AG as API Gateway
+    participant S as Order Service
+    participant DB as Database
+
+    C->>AG: POST /orders {customerId, items} + Idempotency-Key: abc-123
+    AG->>S: Forward request
+    S->>DB: BEGIN; INSERT order; INSERT outbox_event; COMMIT
+    DB-->>S: orderId=42
+    S-->>AG: 201 Created {id:42, status:"PENDING", href:"/orders/42"}
+    AG-->>C: 201 Created
+
+    Note over C: Network drops response!
+    C->>AG: Retry: POST /orders + Idempotency-Key: abc-123
+    AG->>S: Forward with same key
+    S->>DB: SELECT by idempotency_key (found!)
+    S-->>AG: 200 OK {id:42, status:"PENDING"} (same response, no duplicate)
+    AG-->>C: 200 OK {id:42}
+
+    C->>AG: GET /orders/42
+    AG->>S: Forward GET
+    S->>DB: SELECT
+    DB-->>S: Order{42, CONFIRMED}
+    S-->>AG: 200 OK {id:42, status:"CONFIRMED"}
+    AG-->>C: 200 OK
+```
+
+### HTTP Methods — Correct Semantics
+
+| Method | Semantics | Idempotent? | Safe? | Use for |
+|--------|-----------|-------------|-------|---------|
+| GET | Retrieve resource(s) | ✅ | ✅ | Read operations |
+| POST | Create new resource | ❌ | ❌ | Creating resources, non-idempotent actions |
+| PUT | Replace entire resource | ✅ | ❌ | Full updates |
+| PATCH | Partial update | ❌ | ❌ | Partial field updates |
+| DELETE | Remove resource | ✅ | ❌ | Deletion |
+| HEAD | Retrieve metadata only | ✅ | ✅ | Check existence without body |
+| OPTIONS | List allowed methods | ✅ | ✅ | CORS preflight |
+
+### HTTP Status Codes That Matter for Microservices
+
+| Code | Meaning | When to use |
+|------|---------|-------------|
+| 200 OK | Generic success | GET, PUT, PATCH responses |
+| 201 Created | Resource created | POST that created a resource |
+| 204 No Content | Success, no body | DELETE, PUT with no response body |
+| 400 Bad Request | Invalid request | Validation failures (client error) |
+| 401 Unauthorized | Not authenticated | Missing/invalid auth token |
+| 403 Forbidden | Not authorized | Valid token but insufficient permission |
+| 404 Not Found | Resource doesn't exist | GET/DELETE of non-existent ID |
+| 409 Conflict | State conflict | Creating a duplicate, version mismatch |
+| 422 Unprocessable | Business rule violation | Valid JSON but fails business validation |
+| 429 Too Many Requests | Rate limited | Client sending too fast |
+| 500 Internal Server Error | Unexpected server error | Database down, NullPointerException |
+| 503 Service Unavailable | Temporarily down | Downstream dependency down |
+
+### Resource Naming Conventions
+
+```
+✅ CORRECT — noun-based, hierarchical
+  GET    /orders                  → list orders
+  POST   /orders                  → create order
+  GET    /orders/{id}             → get specific order
+  PUT    /orders/{id}             → replace order
+  PATCH  /orders/{id}             → partial update
+  DELETE /orders/{id}             → cancel order
+  GET    /orders/{id}/items       → list order items
+  POST   /orders/{id}/items       → add item to order
+
+❌ WRONG — verb-based (RPC tunnelling over HTTP)
+  POST /placeOrder
+  POST /getOrderById
+  POST /cancelOrderById
+  POST /addItemToOrder
+```
+
+### Common Misconception
+
+> "REST means using HTTP and returning JSON."
+
+**Reality:** REST has six specific architectural constraints. The most commonly violated: **statelessness** (each request must contain all information needed to process it — no session state on the server), **uniform interface** (use HTTP semantics correctly: methods, status codes, resource URIs), and **cacheability** (GET responses can be cached; responses must indicate cache directives). A service that uses HTTP and JSON but returns 200 for all errors, uses POST for all operations, and stores session state in memory is technically HTTP-over-JSON RPC, not REST. The practical implication: REST's constraints produce APIs that are easier to cache, debug, monitor, and evolve.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "SequenceDiagram", "state": "microservices-ms-rest-apis" }
+```
+
+## CODE
+
+### Level 1 — Beginner: Correctly Designed REST Controller
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+@SpringBootApplication
+public class OrderServiceApp {
+    public static void main(String[] args) { SpringApplication.run(OrderServiceApp.class, args); }
+}
+
+@RestController
+@RequestMapping("/orders")
+class OrderController {
+
+    private final Map<Long, Order> store = new ConcurrentHashMap<>();
+    private long nextId = 1;
+
+    // GET /orders — list all (with optional filter)
+    @GetMapping
+    public List<Order> list(@RequestParam(required = false) String status) {
+        return store.values().stream()
+            .filter(o -> status == null || status.equals(o.status()))
+            .toList();
+    }
+
+    // GET /orders/{id} — get by ID
+    @GetMapping("/{id}")
+    public ResponseEntity<Order> get(@PathVariable long id) {
+        Order order = store.get(id);
+        if (order == null) return ResponseEntity.notFound().build();   // 404
+        return ResponseEntity.ok(order);                                // 200
+    }
+
+    // POST /orders — create new order → 201 Created with Location header
+    @PostMapping
+    public ResponseEntity<Order> create(@RequestBody CreateOrderRequest req) {
+        if (req.customerId() <= 0) {
+            return ResponseEntity.badRequest().build();                 // 400
+        }
+        long id = nextId++;
+        Order order = new Order(id, req.customerId(), req.sku(), req.qty(), "PENDING");
+        store.put(id, order);
+        return ResponseEntity
+            .created(java.net.URI.create("/orders/" + id))             // 201 + Location
+            .body(order);
+    }
+
+    // PATCH /orders/{id} — partial update (change status)
+    @PatchMapping("/{id}")
+    public ResponseEntity<Order> update(@PathVariable long id, @RequestBody UpdateOrderRequest req) {
+        Order order = store.get(id);
+        if (order == null) return ResponseEntity.notFound().build();   // 404
+        Order updated = new Order(id, order.customerId(), order.sku(), order.qty(), req.status());
+        store.put(id, updated);
+        return ResponseEntity.ok(updated);                             // 200
+    }
+
+    // DELETE /orders/{id} — cancel
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> cancel(@PathVariable long id) {
+        Order order = store.remove(id);
+        if (order == null) return ResponseEntity.notFound().build();   // 404
+        return ResponseEntity.noContent().build();                     // 204
+    }
+}
+
+record Order(long id, long customerId, String sku, int qty, String status) {}
+record CreateOrderRequest(long customerId, String sku, int qty) {}
+record UpdateOrderRequest(String status) {}
+```
+
+### Level 2 — Intermediate: Idempotency Keys for Safe Retries
+
+```java
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+@RestController
+@RequestMapping("/orders")
+class IdempotentOrderController {
+
+    private final ConcurrentHashMap<String, OrderResponse> idempotencyStore = new ConcurrentHashMap<>();
+    private long nextId = 1;
+
+    /**
+     * POST with idempotency key:
+     * - First call: creates order, stores response under idempotency key, returns 201
+     * - Retry with same key: returns stored response (200), no duplicate created
+     * - Different key: creates a new order
+     *
+     * Idempotency-Key must be set by client (UUID per request attempt)
+     */
+    @PostMapping
+    public ResponseEntity<OrderResponse> placeOrder(
+            @RequestHeader(value = "Idempotency-Key", required = true) String idempotencyKey,
+            @RequestBody PlaceOrderRequest req) {
+
+        // Check if we've already processed this idempotency key
+        OrderResponse existing = idempotencyStore.get(idempotencyKey);
+        if (existing != null) {
+            // Replay the same response — do NOT create another order
+            return ResponseEntity.ok(existing);   // 200 (not 201 — this is a replay)
+        }
+
+        // First time — create the order
+        long id = nextId++;
+        OrderResponse response = new OrderResponse(id, req.customerId(), "PENDING", idempotencyKey);
+
+        // Store atomically: if another thread raced with the same key, use their result
+        OrderResponse saved = idempotencyStore.putIfAbsent(idempotencyKey, response);
+        if (saved != null) {
+            // Another thread created it first (race condition protection)
+            return ResponseEntity.ok(saved);
+        }
+
+        return ResponseEntity
+            .created(java.net.URI.create("/orders/" + id))
+            .body(response);
+    }
+}
+
+record PlaceOrderRequest(long customerId, String sku, int qty) {}
+record OrderResponse(long id, long customerId, String status, String idempotencyKey) {}
+```
+
+### Level 3 — Advanced: Standardized Error Responses + Problem Details
+
+```java
+import org.springframework.http.*;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.*;
+import jakarta.validation.constraints.*;
+import java.time.Instant;
+import java.util.*;
+
+/**
+ * RFC 7807 Problem Details — standard error format for REST APIs.
+ * Produces: { "type": "...", "title": "...", "status": 400, "detail": "...", "instance": "..." }
+ * Supported natively by Spring Boot 3.x via ProblemDetail.
+ */
+@RestController
+@RequestMapping("/orders")
+class OrderControllerWithErrors {
+
+    @PostMapping
+    public ResponseEntity<OrderResponse> create(@RequestBody @jakarta.validation.Valid CreateRequest req) {
+        // Spring auto-validates @Valid annotations, throws MethodArgumentNotValidException on failure
+        return ResponseEntity.status(201).body(new OrderResponse(1L, req.customerId(), "PENDING"));
+    }
+
+    // Business rule violation — 422 Unprocessable Entity
+    @PostMapping("/{id}/cancel")
+    public ResponseEntity<ProblemDetail> cancel(@PathVariable long id) {
+        // Example: trying to cancel a SHIPPED order
+        boolean isShipped = true; // in real code, check the order's status
+        if (isShipped) {
+            ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "Cannot cancel an order that has already been shipped");
+            problem.setTitle("Order State Conflict");
+            problem.setProperty("orderId", id);
+            problem.setProperty("currentStatus", "SHIPPED");
+            problem.setProperty("timestamp", Instant.now());
+            return ResponseEntity.unprocessableEntity().body(problem);  // 422
+        }
+        return ResponseEntity.noContent().build();  // 204
+    }
+}
+
+@RestControllerAdvice
+class GlobalExceptionHandler {
+
+    // Handle @Valid annotation failures → 400 with field-level error details
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ProblemDetail> handleValidationErrors(MethodArgumentNotValidException ex) {
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        problem.setTitle("Validation Failed");
+        List<Map<String, String>> fieldErrors = ex.getBindingResult().getAllErrors().stream()
+            .filter(e -> e instanceof FieldError)
+            .map(e -> {
+                FieldError fe = (FieldError) e;
+                return Map.of("field", fe.getField(), "message", fe.getDefaultMessage());
+            })
+            .toList();
+        problem.setProperty("errors", fieldErrors);
+        return ResponseEntity.badRequest().body(problem);
+    }
+
+    // Handle 404
+    @ExceptionHandler(NoSuchElementException.class)
+    public ResponseEntity<ProblemDetail> handleNotFound(NoSuchElementException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.NOT_FOUND, ex.getMessage());
+        problem.setTitle("Resource Not Found");
+        return ResponseEntity.status(404).body(problem);
+    }
+}
+
+record CreateRequest(
+    @Min(1) long customerId,
+    @NotBlank String sku,
+    @Min(1) @Max(100) int quantity
+) {}
+record OrderResponse(long id, long customerId, String status) {}
+```
+
+### Level 4 — Expert / Production: REST API Design with HATEOAS, Pagination, and ETags
+
+```java
+package com.shop.orders.api;
+
+import org.springframework.data.domain.*;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.stream.*;
+
+/**
+ * Production REST API patterns:
+ * 1. HATEOAS: responses include _links to related resources and next actions
+ * 2. Pagination: cursor-based (for large, frequently-updated collections)
+ * 3. ETags: conditional requests (If-None-Match) for efficient polling
+ * 4. Content negotiation: Accept header support (v1+json, v2+json)
+ * 5. Rate limiting headers: X-RateLimit-Remaining, X-RateLimit-Reset
+ */
+@RestController
+@RequestMapping("/orders")
+public class ProductionOrderController {
+
+    // Cursor-based pagination — more reliable than offset for live data
+    @GetMapping
+    public ResponseEntity<PagedOrdersResponse> list(
+            @RequestParam(defaultValue = "20") int limit,
+            @RequestParam(required = false) String cursor,  // opaque cursor (base64 encoded)
+            @RequestParam(required = false) String status,
+            @RequestHeader(value = "Accept-Version", defaultValue = "v1") String version) {
+
+        // Decode cursor → last seen ID (for keyset pagination)
+        Long lastId = cursor != null ? decodeCursor(cursor) : Long.MAX_VALUE;
+        List<OrderSummary> orders = loadOrders(status, lastId, limit);
+
+        // Build HATEOAS links
+        Map<String, String> links = new LinkedHashMap<>();
+        links.put("self", "/orders?limit=" + limit + (status != null ? "&status=" + status : ""));
+        if (!orders.isEmpty()) {
+            String nextCursor = encodeCursor(orders.get(orders.size() - 1).id());
+            links.put("next", "/orders?cursor=" + nextCursor + "&limit=" + limit);
+        }
+
+        PagedOrdersResponse response = new PagedOrdersResponse(orders, links);
+        return ResponseEntity.ok()
+            .header("X-Total-Count", String.valueOf(orders.size()))
+            .body(response);
+    }
+
+    // ETag support for efficient polling (GET /orders/{id} with If-None-Match)
+    @GetMapping("/{id}")
+    public ResponseEntity<OrderDetail> get(
+            @PathVariable long id,
+            @RequestHeader(value = "If-None-Match", required = false) String ifNoneMatch) {
+
+        OrderDetail order = loadOrder(id);
+        if (order == null) return ResponseEntity.notFound().build();
+
+        // Generate ETag from order's last-modified timestamp or version
+        String etag = "\"" + order.version() + "\"";
+
+        // If client's cached ETag matches, return 304 Not Modified (no body, saves bandwidth)
+        if (etag.equals(ifNoneMatch)) {
+            return ResponseEntity.status(HttpStatus.NOT_MODIFIED)
+                .eTag(etag)
+                .build();
+        }
+
+        return ResponseEntity.ok()
+            .eTag(etag)
+            .lastModified(order.updatedAt().toEpochMilli())
+            .body(order);
+    }
+
+    // Optimistic concurrency: If-Match header prevents lost updates
+    @PutMapping("/{id}")
+    public ResponseEntity<OrderDetail> update(
+            @PathVariable long id,
+            @RequestBody UpdateOrderRequest req,
+            @RequestHeader(value = "If-Match", required = false) String ifMatch) {
+
+        OrderDetail current = loadOrder(id);
+        if (current == null) return ResponseEntity.notFound().build();   // 404
+
+        String currentEtag = "\"" + current.version() + "\"";
+        if (ifMatch != null && !ifMatch.equals(currentEtag)) {
+            // Client's version is stale — another update happened since their last fetch
+            return ResponseEntity.status(HttpStatus.PRECONDITION_FAILED)
+                .body(null);  // 412 Precondition Failed
+        }
+
+        OrderDetail updated = applyUpdate(id, req);
+        return ResponseEntity.ok()
+            .eTag("\"" + updated.version() + "\"")
+            .body(updated);
+    }
+
+    // Stubs
+    private Long decodeCursor(String c) { return Long.parseLong(java.util.Base64.getDecoder().decode(c).toString()); }
+    private String encodeCursor(long id) { return java.util.Base64.getEncoder().encodeToString(String.valueOf(id).getBytes()); }
+    private List<OrderSummary> loadOrders(String status, Long lastId, int limit) {
+        return List.of(new OrderSummary(42, "CONFIRMED", Instant.now()));
+    }
+    private OrderDetail loadOrder(long id) {
+        return new OrderDetail(id, "CONFIRMED", Instant.now(), 1L);
+    }
+    private OrderDetail applyUpdate(long id, UpdateOrderRequest req) {
+        return new OrderDetail(id, req.status(), Instant.now(), 2L);
+    }
+}
+
+record OrderSummary(long id, String status, Instant createdAt) {}
+record OrderDetail(long id, String status, Instant updatedAt, long version) {}
+record UpdateOrderRequest(String status) {}
+record PagedOrdersResponse(List<OrderSummary> data, Map<String, String> links) {}
+```
+
+## REAL_WORLD
+
+### How GitHub Implements REST API Best Practices
+
+GitHub's public API is one of the most widely-used and best-designed REST APIs. Key patterns: (1) **Hypermedia links** in every response (`url`, `html_url`, `events_url` fields — HATEOAS lite); (2) **ETag + 304 Not Modified** for conditional polling — critical for rate limit compliance (GitHub has 5000 req/hour; with ETags, polling unchanged repos doesn't count against the limit); (3) **Link header for pagination** (`<https://api.github.com/repos?page=2>; rel="next"`) instead of wrapping data in a pagination envelope; (4) **Idempotency via request deduplication** — webhook deliveries include a unique `X-GitHub-Delivery` ID; (5) **Rate limiting headers** (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on every response.
+
+```java
+// GitHub-style pagination via Link header (RFC 5988)
+@GetMapping
+public ResponseEntity<List<OrderSummary>> listOrders(
+        @RequestParam(defaultValue = "1") int page,
+        @RequestParam(defaultValue = "30") int perPage) {
+
+    List<OrderSummary> orders = loadOrdersPage(page, perPage);
+    int total = countOrders();
+
+    ResponseEntity.BodyBuilder builder = ResponseEntity.ok();
+
+    // Build RFC 5988 Link headers (no pagination envelope wrapping the data)
+    List<String> links = new ArrayList<>();
+    if (page > 1) links.add(String.format("</orders?page=%d&per_page=%d>; rel=\"prev\"", page-1, perPage));
+    if (page * perPage < total) links.add(String.format("</orders?page=%d&per_page=%d>; rel=\"next\"", page+1, perPage));
+    links.add(String.format("</orders?page=1&per_page=%d>; rel=\"first\"", perPage));
+    links.add(String.format("</orders?page=%d&per_page=%d>; rel=\"last\"", (total/perPage)+1, perPage));
+
+    if (!links.isEmpty()) builder.header("Link", String.join(", ", links));
+    builder.header("X-Total-Count", String.valueOf(total));
+
+    return builder.body(orders);
+}
+
+private List<OrderSummary> loadOrdersPage(int page, int perPage) {
+    return List.of(new OrderSummary(1, "CONFIRMED", Instant.now()));
+}
+private int countOrders() { return 42; }
+```
+
+### Production Gotcha: Using 200 OK for All Errors
+
+```java
+// ❌ DANGEROUS — custom error envelope with always-200:
+// Produced by many enterprise Java apps and "old school" REST implementations
+@GetMapping("/orders/{id}")
+public Map<String, Object> getOrder(@PathVariable long id) {
+    Order order = repo.findById(id).orElse(null);
+    if (order == null) {
+        return Map.of("success", false, "error", "order not found");  // HTTP 200
+    }
+    return Map.of("success", true, "data", order);  // HTTP 200
+}
+// What breaks:
+// 1. Circuit breakers (Resilience4j) count 5xx errors — your 200 error never opens the circuit
+// 2. Load balancers can't distinguish success from failure — keep routing to broken backends
+// 3. Clients must parse body to detect errors — can't use simple try/catch on HTTP exceptions
+// 4. Monitoring (Prometheus) HTTP error rate shows 0% — you're blind to real error rate
+// 5. CDN can't cache responses properly — all look like success to CDN
+
+// ✅ CORRECT — HTTP status codes communicate outcome:
+@GetMapping("/orders/{id}")
+public ResponseEntity<?> getOrderCorrect(@PathVariable long id) {
+    return repo.findById(id)
+        .<ResponseEntity<?>>map(ResponseEntity::ok)                  // 200 with order
+        .orElse(ResponseEntity.notFound().build());                  // 404 (no body needed)
+}
+// Now: circuit breaker counts 4xx/5xx correctly
+//      Monitoring shows real error rate
+//      Clients: catch HttpClientErrorException.NotFound specifically
+//      CDN: can cache successful 200 responses, not 404s
+```
+
+**Why it happens:** Legacy XML-RPC and SOAP used HTTP only as a transport — every call returned HTTP 200 with a SOAP fault in the body for errors. This habit persisted into "REST" implementations where developers continued using HTTP 200 for both success and error. The fix is cultural: REST APIs must use HTTP status codes to communicate outcomes, not envelope the outcome in a JSON body with HTTP 200.
+
+### Performance Characteristics
+
+| Pattern | Latency | Bandwidth | Use case |
+|---------|---------|-----------|----------|
+| GET without cache | 1-50ms | Full payload | First request |
+| GET with ETag (304) | 0.5-5ms | ~0 bytes | Polling unchanged data |
+| GET with CDN cache hit | <5ms | 0 to origin | Static/slow-changing data |
+| POST without idempotency | 5-200ms | Full payload | Risky on retry |
+| POST with idempotency key | 5-200ms | Full payload (first), ~100B (replay) | Safe retries |
+| Cursor-based pagination | 5-20ms | limit × item size | Large collections |
+| Offset pagination | 5-100ms (grows with offset) | limit × item size | Small collections |
+
+## INTERVIEW
+
+**Q1 (Junior): What is REST and what are the most important HTTP methods?**
+A: REST (Representational State Transfer) is an architectural style for distributed hypermedia systems, defined by Roy Fielding in his 2000 dissertation. It prescribes six constraints: client-server separation, statelessness, cacheability, uniform interface, layered system, and code on demand (optional). The most important HTTP methods: **GET** (retrieve resource, safe + idempotent), **POST** (create new resource, neither safe nor idempotent), **PUT** (replace full resource, idempotent), **PATCH** (partial update), **DELETE** (remove resource, idempotent). The key distinction: idempotent methods can be retried safely — calling DELETE on the same resource twice is safe (second call returns 404 or 204). POST is not idempotent — two identical POST requests create two resources, which is why POST endpoints should use idempotency keys to handle network retries safely.
+
+**Q2 (Junior): What HTTP status codes should a REST API use and when?**
+A: The minimal set every REST API must use correctly: (1) **200 OK** — success with a body; (2) **201 Created** — POST that created a resource (include `Location` header with the new resource URL); (3) **204 No Content** — success with no body (DELETE, PUT with no response); (4) **400 Bad Request** — client sent invalid/malformed data (validation errors); (5) **401 Unauthorized** — not authenticated (missing or invalid auth token); (6) **403 Forbidden** — authenticated but not authorized for this resource; (7) **404 Not Found** — resource doesn't exist; (8) **409 Conflict** — request conflicts with current state (creating a duplicate); (9) **422 Unprocessable** — business rule violation (valid JSON, but fails domain rules); (10) **500 Internal Server Error** — unexpected server failure; (11) **503 Service Unavailable** — service is temporarily down. Never return 200 for errors — it breaks monitoring, circuit breakers, and client error handling.
+
+**Q3 (Mid): What is idempotency and why does it matter for microservices REST APIs?**
+A: Idempotency means that performing the same operation multiple times produces the same result as performing it once. In microservices, network calls are unreliable: a POST to create an order might succeed on the server, but the response is lost. The client must retry — and without idempotency, the retry creates a duplicate order. With an `Idempotency-Key` header (a UUID generated by the client per operation), the server stores the response under the key; if the same key arrives again, it returns the stored response without executing the operation twice. This is used by Stripe for all payment creation calls, GitHub for API calls, and any production-grade REST API that handles money or critical mutations. Implementation: store `(idempotency_key, response_body)` in a durable store (database or Redis); check at the start of each POST handler; return stored response if found.
+
+**Q4 (Mid): How does HATEOAS improve REST API discoverability and evolution?**
+A: HATEOAS (Hypermedia As The Engine Of Application State) means REST responses include links to related resources and available actions — the client discovers what it can do next from the response itself, rather than hardcoding URLs. Example: an order response includes `"_links": { "self": "/orders/42", "cancel": "/orders/42/cancel", "payment": "/payments/order-42" }`. Benefits: (1) **Discoverability** — client doesn't need out-of-band documentation to navigate the API; (2) **Evolvability** — server can change URLs without breaking clients who follow links rather than hardcoding them; (3) **Workflow guidance** — links represent available *actions* based on state (cancel link only present when order is cancellable); clients can check if a link exists rather than checking order status and knowing which statuses allow cancellation. Practical level: full HATEOAS (HAL, JSON:API) is complex; a pragmatic middle ground is including the most important `_links` in responses without the full HATEOAS framework.
+
+**Q5 (Senior): When should you choose gRPC over REST for microservice communication?**
+A: gRPC is preferable over REST when: (1) **High throughput internal calls** — gRPC uses HTTP/2 multiplexing and binary Protobuf serialization, making it 5-10× faster than REST/JSON for high-frequency internal service-to-service calls; (2) **Streaming** — gRPC supports server-side, client-side, and bidirectional streaming natively; REST has no standard streaming model; (3) **Strict type safety across languages** — Protobuf schema generates type-safe client code in any language; REST requires OpenAPI + code generation which is more fragile; (4) **Small payload, high call volume** — binary Protobuf messages are typically 3-10× smaller than equivalent JSON. REST is preferable when: external clients (browsers, mobile apps, third-party developers) need to use the API — REST/JSON with OpenAPI documentation is universally understood; debugging with curl, Postman, and browser devtools; public APIs where backward compatibility matters more than performance. Rule of thumb: REST for external/public APIs and non-performance-critical internal APIs; gRPC for performance-sensitive internal service-to-service calls.
+
+**Q6 (Senior): Implement proper pagination for a REST endpoint serving 10 million orders.**
+A: Offset-based pagination (`/orders?page=2&size=50`) is unsuitable at this scale: `OFFSET 500000` requires the database to scan and discard 500,000 rows. Cursor-based (keyset) pagination uses the last seen row's primary key: `SELECT * FROM orders WHERE id > :cursor ORDER BY id ASC LIMIT :size`. The server returns an opaque cursor (base64-encoded last-seen ID) in the response or Link header. Client passes it in the next request: `GET /orders?cursor=<base64>&size=50`. Benefits: O(log n) database query (index seek, not scan), consistent pagination even with concurrent inserts, O(1) memory on the server. Limitations: no random-access pagination (can't jump to page 50), cursor is opaque (clients can't manipulate it). For the response: include `Link: <next-cursor-url>; rel="next"` header (RFC 5988), total count (`X-Total-Count`), and an optional `_links` object in the body for HATEOAS clients.
+
+**Q7 (Senior+): How do you design a REST API to survive schema evolution over 5+ years?**
+A: Five concrete strategies: (1) **Strict backward compatibility discipline**: document and enforce "only add, never remove/rename" for every schema change; use Pact contract tests in CI to detect violations before deployment; (2) **Version conservatively**: use URI versioning (`/v1/`, `/v2/`) only for breaking changes; prefer `Accept: application/vnd.myapp.v2+json` header versioning for non-breaking evolution; (3) **Tolerant reader pattern**: all consumers use `@JsonIgnoreProperties(ignoreUnknown=true)` — they explicitly opt-in to fields they use, tolerating unknown fields from newer producers; (4) **Deprecation process**: when a field must be removed, add `Deprecation` and `Sunset` headers (RFC 8594) to responses using deprecated fields; monitor usage via API gateway metrics; only remove after usage drops to zero plus 6 months; (5) **Schema registry for event streams**: for Kafka-based APIs, use Confluent Schema Registry with `BACKWARD` compatibility enforcement — the registry rejects any schema registration that would break existing consumers. At Stripe's scale: every API version is maintained indefinitely; breaking changes are never made to existing versions; new versions are purely additive. The cost (maintaining many versions) is smaller than the cost of breaking API consumers.
+
+## FEYNMAN CHECK
+
+### Explain REST APIs for Microservices Like I'm 10 Years Old
+
+> Imagine you're at a post office with different windows. There's a rule: each window handles specific requests. Window GET only gives you things. Window POST creates new things. Window DELETE removes things. And there's a number system — if you get a number like 200, everything is fine; 404 means "not found"; 500 means "the post office caught fire." **REST is like this post office: specific windows for specific actions, and numbered results everyone understands.** The tricky part: when the post office mail gets lost (network failure), you send the same letter again. Without a special sticker (idempotency key), you might accidentally get two of whatever you ordered. The sticker says "I already sent this one" so the post office returns the original without making a duplicate.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why does statelessness matter for microservices scalability?**
+> **A:** Stateless REST means each request contains all the information needed to process it — no session state is stored on the server between requests. This enables horizontal scaling: any server in a load-balanced pool can handle any request, because no server has special knowledge of a client's session. If server 1 handles request 1 and then crashes, server 2 can handle request 2 without needing to know about request 1. With stateful sessions, each client must always hit the same server (sticky sessions), which prevents true horizontal scaling and makes node failures visible to users. For microservices with multiple instances behind a load balancer, statelessness is a prerequisite for the "spin up more instances" scaling model.
+
+**Q2: What is the ONE mental model for using HTTP status codes correctly?**
+> **A:** "The HTTP status code is for the protocol layer; the body is for the application layer." Load balancers, circuit breakers, CDNs, and monitoring tools all read HTTP status codes and make routing/caching/alerting decisions based on them — they never parse the JSON body. If you put an error in the body with a 200 status, the infrastructure treats the response as success and all infrastructure-level handling (circuit breaking on errors, skipping CDN caching for errors, alerting on error rates) is bypassed. Use 4xx for client errors (they sent bad data — no point retrying), 5xx for server errors (server is broken — might retry/circuit-break), and 2xx for success. This makes your API work correctly with every piece of HTTP infrastructure automatically.
+
+**Q3: What is the most dangerous REST API mistake? Show it with code.**
+> **A:** Returning HTTP 200 for business errors — makes the circuit breaker blind to failures.
+> ```java
+> // ❌ BREAKS circuit breakers, monitoring, and client error handling
+> @PostMapping("/payments")
+> public Map<String, Object> charge(@RequestBody ChargeRequest req) {
+>     try {
+>         Payment p = paymentService.charge(req);
+>         return Map.of("success", true, "paymentId", p.id());
+>     } catch (InsufficientFundsException e) {
+>         return Map.of("success", false, "error", "insufficient funds");  // HTTP 200 ← WRONG
+>     }
+> }
+> // Circuit breaker counts 5xx errors → at 50% 5xx, opens circuit
+> // With HTTP 200 for errors: 0 5xx errors → circuit never opens
+> // → 100% of requests fail with "insufficient funds" but circuit stays closed
+>
+> // ✅ CORRECT — status codes communicate failure type:
+> @PostMapping("/payments")
+> public ResponseEntity<?> chargeCorrect(@RequestBody ChargeRequest req) {
+>     try {
+>         Payment p = paymentService.charge(req);
+>         return ResponseEntity.status(201).body(Map.of("paymentId", p.id()));
+>     } catch (InsufficientFundsException e) {
+>         ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.PAYMENT_REQUIRED, e.getMessage());
+>         return ResponseEntity.status(402).body(pd);   // 402 Payment Required
+>     }
+> }
+> // Now: circuit breaker correctly counts 4xx (client errors — don't open circuit)
+> // vs 5xx (server errors — open circuit at 50% threshold)
+> ```
+
+**Q4: How does idempotency interact with the at-least-once delivery guarantee of message brokers?**
+> **A:** At-least-once delivery means a message broker guarantees messages are delivered *at least* once but may deliver duplicates (on consumer failure/restart, the broker re-delivers messages that weren't acknowledged). If the consumer processes the message and then crashes before acknowledging, the broker re-delivers — the consumer processes it again. For operations that aren't naturally idempotent (like "create an order" or "charge a card"), the consumer must implement idempotency itself. The Kafka consumer pattern: each message carries a unique event ID; before processing, the consumer checks if this event ID has already been processed (deduplication table in the DB); if yes, skip; if no, process and record the event ID in the same DB transaction. This is the "exactly-once semantics" pattern at the application level — Kafka's transactional producer can do this at the infrastructure level (Kafka transactions), but the application-level pattern is more portable and explicit.
+
+**Q5: One-sentence REST API definition for a senior FAANG engineer.**
+> **A:** "REST (Representational State Transfer) is an architectural style that prescribes stateless client-server communication via a uniform interface using HTTP methods semantically (GET=safe+idempotent, POST=create, PUT=replace-idempotent, DELETE=delete-idempotent), correct status codes (2xx success, 4xx client error, 5xx server error — never 200 for errors), resource-oriented URI design, idempotency keys for non-idempotent mutations to handle network retry safely, cursor-based pagination for large collections, conditional requests (ETag/If-None-Match) for efficient polling, and RFC 7807 Problem Details for structured error responses — all of which make the API correctly interpretable by load balancers, CDNs, circuit breakers, and monitoring tools that read HTTP semantics without parsing response bodies."
+
+## BUILD
+
+### 🏗️ Mini Project: REST API with Idempotency, Error Handling, and Pagination
+
+**What you will build:** A Spring Boot REST API for an order service with: correct HTTP status codes, RFC 7807 Problem Details for errors, idempotency key support, and cursor-based pagination.
+**Why this project:** Forces you to implement all four production REST patterns in one place — the same patterns required at every mature microservices company.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+
+```bash
+mkdir rest-api-demo && cd rest-api-demo
+mkdir -p src/main/java/com/rest
+touch src/main/java/com/rest/{App,OrderController,Order,GlobalExceptionHandler}.java
+touch src/test/java/com/rest/OrderApiTest.java
+```
+
+#### Step 2 — Core Implementation
+
+```java
+package com.rest;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+
+@SpringBootApplication
+public class App {
+    public static void main(String[] args) { SpringApplication.run(App.class, args); }
+}
+
+record Order(long id, long customerId, String sku, int qty, String status, Instant createdAt) {}
+record PlaceOrderRequest(long customerId, String sku, int qty) {}
+
+@RestController
+@RequestMapping("/orders")
+class OrderController {
+    private final ConcurrentHashMap<Long, Order> store = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Order> idempotencyCache = new ConcurrentHashMap<>();
+    private long nextId = 1;
+
+    @PostMapping
+    public ResponseEntity<Order> create(
+            @RequestHeader("Idempotency-Key") String key,
+            @RequestBody PlaceOrderRequest req) {
+        Order existing = idempotencyCache.get(key);
+        if (existing != null) return ResponseEntity.ok(existing);  // replay
+
+        long id = nextId++;
+        Order order = new Order(id, req.customerId(), req.sku(), req.qty(), "PENDING", Instant.now());
+        store.put(id, order);
+        idempotencyCache.put(key, order);
+        return ResponseEntity.created(java.net.URI.create("/orders/" + id)).body(order);  // 201
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Order> get(@PathVariable long id) {
+        Order o = store.get(id);
+        return o != null ? ResponseEntity.ok(o) : ResponseEntity.notFound().build();
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Order>> list(
+            @RequestParam(defaultValue = "10") int limit,
+            @RequestParam(required = false) Long cursor) {
+        return ResponseEntity.ok(store.values().stream()
+            .filter(o -> cursor == null || o.id() < cursor)
+            .sorted(Comparator.comparing(Order::id).reversed())
+            .limit(limit)
+            .toList());
+    }
+}
+```
+
+#### Step 3 — Error Handling
+
+```java
+package com.rest;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+
+@RestControllerAdvice
+class GlobalExceptionHandler {
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ProblemDetail> handleBadRequest(IllegalArgumentException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
+        pd.setTitle("Bad Request");
+        return ResponseEntity.badRequest().body(pd);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ProblemDetail> handleGeneric(Exception e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR,
+            "An unexpected error occurred");
+        return ResponseEntity.internalServerError().body(pd);
+    }
+}
+```
+
+#### Step 4 + Step 5 — Tests
+
+```java
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.*;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.*;
+import com.rest.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class OrderApiTest {
+    @Autowired TestRestTemplate http;
+
+    private ResponseEntity<Order> createOrder(String idempotencyKey) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Idempotency-Key", idempotencyKey);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return http.exchange("/orders",
+            HttpMethod.POST,
+            new HttpEntity<>(new PlaceOrderRequest(1, "SKU-1", 3), headers),
+            Order.class);
+    }
+
+    @Test
+    void createOrderReturns201WithLocation() {
+        ResponseEntity<Order> resp = createOrder(java.util.UUID.randomUUID().toString());
+        assertEquals(HttpStatus.CREATED, resp.getStatusCode());
+        assertNotNull(resp.getHeaders().getLocation());
+    }
+
+    @Test
+    void retryWithSameIdempotencyKeyDoesNotDuplicate() {
+        String key = java.util.UUID.randomUUID().toString();
+        var r1 = createOrder(key);
+        var r2 = createOrder(key);
+        assertEquals(r1.getBody().id(), r2.getBody().id());  // same order ID
+    }
+
+    @Test
+    void getNonExistentOrderReturns404() {
+        ResponseEntity<String> resp = http.getForEntity("/orders/999999", String.class);
+        assertEquals(HttpStatus.NOT_FOUND, resp.getStatusCode());
+    }
+}
+```
+
+**Expected Output:**
+```
+POST /orders (Idempotency-Key: uuid-1)  → 201 Created, Location: /orders/1
+POST /orders (Idempotency-Key: uuid-1)  → 200 OK, same order (idempotency replay)
+GET /orders/1                           → 200 OK, {id:1, status:"PENDING", ...}
+GET /orders/999999                      → 404 Not Found
+GET /orders?limit=5                     → 200 OK, [{...}, ...]
+```
+
+**Stretch Challenges:**
+- [ ] Add `If-Match` / ETag support to prevent lost updates on concurrent PATCH requests
+- [ ] Implement HATEOAS links in the response body
+- [ ] Add OpenAPI documentation via `springdoc-openapi`
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before reading ahead.
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name the HTTP methods, their semantics, and which are idempotent.
+
+**Q2:** List 8 HTTP status codes every microservices developer should know.
+
+**Q3:** What is idempotency? Why is it critical for POST endpoints in microservices?
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** Why is returning HTTP 200 for business errors dangerous in a microservices system?
+
+**Q5:** Compare offset-based vs. cursor-based pagination. When is each appropriate?
+
+**Q6:** Refactor this non-REST endpoint to follow proper REST conventions:
+```java
+@PostMapping("/doPlaceOrder")
+public Map<String, Object> doPlaceOrder(@RequestBody Map<String, Object> params) {
+    // places an order, returns { "result": "ok" } or { "result": "error", "msg": "..." }
+}
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Implement an idempotency key store in 25 lines of Java. Handle the race condition where two parallel requests arrive with the same key simultaneously.
+
+**Q8:** A client calls `POST /payments` but the network drops the response. The client retries 3 times. Without idempotency keys, how many payments are created? Show the fix.
+
+**Q9:** Design the REST API for a hotel booking system. Include resources, HTTP methods, status codes, and pagination strategy.
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ Classic interview: *"How would you design a REST API for a payment service? What would you do differently vs. a blog API?"*
+
+**Q11:** Compare REST, gRPC, and GraphQL for inter-service communication. Draw a decision matrix.
+
+**Q12:** ★ System design: *"Design the REST API layer for a ride-sharing platform. Cover: resource design, error handling, idempotency for ride requests, pagination for trip history, and rate limiting strategy. Justify every design decision."*
+

@@ -129,3 +129,558 @@ public class SlidingWindowMetric {
     private final Deque<Double> window = new ArrayDeque<>();
     private final int maxWindowSize;
     private double currentSum = 0.
+
+## WHY
+
+Choosing between `ArrayList` and `LinkedList` is a classic interview question, but getting it wrong in production causes real performance disasters. Java developers often reach for `LinkedList` when they need "fast insertions" — but modern hardware makes this a mistake 95% of the time.
+
+Here's why this matters so deeply:
+
+1. **CPU cache lines change everything**: A `LinkedList` node lives at a random Heap address. Traversing 1M nodes means 1M L1/L2 cache misses — each miss costs ~100 CPU cycles. An `ArrayList` stores references contiguously, so the CPU prefetcher loads the next 16 references when you read the first one.
+2. **Memory overhead is dramatic**: Each `LinkedList` node is a separate Java object (~32 bytes of overhead: object header + 3 pointers). 1M nodes = 32MB of extra memory just for node metadata. `ArrayList` uses 8 bytes per reference.
+3. **GC pressure**: Millions of `Node` objects create enormous GC work. `ArrayList`'s single backing array is one GC root.
+4. **The "O(1) insertion" myth**: `LinkedList.add(index, element)` is O(n) for traversal to find the node, then O(1) for pointer surgery. It's only truly O(1) at head/tail — and `ArrayDeque` is faster even then.
+5. **JIT optimization**: The JVM JIT compiler can auto-vectorize sequential array access with SIMD instructions. Pointer-chasing linked lists can't be vectorized.
+
+The only legitimate use cases for `LinkedList` are when you have an `Iterator` already at the insertion point, or when implementing a Deque with frequent head/tail operations (where `ArrayDeque` is still better).
+
+## THEORY
+
+### Physical Memory Layout
+
+```
+ArrayList (contiguous memory):
+┌──────┬──────┬──────┬──────┬──────┬──────┐
+│ ref0 │ ref1 │ ref2 │ ref3 │ ref4 │ ref5 │  ← Object[] backing array
+└──────┴──────┴──────┴──────┴──────┴──────┘
+   ↑
+   CPU cache line loads ref0..ref7 at once
+   Accessing ref1 costs 0 extra cache misses ← FAST
+
+LinkedList (scattered heap nodes):
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Node1       │     │ Node2       │     │ Node3       │
+│ item: ptr──────►Obj1  item: ptr──────►Obj2  item:...│
+│ next: ptr───────┐ │ prev: ◄─────┘ │  next: ─────┐  │
+│ prev: null  │   └─►│ ...         │  │ ...        │  │
+└─────────────┘     └─────────────┘  └─────────────┘
+   ↑
+   Each Node is a separate heap object at random address
+   Accessing Node2 requires loading a completely different
+   cache line → L1/L2 cache MISS ← SLOW
+```
+
+### Complexity Comparison
+
+| Operation | ArrayList | LinkedList | Winner & Why |
+|-----------|-----------|------------|--------------|
+| `get(i)` | **O(1)** | O(n) | ArrayList: direct array index math |
+| `add(e)` end | **O(1)** amortized | O(1) | ArrayList: slightly faster (no allocation) |
+| `add(i, e)` middle | O(n) shift | O(n) traverse + O(1) | Tie: ArrayList usually wins (cache effects) |
+| `remove(i)` middle | O(n) shift | O(n) traverse + O(1) | Tie: ArrayList usually wins |
+| `remove(head)` | O(n) | **O(1)** | LinkedList: no traversal needed |
+| `contains(e)` | O(n) | O(n) | Tie |
+| Memory per element | ~8 bytes | ~48 bytes | **ArrayList**: 6x more efficient |
+| Iterator traversal | **Fast** (cache) | Slow (cache misses) | ArrayList: CPU prefetching |
+
+### ArrayList Growth Mechanics
+
+`ArrayList` starts with capacity 10. When full, it grows by **50% (1.5x)**:
+```
+newCapacity = oldCapacity + (oldCapacity >> 1)
+10 → 15 → 22 → 33 → 49 → 73 → 109 → ...
+```
+
+Growth uses `Arrays.copyOf()` which calls `System.arraycopy()` — a native SIMD-optimized memory copy, not element-by-element. A 1M element resize takes microseconds, not milliseconds.
+
+**Pre-sizing eliminates all resizes:**
+```java
+// If you know approximate size, pre-size to avoid 0 resizes:
+List<User> users = new ArrayList<>(expectedUserCount);
+```
+
+### LinkedList Node Object Cost (JVM Object Header)
+
+Every `LinkedList$Node<E>` object on HotSpot JVM (64-bit, no compressed pointers):
+```
+┌────────────────────────────────────────────┐
+│ Object Header (16 bytes)                   │
+│   Mark Word: 8 bytes (hash, GC flags)      │
+│   Class Pointer: 8 bytes                   │
+├────────────────────────────────────────────┤
+│ item:  8 bytes (Object reference)          │
+│ next:  8 bytes (Node reference)            │
+│ prev:  8 bytes (Node reference)            │
+└────────────────────────────────────────────┘
+Total: 40 bytes per node
+```
+
+For 1,000,000 elements:
+- `ArrayList`: ~8MB (8 bytes × 1M references)
+- `LinkedList`: ~40MB (40 bytes × 1M nodes) — **5x more memory**
+
+### When to Use Each
+
+| Use `ArrayList` when... | Use `LinkedList` when... |
+|------------------------|--------------------------|
+| Random access needed (`get(i)`) | Only head/tail operations (use `ArrayDeque` instead) |
+| Mostly appending to end | You have an `Iterator` at the insertion point |
+| Iteration performance critical | Implementing a custom Deque |
+| Memory efficiency matters | Literally never? Use `ArrayDeque` |
+| You don't know — just pick this | — |
+
+**Rule of thumb:** When in doubt, use `ArrayList`. If you need head/tail operations, use `ArrayDeque`. Only use `LinkedList` if benchmarks prove it's faster for your specific use case.
+
+## VISUALIZATION_CONFIG
+```json
+{ "type": "none" }
+```
+
+## CODE
+
+### Level 1 — Beginner
+```java
+import java.util.*;
+
+// Basic ArrayList and LinkedList operations
+public class ListBasics {
+    public static void main(String[] args) {
+        // ArrayList — backed by Object[] array
+        List<String> arrayList = new ArrayList<>();
+        arrayList.add("Alice");
+        arrayList.add("Bob");
+        arrayList.add("Charlie");
+
+        // O(1) random access — direct array index
+        System.out.println(arrayList.get(1));  // Bob
+
+        // LinkedList — doubly-linked list of Node objects
+        List<String> linkedList = new LinkedList<>();
+        linkedList.add("Alice");
+        linkedList.add("Bob");
+        linkedList.add("Charlie");
+
+        // O(n) random access — must traverse pointers
+        System.out.println(linkedList.get(1));  // Bob (but slower internally!)
+
+        // Both implement List<String> — same API, different performance
+        System.out.println(arrayList.size());   // 3
+        System.out.println(linkedList.size());  // 3
+    }
+}
+```
+
+### Level 2 — Building Blocks
+```java
+import java.util.*;
+
+// Demonstrating performance difference: random access
+public class PerformanceComparison {
+
+    static void benchmarkRandomAccess(List<Integer> list, String name) {
+        // Populate
+        for (int i = 0; i < 100_000; i++) list.add(i);
+
+        long start = System.nanoTime();
+        long sum = 0;
+        for (int i = 0; i < list.size(); i++) {
+            sum += list.get(i);  // get(i) is O(1) for ArrayList, O(n) for LinkedList!
+        }
+        long elapsed = System.nanoTime() - start;
+        System.out.printf("%s: sum=%d, time=%d ms%n", name, sum, elapsed / 1_000_000);
+    }
+
+    static void benchmarkIterator(List<Integer> list, String name) {
+        long start = System.nanoTime();
+        long sum = 0;
+        for (int val : list) {  // Iterator-based — O(n) for both, but ArrayList is faster
+            sum += val;
+        }
+        long elapsed = System.nanoTime() - start;
+        System.out.printf("%s iterator: sum=%d, time=%d ms%n", name, sum, elapsed / 1_000_000);
+    }
+
+    public static void main(String[] args) {
+        // ArrayList: index access = blazing fast (array offset calculation)
+        benchmarkRandomAccess(new ArrayList<>(), "ArrayList");
+
+        // LinkedList: index access = catastrophic for large lists (O(n) per call!)
+        benchmarkRandomAccess(new LinkedList<>(), "LinkedList");
+
+        // Iterator traversal: both O(n), ArrayList wins on cache
+        List<Integer> al = new ArrayList<>(); for (int i = 0; i < 100_000; i++) al.add(i);
+        List<Integer> ll = new LinkedList<>(); for (int i = 0; i < 100_000; i++) ll.add(i);
+        benchmarkIterator(al, "ArrayList");
+        benchmarkIterator(ll, "LinkedList");
+        // Typical output: ArrayList ~5ms, LinkedList ~15-50ms for same iteration
+    }
+}
+```
+
+### Level 3 — Intermediate
+```java
+import java.util.*;
+
+// USE CASE ANALYSIS: When LinkedList head/tail is legitimately useful
+public class DequeUseCases {
+
+    // QUEUE operations: LinkedList as Deque (head/tail O(1))
+    // BUT ArrayDeque is faster even here!
+    static void demonstrateQueue() {
+        // LinkedList as Queue
+        Deque<String> linkedQueue = new LinkedList<>();
+        linkedQueue.addLast("first");   // O(1)
+        linkedQueue.addLast("second");  // O(1)
+        linkedQueue.addLast("third");   // O(1)
+        System.out.println(linkedQueue.pollFirst()); // first — O(1)
+
+        // ArrayDeque as Queue — FASTER (circular array, no node allocation)
+        Deque<String> arrayQueue = new ArrayDeque<>();
+        arrayQueue.addLast("first");
+        arrayQueue.addLast("second");
+        System.out.println(arrayQueue.pollFirst()); // first
+    }
+
+    // STACK operations
+    static void demonstrateStack() {
+        // DON'T use Stack class (it's synchronized, legacy)
+        // DON'T use LinkedList as stack (node allocation overhead)
+        // DO use ArrayDeque as stack
+        Deque<Integer> stack = new ArrayDeque<>();
+        stack.push(1);  // addFirst — O(1)
+        stack.push(2);  // addFirst
+        stack.push(3);  // addFirst
+        System.out.println(stack.pop()); // 3 — LIFO
+
+        // For expression evaluation, DFS, undo/redo: ArrayDeque is the standard
+    }
+
+    // MIDDLE INSERTION with iterator — only case LinkedList makes sense
+    static void middleInsertionDemo() {
+        LinkedList<Integer> list = new LinkedList<>(Arrays.asList(1, 2, 4, 5, 6));
+
+        ListIterator<Integer> it = list.listIterator();
+        while (it.hasNext()) {
+            int val = it.next();
+            if (val == 2) {
+                it.add(3);  // O(1) pointer surgery — iterator already at position!
+                // With ArrayList, this would shift all elements after index
+            }
+        }
+        System.out.println(list); // [1, 2, 3, 4, 5, 6]
+    }
+
+    public static void main(String[] args) {
+        demonstrateQueue();
+        demonstrateStack();
+        middleInsertionDemo();
+    }
+}
+```
+
+### Level 4 — Advanced
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+// PRODUCTION PATTERNS: Choosing the right list type
+public class ProductionPatterns {
+
+    // SLIDING WINDOW: Use ArrayDeque (not LinkedList) for O(1) head/tail
+    static double[] movingAverage(int[] prices, int windowSize) {
+        double[] result = new double[prices.length - windowSize + 1];
+        Deque<Integer> window = new ArrayDeque<>(windowSize);  // ArrayDeque, not LinkedList
+        long windowSum = 0;
+
+        for (int i = 0; i < prices.length; i++) {
+            window.addLast(prices[i]);
+            windowSum += prices[i];
+
+            if (window.size() > windowSize) {
+                windowSum -= window.pollFirst();  // O(1) — no node allocation waste
+            }
+            if (window.size() == windowSize) {
+                result[i - windowSize + 1] = (double) windowSum / windowSize;
+            }
+        }
+        return result;
+    }
+
+    // BATCH PROCESSING: Pre-size ArrayList to avoid ALL resizes
+    static List<String> processUsers(int userCount) {
+        // Pre-sized: capacity = userCount, zero resize operations
+        List<String> results = new ArrayList<>(userCount);
+        for (int i = 0; i < userCount; i++) {
+            results.add("user_" + i);  // No resize ever — amortized O(1) is now true O(1)
+        }
+        return results;
+    }
+
+    // BUILDER ACCUMULATION: Building a list of unknown size
+    static List<String> filterValidEmails(List<String> emails) {
+        List<String> valid = new ArrayList<>();  // grows as needed
+        for (String email : emails) {
+            if (email.contains("@") && email.contains(".")) {
+                valid.add(email);
+            }
+        }
+        // Optional: trim to actual size to release unused capacity
+        ((ArrayList<String>) valid).trimToSize();
+        return Collections.unmodifiableList(valid);  // Return immutable view
+    }
+
+    // CONCURRENT: CopyOnWriteArrayList for read-heavy concurrent access
+    static void concurrentDemo() {
+        // CopyOnWriteArrayList: thread-safe, backed by ArrayList copy-on-write
+        List<String> concurrentList = new CopyOnWriteArrayList<>();
+        concurrentList.add("item1");
+        concurrentList.add("item2");
+        // Iterators never throw ConcurrentModificationException
+        // BUT: every write creates a full array copy — only for read-heavy use cases
+        for (String item : concurrentList) {
+            System.out.println(item);  // Safe even if another thread adds during iteration
+        }
+    }
+
+    public static void main(String[] args) {
+        double[] avg = movingAverage(new int[]{10, 20, 15, 30, 25}, 3);
+        System.out.println(Arrays.toString(avg));  // [15.0, 21.67, 23.33]
+
+        List<String> users = processUsers(1000);
+        System.out.println("Users: " + users.size());
+
+        List<String> emails = Arrays.asList("valid@test.com", "invalid", "another@email.org");
+        System.out.println(filterValidEmails(emails));
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+import java.util.*;
+import java.lang.ref.*;
+import java.util.stream.*;
+
+// EXPERT: JMH-style benchmark analysis, custom ArrayList, memory analysis
+public class ExpertListAnalysis {
+
+    // CUSTOM ArrayList with object pool to reduce GC pressure
+    // Demonstrates what happens internally during ArrayList growth
+    static class GrowthTracker<T> extends ArrayList<T> {
+        private int resizeCount = 0;
+        private int lastCapacity = 10;
+
+        @Override
+        public boolean add(T element) {
+            // Reflect current capacity (approximation via size tracking)
+            boolean result = super.add(element);
+            int currentSize = size();
+            // When size exceeds last known capacity, a resize occurred
+            if (currentSize > lastCapacity) {
+                resizeCount++;
+                lastCapacity = lastCapacity + (lastCapacity >> 1); // 1.5x growth
+                System.out.printf("RESIZE #%d: capacity grew to ~%d%n", resizeCount, lastCapacity);
+            }
+            return result;
+        }
+
+        public int getResizeCount() { return resizeCount; }
+    }
+
+    // MEMORY FOOTPRINT COMPARISON
+    static void memoryAnalysis() {
+        Runtime rt = Runtime.getRuntime();
+
+        // Force GC to get accurate baseline
+        System.gc(); System.gc();
+        long before = rt.totalMemory() - rt.freeMemory();
+
+        List<Integer> arrayList = new ArrayList<>(1_000_000);
+        for (int i = 0; i < 1_000_000; i++) arrayList.add(i);
+
+        System.gc();
+        long afterArrayList = rt.totalMemory() - rt.freeMemory();
+        System.out.printf("ArrayList 1M elements: ~%d KB overhead%n",
+            (afterArrayList - before) / 1024);
+
+        arrayList = null;
+        System.gc(); System.gc();
+        before = rt.totalMemory() - rt.freeMemory();
+
+        List<Integer> linkedList = new LinkedList<>();
+        for (int i = 0; i < 1_000_000; i++) linkedList.add(i);
+
+        System.gc();
+        long afterLinkedList = rt.totalMemory() - rt.freeMemory();
+        System.out.printf("LinkedList 1M elements: ~%d KB overhead%n",
+            (afterLinkedList - before) / 1024);
+        // Expected: LinkedList uses 3-5x more memory than ArrayList
+    }
+
+    // CONVERT LinkedList to ArrayList for better performance in existing code
+    static <T> List<T> optimize(LinkedList<T> slow) {
+        // Single O(n) copy — better than repeated O(n) get(i) calls
+        return new ArrayList<>(slow);
+    }
+
+    // STREAMS + COLLECTORS: Building lists efficiently
+    static List<String> buildFromStream(int count) {
+        return IntStream.range(0, count)
+            .mapToObj(i -> "item_" + i)
+            .collect(Collectors.toCollection(() -> new ArrayList<>(count)));
+            // Supply pre-sized ArrayList to Collectors.toCollection
+            // Avoids intermediate resizes during collection
+    }
+
+    public static void main(String[] args) {
+        // Growth tracking
+        GrowthTracker<Integer> tracker = new GrowthTracker<>();
+        for (int i = 0; i < 100; i++) tracker.add(i);
+        System.out.println("Total resizes for 100 elements: " + tracker.getResizeCount());
+        // Output: ~6 resizes (10→15→22→33→49→73→109)
+
+        // Conversion
+        LinkedList<String> slow = new LinkedList<>(Arrays.asList("a", "b", "c"));
+        List<String> fast = optimize(slow);
+        System.out.println(fast.get(0)); // O(1) random access now
+
+        // Stream collection
+        List<String> items = buildFromStream(50);
+        System.out.println("Built: " + items.size() + " items");
+    }
+}
+```
+
+## REAL_WORLD
+
+### Production Bug: O(n²) Loop with LinkedList
+```java
+// REAL PRODUCTION BUG — seen in enterprise code reviews
+@Service
+public class ReportGenerationService {
+
+    // BAD: O(n²) — was causing 30-second report generation for 10K records
+    public List<ReportRow> generateBad(LinkedList<DataRecord> records) {
+        List<ReportRow> result = new LinkedList<>();  // Another LinkedList mistake!
+
+        for (int i = 0; i < records.size(); i++) {
+            // records.get(i) = O(i) traversal. Sum = O(n²) total!
+            DataRecord record = records.get(i);
+            result.add(new ReportRow(record));
+        }
+        return result;
+    }
+
+    // GOOD: O(n) — fixed by using ArrayList and iterator
+    public List<ReportRow> generateGood(List<DataRecord> records) {
+        List<ReportRow> result = new ArrayList<>(records.size());  // Pre-sized!
+
+        for (DataRecord record : records) {  // Iterator-based — O(1) per .next()
+            result.add(new ReportRow(record));
+        }
+        return result;
+    }
+
+    record DataRecord(long id, String data) {}
+    record ReportRow(DataRecord record) {}
+}
+```
+
+### Correct Queue Implementation for Rate Limiter
+```java
+// Sliding window rate limiter using ArrayDeque (NOT LinkedList)
+public class SlidingWindowRateLimiter {
+    private final int maxRequests;
+    private final long windowMs;
+    private final Deque<Long> timestamps;
+
+    public SlidingWindowRateLimiter(int maxRequests, long windowMs) {
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+        this.timestamps = new ArrayDeque<>();  // ArrayDeque — better cache locality than LinkedList
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long cutoff = now - windowMs;
+
+        // Evict expired timestamps from head — O(1) per eviction
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
+            timestamps.pollFirst();
+        }
+
+        if (timestamps.size() < maxRequests) {
+            timestamps.addLast(now);
+            return true;
+        }
+        return false;
+    }
+}
+```
+
+## INTERVIEW
+
+### Q1: What is the internal difference between ArrayList and LinkedList?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak:** "ArrayList uses an array, LinkedList uses a linked list."
+
+✅ **Strong:** "ArrayList is backed by a dynamic `Object[]` array. Elements are stored at contiguous memory addresses. When the array fills up, it grows to 1.5× its size using `System.arraycopy()`. LinkedList is a doubly-linked list where each element is stored in a `Node<E>` object containing the item plus `next` and `prev` pointers. Each Node is a separate heap allocation consuming ~40 bytes. ArrayList provides O(1) random access via index arithmetic; LinkedList requires O(n) pointer traversal. For iteration, ArrayList is significantly faster due to CPU cache line prefetching — adjacent array elements are loaded together, while LinkedList nodes scatter across the heap causing cache misses."
+
+---
+
+### Q2: When would you actually use LinkedList over ArrayList?
+**Difficulty:** Medium | **Companies:** Google, Amazon
+
+❌ **Weak:** "When I need fast insertions in the middle."
+
+✅ **Strong:** "Practically never in modern Java. The only legitimate case is when you already have a `ListIterator` positioned at the insertion point and need O(1) pointer surgery without traversal. Even then, ArrayList's `System.arraycopy()` element shifting via SIMD is often faster for small-to-medium lists due to cache effects. For head/tail operations (queue/stack use cases), `ArrayDeque` is faster than LinkedList because it uses a circular array with no per-element allocation. I'd only use LinkedList if a benchmark explicitly showed it's faster for my specific workload."
+
+---
+
+### Q3: Why is `for (int i=0; i<linkedList.size(); i++) { list.get(i); }` so dangerous?
+**Difficulty:** Medium | **Companies:** Netflix, Spotify
+
+❌ **Weak:** "It's slow because LinkedList doesn't support random access."
+
+✅ **Strong:** "This is an O(n²) disaster. `LinkedList.get(i)` must traverse from the head (or tail if closer) to position `i` — that's O(n) per call. In a loop of n iterations, the total work is O(1) + O(2) + ... + O(n) = O(n²). For 10,000 elements, you're doing ~50 million pointer dereferences. The fix is using an enhanced `for-each` loop or `Iterator`, which maintains a cursor to the current node — making each `.next()` call O(1). The total traversal becomes O(n)."
+
+---
+
+### Q4: How does ArrayList grow and what is the amortized cost of add()?
+**Difficulty:** Medium | **Companies:** Facebook, Uber
+
+❌ **Weak:** "It doubles in size when full."
+
+✅ **Strong:** "ArrayList grows by 50% (not 100%) using the formula `newCapacity = oldCapacity + (oldCapacity >> 1)`. Starting at capacity 10, it grows: 10→15→22→33→49→73→109... Growth triggers a `System.arraycopy()` call which is a native SIMD-optimized memory copy. The amortized cost of `add(E)` is O(1): even though resize is O(n), it happens exponentially rarely. Over n additions, the total copy work is n + n/1.5 + n/1.5² + ... ≈ 3n — so each add is O(1) amortized. Pre-sizing with `new ArrayList<>(expectedSize)` eliminates all resizes entirely."
+
+---
+
+### Q5: What is the memory overhead of LinkedList vs ArrayList for 1 million elements?
+**Difficulty:** Hard | **Companies:** Trading firms, High-performance systems
+
+❌ **Weak:** "LinkedList uses more memory because of pointers."
+
+✅ **Strong:** "For 1M elements: ArrayList uses ~8MB (8 bytes per Object reference × 1M, possibly ~12MB with growth padding). LinkedList uses ~40MB — each Node is a separate Java object with a 16-byte object header (mark word + class pointer), 8 bytes for the element reference, 8 bytes for next pointer, and 8 bytes for prev pointer = 40 bytes × 1M = 40MB. That's **5× more memory** just for the list structure. Plus, 1M separate heap objects create enormous garbage collector pressure — the GC must track and traverse each Node object. This can cause GC pause time increases of 10-50ms compared to ArrayList's single heap object."
+
+## FEYNMAN CHECK
+
+Imagine you store 1,000 books. With **ArrayList**, you stack them in a single, perfectly organized bookshelf in alphabetical order. Finding book #500? Count 500 positions — done instantly. Inserting between #500 and #501? Slide every book from #501 onward one position right.
+
+With **LinkedList**, each book is on its own floating desk scattered around a huge warehouse. Each desk has a label saying "the next book is on desk #XYZ." To find book #500, you start at desk #1 and follow directions 500 times. Finding it takes 500 trips across the warehouse. The CPU cache works like your hands — it can carry 8 books at once from a nearby area. With the bookshelf, it grabs 8 consecutive books immediately. With the warehouse, it has to run to a random location for every single book.
+
+## BUILD
+
+**Challenge 1:** Write a method `findDuplicate(List<Integer> list)` that is O(n). Test it with both an ArrayList and LinkedList of 100K elements and measure the time difference.
+
+**Challenge 2:** Implement a circular buffer / ring buffer using a fixed-size `Object[]` array (no ArrayList, no LinkedList) with `add`, `poll`, `peek`, `isFull`, and `isEmpty` methods.
+
+**Challenge 3:** Write a benchmark that demonstrates the O(n²) vs O(n) difference: one method using index-based loop on LinkedList, another using iterator. Print execution times for 10K, 50K, and 100K elements.
+
+## SPACED REVIEW
+
+- **Day 1:** What data structure backs ArrayList internally? What is the growth formula?
+- **Day 3:** Why is `linkedList.get(i)` inside a for loop O(n²)?
+- **Day 7:** When would you use ArrayDeque instead of LinkedList?
+- **Day 14:** Calculate the memory usage difference between ArrayList and LinkedList for 500K Integer elements
+- **Day 30:** Explain why ArrayList iteration is faster than LinkedList iteration even though both are O(n)

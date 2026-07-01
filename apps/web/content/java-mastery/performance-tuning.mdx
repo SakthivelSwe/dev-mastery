@@ -5,114 +5,600 @@ level: 5
 ---
 
 ## WHY
-You built a Spring Boot application, and it works perfectly on your local machine. But when deployed to production under a load of 10,000 concurrent users, the response times spike to 5 seconds, CPU usage hits 100%, and the application eventually crashes with an `OutOfMemoryError`.
 
-**Performance Tuning** is the dark art of profiling the JVM, identifying bottlenecks, and optimizing resource usage. Without these skills, you cannot scale a Java application. You will simply be throwing more money at AWS servers to mask underlying architectural inefficiencies.
+Your Spring Boot application works perfectly locally. Under 10,000 concurrent users in production: response times spike to 5 seconds, CPU hits 100%, memory grows continuously until `OutOfMemoryError`. The application crashes.
+
+Performance tuning is the discipline of making Java applications fast and stable under production load. Five reasons you MUST understand it:
+
+1. **GC stop-the-world pauses**: The default G1GC with default settings can pause your app for 200ms+ at scale. With the wrong heap size, you get 2-second pauses every 30 seconds — latency spikes that kill user experience.
+2. **Memory leaks in GC-managed languages**: Java has GC, but you can still "leak" memory by keeping strong references in static collections, ThreadLocal caches, and event listener registries. The GC can't collect objects you're still referencing.
+3. **Thread contention**: 100 threads fighting for the same `synchronized` lock = 99 threads blocked. Profiling reveals this as 99% thread wait time.
+4. **Object allocation rate**: Creating 10 million objects/second in a hot loop generates 10 million GC candidates. The GC barely keeps up, burning 30% of CPU on collection.
+5. **Connection pool exhaustion**: All 20 DB connections in use, 200 threads waiting. Not a DB problem — a pool size misconfiguration problem.
+
+Without profiling tools (JFR, JMC, async-profiler) and tuning knowledge, you're guessing. Every Java engineer at Netflix, Google, and trading firms must understand these mechanics.
 
 ## THEORY
-### The Three Pillars of Tuning
-1. **Garbage Collection (GC) Tuning:** The JVM pauses your application to clean up memory (Stop-The-World events). If your app is constantly pausing, performance dies.
-2. **Memory Leaks:** Unlike C++, Java has a Garbage Collector, but you can still "leak" memory if you keep references to objects you no longer need, eventually crashing the JVM.
-3. **Thread Contention:** When multiple threads fight for the same lock (`synchronized` blocks or database connections), they block each other, wasting CPU cycles and destroying throughput.
+
+### The JVM Performance Triangle
+
+```
+            THROUGHPUT
+           (requests/sec)
+              ▲
+             / \
+            /   \
+           /     \
+          /  GC   \
+         / TUNING  \
+        /___________\
+    LATENCY       MEMORY
+  (ms/request)  (heap size)
+
+Optimizing one corner often hurts others:
+- Bigger heap → better throughput, but longer GC pauses
+- Smaller heap → faster GC, but more frequent GC (hurts throughput)
+- ZGC → sub-1ms pauses, but higher CPU/memory cost
+```
+
+### Key Profiling Tools
+
+| Tool | Type | Cost | Best For |
+|------|------|------|---------|
+| **JFR (Java Flight Recorder)** | JVM-native profiler | < 1% overhead | Production profiling |
+| **JMC (Java Mission Control)** | JFR viewer | None (analysis) | Visualizing JFR data |
+| **async-profiler** | Sampling profiler | ~1-3% | CPU + allocation profiling |
+| **VisualVM** | JMX-based profiler | 5-15% overhead | Development profiling |
+| **JStack** | Thread dump | Instant | Deadlock/contention diagnosis |
+| **JMap** | Heap dump | Stops app briefly | Memory leak diagnosis |
+
+### Garbage Collector Selection Guide
+
+| GC | When to Use | Pause Goal | Throughput |
+|----|-------------|------------|------------|
+| **Serial GC** | Small heaps < 100MB, single-core | N/A | Good for small apps |
+| **Parallel GC** | Batch processing, throughput priority | 500ms+ acceptable | Highest raw throughput |
+| **G1GC** (default) | General purpose, 1-32GB heaps | < 200ms target | Good balance |
+| **ZGC** (Java 15+) | Low-latency APIs, large heaps | < 1ms | ~10-15% lower throughput |
+| **Shenandoah** | Similar to ZGC | < 10ms | Moderate throughput |
+
+### Critical JVM Flags
+
+```bash
+# Memory sizing
+-Xms4g -Xmx4g          # Lock initial=max heap (avoid heap resizing overhead)
+-XX:NewRatio=2          # Young:Old generation ratio (higher = smaller Young gen)
+-XX:MaxMetaspaceSize=512m  # Limit Metaspace growth
+
+# GC selection
+-XX:+UseG1GC            # G1 (default Java 11+)
+-XX:+UseZGC             # ZGC (Java 15+, sub-millisecond pauses)
+-XX:MaxGCPauseMillis=100 # G1: target max pause (best effort)
+
+# GC logging (essential for production)
+-Xlog:gc*:file=/logs/gc.log:time,uptime,pid,level:filecount=5,filesize=100m
+
+# Crash diagnostics
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/logs/heap-dump.hprof
+-XX:+ExitOnOutOfMemoryError  # Kill app instead of limping on
+
+# Container-awareness (critical for Docker/K8s)
+-XX:MaxRAMPercentage=75.0  # Use 75% of container memory for heap
+# Without this: JVM thinks it has the HOST's RAM (e.g. 64GB) not the container's (e.g. 2GB)
+
+# JIT tuning
+-server                  # Enable server JIT (C2 compiler, more aggressive optimization)
+-XX:+UseStringDeduplication  # G1 deduplicates identical String objects
+```
+
+### Memory Leak Patterns
+
+| Leak Pattern | Cause | Fix |
+|-------------|-------|-----|
+| Static collection | `static Map<K,V>` grows forever | Use Caffeine/Redis with TTL |
+| ThreadLocal leak | ThreadLocal set, never removed | `threadLocal.remove()` in finally |
+| Inner class listener | Anonymous inner class holds outer class reference | Use WeakReference or lambdas |
+| ClassLoader leak | Plugin ClassLoader held by static field | Use WeakReference to ClassLoader |
+| Unclosed streams | `InputStream` not closed → native memory | try-with-resources always |
+
+### Object Allocation and the Object Pool Anti-Pattern
+
+Modern JVM heap allocation for short-lived objects is O(1) — just a pointer bump in Eden space. Short-lived objects are collected by Minor GC (very fast). Manually pooling objects:
+- Keeps objects in Old Generation (avoids Minor GC) → requires Major GC (slow)
+- Adds synchronization overhead to the pool
+- Usually SLOWER than just allocating new objects
+
+**Exception**: Object pooling IS valid for heavyweight resources: DB connections, threads, ByteBuffers, SSL sessions.
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "performance-tuning" }
+{ "type": "none" }
 ```
 
 ## CODE
 
-### Level 1 — Beginner (String Concatenation in Loops)
-The most common beginner performance mistake in Java is ignoring String immutability. Every time you modify a String, Java creates a brand new Object in memory.
-
+### Level 1 — Beginner
 ```java
-// THE TERRIBLE WAY
-// This creates 10,000 separate String objects in memory!
-// The Garbage Collector will go into overdrive trying to clean them up.
-public String buildReport(List<String> data) {
-    String report = "";
-    for (String line : data) {
-        report += line + "\n"; 
-    }
-    return report;
-}
+import java.util.*;
 
-// THE PERFORMANT WAY
-// StringBuilder modifies a single underlying character array.
-// It is vastly faster and creates almost zero garbage!
-public String buildReportOptimized(List<String> data) {
-    StringBuilder report = new StringBuilder();
-    for (String line : data) {
-        report.append(line).append("\n");
+// COMMON PERFORMANCE ANTI-PATTERNS and their fixes
+public class BasicPerformanceFixes {
+
+    // ANTI-PATTERN 1: String concatenation in a loop
+    // Each += creates a new String object in the String pool → O(n²) memory
+    static String buildReportBad(List<String> lines) {
+        String result = "";
+        for (String line : lines) {
+            result += line + "\n";  // Creates a new String EVERY iteration!
+        }
+        return result;
     }
-    return report.toString();
+
+    // FIX: StringBuilder — modifies single char[] buffer → O(n)
+    static String buildReportGood(List<String> lines) {
+        StringBuilder sb = new StringBuilder(lines.size() * 64);  // Pre-size estimate
+        for (String line : lines) {
+            sb.append(line).append('\n');  // char literal, not String "\n"
+        }
+        return sb.toString();
+    }
+
+    // ANTI-PATTERN 2: Autoboxing in tight loops
+    static long sumBad(List<Integer> numbers) {
+        long sum = 0;
+        for (Integer n : numbers) {
+            sum += n;  // n.intValue() → unboxing on every iteration (millions of times)
+        }
+        return sum;
+    }
+
+    // FIX: Use int[] instead of List<Integer> for pure numeric computation
+    static long sumGood(int[] numbers) {
+        long sum = 0;
+        for (int n : numbers) {
+            sum += n;  // No boxing/unboxing — pure primitive arithmetic
+        }
+        return sum;
+    }
+
+    // Benchmark comparison
+    public static void main(String[] args) {
+        List<String> lines = new ArrayList<>();
+        for (int i = 0; i < 10_000; i++) lines.add("Line " + i);
+
+        // Bad: string concat
+        long start = System.nanoTime();
+        String bad = buildReportBad(lines);
+        System.out.printf("String concat: %d ms%n", (System.nanoTime() - start) / 1_000_000);
+
+        // Good: StringBuilder
+        start = System.nanoTime();
+        String good = buildReportGood(lines);
+        System.out.printf("StringBuilder: %d ms%n", (System.nanoTime() - start) / 1_000_000);
+        // Typical: String concat ~400ms, StringBuilder ~2ms for 10K lines
+    }
 }
 ```
 
-### Level 2 — Building Blocks (Identifying Memory Leaks)
-How does a language with an automatic Garbage Collector (GC) leak memory? 
-By putting objects into a static collection and forgetting to remove them!
-
+### Level 2 — Building Blocks
 ```java
-public class CacheManager {
-    // A static map lives for the entire lifecycle of the application!
-    private static final Map<String, UserSession> cache = new HashMap<>();
+import java.util.*;
+import java.lang.ref.*;
 
-    public void loginUser(String sessionId, UserSession session) {
-        cache.put(sessionId, session);
+// MEMORY LEAKS: Causes and fixes
+public class MemoryLeakPatterns {
+
+    // LEAK 1: Static cache without eviction
+    static class LeakySessionCache {
+        private static final Map<String, Object> sessions = new HashMap<>();  // GROWS FOREVER
+
+        public static void addSession(String id, Object session) {
+            sessions.put(id, session);
+            // If we never call removeSession(), map never shrinks
+        }
     }
 
-    public void logoutUser(String sessionId) {
-        // DANGER! If we forget to call this method, or if an Exception occurs 
-        // before this is called, the session lives in the HashMap forever!
-        // The GC cannot delete it because the Map still holds a strong reference to it!
-        cache.remove(sessionId);
+    // FIX 1: WeakHashMap — GC can collect keys when no strong references remain
+    static class SafeSessionCache {
+        private static final Map<String, Object> sessions = new WeakHashMap<>();
+        // Keys (session IDs) auto-removed when no other code holds a reference to them
+    }
+
+    // LEAK 2: ThreadLocal not removed
+    static class LeakyThreadLocal {
+        private static final ThreadLocal<byte[]> buffer = new ThreadLocal<>();
+
+        public void process() {
+            buffer.set(new byte[1024 * 1024]);  // 1MB per thread
+            try {
+                // do work
+            } finally {
+                buffer.remove();  // CRITICAL: must remove, or memory leaks in thread pools!
+                // Thread pool threads are reused — old ThreadLocals accumulate!
+            }
+        }
+    }
+
+    // LEAK 3: Event listener holding reference
+    static class EventBus {
+        private static final List<Runnable> listeners = new ArrayList<>();
+
+        // If listener is anonymous inner class, it holds reference to outer class
+        // If outer class is discarded but listener stays registered → memory leak
+        public static void addListener(Runnable listener) {
+            listeners.add(listener);
+            // FIX: Use WeakReference<Runnable> to avoid strong reference chain
+        }
+
+        // CORRECT: use WeakReference in listener list
+        private static final List<WeakReference<Runnable>> weakListeners = new ArrayList<>();
+        public static void addWeakListener(Runnable listener) {
+            weakListeners.add(new WeakReference<>(listener));
+        }
+        public static void fireEvent() {
+            weakListeners.removeIf(ref -> ref.get() == null);  // Remove collected listeners
+            weakListeners.forEach(ref -> { Runnable r = ref.get(); if (r != null) r.run(); });
+        }
     }
 }
 ```
 
-*The Fix:* Use proper eviction strategies like **WeakHashMap** (which allows the GC to delete keys if no one else is using them), or use a professional caching library like Caffeine/Redis with Time-To-Live (TTL) expirations.
+### Level 3 — Intermediate
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
-### Level 3 — Intermediate (Profiling with JFR)
-You cannot tune what you cannot measure. Guessing where the bottleneck is will waste weeks of your time. 
-**Java Flight Recorder (JFR)** is a profiling tool built directly into the JVM. It has almost zero overhead (< 1%), meaning you can run it safely in Production!
+// THREAD CONTENTION: Finding and fixing lock bottlenecks
+public class ThreadContentionDemo {
 
-You start a recording via the command line on your production server:
-```bash
-# Start a 60-second recording of the running JVM (PID 12345)
-jcmd 12345 JFR.start duration=60s filename=recording.jfr
+    // ANTI-PATTERN: Coarse-grained lock — entire method synchronized
+    static class ContentedCounter {
+        private int count = 0;
+
+        // ALL operations lock on 'this' — massive contention under high load
+        public synchronized void increment() { count++; }
+        public synchronized void decrement() { count--; }
+        public synchronized int get() { return count; }
+    }
+
+    // FIX 1: AtomicInteger — lock-free CAS, much faster under contention
+    static class LockFreeCounter {
+        private final AtomicInteger count = new AtomicInteger(0);
+
+        public void increment() { count.incrementAndGet(); }  // lock cmpxchg instruction
+        public void decrement() { count.decrementAndGet(); }
+        public int get() { return count.get(); }
+    }
+
+    // FIX 2: LongAdder — stripe-based, fastest for pure increment workloads
+    static class HighThroughputCounter {
+        private final LongAdder count = new LongAdder();
+
+        public void increment() { count.increment(); }  // No contention — different cell per thread
+        public long get() { return count.sum(); }
+    }
+
+    // PROFILING: Find thread contention with thread dumps
+    static void detectContention() {
+        // In production, capture with: kill -3 <pid>  or  jstack <pid>
+        // Look for threads in state: BLOCKED (waiting on monitor entry)
+        // All threads waiting on same lock = contention bottleneck
+
+        Thread.getAllStackTraces().forEach((thread, stackTrace) -> {
+            if (thread.getState() == Thread.State.BLOCKED) {
+                System.out.println("BLOCKED thread: " + thread.getName());
+            }
+        });
+    }
+
+    // BENCHMARK: Compare contention under 10 threads
+    public static void main(String[] args) throws InterruptedException {
+        int THREADS = 10, OPS = 100_000;
+
+        for (var entry : new Object[][]{{new ContentedCounter(), "Synchronized"},
+                                        {new LockFreeCounter(), "AtomicInteger"},
+                                        {new HighThroughputCounter(), "LongAdder"}}) {
+            long start = System.nanoTime();
+            Thread[] ts = new Thread[THREADS];
+            for (int i = 0; i < THREADS; i++) {
+                Object counter = entry[0];
+                ts[i] = new Thread(() -> {
+                    for (int j = 0; j < OPS; j++) {
+                        if (counter instanceof ContentedCounter c) c.increment();
+                        else if (counter instanceof LockFreeCounter lf) lf.increment();
+                        else ((HighThroughputCounter) counter).increment();
+                    }
+                });
+                ts[i].start();
+            }
+            for (Thread t : ts) t.join();
+            System.out.printf("%s: %d ms%n", entry[1], (System.nanoTime() - start) / 1_000_000);
+        }
+        // Typical: Synchronized ~50ms, AtomicInt ~20ms, LongAdder ~5ms
+    }
+}
 ```
 
-You then open the `recording.jfr` file in **Java Mission Control (JMC)** on your laptop. It provides a visual dashboard showing exactly which Methods took the most CPU time, how many Objects were allocated, and exactly how long the Garbage Collector paused your app!
+### Level 4 — Advanced
+```java
+import java.lang.management.*;
 
-### Level 4 — Advanced (Tuning the Garbage Collector)
-If JFR shows that your application is spending 20% of its time paused for Garbage Collection, you must tune the JVM flags.
+// JVM MONITORING: MXBeans, GC tuning, heap analysis
+public class JvmPerformanceMonitor {
 
-There are different Garbage Collectors for different use cases:
-1. **G1GC (Garbage-First):** The default since Java 9. Great balance of throughput and latency.
-2. **ZGC (Z Garbage Collector):** Introduced in Java 15. Designed for massive heaps (Terabytes). Guarantees pause times under 1 millisecond!
-3. **Parallel GC:** Maximizes raw throughput at the expense of longer pause times (great for offline batch processing).
+    // Read GC stats programmatically
+    static void printGCStats() {
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            System.out.printf("GC: %-20s | Count: %5d | Total Time: %5d ms%n",
+                gc.getName(), gc.getCollectionCount(), gc.getCollectionTime());
+        }
+        // Output:
+        // G1 Young Generation | Count:   42 | Total Time:   380 ms
+        // G1 Old Generation   | Count:    1 | Total Time:    45 ms
+        // If Young GC count is very high → heap too small, increase -Xmx
+        // If Old GC count > 0 → promotion too fast, tune -XX:NewRatio
+    }
 
-You configure these via command-line flags when starting the application:
+    // Monitor heap usage live
+    static void printHeapUsage() {
+        MemoryMXBean memBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heap = memBean.getHeapMemoryUsage();
+        long usedMB = heap.getUsed() / (1024 * 1024);
+        long maxMB = heap.getMax() / (1024 * 1024);
+        double percent = 100.0 * heap.getUsed() / heap.getMax();
+        System.out.printf("Heap: %d/%d MB (%.1f%%)%n", usedMB, maxMB, percent);
+        // If % stays > 80% → memory pressure → risk of OOM
+    }
 
-```bash
-# Start the app with optimized GC settings
-java -server \
-     -Xms4G -Xmx4G \                  # Lock initial and max heap to 4GB to prevent resizing overhead
-     -XX:+UseZGC \                    # Use the ultra-low latency ZGC
-     -XX:+HeapDumpOnOutOfMemoryError \# Generate a heap dump if the app crashes for debugging!
-     -XX:HeapDumpPath=/logs/ \
-     -jar my-application.jar
+    // Detect GC pressure: if GC is running > 5% of time
+    static boolean isGCPressureHigh() {
+        long totalGCTime = ManagementFactory.getGarbageCollectorMXBeans().stream()
+            .mapToLong(GarbageCollectorMXBean::getCollectionTime).sum();
+        long uptime = ManagementFactory.getRuntimeMXBean().getUptime();
+        double gcPercent = 100.0 * totalGCTime / uptime;
+        System.out.printf("GC overhead: %.2f%% of runtime%n", gcPercent);
+        return gcPercent > 5.0;  // > 5% = GC pressure (consider tuning)
+    }
+
+    // Profile allocation rate
+    static void measureAllocationRate() {
+        Runtime rt = Runtime.getRuntime();
+        long before = rt.totalMemory() - rt.freeMemory();
+
+        // Run your workload here
+        List<byte[]> allocations = new java.util.ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            allocations.add(new byte[1024]);  // 1KB per allocation
+        }
+
+        long after = rt.totalMemory() - rt.freeMemory();
+        System.out.printf("Allocated: ~%d KB%n", (after - before) / 1024);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread.sleep(1000);  // Let JVM warm up
+        printGCStats();
+        printHeapUsage();
+        System.out.println("GC pressure high: " + isGCPressureHigh());
+        measureAllocationRate();
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+import org.openjdk.jmh.annotations.*;
+import java.util.concurrent.*;
+import java.util.*;
+
+// JMH BENCHMARKS: Proper microbenchmarking (prevents JIT cheating)
+@State(Scope.Benchmark)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+@Warmup(iterations = 5, time = 1)
+@Measurement(iterations = 10, time = 1)
+@Fork(2)
+public class JmhBenchmarks {
+
+    // JMH PREVENTS common benchmark mistakes:
+    // - Dead code elimination (JIT removes unused results)
+    // - Constant folding (JIT evaluates constant expressions at compile time)
+    // - Loop unrolling (JIT unrolls short loops)
+
+    @Param({"100", "1000", "10000"})
+    private int size;
+    private int[] primitiveArray;
+    private Integer[] boxedArray;
+
+    @Setup
+    public void setup() {
+        primitiveArray = new int[size];
+        boxedArray = new Integer[size];
+        for (int i = 0; i < size; i++) {
+            primitiveArray[i] = i;
+            boxedArray[i] = i;
+        }
+    }
+
+    @Benchmark
+    public long primitiveSum() {
+        long sum = 0;
+        for (int n : primitiveArray) sum += n;
+        return sum;  // Return value prevents dead code elimination
+    }
+
+    @Benchmark
+    public long boxedSum() {
+        long sum = 0;
+        for (Integer n : boxedArray) sum += n;  // Unboxing on every iteration
+        return sum;
+    }
+
+    @Benchmark
+    public String stringConcat(Blackhole bh) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < size; i++) sb.append(i);
+        return sb.toString();
+    }
+
+    // OBJECT POOL benchmark — demonstrates when pooling IS valid
+    @Benchmark
+    public byte[] withoutPool() {
+        return new byte[4096];  // Short-lived → Eden space → Minor GC handles quickly
+    }
+
+    // For heavyweight resources (like ByteBuffer.allocateDirect), pooling is valid
+    // For simple heap objects, JVM is faster without pooling
+}
+
+// HOT PATH OPTIMIZATION TECHNIQUES
+class HotPathOptimizations {
+
+    // 1. ESCAPE ANALYSIS: JVM eliminates heap allocation for short-lived objects
+    static int computeWithoutAlloc() {
+        // Point never escapes this method → JVM may stack-allocate it (no heap allocation!)
+        java.awt.Point p = new java.awt.Point(10, 20);
+        return p.x + p.y;
+        // JIT may optimize to: return 10 + 20; (scalar replacement)
+    }
+
+    // 2. METHOD INLINING: JIT inlines small hot methods (max 35 bytecodes)
+    // Methods called millions of times get inlined into callers
+    // -XX:+PrintInlining to see what the JIT inlines
+    static int inline1(int x) { return x * 2; }  // JIT inlines this
+    static int inline2(int x) { return inline1(x) + 1; }  // And this
+
+    // 3. BRANCH PREDICTION HINTS: Order if-else for most common case first
+    static String describeNumber(int n) {
+        if (n > 0) return "positive";   // Most common case first → faster prediction
+        if (n < 0) return "negative";
+        return "zero";
+    }
+
+    // 4. SIMD VECTORIZATION: Simple array loops JIT can auto-vectorize
+    static int[] addArrays(int[] a, int[] b) {
+        int[] result = new int[a.length];
+        for (int i = 0; i < a.length; i++) {
+            result[i] = a[i] + b[i];  // JIT may use SSE/AVX for 4-8 additions per cycle
+        }
+        return result;
+    }
+}
 ```
 
 ## REAL_WORLD
-**Database Connection Pools**
-The #1 bottleneck in enterprise Java applications is rarely the CPU; it is the Database. 
-Opening a new TCP connection to a PostgreSQL database takes several milliseconds. If 1,000 users hit your API, and your app tries to open 1,000 separate DB connections simultaneously, the database will crash.
-Performance tuning absolutely requires a **Connection Pool** (like HikariCP, the default in Spring Boot). The pool keeps a small set of connections open permanently (e.g., 20 connections). When a thread needs the DB, it borrows a connection, runs the query, and instantly returns it to the pool. Properly sizing this pool (usually between 10-50, counterintuitively *smaller* than you think) is the most critical tuning step for backend applications.
+
+### Kubernetes JVM Configuration
+```yaml
+# deployment.yaml — production JVM tuning for Docker/K8s
+containers:
+  - name: order-service
+    image: mycompany/order-service:1.0
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"   # Container limit: 2GB
+        cpu: "2000m"
+    env:
+      - name: JAVA_OPTS
+        value: >-
+          -XX:MaxRAMPercentage=75.0
+          -XX:+UseZGC
+          -XX:+HeapDumpOnOutOfMemoryError
+          -XX:HeapDumpPath=/tmp/heap.hprof
+          -XX:+ExitOnOutOfMemoryError
+          -Xlog:gc*:file=/logs/gc.log:time:filecount=3,filesize=50m
+```
+
+```java
+// HikariCP connection pool tuning
+@Configuration
+public class DatabaseConfig {
+
+    @Bean
+    public HikariDataSource dataSource() {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:postgresql://localhost:5432/mydb");
+
+        // SIZING: For each DB request taking ~10ms and target 100 RPS:
+        // Pool size = (100 RPS × 10ms) / 1000ms = 1 connection needed!
+        // In reality: add buffer for bursts
+        // Formula: pool_size = (target_throughput × avg_query_time_ms) / 1000
+        config.setMaximumPoolSize(20);  // Not 200! Bigger is NOT better for pools
+        config.setMinimumIdle(5);
+        config.setConnectionTimeout(3_000);  // Fail fast if no connection in 3s
+        config.setIdleTimeout(600_000);      // Return idle connections after 10min
+        config.setMaxLifetime(1_800_000);    // Recycle connections every 30min
+
+        return new HikariDataSource(config);
+    }
+}
+```
 
 ## INTERVIEW
-**Q: My application is running slowly. I looked at the code and realized we are creating thousands of short-lived objects inside a loop. I want to optimize this by creating an "Object Pool" to reuse the objects instead of letting the Garbage Collector deal with them. Is this a good idea?**
-A: **No, this is an infamous anti-pattern in modern Java.** 
-In the late 1990s, Object Pooling was a valid optimization because object creation was expensive. In modern JVMs, allocating a new object in the Eden space is incredibly cheap (it just bumps a pointer). The Garbage Collector is heavily optimized to clean up millions of short-lived, unreachable objects almost instantly with zero overhead. 
-If you implement an Object Pool, you are forcing those objects to stay alive permanently. This promotes them to the "Old Generation" memory space, forcing the JVM to run massive, expensive "Full GC" sweeps, completely destroying your performance. Always let the GC handle short-lived objects.
+
+### Q1: How do you profile a Java application in production?
+**Difficulty:** Hard | **Companies:** Netflix, Spotify, trading firms
+
+❌ **Weak:** "Use VisualVM or add print statements."
+
+✅ **Strong:** "The gold standard for production profiling is **Java Flight Recorder (JFR)** — built into the JVM since Java 11, < 1% overhead. Start a recording with `jcmd <pid> JFR.start duration=60s filename=recording.jfr`, then analyze in **Java Mission Control (JMC)**. JFR shows: top CPU methods (Method Profiling), object allocation hotspots (Allocation Statistics), GC pauses (GC view), thread blocking (Thread view), I/O wait times. For Linux: **async-profiler** captures CPU + allocations with flame graphs — excellent for finding hot paths. Never use VisualVM in production — its instrumentation adds 5-15% overhead."
+
+---
+
+### Q2: What causes a Java application to slow down over time even though no code changed?
+**Difficulty:** Hard | **Companies:** All companies with long-running services
+
+❌ **Weak:** "Memory leak."
+
+✅ **Strong:** "Several causes: (1) **Heap fragmentation** — Old Generation fills up with long-lived objects, Major GC runs more frequently. Solution: increase heap, tune GC settings. (2) **Memory leak** — static collections or ThreadLocals holding strong references to objects that should be collected. Old Generation grows until OOM. Solution: heap dump + Eclipse Memory Analyzer. (3) **JIT de-optimization** — after 10,000+ calls, the JIT compiles a method with inlined assumptions. If those assumptions break at runtime, JIT decompiles back to interpretation ('deoptimization'). High deoptimization rate can cause slowdown. (4) **Connection pool exhaustion** — DB response times creep up, all pool connections busy, requests queue up. (5) **GC promotion failure** — objects survive too many Minor GC cycles, promote to Old Gen, fill it up."
+
+---
+
+### Q3: Why is object pooling usually an anti-pattern in modern Java?
+**Difficulty:** Medium | **Companies:** Google, Oracle
+
+❌ **Weak:** "GC is fast enough now."
+
+✅ **Strong:** "Modern JVM heap allocation in Eden Space is ~2-5 CPU instructions — just a pointer bump. Minor GC collects short-lived objects in < 10ms. When you pool objects: (1) Objects are promoted to Old Generation because they're long-lived — Major GC (slow, hundreds of ms) must handle them. (2) Pool access requires synchronization — adds 100-1000ns per access vs ~2ns for allocation. (3) Object state corruption risk when reusing pooled objects. (4) Increased code complexity for no measurable gain. Pooling IS valid for heavyweight resources: `Connection` (50ms to create), `SSLEngine` (expensive handshake), `ByteBuffer.allocateDirect()` (OS memory, not heap). For regular Java objects, allocate and let GC do its job."
+
+---
+
+### Q4: How do you properly size a database connection pool?
+**Difficulty:** Medium | **Companies:** Backend-heavy companies
+
+❌ **Weak:** "Set it to 100 to be safe."
+
+✅ **Strong:** "Bigger is NOT better. The formula is: `pool_size = target_throughput × avg_query_time_in_seconds`. For 100 RPS with 20ms average queries: `pool_size = 100 × 0.020 = 2 connections`. Add 3-5x buffer for burst → 10 connections. Most production apps work well with 10-30 connections. Larger pools: (1) Exceed database's max connections. (2) Context-switching overhead as DB serves many concurrent queries. (3) Database itself becomes a bottleneck — it only has so many cores. HikariCP recommendation: `pool_size = (core_count × 2) + effective_spindle_count`. Setting `maxPoolSize=200` on a 4-core DB is actively harmful."
+
+---
+
+### Q5: What is the difference between throughput and latency in GC tuning?
+**Difficulty:** Hard | **Companies:** All performance-critical systems
+
+❌ **Weak:** "Throughput is speed, latency is delay."
+
+✅ **Strong:** "In GC context: **throughput** = percentage of time application threads run (vs GC threads). 95% throughput means GC uses 5% of time. **Latency** = the worst-case pause duration (stop-the-world time). These conflict: Parallel GC maximizes throughput (fewer, longer pauses — good for batch processing). ZGC maximizes latency (concurrent GC, < 1ms pauses — good for APIs). G1GC balances both with a target pause time (`-XX:MaxGCPauseMillis=100`). For web APIs: optimize for p99 latency (ZGC, Shenandoah). For batch ETL jobs: optimize for throughput (Parallel GC, larger heap). For general microservices: G1GC with `-XX:MaxGCPauseMillis=200`."
+
+## FEYNMAN CHECK
+
+Imagine your Java app is a restaurant. **Throughput** = how many meals you serve per hour. **Latency** = how long each customer waits. The **Garbage Collector** is the cleaning crew — periodically, they stop service (Stop-The-World) to clean tables. G1GC cleans in small batches every 100ms — customers wait briefly, often. Parallel GC cleans less often but stops everything for 2 seconds. ZGC cleans while service continues — customers never wait more than 1ms, but the cleaning crew uses more resources. A **memory leak** is tables never getting cleared even after customers leave — the restaurant fills up. **Thread contention** is 50 waiters fighting for one kitchen door — 49 waiters blocked, one working.
+
+## BUILD
+
+**Challenge 1:** Write a benchmark comparing String `+`, `StringBuilder`, and `String.join()` for building 10,000-line reports. Use `System.nanoTime()` for timing. What's the speedup ratio?
+
+**Challenge 2:** Create a deliberate memory leak using a static `HashMap`. Add 10M entries without removing them. Watch heap grow with `Runtime.getRuntime().totalMemory()`. Then fix it with `WeakHashMap`.
+
+**Challenge 3:** Build a `ThreadContentionBenchmark` comparing `synchronized` counter vs `AtomicInteger` vs `LongAdder` with 8 threads each doing 1M increments. Measure and explain the time difference.
+
+## SPACED REVIEW
+
+- **Day 1:** What are the three pillars of Java performance tuning?
+- **Day 3:** What's the difference between G1GC, ZGC, and Parallel GC? When would you use each?
+- **Day 7:** Write code that creates a memory leak. How would you detect it in production?
+- **Day 14:** What JVM flags would you set for a Spring Boot app running in a 2GB Docker container?
+- **Day 30:** Profile a slow endpoint using JFR. List 5 things you'd look for in the JMC output.

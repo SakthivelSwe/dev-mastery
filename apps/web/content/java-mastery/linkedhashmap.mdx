@@ -5,136 +5,541 @@ level: 3
 ---
 
 ## WHY
-`HashMap` is lightning fast, but it scrambles your data. If you insert elements A, B, and C, iterating over the map might return C, A, B. 
-`TreeMap` keeps data perfectly sorted (A, B, C), but it slows down insertions to `O(log n)`.
 
-What if you want the blistering `O(1)` speed of a `HashMap`, but you also want to remember the exact order in which elements were inserted? Or, what if you are building an LRU (Least Recently Used) cache and need to know exactly which element was accessed the longest time ago so you can delete it? 
+`HashMap` is lightning fast but scrambles insertion order. `TreeMap` maintains sorted order but slows to O(log n). `LinkedHashMap` gives you the best of both: **O(1) get/put with predictable iteration order** — either insertion order or access order (LRU).
 
-Enter `LinkedHashMap`. It bridges the gap by wrapping a standard `HashMap` with an independent doubly-linked list running through every single entry, providing `O(1)` performance with predictable iteration order.
+This matters in five real production scenarios:
+
+1. **Preserving database ORDER BY**: When you stream SQL results into a Map, `HashMap` destroys the sort. `LinkedHashMap` keeps the row order.
+2. **LRU cache in 5 lines**: With `accessOrder=true` + `removeEldestEntry()` override, LinkedHashMap IS a production-grade LRU cache.
+3. **JSON field ordering**: `ObjectMapper` serializes maps in iteration order. Returning a `HashMap` gives clients non-deterministic JSON. `LinkedHashMap` ensures consistent field ordering.
+4. **Building ordered configuration**: Configuration files often require key ordering — `LinkedHashMap` preserves the order properties/keys were specified.
+5. **Audit trail/history**: Maintaining the sequence of operations in a map (most recent last) without a separate list structure.
+
+The alternative — keeping a separate `HashMap` + `ArrayList` for ordering — is error-prone and uses more memory than `LinkedHashMap`'s elegant single-structure approach.
 
 ## THEORY
-### The Hybrid Architecture
-A `LinkedHashMap` extends `HashMap`. It maintains the exact same bucket array and hash functions. 
-However, it overrides the internal `Node` class to include `before` and `after` pointers. 
-Every time you insert a new key-value pair, it does two things:
-1. It hashes the key and places the Node in the array bucket (just like `HashMap`).
-2. It links the new Node to the tail of a global doubly-linked list.
-When you iterate over a `LinkedHashMap`, it completely ignores the hash buckets and simply walks the doubly-linked list from head to tail. This guarantees that iteration is ALWAYS in **Insertion Order**.
 
-### Access Order and LRU Caches
-By default, `LinkedHashMap` maintains Insertion Order. But you can pass a special flag to its constructor: `accessOrder = true`.
-When Access Order is enabled, every time you call `.get(key)`, the `LinkedHashMap` physically removes that node from its current position in the linked list and moves it to the tail. Thus, the head of the list is always the *least recently used* item, and the tail is the *most recently used* item. 
-It also provides a protected method: `removeEldestEntry()`. By overriding this method to return `true` when the map size exceeds a limit (e.g., 100), the map will automatically delete the head node, giving you a production-grade LRU cache in about 5 lines of code.
+### Hybrid Architecture: HashMap + Doubly-Linked List
+
+`LinkedHashMap` extends `HashMap`. It overrides the internal `Node` class to add two extra pointers:
+
+```
+HashMap internal structure (bucket array):
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│  0  │  1  │  2  │  3  │  4  │  5  │ ... │  ← buckets array
+└─────┴──┬──┴─────┴──┬──┴─────┴──┬──┴─────┘
+         │           │           │
+         ▼           ▼           ▼
+       "Bob"       "Alice"     "Charlie"
+
+LinkedHashMap adds a global doubly-linked list ACROSS all buckets:
+
+head ←→ "Alice" ←→ "Bob" ←→ "Charlie" ←→ tail
+         (bucket[3])  (bucket[1])  (bucket[5])
+
+Iteration walks the LINKED LIST, not the buckets
+→ guaranteed insertion order, regardless of hash positions
+```
+
+Each `LinkedHashMap.Entry<K,V>` has:
+- Standard `HashMap.Node` fields: `key`, `value`, `hash`, `next` (bucket chain)
+- Extra fields: `before` (prev in linked list), `after` (next in linked list)
+- Memory overhead: +16 bytes per entry (two extra 8-byte pointers on 64-bit JVM)
+
+### Insertion Order Mode (Default)
+
+```java
+new LinkedHashMap<>()           // Default: insertionOrder = false (actually = true insertion order)
+new LinkedHashMap<>(16, 0.75f)  // Initial capacity + load factor
+```
+
+- New entries appended to the **tail** of the linked list
+- `remove()` unlinks the node from the list O(1) and removes from bucket O(1)
+- Iteration walks head → tail → gives insertion order
+
+### Access Order Mode (for LRU)
+
+```java
+new LinkedHashMap<>(16, 0.75f, true)  // accessOrder = true
+```
+
+Every `get(key)` or `put(key, value)` **moves the accessed node to the tail** (most recently used):
+
+```
+State: head → [2] → [3] → [1] ← tail   (insertion order)
+After get(2):
+         head → [3] → [1] → [2] ← tail  (2 moved to end = most recently used)
+```
+
+The **head** is always the **Least Recently Used** item.
+
+### `removeEldestEntry()` Hook
+
+After every `put()`, `LinkedHashMap` calls `removeEldestEntry(Map.Entry<K,V> eldest)`. If it returns `true`, the eldest entry (head of linked list = LRU item) is automatically removed.
+
+Default implementation: `return false;` (never evicts automatically)
+LRU cache implementation: `return size() > MAX_CAPACITY;`
+
+### Memory Cost Comparison
+
+| Map Type | Extra Per Entry | Ordering | Iteration Order |
+|----------|-----------------|----------|-----------------|
+| `HashMap` | 0 bytes | None | Random (bucket order) |
+| `LinkedHashMap` | +16 bytes (2 pointers) | Insertion or Access | Insertion/LRU |
+| `TreeMap` | +24 bytes (3 pointers + color bit) | Sorted (natural/Comparator) | Sorted |
+
+### Thread Safety
+
+`LinkedHashMap` is **not thread-safe**. Under concurrent access:
+- `ConcurrentHashMap` has no ordered variant
+- For thread-safe LRU: use `Collections.synchronizedMap(new LinkedHashMap<>(..., true))`  or implement with `ReentrantReadWriteLock`
+- For production: consider Caffeine cache (`LoadingCache.maximumSize()`) which uses Window TinyLFU, not pure LRU
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DataStructureVisualizer", "state": "linked-hash-map-lru" }
+{ "type": "none" }
 ```
 
 ## CODE
 
 ### Level 1 — Beginner
 ```java
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 
-public class InsertionOrder {
+// Basic: LinkedHashMap vs HashMap ordering
+public class InsertionOrderDemo {
     public static void main(String[] args) {
-        Map<String, Integer> hash = new HashMap<>();
-        hash.put("Zebra", 1); hash.put("Apple", 2); hash.put("Monkey", 3);
-        // Prints scrambled! (e.g. Apple, Zebra, Monkey)
-        System.out.println("HashMap: " + hash.keySet()); 
-        
-        Map<String, Integer> linked = new LinkedHashMap<>();
-        linked.put("Zebra", 1); linked.put("Apple", 2); linked.put("Monkey", 3);
-        // GUARANTEED to print Zebra, Apple, Monkey
-        System.out.println("Linked: " + linked.keySet());
+        // HashMap: no ordering guarantee
+        Map<String, Integer> hashMap = new HashMap<>();
+        hashMap.put("Zebra", 1);
+        hashMap.put("Apple", 2);
+        hashMap.put("Monkey", 3);
+        System.out.println("HashMap:       " + hashMap.keySet());
+        // Output: UNPREDICTABLE — could be [Apple, Monkey, Zebra] or any order
+
+        // LinkedHashMap: insertion order guaranteed
+        Map<String, Integer> linkedMap = new LinkedHashMap<>();
+        linkedMap.put("Zebra", 1);
+        linkedMap.put("Apple", 2);
+        linkedMap.put("Monkey", 3);
+        System.out.println("LinkedHashMap: " + linkedMap.keySet());
+        // Always prints: [Zebra, Apple, Monkey]
+
+        // TreeMap: alphabetical order
+        Map<String, Integer> treeMap = new TreeMap<>();
+        treeMap.put("Zebra", 1);
+        treeMap.put("Apple", 2);
+        treeMap.put("Monkey", 3);
+        System.out.println("TreeMap:       " + treeMap.keySet());
+        // Always prints: [Apple, Monkey, Zebra]
+
+        // Use LinkedHashMap when you need: O(1) ops + preserve insertion order
+        // Use TreeMap when you need: sorted order + range queries
+        // Use HashMap when: order doesn't matter (fastest, least memory)
     }
 }
 ```
 
 ### Level 2 — Building Blocks
 ```java
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 
-public class AccessOrder {
+// Access order mode for LRU-like behavior
+public class AccessOrderDemo {
     public static void main(String[] args) {
-        // The 3rd parameter 'true' turns on Access Order
-        Map<Integer, String> cache = new LinkedHashMap<>(16, 0.75f, true);
-        
-        cache.put(1, "A");
-        cache.put(2, "B");
-        cache.put(3, "C");
-        
-        // Reading key 1 moves it to the END of the linked list
-        cache.get(1); 
-        
-        // Prints: 2, 3, 1
-        System.out.println(cache.keySet());
+        // accessOrder=true: get() moves entry to tail (most recently used)
+        Map<Integer, String> lruMap = new LinkedHashMap<>(16, 0.75f, true);
+
+        lruMap.put(1, "Page A");
+        lruMap.put(2, "Page B");
+        lruMap.put(3, "Page C");
+
+        System.out.println("Before access: " + lruMap.keySet());
+        // [1, 2, 3] — insertion order also = access order initially
+
+        lruMap.get(1);  // 1 accessed → moved to tail
+        System.out.println("After get(1):  " + lruMap.keySet());
+        // [2, 3, 1] — 1 moved to end (most recently used)
+
+        lruMap.get(2);  // 2 accessed → moved to tail
+        System.out.println("After get(2):  " + lruMap.keySet());
+        // [3, 1, 2] — 2 moved to end
+
+        // Head of list (3) = Least Recently Used
+        // Tail of list (2) = Most Recently Used
+        System.out.println("LRU entry: " + lruMap.entrySet().iterator().next());
+        // LRU entry: 3=Page C (will be evicted first)
     }
 }
 ```
 
 ### Level 3 — Intermediate
 ```java
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 
-// Building a production-grade LRU Cache in 5 lines
-public class LRUCache<K, V> extends LinkedHashMap<K, V> {
-    private final int MAX_ENTRIES;
+// LRU Cache implementation — production pattern
+public class LRUCacheDemo {
 
-    public LRUCache(int maxEntries) {
-        // Enable access order
-        super(maxEntries + 1, 1.0f, true);
-        this.MAX_ENTRIES = maxEntries;
+    // Simple LRU Cache in ~5 lines using LinkedHashMap
+    static class LRUCache<K, V> extends LinkedHashMap<K, V> {
+        private final int capacity;
+
+        public LRUCache(int capacity) {
+            // Initial capacity = capacity+1 (prevent resize at max load)
+            // Load factor = 1.0f (fill completely before growing)
+            // accessOrder = true (moves recently accessed entries to tail)
+            super(capacity + 1, 1.0f, true);
+            this.capacity = capacity;
+        }
+
+        // Called after every put(). Returns true → remove eldest (LRU) entry
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+            return size() > capacity;
+        }
+
+        public V getIfPresent(K key) {
+            return getOrDefault(key, null);  // get() triggers access-order move-to-tail
+        }
     }
 
-    // The JVM automatically calls this after every put().
-    // If it returns true, it deletes the oldest item!
-    @Override
-    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
-        return size() > MAX_ENTRIES;
+    public static void main(String[] args) {
+        LRUCache<Integer, String> cache = new LRUCache<>(3);
+
+        cache.put(1, "User-Alice");
+        cache.put(2, "User-Bob");
+        cache.put(3, "User-Charlie");
+        System.out.println("Cache: " + cache);  // {1=User-Alice, 2=User-Bob, 3=User-Charlie}
+
+        cache.get(1);  // Alice accessed → moved to tail (most recently used)
+        System.out.println("After get(1): " + cache.keySet());  // [2, 3, 1]
+
+        cache.put(4, "User-Dave");  // Cache full → evicts head (LRU = Bob)
+        System.out.println("After add Dave: " + cache);  // {3=User-Charlie, 1=User-Alice, 4=User-Dave}
+        // Bob (key=2) was evicted because it was least recently used!
+
+        System.out.println("Bob cached? " + cache.containsKey(2));  // false
+        System.out.println("Alice cached? " + cache.containsKey(1));  // true
     }
 }
 ```
 
 ### Level 4 — Advanced
 ```java
-public class CacheUsage {
+import java.util.*;
+import java.util.concurrent.*;
+
+// Thread-safe LRU Cache + JSON field ordering
+public class ProductionLinkedHashMap {
+
+    // Thread-safe LRU using synchronized wrapper
+    static class ThreadSafeLRUCache<K, V> {
+        private final Map<K, V> cache;
+
+        public ThreadSafeLRUCache(int capacity) {
+            // Synchronized wrapper around LinkedHashMap
+            this.cache = Collections.synchronizedMap(
+                new LinkedHashMap<>(capacity + 1, 1.0f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                        return size() > capacity;
+                    }
+                }
+            );
+        }
+
+        public V get(K key) {
+            return cache.get(key);  // Synchronized
+        }
+
+        public void put(K key, V value) {
+            cache.put(key, value);  // Synchronized
+        }
+
+        public boolean containsKey(K key) {
+            return cache.containsKey(key);  // Synchronized
+        }
+    }
+
+    // PRESERVING DATABASE ORDER BY using LinkedHashMap
+    // Scenario: query returns roles ordered by priority
+    static Map<String, Integer> buildRolePriorityMap(List<String[]> dbRows) {
+        // WRONG: HashMap destroys the ORDER BY sort from DB!
+        Map<String, Integer> broken = new HashMap<>();
+        for (String[] row : dbRows) broken.put(row[0], Integer.parseInt(row[1]));
+
+        // CORRECT: LinkedHashMap preserves ORDER BY sequence
+        Map<String, Integer> ordered = new LinkedHashMap<>();
+        for (String[] row : dbRows) ordered.put(row[0], Integer.parseInt(row[1]));
+
+        return ordered;  // JSON serialization will maintain this order
+    }
+
+    // BUILDING ORDERED JSON RESPONSE
+    static Map<String, Object> buildApiResponse(boolean success, Object data, String message) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        // Field order matters for API contracts — clients expect "status" first
+        response.put("status", success ? "success" : "error");
+        response.put("message", message);
+        response.put("data", data);
+        response.put("timestamp", System.currentTimeMillis());
+        return response;
+        // Serialized JSON: {"status":"success","message":"OK","data":...,"timestamp":...}
+        // NOT: {"timestamp":...,"data":...,"status":"success","message":"OK"}  ← broken HashMap
+    }
+
     public static void main(String[] args) {
-        LRUCache<Integer, String> imageCache = new LRUCache<>(3);
-        
-        imageCache.put(1, "image1.png");
-        imageCache.put(2, "image2.png");
-        imageCache.put(3, "image3.png"); // Map is full (Size 3)
-        
-        imageCache.get(1); // 1 is now the MOST recently used
-        
-        imageCache.put(4, "image4.png"); // Triggers removeEldestEntry!
-        
-        // Key 2 was the LEAST recently used, so it was evicted!
-        // Prints: {3=image3.png, 1=image1.png, 4=image4.png}
-        System.out.println(imageCache);
+        // Thread-safe LRU
+        ThreadSafeLRUCache<String, String> sessionCache = new ThreadSafeLRUCache<>(100);
+        sessionCache.put("session-abc", "user-42");
+        sessionCache.put("session-def", "user-17");
+        System.out.println("Session found: " + sessionCache.get("session-abc"));
+
+        // Database ORDER BY preservation
+        List<String[]> dbRows = List.of(
+            new String[]{"SUPERADMIN", "100"},
+            new String[]{"ADMIN", "90"},
+            new String[]{"MANAGER", "50"},
+            new String[]{"USER", "10"}
+        );
+        Map<String, Integer> roles = buildRolePriorityMap(dbRows);
+        System.out.println("Roles in priority order: " + roles.keySet());
+        // [SUPERADMIN, ADMIN, MANAGER, USER] — preserved ✓
+
+        // Ordered API response
+        Map<String, Object> response = buildApiResponse(true, Map.of("id", 42), "User found");
+        System.out.println(response);
+        // {status=success, message=User found, data={id=42}, timestamp=...}
+    }
+}
+```
+
+### Level 5 — Expert
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+
+// Expert: Custom expiry LRU, TTL cache, Caffeine comparison
+public class ExpertLinkedHashMapPatterns {
+
+    // TTL-expiry LRU Cache: entries expire after TTL regardless of access
+    static class TtlLruCache<K, V> {
+        private record Entry<V>(V value, long expiresAt) {}
+
+        private final Map<K, Entry<V>> cache;
+        private final long ttlMs;
+
+        public TtlLruCache(int capacity, long ttlMs) {
+            this.ttlMs = ttlMs;
+            this.cache = new LinkedHashMap<>(capacity + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<K, Entry<V>> eldest) {
+                    // Evict if: over capacity OR eldest entry is expired
+                    return size() > capacity || eldest.getValue().expiresAt() < System.currentTimeMillis();
+                }
+            };
+        }
+
+        public void put(K key, V value) {
+            cache.put(key, new Entry<>(value, System.currentTimeMillis() + ttlMs));
+        }
+
+        public Optional<V> get(K key) {
+            Entry<V> entry = cache.get(key);
+            if (entry == null) return Optional.empty();
+            if (entry.expiresAt() < System.currentTimeMillis()) {
+                cache.remove(key);  // Expired — remove and return empty
+                return Optional.empty();
+            }
+            return Optional.of(entry.value());
+        }
+    }
+
+    // CACHE STAMPEDE PREVENTION: compute-if-absent with locking
+    static class CacheWithStampedeProtection<K, V> {
+        private final Map<K, V> cache;
+        private final Map<K, CompletableFuture<V>> pendingLoads = new ConcurrentHashMap<>();
+        private final Function<K, V> loader;
+
+        public CacheWithStampedeProtection(int capacity, Function<K, V> loader) {
+            this.loader = loader;
+            this.cache = Collections.synchronizedMap(
+                new LinkedHashMap<>(capacity + 1, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                        return size() > capacity;
+                    }
+                }
+            );
+        }
+
+        // Only ONE thread loads per key — others wait for the same CompletableFuture
+        public V getOrLoad(K key) throws Exception {
+            V cached = cache.get(key);
+            if (cached != null) return cached;
+
+            CompletableFuture<V> future = pendingLoads.computeIfAbsent(key, k -> {
+                CompletableFuture<V> f = new CompletableFuture<>();
+                // Load asynchronously
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        V value = loader.apply(k);
+                        cache.put(k, value);
+                        f.complete(value);
+                    } catch (Exception e) {
+                        f.completeExceptionally(e);
+                    } finally {
+                        pendingLoads.remove(k);
+                    }
+                });
+                return f;
+            });
+
+            return future.get();  // All threads waiting for same key share this future
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // TTL LRU cache — entries expire after 1 second
+        TtlLruCache<String, String> ttlCache = new TtlLruCache<>(10, 1_000);
+        ttlCache.put("key1", "value1");
+        System.out.println("Immediate: " + ttlCache.get("key1"));  // Optional[value1]
+        Thread.sleep(1_500);
+        System.out.println("After TTL: " + ttlCache.get("key1"));  // Optional.empty
+
+        // Cache stampede protection
+        CacheWithStampedeProtection<String, String> safeCache =
+            new CacheWithStampedeProtection<>(100, key -> {
+                System.out.println("Loading: " + key + " on " + Thread.currentThread().getName());
+                try { Thread.sleep(100); } catch (InterruptedException e) {}
+                return "value_for_" + key;
+            });
+
+        // 5 threads requesting same key — only ONE should trigger the loader
+        var futures = new ArrayList<CompletableFuture<Void>>();
+        for (int i = 0; i < 5; i++) {
+            futures.add(CompletableFuture.runAsync(() -> {
+                try {
+                    System.out.println("Got: " + safeCache.getOrLoad("shared-key"));
+                } catch (Exception e) {}
+            }));
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        // "Loading: shared-key" should appear exactly ONCE
     }
 }
 ```
 
 ## REAL_WORLD
-In Spring Boot applications, developers often need to fetch a list of roles from the database and send them to the frontend UI as JSON. 
-If the database query sorts the roles by `priority` using `ORDER BY priority DESC`, the JDBC driver returns the rows in perfect order. 
-However, if the developer blindly maps those rows into a standard `HashMap<String, RoleDTO>`, the Map destroys the sorting! When the JSON is serialized and sent to the frontend, the UI renders the roles out of order, leading to a horrible user experience.
 
-To preserve the `ORDER BY` clause from a database when constructing a Map, you **must** use a `LinkedHashMap`. It guarantees that the JSON serialization will process the keys in the exact order they were inserted.
+### Spring Boot: Preserving Column Order in Dynamic Reports
+```java
+@Service
+public class ReportService {
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    // BAD: HashMap destroys the column order from ORDER BY
+    public List<Map<String, Object>> getBadReport() {
+        return jdbc.queryForList("SELECT id, name, email, created_at FROM users ORDER BY created_at");
+        // JdbcTemplate returns HashMap internally → column order random → bad spreadsheet
+    }
+
+    // GOOD: Force LinkedHashMap for ordered columns
+    public List<Map<String, Object>> getOrderedReport() {
+        return jdbc.query(
+            "SELECT id, name, email, created_at FROM users ORDER BY created_at",
+            (rs, rowNum) -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("id", rs.getLong("id"));
+                row.put("name", rs.getString("name"));
+                row.put("email", rs.getString("email"));
+                row.put("created_at", rs.getTimestamp("created_at"));
+                return row;  // LinkedHashMap → Jackson serializes in insertion order
+            }
+        );
+        // JSON: [{"id":1,"name":"Alice","email":"...","created_at":"..."}, ...]
+        // Column order preserved ✓
+    }
+
+    // HTTP response caching with LRU eviction
+    private final Map<String, byte[]> responseCache = new LinkedHashMap<>(200, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+            return size() > 200;  // Max 200 cached responses
+        }
+    };
+
+    public byte[] getCachedResponse(String cacheKey) {
+        return responseCache.get(cacheKey);  // Moves to tail (most recently used)
+    }
+}
+```
 
 ## INTERVIEW
-**Q: How does `LinkedHashMap` guarantee insertion order?**
-A: It maintains a global doubly-linked list connecting all entries. When a new entry is put into the map, it is appended to the tail of this list. When you iterate over the map, it simply follows the linked list pointers instead of scanning the array buckets.
 
-**Q: Does `LinkedHashMap` consume more memory than `HashMap`?**
-A: Yes. Every `Node` in a `LinkedHashMap` has two extra pointers (`before` and `after`) to maintain the doubly-linked list. On a 64-bit JVM, this adds 16 bytes of overhead to every single entry in the map.
+### Q1: What is the internal difference between HashMap and LinkedHashMap?
+**Difficulty:** Medium | **Companies:** All
 
-**Q: How do you configure a `LinkedHashMap` to act as an LRU Cache?**
-A: You must invoke the constructor with the `accessOrder` boolean set to `true`. Then, you override the `removeEldestEntry(Map.Entry eldest)` method to return `true` when the map's size exceeds your desired maximum capacity. The map will automatically evict the least recently accessed item.
+❌ **Weak:** "LinkedHashMap maintains insertion order."
+
+✅ **Strong:** "LinkedHashMap extends HashMap and uses the same bucket array + hash function for O(1) get/put. The key difference is that LinkedHashMap overrides the `Node` class to add `before` and `after` pointers, maintaining a global doubly-linked list that threads through all entries. On every `put()`, the new node is appended to the tail. On every `get()` with access order enabled, the accessed node is unlinked from its position and moved to the tail. Iteration walks this linked list (head to tail), giving insertion or access order, bypassing the random bucket layout. The overhead is +16 bytes per entry (two extra 8-byte pointers on 64-bit JVM)."
+
+---
+
+### Q2: How do you implement a production-grade LRU cache in Java?
+**Difficulty:** Medium | **Companies:** Google, Amazon, Facebook
+
+❌ **Weak:** "Use LinkedHashMap with accessOrder=true."
+
+✅ **Strong:** "Two approaches: (1) **LinkedHashMap**: `new LinkedHashMap<>(capacity+1, 0.75f, true)` + override `removeEldestEntry()` to return `size() > capacity`. Every `get()` moves the entry to the tail (MRU). Head = LRU. When `put()` would exceed capacity, `removeEldestEntry()` returns true, auto-evicting the LRU. Wrap in `Collections.synchronizedMap()` for thread safety. (2) **Manual**: `HashMap<K, Node>` + doubly-linked list with explicit head/tail pointers. This is what Caffeine and Redis use — allows custom eviction policies (W-TinyLFU, LFU) beyond pure LRU. For production, consider Caffeine's `LoadingCache` which implements Window TinyLFU with much better hit rate than LRU."
+
+---
+
+### Q3: When would you use LinkedHashMap over HashMap in an API?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak:** "When you need to maintain order."
+
+✅ **Strong:** "Three main cases: (1) **Preserving database ORDER BY**: When streaming JDBC ResultSet into a Map, HashMap loses the sort order from `ORDER BY`. LinkedHashMap preserves it — critical for ordered dropdown menus or sorted reports. (2) **JSON field ordering**: When building dynamic JSON responses (`Map<String, Object>`), Jackson serializes keys in iteration order. LinkedHashMap ensures `status` appears before `data` — important for API contract consistency. (3) **LRU cache**: With `accessOrder=true`, LinkedHashMap tracks access recency — foundation for session caches, HTTP response caches, and query result caches without needing external dependencies."
+
+---
+
+### Q4: What is the time complexity of LinkedHashMap operations?
+**Difficulty:** Easy | **Companies:** All
+
+❌ **Weak:** "Same as HashMap — O(1)."
+
+✅ **Strong:** "`get()`, `put()`, `remove()`, `containsKey()` are all O(1) average case — same as HashMap, using the same hash bucket array. The doubly-linked list operations (appending to tail on insert, moving to tail on access, removing from list on delete) are all O(1) pointer operations. Iteration is O(n) where n = number of entries — it walks the linked list. Space complexity is O(n) with a constant factor larger than HashMap: each entry has +16 bytes for the two extra linked list pointers."
+
+---
+
+### Q5: What happens to the `removeEldestEntry()` contract if you call `size()` on a custom subclass?
+**Difficulty:** Hard | **Companies:** Oracle, JetBrains
+
+❌ **Weak:** "It returns the current size."
+
+✅ **Strong:** "`removeEldestEntry()` is called by `afterNodeInsertion()` AFTER the new entry has already been inserted into the map. So `size()` inside `removeEldestEntry()` already reflects the new size including the just-inserted entry. This is why the correct condition is `return size() > MAX_CAPACITY` (not `>=`). If you use `>=`, you'd evict after reaching capacity rather than exceeding it, resulting in max capacity-1 entries. Also critical: `removeEldestEntry()` must NOT call `put()` or modify the map — it's called during the `put()` execution stack, and modifying the map during this callback causes `ConcurrentModificationException` or infinite recursion."
+
+## FEYNMAN CHECK
+
+`LinkedHashMap` is like a library with two systems: a card catalog (hash table) for fast lookups by title, and a physical shelf where books are arranged in order. When you add a new book, it goes into the card catalog AND onto the end of the shelf. When you look up a book, you use the card catalog for O(1) speed. When you walk the library in order, you follow the shelf. In LRU mode, every time you check out a book, a librarian moves it to the end of the shelf. The book at the very front? That's the one nobody has touched in the longest time — the least recently used.
+
+## BUILD
+
+**Challenge 1:** Implement an `LRUCache<K,V>` using ONLY `HashMap` + a manually managed doubly-linked list. This is the standard interview question — no LinkedHashMap allowed. O(1) get and put.
+
+**Challenge 2:** Build a JDBC ResultSet → `LinkedHashMap` mapper that preserves column order from a `SELECT *` query. Compare JSON output with a HashMap-based mapper.
+
+**Challenge 3:** Create a `TtlCache<K,V>` that evicts entries both when the cache exceeds capacity (LRU) AND when entries expire after a configurable TTL.
+
+## SPACED REVIEW
+
+- **Day 1:** What extra data does LinkedHashMap.Entry have compared to HashMap.Entry?
+- **Day 3:** Write an LRU cache using LinkedHashMap in 10 lines of code
+- **Day 7:** What's the difference between insertion order and access order in LinkedHashMap?
+- **Day 14:** What happens when `removeEldestEntry()` is called? What's the size at that point?
+- **Day 30:** Why does `Collections.synchronizedMap(linkedHashMap)` require external synchronization during iteration? How do you safely iterate it?

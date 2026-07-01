@@ -144,3 +144,227 @@ A: For a marketing + e-commerce site, Next.js provides critical capabilities tha
 4. **Image optimization:** Next.js `<Image>` component automatically converts images to WebP, serves correct sizes for each device, and lazy-loads — e-commerce is image-heavy, this is a significant performance win.
 
 CRA/Vite are fine for internal dashboards or apps behind authentication where SEO doesn't matter. For public-facing sites, Next.js is the clear choice.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Like I'm 10 Years Old
+> Next.js is a React framework that adds PRODUCTION SUPERPOWERS on top of React. React alone only runs in the browser — Next.js adds a Node.js server that can run your React components on the SERVER before sending HTML to the browser. This means the user sees REAL content immediately instead of a blank page waiting for JavaScript. The non-obvious depth: Next.js is a FULL-STACK framework — your React components can read databases, call APIs, and run server-only code in the same codebase as your UI, with no separate backend needed. This is why Next.js powers high-traffic production apps at Vercel, TikTok, Twitch, and Hulu — it gives React apps server-rendering performance without the complexity of maintaining a separate API server.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What fundamental problem does Next.js solve that React alone cannot?**
+> **A:** React is a CLIENT-SIDE library — it ships JavaScript to the browser and renders HTML there. This means: (1) First page load shows blank HTML until JS downloads and runs (bad for LCP Core Web Vitals). (2) Search engines see empty pages (bad for SEO). (3) Every API call goes browser → your backend → third-party API (extra latency). Next.js solves all three: server-rendered HTML arrives pre-populated, search engines index real content, and server components call databases/APIs directly from the server with zero client-side network overhead.
+
+**Q2: What is the single mental model that makes Next.js click?**
+> **A:** "The file system IS the router." Every file in app/ or pages/ becomes a route automatically — no router configuration needed. app/dashboard/settings/page.tsx becomes /dashboard/settings. This convention-over-configuration principle extends to layouts (layout.tsx), loading states (loading.tsx), error boundaries (error.tsx), and API routes (route.ts). Once you internalize this, the entire framework becomes predictable — you know where to put any feature before you write a line of code.
+
+**Q3: Most dangerous misconception about Next.js?**
+> **A:** Server Components can do anything React components can:
+> ```typescript
+> // WRONG: Server Component using React hooks
+> // app/products/page.tsx
+> export default function ProductsPage() {
+>   const [count, setCount] = useState(0);  // ERROR: hooks don't exist on server
+>   useEffect(() => { fetchData(); }, []);   // ERROR: no browser lifecycle on server
+>   return <div>{count}</div>;
+> }
+>
+> // CORRECT: Server Components = async functions, no hooks
+> export default async function ProductsPage() {
+>   const products = await db.query('SELECT * FROM products');
+>   return <ProductList products={products} />;
+> }
+> // Add 'use client' at top of file to use hooks
+> ```
+
+**Q4: How does Next.js's build output differ from a plain React app?**
+> **A:** A plain React build (CRA/Vite) produces static HTML + JS that always runs in the browser — identical for all users. Next.js build produces a HYBRID output: static HTML pages (pre-generated at build time for SSG routes), Node.js server functions (for SSR routes), Edge Runtime functions (for middleware, edge API routes), and static assets. The output can be deployed to Vercel (managed), a Node.js server, Docker, or exported as fully static HTML (next export) for CDN-only hosting.
+
+**Q5: FAANG-grade one-sentence definition of Next.js.**
+> **A:** "Next.js is a React meta-framework providing file-system-based routing, React Server Components for zero-client-bundle server rendering, multiple data fetching strategies (SSG, SSR, ISR, streaming), Edge Runtime support, built-in image/font optimisation, and a full-stack deployment model — enabling React applications to achieve sub-second Time To First Byte with progressive hydration while maintaining the developer experience of a single-repository full-stack application."
+
+## BUILD
+
+### 🏗️ Mini Project: Full-Stack Next.js App — Products Catalog With SSR + API Routes + DB
+
+**What you will build:** A products listing page using App Router: server component fetching from a SQLite database, client component for search filtering, API route for CRUD, and a loading skeleton — demonstrating every core Next.js concept in one app.
+**Why this project:** Forces Server Components, Client Components, API Routes, and the App Router file structure together.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest nextjs-products --typescript --tailwind --app --src-dir
+cd nextjs-products
+npm install better-sqlite3 @types/better-sqlite3
+```
+
+#### Step 2 — Database Layer (server-only)
+```typescript
+// src/lib/db.ts
+import Database from 'better-sqlite3';
+import path from 'path';
+
+const db = new Database(path.join(process.cwd(), 'products.db'));
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    category TEXT NOT NULL,
+    in_stock INTEGER DEFAULT 1
+  )
+`);
+
+// Seed if empty
+const count = (db.prepare('SELECT COUNT(*) as count FROM products').get() as any).count;
+if (count === 0) {
+  const insert = db.prepare('INSERT INTO products (name, price, category) VALUES (?, ?, ?)');
+  [
+    ['Next.js Handbook', 29.99, 'books'],
+    ['React Deep Dive', 39.99, 'books'],
+    ['TypeScript Course', 49.99, 'courses'],
+    ['Node.js Mastery', 44.99, 'courses'],
+    ['VSCode Pro', 0, 'tools'],
+  ].forEach(([name, price, category]) => insert.run(name, price, category));
+}
+
+export interface Product { id: number; name: string; price: number; category: string; in_stock: number; }
+
+export const getProducts = (category?: string): Product[] => {
+  if (category) return db.prepare('SELECT * FROM products WHERE category = ?').all(category) as Product[];
+  return db.prepare('SELECT * FROM products').all() as Product[];
+};
+
+export const getProduct = (id: number): Product | undefined =>
+  db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Product | undefined;
+```
+
+#### Step 3 — Server Component Page
+```typescript
+// src/app/products/page.tsx
+import { getProducts } from '@/lib/db';
+import { ProductCard } from '@/components/ProductCard';
+import { SearchFilter } from '@/components/SearchFilter';
+import { Suspense } from 'react';
+
+interface Props { searchParams: { category?: string } }
+
+// This runs on the SERVER — no client bundle, direct DB access
+export default async function ProductsPage({ searchParams }: Props) {
+  const products = getProducts(searchParams.category);
+
+  return (
+    <main className="container mx-auto p-8">
+      <h1 className="text-3xl font-bold mb-6">Products ({products.length})</h1>
+      <SearchFilter />  {/* Client Component for interactivity */}
+      <Suspense fallback={<div className="animate-pulse">Loading...</div>}>
+        <div className="grid grid-cols-3 gap-4 mt-4">
+          {products.map(p => <ProductCard key={p.id} product={p} />)}
+        </div>
+      </Suspense>
+    </main>
+  );
+}
+
+// Revalidate cache every 60 seconds (ISR)
+export const revalidate = 60;
+```
+
+#### Step 4 — API Route for CRUD
+```typescript
+// src/app/api/products/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { getProducts } from '@/lib/db';
+import Database from 'better-sqlite3';
+import path from 'path';
+
+const db = new Database(path.join(process.cwd(), 'products.db'));
+
+export async function GET(request: NextRequest) {
+  const category = request.nextUrl.searchParams.get('category') ?? undefined;
+  const products = getProducts(category);
+  return NextResponse.json(products);
+}
+
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  const { name, price, category } = body;
+
+  if (!name || price === undefined || !category) {
+    return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+  }
+
+  const result = db.prepare('INSERT INTO products (name, price, category) VALUES (?, ?, ?)')
+    .run(name, price, category);
+
+  return NextResponse.json({ id: result.lastInsertRowid }, { status: 201 });
+}
+```
+
+#### Step 5 — Loading and Error Pages
+```typescript
+// src/app/products/loading.tsx
+export default function ProductsLoading() {
+  return (
+    <div className="grid grid-cols-3 gap-4 p-8">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="h-40 bg-gray-200 animate-pulse rounded-lg" />
+      ))}
+    </div>
+  );
+}
+
+// src/app/products/error.tsx
+'use client';
+export default function ProductsError({ error, reset }: { error: Error; reset: () => void }) {
+  return (
+    <div className="p-8">
+      <h2>Failed to load products: {error.message}</h2>
+      <button onClick={reset} className="mt-4 px-4 py-2 bg-blue-500 text-white rounded">
+        Try again
+      </button>
+    </div>
+  );
+}
+```
+
+**Expected Output:**
+```
+npm run dev
+http://localhost:3000/products -> shows 5 products (SSR, instant HTML)
+?category=books -> filters to 2 books
+/api/products -> JSON array
+POST /api/products -> creates product, returns {id: 6}
+```
+
+**Stretch Challenges:**
+- [ ] Add a product detail page with generateStaticParams for SSG
+- [ ] Add optimistic UI updates for the add-product form using Server Actions
+- [ ] Add a loading.tsx skeleton that matches the exact product card dimensions
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What problems does Next.js solve that React alone cannot?
+**Q2:** What is the file-system router rule in Next.js App Router?
+**Q3:** Write the minimal App Router page that fetches data from a DB. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the difference between a Server Component and a Client Component?
+**Q5:** A junior adds useState to a Server Component — what error and why?
+**Q6:** When does Next.js revalidate a page vs serve from cache?
+
+### Day 7 — Application
+**Q7:** Build a Next.js app with SSG product pages and ISR for updates.
+**Q8:** A PR puts a large library import in a Server Component — does it affect bundle size?
+**Q9:** What is next.config.js and what are the three most important options?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Next.js rendering strategies — when would you use SSG, SSR, ISR, and Streaming for a real e-commerce site?"
+**Q11:** Draw: Next.js build output — static pages, server functions, edge functions, assets.
+**Q12:** ★ System design: "Design the Next.js architecture for a high-traffic news site — 10M users, SEO-critical, personalised recommendations, real-time comments."

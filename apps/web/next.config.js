@@ -1,4 +1,5 @@
 /** @type {import('next').NextConfig} */
+const path = require('path');
 const { setupDevPlatform } = process.env.NODE_ENV === 'development'
   ? require('@cloudflare/next-on-pages/next-dev')
   : { setupDevPlatform: () => {} };
@@ -7,11 +8,17 @@ const nextConfig = {
   reactStrictMode: true,
 
   // Required for @cloudflare/next-on-pages
-  // Tells Next.js to produce edge-compatible output
   experimental: {},
 
+  webpack: (config) => {
+    // Force all packages to use the same single React instance
+    // Prevents "multiple React versions" error from @mdx-js/react etc.
+    config.resolve.alias['react'] = path.resolve('./node_modules/react');
+    config.resolve.alias['react-dom'] = path.resolve('./node_modules/react-dom');
+    return config;
+  },
+
   images: {
-    // Cloudflare Pages doesn't have a Node image optimizer — use unoptimized
     unoptimized: true,
     domains: ['avatars.githubusercontent.com', 'lh3.googleusercontent.com'],
   },

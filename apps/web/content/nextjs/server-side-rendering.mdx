@@ -112,3 +112,233 @@ When a user requests an SSR page, the request hits your server. The server must 
 A: It is marked as `λ (Server)` because it uses `searchParams`, which forces the page into Dynamic Rendering (SSR).
 
 No, it cannot be completely statically generated. Search parameters (`?page=2`, `?sort=asc`) are not part of the file path. They can be any arbitrary value provided by the user at request time. Since Next.js cannot know all possible search parameter combinations at build time, it must render the page dynamically on the server for each request to read those parameters.
+
+## FEYNMAN CHECK
+
+### Explain Next.js SSR Like I'm 10 Years Old
+> Server-Side Rendering (SSR) means Next.js renders your page HTML on the server FOR EVERY REQUEST — when a user visits /dashboard, the server fetches their data and sends them a pre-built HTML page personalised for them. Without SSR, the server sends an empty HTML shell and the browser does all the work (slow first load, blank page). With SSR, the user sees real content IMMEDIATELY because the HTML arrives pre-populated. The non-obvious trade-off: SSR means EVERY page visit hits your server — it cannot be cached on a CDN. For truly high-traffic pages (millions of hits), SSG (pre-built HTML on CDN) is faster. SSR is best for personalised pages (dashboards, account, cart) where the content must be fresh for each user.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you use SSR (dynamic rendering) vs SSG?**
+> **A:** Use SSR when: content is personalised per user (dashboard, account page), content must be real-time (stock prices, live inventory), the page requires request-time data (cookies for auth, IP for geo), or content changes too frequently for ISR. Use SSG when: content is the same for all users (blog posts, docs, landing pages), content changes rarely (daily or less), or maximum performance is needed (CDN-served, sub-50ms TTFB). The rule: if you need the request object (cookies, headers, IP) to render the page, you need SSR. Otherwise, prefer SSG.
+
+**Q2: Mental model for Next.js App Router dynamic rendering?**
+> **A:** In the App Router, pages are STATICALLY RENDERED by default. They become DYNAMICALLY RENDERED (SSR) automatically when: the component accesses dynamic functions (cookies(), headers(), searchParams), when you use unstable_noStore() or fetch('url', { cache: 'no-store' }), or when you export dynamic = 'force-dynamic'. Next.js infers this at build time — if it detects dynamic function usage, it marks the route as dynamic and skips pre-rendering. No explicit SSR configuration needed; it happens based on your code.
+
+**Q3: Most dangerous misconception about SSR?**
+> **A:** SSR responses can be cached by CDNs:
+> ```typescript
+> // WRONG: SSR pages are dynamic — CDNs cannot cache them per-user
+> // Putting a personalised page behind a CDN serves the same cached page to everyone:
+> // User A logs in -> CDN caches their dashboard -> User B gets User A's dashboard!
+>
+> // CORRECT: SSR responses MUST have appropriate cache-control headers
+> // For personalised pages:
+> import { headers } from 'next/headers';
+> export default async function DashboardPage() {
+>   const cookieStore = cookies();  // accessing cookies forces dynamic rendering
+>   const user = await getUserFromCookie(cookieStore.get('session'));
+>   return <Dashboard user={user} />;
+> }
+> // Next.js sets Cache-Control: private, no-cache automatically for dynamic pages
+> ```
+
+**Q4: How does streaming improve SSR performance?**
+> **A:** Traditional SSR: wait for ALL server work to complete → send complete HTML → user sees page. Streaming SSR: send HTML shell immediately → stream each Suspense boundary's HTML as it resolves → user sees the page skeleton instantly, data fills in progressively. Next.js implements this via React 18's streaming server renderer. The critical metric: Time To First Byte (TTFB) drops to near-zero with streaming because the shell arrives instantly, while Time To Interactive improves because interactive content streams in without blocking.
+
+**Q5: FAANG-grade definition of Next.js SSR.**
+> **A:** "Next.js server-side rendering (dynamic rendering) generates page HTML at request time on the Node.js server — triggered automatically when dynamic functions (cookies(), headers(), searchParams) are used or fetch is called with cache: 'no-store' — producing per-request personalised HTML with React 18 streaming for progressive content delivery — setting private, no-cache response headers to prevent CDN caching — appropriate for authenticated, personalised, or real-time content where static pre-generation is impossible — with Suspense boundaries enabling simultaneous HTML streaming of fast and slow content without blocking."
+
+## BUILD
+
+### 🏗️ Mini Project: Personalised Dashboard — Cookie-Based Auth + Dynamic SSR + Streaming
+
+**What you will build:** A dashboard page that: reads a session cookie for auth, fetches user-specific data server-side (no API calls from client), streams slow widgets via Suspense, and demonstrates the dynamic rendering trigger.
+**Why this project:** Forces all SSR triggers: cookies(), dynamic rendering, Suspense streaming.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest ssr-demo --typescript --tailwind --app
+npm install jose  # for JWT verification
+```
+
+#### Step 2 — Auth Utilities
+```typescript
+// src/lib/auth.ts
+import { cookies } from 'next/headers';
+
+export interface SessionUser { id: string; name: string; email: string; role: string; }
+
+export async function getSessionUser(): Promise<SessionUser | null> {
+  const cookieStore = cookies();  // TRIGGERS DYNAMIC RENDERING
+  const token = cookieStore.get('session')?.value;
+  if (!token) return null;
+
+  // In production: verify JWT with jose
+  // For demo, decode a simple base64 token
+  try {
+    const payload = JSON.parse(atob(token));
+    return payload as SessionUser;
+  } catch {
+    return null;
+  }
+}
+```
+
+#### Step 3 — Dynamic SSR Dashboard
+```typescript
+// src/app/dashboard/page.tsx
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+import { Suspense } from 'react';
+import { getSessionUser } from '@/lib/auth';
+
+// Simulate slow data fetches
+async function getRevenueMetrics(userId: string) {
+  await new Promise(r => setTimeout(r, 1500));  // slow query
+  return { total: 42000, growth: 12.5, currency: 'USD' };
+}
+
+async function getRecentActivity(userId: string) {
+  await new Promise(r => setTimeout(r, 500));   // fast query
+  return [
+    { id: 1, action: 'Deployed app', time: '2m ago' },
+    { id: 2, action: 'PR merged', time: '15m ago' },
+  ];
+}
+
+async function RevenueWidget({ userId }: { userId: string }) {
+  const metrics = await getRevenueMetrics(userId);
+  return (
+    <div className="bg-white rounded-lg p-6 shadow">
+      <h3 className="font-bold text-gray-600">Revenue</h3>
+      <p className="text-3xl font-bold">{metrics.total.toLocaleString()} {metrics.currency}</p>
+      <p className="text-green-500">+{metrics.growth}% this month</p>
+    </div>
+  );
+}
+
+async function ActivityFeed({ userId }: { userId: string }) {
+  const activity = await getRecentActivity(userId);
+  return (
+    <ul className="space-y-2">
+      {activity.map(a => (
+        <li key={a.id} className="flex justify-between text-sm">
+          <span>{a.action}</span>
+          <span className="text-gray-400">{a.time}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export default async function DashboardPage() {
+  const user = await getSessionUser();
+  if (!user) redirect('/login');  // server-side redirect if not authenticated
+
+  return (
+    <main className="p-8 max-w-4xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Welcome, {user.name}</h1>
+      <p className="text-gray-500 mb-6">{user.email}</p>
+
+      <div className="grid grid-cols-2 gap-6">
+        {/* ActivityFeed is fast — streams first */}
+        <Suspense fallback={<div className="h-40 animate-pulse bg-gray-100 rounded-lg" />}>
+          <ActivityFeed userId={user.id} />
+        </Suspense>
+
+        {/* RevenueWidget is slow — streams after 1.5s */}
+        <Suspense fallback={<div className="h-40 animate-pulse bg-gray-100 rounded-lg" />}>
+          <RevenueWidget userId={user.id} />
+        </Suspense>
+      </div>
+    </main>
+  );
+}
+```
+
+#### Step 4 — Login API Route
+```typescript
+// src/app/api/login/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function POST(request: NextRequest) {
+  const { email, password } = await request.json();
+
+  // Demo auth — in production: verify against DB
+  if (email === 'demo@example.com' && password === 'password') {
+    const user = { id: '1', name: 'Demo User', email, role: 'user' };
+    const token = btoa(JSON.stringify(user));
+
+    const response = NextResponse.json({ success: true });
+    response.cookies.set('session', token, {
+      httpOnly: true, secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax', maxAge: 60 * 60 * 24,  // 1 day
+    });
+    return response;
+  }
+  return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
+}
+```
+
+#### Step 5 — Tests
+```typescript
+// Test the auth utility
+import { getSessionUser } from '@/lib/auth';
+
+jest.mock('next/headers', () => ({
+  cookies: () => ({
+    get: (name: string) => name === 'session'
+      ? { value: btoa(JSON.stringify({ id: '1', name: 'Test', email: 'a@b.com', role: 'user' })) }
+      : undefined,
+  }),
+}));
+
+it('getSessionUser returns user from valid cookie', async () => {
+  const user = await getSessionUser();
+  expect(user?.email).toBe('a@b.com');
+  expect(user?.name).toBe('Test');
+});
+```
+
+**Expected Output:**
+```
+POST /api/login -> sets session cookie
+/dashboard (with cookie) -> user-specific HTML rendered on server
+/dashboard (no cookie) -> redirects to /login
+ActivityFeed appears first (500ms), RevenueWidget streams in after 1.5s
+curl -H "Cookie: session=..." http://localhost:3000/dashboard -> full HTML response
+```
+
+**Stretch Challenges:**
+- [ ] Replace base64 token with proper JWT using jose
+- [ ] Add middleware.ts that protects all /dashboard/* routes
+- [ ] Measure TTFB improvement of streaming vs non-streaming SSR
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What makes a Next.js page dynamically rendered (SSR)?
+**Q2:** Why can't SSR pages be cached on a CDN?
+**Q3:** Write an SSR page that reads a session cookie. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the difference between SSR and streaming SSR?
+**Q5:** A junior puts a public product page on SSR — explain the performance cost.
+**Q6:** What Next.js function auto-triggers dynamic rendering?
+
+### Day 7 — Application
+**Q7:** Add a dashboard page that shows user-specific data from cookies.
+**Q8:** A PR uses getServerSideProps but the team migrated to App Router — refactor.
+**Q9:** How do you force a Server Component to always be dynamic without using cookies?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Compare Next.js SSR and SSG — when does each one perform better and why?"
+**Q11:** Draw: SSR request flow — browser request → Next.js server → DB → HTML → browser hydration.
+**Q12:** ★ System design: "Design the rendering strategy for an e-commerce site: homepage, product pages, cart, checkout, and account."

@@ -148,3 +148,275 @@ A: **Cross-Origin Resource Sharing (CORS) Security.**
 Browsers implement a strict security rule called the *Same-Origin Policy*. By default, a website running on `mywebsite.com` is forbidden from reading data retrieved from `weather.com`. This prevents malicious websites from silently making requests to your bank account API while you are logged in.
 When you `fetch` a different domain, the browser requires the *target server* (weather.com) to include a specific HTTP header (`Access-Control-Allow-Origin: *`) explicitly granting permission for your website to read its data.
 *The Fix:* If you own the API, you must configure your backend server (e.g., Express or Spring Boot) to emit the correct CORS headers. If you do not own the API, you cannot bypass CORS in the browser. You must set up a "Proxy Server" (using Node.js or Next.js API routes on your own domain) to make the request on behalf of the client, because the CORS restriction only exists in web browsers, not on backend servers!
+
+## FEYNMAN CHECK
+
+### Explain the Fetch API Like I'm 10 Years Old
+> fetch() is the modern browser API for making HTTP requests. It returns a PROMISE that resolves to a Response object. The non-obvious trap: fetch() ONLY rejects the promise on NETWORK ERRORS (DNS failure, no internet). A 404 or 500 response is considered a "successful network call" — the Promise resolves, but `response.ok` is false. You MUST check `response.ok` manually. Response bodies are STREAMS — you can only read them ONCE. `response.json()` and `response.text()` return promises that buffer and parse the stream. Timeouts require AbortController — fetch has no built-in timeout option. Credentials (cookies, auth headers) are NOT sent by default to cross-origin requests — set `credentials: 'include'` for cookies.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What replaced XMLHttpRequest and why is fetch better?**
+> **A:** XHR was callback-based, verbose, had progress events but terrible composability. fetch uses Promises — chainable, async/await compatible. fetch supports Streams (read huge responses chunk by chunk without buffering), AbortSignal for cancellation, and has a cleaner API. The ONE thing XHR has that fetch originally didn't: upload progress events (now available via `request.body.pipeThrough` for modern fetch streams). For simple HTTP calls, fetch is objectively superior.
+
+**Q2: Mental model for the response lifecycle?**
+> **A:** fetch(url) → network happens → a Response is returned (headers available NOW, but body is a STREAM not yet read). Call `response.json()` / `response.text()` / `response.arrayBuffer()` / `response.blob()` to consume the body — each returns a Promise that resolves when buffering/parsing is done. Calling two body-consuming methods throws "body already consumed." Check `response.bodyUsed` or clone the response (`response.clone()`) for multiple reads.
+
+**Q3: Most dangerous misconception?**
+> **A:** fetch rejects on HTTP error status:
+> ```js
+> // ❌ This never catches 404 or 500 — they resolve successfully
+> try {
+>   const data = await fetch('/api/user/999').then(r => r.json());
+> } catch (e) {
+>   console.error('error', e);   // only runs on network failure
+> }
+>
+> // ✅ Check response.ok
+> const response = await fetch('/api/user/999');
+> if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+> const data = await response.json();
+> ```
+
+**Q4: How does AbortController work with fetch?**
+> **A:** `const ctrl = new AbortController()` creates a controller. Pass `signal: ctrl.signal` to fetch. Calling `ctrl.abort()` triggers an AbortError on the fetch Promise (and any attached streams). You can reuse one signal across multiple fetches to cancel them all. It's the standard pattern for cancelling stale requests in React useEffect cleanup functions.
+
+**Q5: FAANG-grade definition?**
+> **A:** "The Fetch API is a Promise-based HTTP client standardised in the browser environment (and available in Node.js 18+ natively) — returning a Response wrapping a ReadableStream body consumed exactly once via .json()/.text()/.blob()/.arrayBuffer() — resolving on any HTTP response (including 4xx/5xx) and rejecting only on network errors — with timeout, cancellation, and retry implemented externally via AbortController, Promise.race, and wrapper utilities."
+
+## BUILD
+
+### 🏗️ Mini Project: Production Fetch Wrapper With Retry, Timeout, And Type-Safety
+
+**What you will build:** An apiFetch(url, options) wrapper around the native fetch that: throws on non-ok responses, supports abort-signal timeout, retries with exponential backoff on network errors, and parses/validates the response JSON.
+**Why this project:** Every production codebase has exactly this wrapper — forces the real edge cases of fetch.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir js-fetch && cd js-fetch
+npm init -y && npm install -D vitest
+ni apiFetch.js, apiFetch.test.js -ItemType File
+```
+
+#### Step 2 — The Wrapper
+```js
+// apiFetch.js
+
+export class HttpError extends Error {
+  constructor(status, statusText, body) {
+    super(`HTTP ${status}: ${statusText}`);
+    this.name = 'HttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export async function apiFetch(url, {
+  method = 'GET',
+  headers = {},
+  body,
+  timeout = 10_000,
+  retries = 2,
+  retryDelay = 500,
+  signal: externalSignal,
+} = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('Request timeout')), timeout);
+
+  // Chain external signal with internal timeout signal
+  externalSignal?.addEventListener('abort', () => controller.abort(externalSignal.reason));
+
+  const attempt = async (n) => {
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        let errorBody;
+        try { errorBody = await response.json(); } catch { errorBody = null; }
+        throw new HttpError(response.status, response.statusText, errorBody);
+      }
+
+      const contentType = response.headers.get('content-type') ?? '';
+      return contentType.includes('application/json')
+        ? response.json()
+        : response.text();
+
+    } catch (err) {
+      // Don't retry HTTP errors or aborts — only retry network failures
+      if (err instanceof HttpError) throw err;
+      if (err.name === 'AbortError') throw err;
+
+      if (n > 0) {
+        await new Promise(r => setTimeout(r, retryDelay * (retries - n + 1)));
+        return attempt(n - 1);
+      }
+      throw err;
+    }
+  };
+
+  try {
+    return await attempt(retries);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+#### Step 3 — Use It
+```js
+// demo.js
+import { apiFetch, HttpError } from './apiFetch.js';
+
+// Basic GET
+const user = await apiFetch('/api/users/1');
+console.log('user:', user);
+
+// POST with body
+const created = await apiFetch('/api/users', {
+  method: 'POST',
+  body: { name: 'Ana', email: 'ana@dev.io' },
+});
+console.log('created:', created);
+
+// Error handling
+try {
+  await apiFetch('/api/users/9999');
+} catch (e) {
+  if (e instanceof HttpError && e.status === 404) {
+    console.log('User not found');
+  } else {
+    throw e;
+  }
+}
+
+// Timeout + cancel
+const ctrl = new AbortController();
+setTimeout(() => ctrl.abort(), 500);
+try {
+  await apiFetch('/api/slow-endpoint', { timeout: 2000, signal: ctrl.signal });
+} catch (e) {
+  console.log('Cancelled:', e.name);
+}
+```
+
+#### Step 4 — Error Handling: Streaming Body
+```js
+// Stream large response
+async function streamJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let chunks = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks += decoder.decode(value, { stream: true });
+    process.stdout.write('.');   // progress indicator
+  }
+  return JSON.parse(chunks);
+}
+```
+
+#### Step 5 — Tests
+```js
+// apiFetch.test.js
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { apiFetch, HttpError } from './apiFetch.js';
+
+// Mock global fetch
+const mockFetch = vi.fn();
+globalThis.fetch = mockFetch;
+
+function makeResponse(status, body) {
+  return Promise.resolve({
+    ok: status < 400,
+    status,
+    statusText: status === 200 ? 'OK' : 'Error',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    json: () => Promise.resolve(body),
+  });
+}
+
+describe('apiFetch', () => {
+  beforeEach(() => mockFetch.mockClear());
+
+  it('returns parsed JSON on success', async () => {
+    mockFetch.mockReturnValue(makeResponse(200, { id: 1 }));
+    const r = await apiFetch('/api/user');
+    expect(r).toEqual({ id: 1 });
+  });
+
+  it('throws HttpError on 4xx/5xx', async () => {
+    mockFetch.mockReturnValue(makeResponse(404, { message: 'not found' }));
+    await expect(apiFetch('/api/user')).rejects.toBeInstanceOf(HttpError);
+  });
+
+  it('retries on network error', async () => {
+    mockFetch
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockReturnValue(makeResponse(200, 'ok'));
+    const r = await apiFetch('/api', { retryDelay: 1 });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(r).toBe('ok');
+  });
+
+  it('does not retry HttpError', async () => {
+    mockFetch.mockReturnValue(makeResponse(500, { error: 'server' }));
+    await expect(apiFetch('/api', { retryDelay: 1 })).rejects.toBeInstanceOf(HttpError);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+**Expected Output:**
+```
+user: { id: 1, name: 'Ana', email: 'a@dev.io' }
+created: { id: 2, name: 'Ana', email: 'ana@dev.io' }
+User not found
+Cancelled: AbortError
+
+# 4/4 tests pass
+```
+
+**Stretch Challenges:**
+- [ ] Add caching using a Map keyed by URL
+- [ ] Add request deduplication for concurrent same-URL calls
+- [ ] Add telemetry that sends timing/error metrics to a monitoring API
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When does fetch() reject?
+**Q2:** How do you timeout a fetch request?
+**Q3:** Write a one-liner that fetches and parses JSON, throwing on non-ok. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why can you only consume a Response body once?
+**Q5:** A junior does `const r = await fetch('/api'); const j = await r.json(); const t = await r.text()` — diagnose.
+**Q6:** Add timeout + retry to:
+```js
+async function getUser(id) {
+  return fetch('/api/users/'+id).then(r => r.json());
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a cancelable fetch with a component that cleans up on unmount.
+**Q8:** A PR uses axios — explain what fetch provides natively that justifies removing the dependency.
+**Q9:** What's the performance cost of JSON.parse for 5MB responses vs streaming?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every step of the fetch API — from call to parsed data, including error surfaces."
+**Q11:** Draw: fetch lifecycle (Promise states, Response stream, abort signal interaction).
+**Q12:** ★ System design: "Architect the HTTP client layer for a SPA: caching, deduplication, retry, auth injection, and error surfacing."

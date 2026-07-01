@@ -158,3 +158,196 @@ A: **Components do not inherently emit native DOM events!**
 When you put a directive on a native `<circle>` or `<button>`, the browser naturally bubbles up a native JavaScript `MouseEvent` called `click`. `@HostListener('click')` catches it perfectly.
 However, `<my-custom-component>` is an Angular abstraction, not a native interactive element. Unless the developer who built `my-custom-component` explicitly added an `@Output() click = new EventEmitter()` inside the component, it will never emit a `click` event for the `@HostListener` to catch!
 *The Fix:* If you need to track physical clicks on a custom component, you must wrap the component in a native `<div>` and attach the directive to the `<div>`, OR use `ElementRef` in the directive to drill down into the component's physical DOM node and attach a native listener directly!
+
+## FEYNMAN CHECK
+
+### Explain Custom Angular Directives Like I'm 10 Years Old
+> Custom directives let you attach reusable BEHAVIOUR to any HTML element — without creating a component (which has its own template). If you want an element to turn blue when hovered, auto-focus on init, or validate input format, you write a directive. The @Directive decorator registers it; the selector declares which elements it applies to. The directive gets access to the host element via ElementRef, can modify host properties/classes/styles via HostBinding, and can listen to host events via HostListener. The non-obvious distinction: use a DIRECTIVE when you want to ADD BEHAVIOUR to existing elements; use a COMPONENT when you need a new UI building block with its own template.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: When should you create a directive vs a component?**
+> **A:** Create a DIRECTIVE when: you want to add cross-cutting behaviour to existing elements (focus, tooltip, permissions, lazy-load, drag-drop, copy-to-clipboard), the feature doesn't require its own HTML structure, and it should work on any element type. Create a COMPONENT when: you are building a new UI element with its own template (button, card, modal, data-table), the visual structure is the primary concern. Rule of thumb: directives are ADVERBS (modify how something behaves), components are NOUNS (things in the UI).
+
+**Q2: Mental model for HostBinding and HostListener?**
+> **A:** HostBinding binds a TypeScript property to a HOST element property, attribute, or CSS class — @HostBinding('class.active') isActive = false; makes Angular add/remove the 'active' class based on isActive. HostListener registers a DOM event listener on the host element — @HostListener('click') onClick() { ... }. These are the DECLARATIVE alternative to manually calling renderer.setStyle(el) or el.addEventListener() in lifecycle hooks — more Angular-idiomatic, works with SSR, doesn't directly touch the DOM.
+
+**Q3: Most dangerous misconception about custom directives?**
+> **A:** Directly manipulating the DOM is fine in directives:
+> ```typescript
+> // WRONG: direct DOM manipulation breaks server-side rendering
+> constructor(private el: ElementRef) {}
+> ngOnInit() { this.el.nativeElement.style.color = 'red'; }
+>
+> // CORRECT: use Renderer2 for platform-safe DOM manipulation
+> constructor(private el: ElementRef, private renderer: Renderer2) {}
+> ngOnInit() { this.renderer.setStyle(this.el.nativeElement, 'color', 'red'); }
+> // Renderer2 works on Node.js (SSR), Web Workers, and Native Script
+> ```
+
+**Q4: How do structural directives work internally with ViewContainerRef?**
+> **A:** Structural directives control whether a DOM subtree is RENDERED by using ViewContainerRef and TemplateRef. @ViewContainerRef is the placeholder where elements can be inserted; @TemplateRef is the ng-template content. When *ngIf="true", Angular calls vcr.createEmbeddedView(templateRef) — inserting the view. When false, vcr.clear() removes it. You can build custom structural directives by injecting these two and controlling createEmbeddedView/clear yourself.
+
+**Q5: FAANG-grade definition of Angular custom directives.**
+> **A:** "An Angular custom directive is a TypeScript class decorated with @Directive that attaches reusable imperative behaviour to host elements — using ElementRef/Renderer2 for platform-safe DOM manipulation, @HostBinding for property/class/style bindings, @HostListener for event handling, @Input for configuration, and ViewContainerRef/TemplateRef for structural directives that create or destroy DOM subtrees — with the [selector] pattern enabling seamless composition on any element without template modification."
+
+## BUILD
+
+### 🏗️ Mini Project: Three Production Directives — Tooltip, Permission Guard, Auto-Focus
+
+**What you will build:** (1) [appTooltip]="text" — shows a floating tooltip on hover using Renderer2. (2) [appPermission]="'admin'" — structural directive that conditionally renders based on user role. (3) appAutoFocus — focuses the input on ngAfterViewInit.
+**Why this project:** Three different directive patterns covering attribute, structural, and ViewInit access.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new directive-lab --standalone --routing false
+ng generate directive tooltip --standalone
+ng generate directive permission --standalone
+ng generate directive auto-focus --standalone
+```
+
+#### Step 2 — Tooltip Directive
+```typescript
+// tooltip.directive.ts
+import { Directive, Input, ElementRef, Renderer2, HostListener, OnDestroy } from '@angular/core';
+
+@Directive({ selector: '[appTooltip]', standalone: true })
+export class TooltipDirective implements OnDestroy {
+  @Input('appTooltip') tooltipText = '';
+  private tooltipEl: HTMLElement | null = null;
+
+  constructor(private el: ElementRef, private renderer: Renderer2) {}
+
+  @HostListener('mouseenter') onEnter() {
+    this.tooltipEl = this.renderer.createElement('div');
+    this.renderer.setStyle(this.tooltipEl, 'position', 'absolute');
+    this.renderer.setStyle(this.tooltipEl, 'background', '#333');
+    this.renderer.setStyle(this.tooltipEl, 'color', '#fff');
+    this.renderer.setStyle(this.tooltipEl, 'padding', '4px 8px');
+    this.renderer.setStyle(this.tooltipEl, 'border-radius', '4px');
+    this.renderer.setStyle(this.tooltipEl, 'font-size', '12px');
+    this.renderer.setStyle(this.tooltipEl, 'z-index', '9999');
+    this.renderer.appendChild(this.tooltipEl, this.renderer.createText(this.tooltipText));
+    const rect = this.el.nativeElement.getBoundingClientRect();
+    this.renderer.setStyle(this.tooltipEl, 'top', (rect.bottom + window.scrollY + 4) + 'px');
+    this.renderer.setStyle(this.tooltipEl, 'left', (rect.left + window.scrollX) + 'px');
+    this.renderer.appendChild(document.body, this.tooltipEl);
+  }
+
+  @HostListener('mouseleave') onLeave() { this.removeTooltip(); }
+  ngOnDestroy() { this.removeTooltip(); }
+
+  private removeTooltip() {
+    if (this.tooltipEl) {
+      this.renderer.removeChild(document.body, this.tooltipEl);
+      this.tooltipEl = null;
+    }
+  }
+}
+```
+
+#### Step 3 — Permission Structural Directive
+```typescript
+// permission.directive.ts
+import { Directive, Input, TemplateRef, ViewContainerRef, inject } from '@angular/core';
+import { AuthService } from '../auth.service';
+
+@Directive({ selector: '[appPermission]', standalone: true })
+export class PermissionDirective {
+  private templateRef = inject(TemplateRef);
+  private vcr = inject(ViewContainerRef);
+  private auth = inject(AuthService);
+  private isRendered = false;
+
+  @Input('appPermission') set permission(required: string) {
+    const hasAccess = this.auth.hasPermission(required);
+    if (hasAccess && !this.isRendered) {
+      this.vcr.createEmbeddedView(this.templateRef);
+      this.isRendered = true;
+    } else if (!hasAccess && this.isRendered) {
+      this.vcr.clear();
+      this.isRendered = false;
+    }
+  }
+}
+
+// Usage: <button *appPermission="'admin'">Delete User</button>
+```
+
+#### Step 4 — AutoFocus Directive
+```typescript
+// auto-focus.directive.ts
+import { Directive, ElementRef, AfterViewInit } from '@angular/core';
+
+@Directive({ selector: '[appAutoFocus]', standalone: true })
+export class AutoFocusDirective implements AfterViewInit {
+  constructor(private el: ElementRef<HTMLElement>) {}
+  ngAfterViewInit() { setTimeout(() => this.el.nativeElement.focus(), 0); }
+}
+
+// Usage: <input appAutoFocus placeholder="Focused on load">
+```
+
+#### Step 5 — Tests
+```typescript
+describe('TooltipDirective', () => {
+  it('creates tooltip element on mouseenter', () => {
+    const fixture = TestBed.createComponent(TestHostComponent);
+    fixture.detectChanges();
+    const el = fixture.debugElement.query(By.directive(TooltipDirective));
+    el.nativeElement.dispatchEvent(new Event('mouseenter'));
+    expect(document.body.querySelector('div')).toBeTruthy();
+    el.nativeElement.dispatchEvent(new Event('mouseleave'));
+    expect(document.body.querySelector('div')).toBeFalsy();
+  });
+});
+
+describe('AutoFocusDirective', () => {
+  it('focuses the input after view init', async () => {
+    const fixture = TestBed.createComponent(TestHostComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const input = fixture.nativeElement.querySelector('input[appAutoFocus]');
+    expect(document.activeElement).toBe(input);
+  });
+});
+```
+
+**Expected Output:**
+```
+Hover over button -> tooltip appears, leave -> disappears
+Admin-only button visible for admin, hidden for viewer
+Input auto-focused on page load
+```
+
+**Stretch Challenges:**
+- [ ] Add animation to the tooltip using Angular Animations
+- [ ] Make appPermission an else block (like *ngIf with else)
+- [ ] Add a [appHighlight]="color" directive that highlights text on select
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** When do you use a directive vs a component?
+**Q2:** What is HostBinding and HostListener?
+**Q3:** Write the smallest possible custom attribute directive. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why use Renderer2 instead of directly accessing nativeElement.style?
+**Q5:** A junior uses document.getElementById in a directive — what's wrong?
+**Q6:** What is the difference between an attribute directive and a structural directive?
+
+### Day 7 — Application
+**Q7:** Build a [appClickOutside] directive that emits when a click occurs outside the element.
+**Q8:** A PR creates a component just to add a CSS class conditionally — refactor to directive.
+**Q9:** How do you pass configuration to a structural directive (like *ngIf with else)?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "How do structural directives work internally? Explain ViewContainerRef and TemplateRef."
+**Q11:** Draw: the internal mechanism of *ngIf false -> true transition.
+**Q12:** ★ System design: "Build a cross-cutting permission system using directives for 50+ UI elements."

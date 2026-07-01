@@ -190,3 +190,194 @@ A: It is a brilliant built-in directive used for navigation menus. If you write 
 
 **Q: What is the `canDeactivate` Guard used for?**
 A: `canActivate` blocks users from *entering* a route. `canDeactivate` blocks users from *leaving* a route. It is almost exclusively used to intercept a user trying to navigate away from a form with unsaved changes, allowing you to pop up a warning: "You have unsaved changes! Are you sure you want to leave?"
+
+## FEYNMAN CHECK
+
+### Explain Angular Routing Like I'm 10 Years Old
+> Angular routing maps browser URLs to components — when the URL is /users, show UserListComponent; when /users/42, show UserDetailComponent. The Router replaces the browser's full-page navigation with client-side navigation — the URL changes but no new HTML is downloaded. Angular uses the HTML5 History API (pushState) by default, making URLs look normal (/users instead of #/users). Lazy loading is the critical optimisation: { path: 'admin', loadComponent: () => import('./admin') } means the admin component's JavaScript is only downloaded when the user navigates to /admin — not on initial page load. The non-obvious depth: Angular's router is a state machine — every navigation goes through Redirect → CanActivate guards → Resolve data → ActivateRoute component → CanDeactivate — each step can cancel the navigation.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the router navigation lifecycle?**
+> **A:** (1) NavigationStart event. (2) URL parsing and matching to route config. (3) Redirects applied. (4) CanMatch guards — should this route handle the URL at all? (5) CanActivate guards — is the user allowed here? (6) CanActivateChild for child routes. (7) Resolve — pre-fetch data before component activates. (8) ActivateRoute — router-outlet renders the component. (9) NavigationEnd event. (10) CanDeactivate on leaving. At each step, a guard can return false or a UrlTree to cancel or redirect the navigation.
+
+**Q2: Mental model for ActivatedRoute and paramMap?**
+> **A:** ActivatedRoute is the snapshot of the CURRENT route — providing params (URL segments like :id), queryParams (search params after ?), data (static data from route config + resolved data), url (URL segments array), and fragment (#hash). paramMap and queryParamMap are Observables — they emit new values when the URL changes WITHOUT recreating the component (e.g., navigating /users/1 -> /users/2 reuses UserDetailComponent but emits a new params observable value). Use the observable form for single-page detail views to avoid creating/destroying the component on every navigation.
+
+**Q3: Most dangerous misconception about Angular routing?**
+> **A:** Lazy loading always improves performance:
+> ```typescript
+> // WRONG: Too many tiny lazy routes can HURT performance
+> // Each lazy module requires a separate HTTP request on first navigation
+> // 20 lazy routes = 20 network waterfalls on first visit to each
+>
+> // CORRECT: Lazy load FEATURE areas, not individual components
+> // Group related features together:
+> { path: 'admin', loadChildren: () => import('./admin/admin.routes') }
+> // This loads ALL admin routes in one bundle — one request for the whole feature
+>
+> // Also: use preloadingStrategy: PreloadAllModules to preload
+> // lazy routes in the background after initial load
+> ```
+
+**Q4: How do route guards work with signals and functional guards?**
+> **A:** Modern Angular (v15+) supports functional guards — plain functions returning boolean, UrlTree, or Observable<boolean>. The inject() function works in guard factories because guards run in an injection context. Functional guards are more composable: const adminGuard = () => inject(AuthService).isAdmin() ? true : redirect('/login'). They are also easier to test — no TestBed needed, just call the function with mocked inject() dependencies.
+
+**Q5: FAANG-grade definition of Angular routing.**
+> **A:** "Angular Router is a declarative, configuration-driven client-side router implementing the HTML5 History API — matching URL paths to component trees via a route configuration (Routes array) with lazy loading via dynamic import(), parameterised segments via :param syntax, guard pipeline (CanActivate, CanActivateChild, CanDeactivate, CanMatch, Resolve) forming a state-machine-like navigation lifecycle, router-outlet as the dynamic component insertion point, and preloading strategies for background bundle fetching to balance initial load speed with navigation responsiveness."
+
+## BUILD
+
+### 🏗️ Mini Project: Lazy-Loaded Router With Guards, Resolvers, and Breadcrumbs
+
+**What you will build:** A 3-route app (Home, Products, Product Detail) with lazy loading, a CanActivate auth guard, a Resolve data resolver, and dynamic breadcrumbs from route data — the routing patterns every production Angular app uses.
+**Why this project:** Forces lazy loading, functional guards, resolvers, and ActivatedRoute patterns together.
+**Time estimate:** 40 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new routing-demo --standalone --routing
+cd routing-demo
+ng generate component products --standalone
+ng generate component product-detail --standalone
+ng generate service auth
+ng generate service product
+```
+
+#### Step 2 — Auth Guard and Product Resolver
+```typescript
+// auth.guard.ts
+import { inject } from '@angular/core';
+import { Router } from '@angular/router';
+import { AuthService } from './auth.service';
+
+export const authGuard = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+  return auth.isLoggedIn() ? true : router.createUrlTree(['/login']);
+};
+
+// product.resolver.ts
+import { inject } from '@angular/core';
+import { ActivatedRouteSnapshot } from '@angular/router';
+import { ProductService } from './product.service';
+
+export const productResolver = (route: ActivatedRouteSnapshot) => {
+  const id = Number(route.paramMap.get('id'));
+  return inject(ProductService).getProduct(id);
+};
+```
+
+#### Step 3 — Routes With Lazy Loading
+```typescript
+// app.routes.ts
+import { Routes } from '@angular/router';
+import { authGuard } from './auth.guard';
+import { productResolver } from './product.resolver';
+
+export const routes: Routes = [
+  { path: '', redirectTo: 'home', pathMatch: 'full' },
+  {
+    path: 'products',
+    canActivate: [authGuard],
+    data: { breadcrumb: 'Products' },
+    loadComponent: () => import('./products/products.component').then(m => m.ProductsComponent),
+  },
+  {
+    path: 'products/:id',
+    canActivate: [authGuard],
+    data: { breadcrumb: 'Product Detail' },
+    resolve: { product: productResolver },
+    loadComponent: () => import('./product-detail/product-detail.component').then(m => m.ProductDetailComponent),
+  },
+  { path: '**', redirectTo: '' },
+];
+```
+
+#### Step 4 — Product Detail With Activated Route
+```typescript
+// product-detail.component.ts
+import { Component, inject } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
+import { AsyncPipe } from '@angular/common';
+
+@Component({
+  standalone: true, imports: [AsyncPipe],
+  template: `
+    @if (route.data | async; as data) {
+      <h1>{{ data.product.name }}</h1>
+      <p>Price: {{ data.product.price | currency }}</p>
+    }
+  `,
+})
+export class ProductDetailComponent {
+  route = inject(ActivatedRoute);
+}
+```
+
+#### Step 5 — Tests
+```typescript
+describe('authGuard', () => {
+  it('returns true when logged in', () => {
+    TestBed.configureTestingModule({ providers: [
+      { provide: AuthService, useValue: { isLoggedIn: () => true } },
+      { provide: Router, useValue: { createUrlTree: (p: any[]) => p } },
+    ]});
+    const result = TestBed.runInInjectionContext(() => authGuard());
+    expect(result).toBe(true);
+  });
+  it('redirects when not logged in', () => {
+    TestBed.configureTestingModule({ providers: [
+      { provide: AuthService, useValue: { isLoggedIn: () => false } },
+      { provide: Router, useValue: { createUrlTree: (p: any[]) => p } },
+    ]});
+    const result = TestBed.runInInjectionContext(() => authGuard());
+    expect(result).toEqual(['/login']);
+  });
+});
+```
+
+**Expected Output:**
+```
+/products -> lazily loaded ProductsComponent (network tab shows chunk)
+/products/1 -> resolver fetches product before component activates
+Not logged in -> redirect to /login
+Tests: 2 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a CanDeactivate guard on the product edit page
+- [ ] Add PreloadAllModules strategy
+- [ ] Add breadcrumbs by reading route.data.breadcrumb up the route hierarchy
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What is the order of router lifecycle steps?
+**Q2:** Difference between routerLink and Router.navigate()?
+**Q3:** Write a lazy-loaded route definition. From memory.
+
+### Day 3 — Comprehension
+**Q4:** What is the difference between paramMap (Observable) and snapshot.params?
+**Q5:** A junior uses too many small lazy modules — explain the waterfall performance issue.
+**Q6:** Refactor to functional guard:
+```typescript
+@Injectable()
+export class AuthGuard implements CanActivate {
+  canActivate() { return this.auth.isLoggedIn() ? true : this.router.createUrlTree(['/login']); }
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a breadcrumb component that reads route data up the route tree.
+**Q8:** A PR navigates to /users/1 then /users/2 — does UserDetailComponent recreate?
+**Q9:** What is withRouterConfig({ onSameUrlNavigation: 'reload' }) used for?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every step Angular's router takes from URL change to component render."
+**Q11:** Draw: router navigation state machine — all guard types in order.
+**Q12:** ★ System design: "Design routing for an Angular SPA with 100+ routes, 5 permission levels, and 3 user types."

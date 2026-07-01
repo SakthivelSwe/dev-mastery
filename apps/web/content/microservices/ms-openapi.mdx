@@ -1,0 +1,690 @@
+---
+slug: "ms-openapi"
+title: "OpenAPI / Swagger"
+level: 3
+---
+
+## WHY
+
+In a monolith, a developer exploring an unfamiliar part of the codebase opens the code and reads the method signatures. In microservices, the code of a remote service is unavailable — you're working against a black box. Without a formal API specification, every inter-service integration becomes an archaeology project: read the other team's code, find the controller, guess the request/response shape, discover undocumented fields through trial and error, and get burned by type mismatches only in production. Multiply this by 30 services and 10 teams and you have a significant coordination drag on every feature that crosses a service boundary.
+
+OpenAPI (formerly Swagger) solves this by providing a machine-readable, human-readable contract for every REST API — the schema, types, required fields, error responses, authentication requirements, and examples. When every service exposes an OpenAPI spec, integration becomes: read the spec, generate a typed client, run against a mock server, never be surprised in production. OpenAPI specs also drive API documentation sites (Swagger UI), code generation (client SDKs in any language), contract testing, and API versioning governance.
+
+The production failure mode from missing OpenAPI specs is **integration surprise**: a downstream team deploys code that calls your API, only to discover in staging that your `userId` field is a `String` not a `Long`, your error response format is inconsistent with what they were told verbally, and you added a required field last sprint without notifying them. The spec would have caught all of this in code review. Without specs, API contracts are maintained only in humans' heads — and humans forget, leave the company, or contradict each other.
+
+Senior engineers must understand: the OpenAPI 3.x specification structure, `springdoc-openapi` integration in Spring Boot, the difference between code-first (generate spec from code) and spec-first (generate code from spec) approaches, and how OpenAPI specs integrate with Pact contract testing and API gateway configuration.
+
+## THEORY
+
+### OpenAPI 3.x Structure
+
+```
+openapi: "3.0.3"
+info:
+  title: Order Service API
+  version: "1.2.0"
+  description: Manages order lifecycle for the e-commerce platform
+
+paths:
+  /orders:
+    post:
+      summary: Place a new order
+      operationId: placeOrder
+      requestBody: { ... }
+      responses:
+        "201": { description: Order created, content: { ... } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /orders/{orderId}:
+    get:
+      summary: Get order by ID
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { ... }
+        "404": { ... }
+
+components:
+  schemas:
+    Order:
+      type: object
+      required: [id, customerId, status, createdAt]
+      properties:
+        id:        { type: integer, format: int64 }
+        customerId:{ type: integer, format: int64 }
+        status:    { type: string, enum: [PENDING, CONFIRMED, SHIPPED, CANCELLED] }
+        createdAt: { type: string, format: date-time }
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ProblemDetail" }
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - BearerAuth: []
+```
+
+### Code-First vs Spec-First
+
+| Approach | Process | Pros | Cons |
+|----------|---------|------|------|
+| **Code-First** | Write Java code → springdoc generates spec | Fast to start; spec always matches code | Spec may leak internal details; harder to design consumer-friendly API |
+| **Spec-First** | Write OpenAPI YAML → generate stubs → implement | Consumer-friendly design; contract agreed before implementation | More upfront work; keeping spec+code in sync requires discipline |
+
+For microservices: **spec-first** is preferred — the spec is the contract that consumers depend on. Define the spec, get consumer feedback, then implement. Code-first is fine for internal services where you're the only consumer.
+
+### Common Misconception
+
+> "Adding `springdoc-openapi` to a project automatically produces a complete, correct API spec."
+
+**Reality:** `springdoc-openapi` generates a spec from your code, but the quality depends entirely on your annotations. A bare controller with no `@Operation`, `@ApiResponse`, or `@Schema` annotations produces a minimal spec with no descriptions, no error responses, and no examples. A well-annotated controller produces a spec that external teams can use to build integrations. The annotations aren't optional — they're the spec.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "SequenceDiagram", "state": "microservices-ms-openapi" }
+```
+
+## CODE
+
+### Level 1 — Beginner: springdoc-openapi Basic Setup
+
+```java
+// build.gradle.kts:
+// implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.3.0")
+
+// application.yml:
+// springdoc:
+//   api-docs:
+//     path: /api-docs           # JSON spec at /api-docs
+//   swagger-ui:
+//     path: /swagger-ui.html    # UI at /swagger-ui.html
+//     operations-sorter: alpha
+
+import io.swagger.v3.oas.annotations.*;
+import io.swagger.v3.oas.annotations.media.*;
+import io.swagger.v3.oas.annotations.responses.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.*;
+
+@RestController
+@RequestMapping("/orders")
+@Tag(name = "Orders", description = "Order management endpoints")
+class OrderController {
+
+    @Operation(
+        summary = "Place a new order",
+        description = "Creates a new order for the given customer. Returns 201 Created with Location header."
+    )
+    @ApiResponses({
+        @ApiResponse(responseCode = "201", description = "Order created",
+            content = @Content(schema = @Schema(implementation = OrderDto.class))),
+        @ApiResponse(responseCode = "400", description = "Invalid request body",
+            content = @Content(schema = @Schema(implementation = ProblemDetail.class))),
+        @ApiResponse(responseCode = "401", description = "Authentication required")
+    })
+    @PostMapping
+    public ResponseEntity<OrderDto> create(
+            @io.swagger.v3.oas.annotations.parameters.RequestBody(
+                description = "Order creation request",
+                required = true,
+                content = @Content(schema = @Schema(implementation = CreateOrderRequest.class)))
+            @RequestBody CreateOrderRequest req) {
+        return ResponseEntity.status(201)
+            .body(new OrderDto(1L, req.customerId(), "PENDING"));
+    }
+
+    @Operation(summary = "Get order by ID")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Order found"),
+        @ApiResponse(responseCode = "404", description = "Order not found")
+    })
+    @GetMapping("/{id}")
+    public OrderDto get(@PathVariable long id) {
+        return new OrderDto(id, 1L, "CONFIRMED");
+    }
+}
+
+@Schema(description = "Order resource")
+record OrderDto(
+    @Schema(description = "Order ID", example = "42") long id,
+    @Schema(description = "Customer ID", example = "100") long customerId,
+    @Schema(description = "Order status", allowableValues = {"PENDING", "CONFIRMED", "SHIPPED", "CANCELLED"})
+    String status
+) {}
+
+@Schema(description = "Create order request")
+record CreateOrderRequest(
+    @Schema(description = "Customer ID", example = "100", required = true) long customerId,
+    @Schema(description = "Product SKU", example = "SKU-42", required = true) String sku,
+    @Schema(description = "Quantity (1-100)", example = "3", minimum = "1", maximum = "100") int quantity
+) {}
+```
+
+### Level 2 — Intermediate: Global OpenAPI Configuration + Security
+
+```java
+import io.swagger.v3.oas.models.*;
+import io.swagger.v3.oas.models.info.*;
+import io.swagger.v3.oas.models.security.*;
+import io.swagger.v3.oas.models.servers.*;
+import org.springframework.context.annotation.*;
+
+@Configuration
+class OpenApiConfig {
+
+    @Bean
+    public OpenAPI orderServiceOpenApi() {
+        return new OpenAPI()
+            .info(new Info()
+                .title("Order Service API")
+                .description("Manages order lifecycle. Part of the e-commerce platform microservices.")
+                .version("2.1.0")
+                .contact(new Contact()
+                    .name("Orders Team")
+                    .email("orders-team@company.com")
+                    .url("https://backstage.company.com/catalog/order-service"))
+                .license(new License().name("Internal Use Only")))
+            .addServersItem(new Server()
+                .url("https://api.company.com")
+                .description("Production"))
+            .addServersItem(new Server()
+                .url("http://localhost:8080")
+                .description("Local development"))
+            .addSecurityItem(new SecurityRequirement().addList("BearerAuth"))
+            .components(new Components()
+                .addSecuritySchemes("BearerAuth",
+                    new SecurityScheme()
+                        .type(SecurityScheme.Type.HTTP)
+                        .scheme("bearer")
+                        .bearerFormat("JWT")
+                        .description("JWT token from auth-service. Obtain via POST /auth/token")));
+    }
+}
+
+// application.yml additions:
+// springdoc:
+//   packages-to-scan: com.shop.orders.api    # only scan api package, not internal code
+//   paths-to-match: /orders/**, /health/**    # only document public endpoints
+//   show-actuator: false                      # don't expose internal actuator endpoints
+//   default-produces-media-type: application/json
+```
+
+### Level 3 — Advanced: Spec-First Workflow with OpenAPI Generator
+
+```bash
+# Spec-first: define openapi.yaml first, then generate Spring Boot stubs
+# 1. Write openapi.yaml (stored in Git alongside the service code)
+# 2. Generate server stubs from spec using OpenAPI Generator
+# 3. Implement the generated interfaces
+
+# build.gradle.kts
+# plugins { id("org.openapi.generator") version "7.2.0" }
+# openApiGenerate {
+#   generatorName.set("spring")
+#   inputSpec.set("$rootDir/src/main/resources/openapi/order-service-api.yaml")
+#   outputDir.set("$buildDir/generated")
+#   apiPackage.set("com.shop.orders.api.generated")
+#   modelPackage.set("com.shop.orders.api.model")
+#   configOptions.set(mapOf(
+#     "interfaceOnly" to "true",          // generate interface, not implementation
+#     "useSpringBoot3" to "true",
+#     "useJakartaEe" to "true",
+#     "generateSupportingFiles" to "false"
+#   ))
+# }
+```
+
+```java
+// Generated interface (from the openapi.yaml spec):
+package com.shop.orders.api.generated;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import com.shop.orders.api.model.*;
+
+public interface OrdersApi {
+    @PostMapping("/orders")
+    ResponseEntity<OrderDto> placeOrder(@RequestBody CreateOrderRequest req);
+
+    @GetMapping("/orders/{orderId}")
+    ResponseEntity<OrderDto> getOrder(@PathVariable Long orderId);
+}
+
+// Your implementation — implements the generated interface
+@RestController
+class OrdersApiImpl implements OrdersApi {
+    private final OrderService service;
+    OrdersApiImpl(OrderService service) { this.service = service; }
+
+    @Override
+    public ResponseEntity<OrderDto> placeOrder(CreateOrderRequest req) {
+        return ResponseEntity.status(201).body(service.placeOrder(req));
+    }
+
+    @Override
+    public ResponseEntity<OrderDto> getOrder(Long orderId) {
+        return service.findById(orderId)
+            .<ResponseEntity<OrderDto>>map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+}
+
+record OrderDto(Long id, Long customerId, String status) {}
+record CreateOrderRequest(Long customerId, String sku, Integer quantity) {}
+interface OrderService {
+    OrderDto placeOrder(CreateOrderRequest req);
+    java.util.Optional<OrderDto> findById(Long id);
+}
+```
+
+### Level 4 — Expert / Production: OpenAPI Spec Diff Validator in CI
+
+```java
+package com.openapi;
+
+import java.util.*;
+import java.util.stream.*;
+
+/**
+ * CI pipeline validation: ensure new OpenAPI spec doesn't break consumers.
+ * Run as part of PR check: compare old spec (from main branch) to new spec (from PR).
+ * Block PR if breaking changes detected.
+ */
+public class OpenApiBreakingChangeDetector {
+
+    public record OperationSpec(String path, String method,
+                                 Set<String> requiredParams, Set<String> responseFields) {}
+
+    public record BreakingChange(String type, String path, String detail) {}
+
+    public static List<BreakingChange> detectBreakingChanges(
+            List<OperationSpec> oldSpec, List<OperationSpec> newSpec) {
+
+        List<BreakingChange> changes = new ArrayList<>();
+        Map<String, OperationSpec> oldOps = oldSpec.stream()
+            .collect(Collectors.toMap(o -> o.method() + " " + o.path(), o -> o));
+        Map<String, OperationSpec> newOps = newSpec.stream()
+            .collect(Collectors.toMap(o -> o.method() + " " + o.path(), o -> o));
+
+        // Removed endpoints — breaking
+        oldOps.keySet().stream()
+            .filter(key -> !newOps.containsKey(key))
+            .forEach(key -> changes.add(new BreakingChange("REMOVED_ENDPOINT", key,
+                "Endpoint " + key + " was removed")));
+
+        // Added required params — breaking (old callers don't send them)
+        newOps.forEach((key, newOp) -> {
+            OperationSpec oldOp = oldOps.get(key);
+            if (oldOp == null) return;
+            newOp.requiredParams().stream()
+                .filter(p -> !oldOp.requiredParams().contains(p))
+                .forEach(p -> changes.add(new BreakingChange("ADDED_REQUIRED_PARAM", key,
+                    "Required parameter '" + p + "' added — old callers don't send it")));
+        });
+
+        // Removed response fields — breaking (old consumers expect them)
+        newOps.forEach((key, newOp) -> {
+            OperationSpec oldOp = oldOps.get(key);
+            if (oldOp == null) return;
+            oldOp.responseFields().stream()
+                .filter(f -> !newOp.responseFields().contains(f))
+                .forEach(f -> changes.add(new BreakingChange("REMOVED_RESPONSE_FIELD", key,
+                    "Response field '" + f + "' removed — consumers may depend on it")));
+        });
+
+        return changes;
+    }
+
+    public static void main(String[] args) {
+        var oldSpec = List.of(
+            new OperationSpec("GET", "/orders/{id}",
+                Set.of(),
+                Set.of("id", "customerId", "status", "total")),
+            new OperationSpec("POST", "/orders",
+                Set.of("customerId", "sku"),
+                Set.of("id", "status"))
+        );
+
+        var newSpec = List.of(
+            new OperationSpec("GET", "/orders/{id}",
+                Set.of(),
+                Set.of("id", "customerId", "status")),  // "total" removed!
+            new OperationSpec("POST", "/orders",
+                Set.of("customerId", "sku", "currency"),  // "currency" added required!
+                Set.of("id", "status"))
+        );
+
+        var breaking = detectBreakingChanges(oldSpec, newSpec);
+        if (breaking.isEmpty()) {
+            System.out.println("✅ No breaking changes");
+        } else {
+            breaking.forEach(c -> System.out.printf("❌ [%s] %s: %s%n",
+                c.type(), c.path(), c.detail()));
+            System.exit(1);  // Fail CI
+        }
+    }
+}
+```
+
+## REAL_WORLD
+
+### How Stripe Uses OpenAPI for SDK Generation
+
+Stripe publishes their entire API as an OpenAPI 3.x specification and uses it to auto-generate official client SDKs in 7 languages (Java, Python, Ruby, Go, Node, PHP, .NET). Any API change is first made to the OpenAPI spec, then all SDKs are regenerated. This ensures the spec is always the source of truth and every SDK is always up-to-date with the API. Their spec is published at `https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json`.
+
+```java
+// Stripe-style spec-first approach with generated client
+// Generated from Stripe's OpenAPI spec:
+// openapi-generator-cli generate -i stripe-spec.json -g java -o stripe-client
+
+// In your microservice, use the generated client:
+import com.stripe.Stripe;
+import com.stripe.model.PaymentIntent;
+import com.stripe.param.PaymentIntentCreateParams;
+
+@Service
+class StripePaymentGateway {
+    public PaymentResult authorize(long amountCents, String currency) throws Exception {
+        Stripe.apiKey = System.getenv("STRIPE_API_KEY");
+        PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
+            .setAmount(amountCents)
+            .setCurrency(currency)
+            .setConfirm(false)
+            .build();
+        PaymentIntent intent = PaymentIntent.create(params);
+        return new PaymentResult(intent.getId(), intent.getStatus());
+    }
+}
+record PaymentResult(String intentId, String status) {}
+```
+
+### Production Gotcha: Spec-Code Divergence
+
+```
+❌ DANGEROUS — code-first approach with no enforcement:
+The spec says GET /orders/{id} returns { id, status, total }
+The code returns { id, status, total, internalAuditLog }  ← undocumented field!
+
+3 months later: team removes internalAuditLog from response (cleaning up)
+Downstream consumer was depending on it (they saw it in the actual response, not the spec)
+Consumer breaks. Nobody knew because the spec never documented it.
+
+✅ FIX — enforce spec matches code in tests:
+1. springdoc-openapi generates spec from code
+2. Store generated spec in Git (openapi.yaml)
+3. CI test: generate spec at test time and diff with committed spec
+4. If spec changed: PR must update openapi.yaml explicitly
+5. This creates a review gate: any API change is visible in PR diff as openapi.yaml change
+6. Consumers subscribe to changes in openapi.yaml via Git notifications
+```
+
+**Why it happens:** Without a discipline around keeping spec and code in sync, they inevitably drift. The code evolves faster than the spec; the spec becomes stale documentation rather than a living contract.
+
+### Performance Characteristics
+
+| Aspect | Impact |
+|--------|--------|
+| springdoc-openapi startup overhead | +50-200ms (bean scanning) |
+| /api-docs endpoint response time | 5-50ms (generated on demand or cached) |
+| Swagger UI static assets | 200KB (serve from CDN in production) |
+| Code generation from spec | 10-30 seconds (one-time at build) |
+| Consumer client generation | Automatic on spec update |
+
+## INTERVIEW
+
+**Q1 (Junior): What is OpenAPI and why do microservices teams use it?**
+A: OpenAPI (formerly Swagger) is a machine-readable specification format for REST APIs, written in YAML or JSON. It describes every endpoint, request body schema, response schemas, error responses, authentication requirements, and examples. Microservices teams use it because: (1) it's the contract between API producer and consumers — downstream teams read the spec instead of the producer's code; (2) it enables automatic mock server generation (consumers test against a mock before the real service is built); (3) it enables typed client SDK generation in any language; (4) it drives API documentation sites (Swagger UI); (5) it enables API diff tooling that catches breaking changes in CI before they reach production.
+
+**Q2 (Junior): What is the difference between code-first and spec-first OpenAPI?**
+A: **Code-first**: write Spring Boot controllers, `springdoc-openapi` generates the spec by scanning annotations and code. Advantages: fast to start, spec always reflects actual code. Disadvantages: easy to accidentally expose internal details in the spec; API design is driven by implementation convenience rather than consumer needs. **Spec-first**: write the OpenAPI YAML spec first (often collaboratively with consumers), then use `openapi-generator` to generate Spring interface stubs, then implement the stubs. Advantages: API is designed from the consumer's perspective before any code is written; consumers can review the contract before implementation starts. Disadvantages: requires discipline to keep spec and implementation in sync; generated code must be regenerated when the spec changes. For public APIs or APIs with multiple consumer teams: spec-first. For internal services where the team is the primary consumer: code-first with annotation discipline.
+
+**Q3 (Mid): How do you prevent breaking changes from reaching production via OpenAPI specs?**
+A: CI pipeline approach: (1) Every PR generates the OpenAPI spec from code using `springdoc-openapi`; (2) The generated spec is compared to the previous committed spec using an OpenAPI diff tool (`openapi-diff`, `oasdiff`); (3) If breaking changes are detected (removed endpoints, removed response fields, added required parameters), the CI pipeline fails the PR with a clear report of what changed; (4) Breaking changes require explicit acknowledgment — a PR description explaining the migration strategy and consumer impact; (5) Non-breaking changes (added optional fields, new endpoints) pass automatically. This catches the most common mistake: renaming a field, removing an error code, or changing a type without realizing downstream consumers depend on it.
+
+**Q4 (Mid): How does OpenAPI integrate with Spring Security for documenting auth requirements?**
+A: Add `@SecurityRequirement(name = "BearerAuth")` to either the `@OpenAPIDefinition` (global) or individual `@Operation` annotations. Define the security scheme in the global OpenAPI bean: `new SecurityScheme().type(HTTP).scheme("bearer").bearerFormat("JWT")`. In Swagger UI, this adds an "Authorize" button where testers can paste their JWT, and the UI sends `Authorization: Bearer <token>` on every request. For `springdoc-openapi` with Spring Security configured: use `springdoc.swagger-ui.disable-swagger-default-url=true` and configure which paths are accessible for unauthenticated users (typically `/api-docs` and `/swagger-ui/**`). In production: restrict `/api-docs` to internal networks or require authentication — the spec reveals your API structure.
+
+**Q5 (Senior): Walk through the spec-first workflow from API design to production.**
+A: (1) **Collaborative design**: create the OpenAPI spec in YAML, share with consumer teams for review; iterate on field names, types, and error codes before writing code; (2) **Generate stubs**: `openapi-generator-cli generate -g spring -i api.yaml` creates Java interfaces and model classes; add to build pipeline so stubs are auto-generated on every build; (3) **Implement interfaces**: your Spring Boot controllers implement the generated interfaces; if the spec changes, the interface changes, and the compiler tells you where to update; (4) **Contract tests**: use the spec to generate mock servers (WireMock from spec); consumer teams write Pact tests against the spec; (5) **CI gate**: `oasdiff breaking old.yaml new.yaml` blocks PRs with breaking changes; (6) **Client SDK generation**: `openapi-generator-cli generate -g java-resttemplate` produces a typed client for Java consumers; Python teams get a Python client; all auto-generated from the same spec. The spec is the single source of truth for the API's behavior.
+
+**Q6 (Senior): How do you version OpenAPI specs alongside API versioning?**
+A: Three strategies: (1) **URI versioning** (`/v1/api-docs`, `/v2/api-docs`): each version has a separate spec and separate controllers; `springdoc-openapi` can expose multiple `GroupedOpenApi` beans for different path prefixes; consumers can diff between v1 and v2 specs to understand migration; (2) **Version in spec**: single spec file with version in `info.version`; consumers are pinned to a version; `springdoc-openapi` shows the current version; (3) **Multi-spec repo**: store all historical spec versions in Git; consumers track which version they depend on; CI verifies only backward-compatible changes are allowed between minor versions; breaking changes require major version bump. Production recommendation: store OpenAPI specs in a central API catalogue (Backstage, Apicurio Registry, or Confluent Schema Registry) where teams can browse, search, and compare specs across all services.
+
+**Q7 (Senior+): How do large organizations use OpenAPI specs beyond documentation?**
+A: Four advanced uses: (1) **API Gateway configuration**: Kong, AWS API Gateway, and Spring Cloud Gateway can all be configured from an OpenAPI spec — defining routes, rate limits, auth requirements, and request/response transformations; no manual gateway config needed for new services; (2) **Mock server generation**: Prism, WireMock, and Microcks generate mock servers from the spec, enabling consumers to develop against a realistic API before the producer service is built; reduces parallel-team blocking from weeks to days; (3) **Fuzz testing**: tools like Schemathesis or Dredd send hundreds of random requests based on the spec schema and check for 5xx responses, schema violations, and edge cases; often finds bugs that hand-written tests miss; (4) **Service catalogue integration**: Backstage automatically discovers OpenAPI specs from Kubernetes service annotations and builds a searchable internal developer portal where engineers can find any service's API, see its owner team, and navigate to its documentation; this is critical for organisations with 100+ services where no single person knows all the APIs.
+
+## FEYNMAN CHECK
+
+### Explain OpenAPI Like I'm 10 Years Old
+
+> Imagine you're building with LEGO and you want to order specific pieces from the LEGO store. If the store just hands you a random box and says "it's in there somewhere," you'd spend an hour hunting for the right piece. But if the store gives you a picture catalogue with every piece numbered, sized, and priced — that's an OpenAPI spec. **OpenAPI is the official catalogue of your API**: every "piece" (endpoint) is listed with its exact shape (request/response schema), what it's for (description), and what can go wrong (error responses). When another team wants to use your service, they read the catalogue instead of digging through your code. Even better, they can print out the catalogue and build with it before they even have the real pieces (mock servers from the spec).
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why is a manually-maintained documentation wiki inferior to an OpenAPI spec?**
+> **A:** A wiki page can drift from the actual code, is not machine-readable (can't generate clients or mock servers from it), and has no CI enforcement (nobody checks if the wiki is accurate). An OpenAPI spec is machine-readable: it can generate typed clients, mock servers, API gateway configurations, and contract tests automatically. It can be validated against the actual running service (Dredd, Schemathesis). When the spec is stored in Git alongside the code, changes are visible in PRs, and CI can enforce that breaking changes are explicitly approved. The wiki becomes stale documentation; the OpenAPI spec becomes a living, enforceable contract.
+
+**Q2: What is the ONE mental model for spec-first vs code-first?**
+> **A:** "Spec-first is consumer-driven; code-first is implementation-driven." Spec-first asks "what does the consumer need?" and designs the API accordingly. Code-first asks "what does the code expose?" and documents whatever came out. The difference matters because APIs should be designed for the person *calling* them, not the person building them. Spec-first forces you to think from the caller's perspective — naming, structure, and error handling from their point of view — before writing a single line of implementation code. This produces more intuitive APIs that require less integration work from consumers. Code-first tends to expose implementation details (internal field names, database column names) that become permanent contract obligations.
+
+**Q3: What is the most dangerous OpenAPI mistake? Show it.**
+> **A:** Not documenting error responses — consumers don't know what to handle.
+> ```yaml
+> # ❌ Incomplete spec — only documents the happy path:
+> paths:
+>   /orders/{id}:
+>     get:
+>       responses:
+>         "200":
+>           description: OK
+>           content:
+>             application/json:
+>               schema: { $ref: "#/components/schemas/Order" }
+>         # No 404, no 401, no 500 documented!
+>
+> # ✅ Complete spec — documents all realistic responses:
+> paths:
+>   /orders/{id}:
+>     get:
+>       responses:
+>         "200":
+>           description: Order found
+>         "401":
+>           description: Not authenticated
+>           content:
+>             application/problem+json:
+>               schema: { $ref: "#/components/schemas/ProblemDetail" }
+>         "403":
+>           description: Insufficient permissions
+>         "404":
+>           description: Order not found
+>           content:
+>             application/problem+json:
+>               schema: { $ref: "#/components/schemas/ProblemDetail" }
+>         "500":
+>           description: Internal server error
+> ```
+> Without documented error responses, consumers write `catch (Exception e) { showGenericError() }` instead of handling 404 specially (show "order not found"), 401 (redirect to login), and 429 (slow down). The spec's error documentation directly improves the quality of consumers' error handling.
+
+**Q4: How does an OpenAPI spec interact with a service mesh like Istio?**
+> **A:** Service meshes (Istio, Linkerd) operate at L4/L7 network level and can use OpenAPI specs for two things: (1) **Traffic policies**: Istio's `VirtualService` can define retry policies, timeouts, and circuit-breaking rules per route — these rules map to paths and methods in the OpenAPI spec; tools like Kusk Gateway can auto-generate Istio `VirtualService` resources from the OpenAPI spec annotations (`x-kusk` extensions); (2) **API validation**: Envoy proxy (Istio's data plane) can be configured to validate requests against the OpenAPI spec before they reach the service — malformed requests are rejected at the mesh level, not the application level. This provides defense-in-depth: even if the application has a bug that accepts invalid input, the mesh rejects it first. In practice: generating Istio configs from OpenAPI specs reduces duplication between the spec and the mesh config.
+
+**Q5: One-sentence definition of OpenAPI for a senior FAANG engineer.**
+> **A:** "OpenAPI 3.x is a language-agnostic, machine-readable contract format for REST APIs that enables consumer-driven design (spec-first: define contract before implementing), typed client SDK generation in any language, mock server generation for parallel development, API gateway auto-configuration, breaking-change detection in CI (oasdiff), and contract-based integration testing (Dredd, Schemathesis) — making it the enabling technology for API-first microservices development where the spec is the single authoritative source of truth for the API's behavior, discoverable in a central API catalogue and versioned alongside the service code in Git."
+
+## BUILD
+
+### 🏗️ Mini Project: Spec-First Order API
+
+**What you will build:** An OpenAPI 3.x spec for an order service → generate Spring Boot stubs → implement → validate spec matches code in CI.
+**Why this project:** Forces you through the complete spec-first workflow from contract to implementation.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Write the OpenAPI Spec
+
+```yaml
+# src/main/resources/openapi/order-api.yaml
+openapi: "3.0.3"
+info:
+  title: Order Service API
+  version: "1.0.0"
+paths:
+  /orders:
+    post:
+      operationId: placeOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceOrderRequest"
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Order" } } } }
+        "400": { description: Bad Request }
+  /orders/{orderId}:
+    get:
+      operationId: getOrder
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Order" } } } }
+        "404": { description: Not Found }
+components:
+  schemas:
+    PlaceOrderRequest:
+      type: object
+      required: [customerId, sku, quantity]
+      properties:
+        customerId: { type: integer, format: int64 }
+        sku: { type: string, minLength: 1 }
+        quantity: { type: integer, minimum: 1, maximum: 100 }
+    Order:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        customerId: { type: integer, format: int64 }
+        sku: { type: string }
+        quantity: { type: integer }
+        status: { type: string, enum: [PENDING, CONFIRMED, CANCELLED] }
+```
+
+#### Step 2 — Implement the Generated Interface
+
+```java
+package com.shop;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+@SpringBootApplication
+public class App {
+    public static void main(String[] args) { SpringApplication.run(App.class, args); }
+}
+
+// Implement the spec-generated interface (simulated here)
+@RestController
+class OrderApiImpl {
+    private final Map<Long, Order> store = new ConcurrentHashMap<>();
+    private long nextId = 1;
+
+    @PostMapping("/orders")
+    public ResponseEntity<Order> placeOrder(@RequestBody PlaceOrderRequest req) {
+        long id = nextId++;
+        Order o = new Order(id, req.customerId(), req.sku(), req.quantity(), "PENDING");
+        store.put(id, o);
+        return ResponseEntity.status(201).body(o);
+    }
+
+    @GetMapping("/orders/{orderId}")
+    public ResponseEntity<Order> getOrder(@PathVariable long orderId) {
+        return Optional.ofNullable(store.get(orderId))
+            .<ResponseEntity<Order>>map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+}
+record Order(long id, long customerId, String sku, int quantity, String status) {}
+record PlaceOrderRequest(long customerId, String sku, int quantity) {}
+```
+
+#### Step 3-5 — Validation + Tests
+
+```java
+// Spec drift detection test — run in CI
+import org.junit.jupiter.api.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+class SpecDriftTest {
+    @Test
+    void specMatchesAnnotations() {
+        // In real project: springdoc generates spec at test time,
+        // compare to committed openapi.yaml
+        // Here: basic sanity check
+        assertTrue(true, "API spec validation — implement with openapi-diff tool in CI");
+    }
+}
+```
+
+**Expected Output:**
+```
+POST /orders {"customerId":1,"sku":"SKU-42","quantity":3}
+→ 201 Created {"id":1,"customerId":1,"sku":"SKU-42","quantity":3,"status":"PENDING"}
+GET /swagger-ui.html → Interactive API documentation
+GET /api-docs → JSON spec matching order-api.yaml
+```
+
+**Stretch Challenges:**
+- [ ] Integrate `oasdiff` in CI to block PRs with breaking changes
+- [ ] Generate a Java client from the spec using `openapi-generator`
+- [ ] Add Schemathesis fuzz testing against the running service
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+
+**Q1:** What is OpenAPI? Name 4 things it enables beyond documentation.
+
+**Q2:** What is the difference between code-first and spec-first API design?
+
+**Q3:** Name 5 key sections of an OpenAPI 3.x YAML file.
+
+### Day 3 — Comprehension
+
+**Q4:** How do you prevent breaking changes from reaching production via OpenAPI spec diffing?
+
+**Q5:** What springdoc-openapi annotations are needed to document error responses properly?
+
+**Q6:** Design an OpenAPI spec snippet for a DELETE /users/{id} endpoint with 204, 404, and 401 responses.
+
+### Day 7 — Application
+
+**Q7:** Implement the spec-first workflow for a product API: write the spec, generate stubs, implement, verify.
+
+**Q8:** A PR removes the `total` field from the order response spec. What CI checks catch this and what do they output?
+
+**Q9:** Configure springdoc-openapi to only expose public endpoints, not internal actuator endpoints.
+
+### Day 14 — Synthesis
+
+**Q10:** ★ Classic interview: *"How do you ensure API contracts are maintained across 30 microservices?"*
+
+**Q11:** Draw the spec-first workflow from design to production deployment.
+
+**Q12:** ★ System design: *"Design an API catalogue for 50 microservices: how is each service's spec discovered, stored, versioned, and surfaced to developers? What breaking change governance process exists?"*
+

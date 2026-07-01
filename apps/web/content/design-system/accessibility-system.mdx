@@ -142,3 +142,527 @@ it('Button should have no accessibility violations', async () => {
   expect(results).toHaveNoViolations();
 });
 ```
+
+
+## CODE
+
+### Level 1 — Beginner: Accessible Button with ARIA
+```tsx
+// Accessible button — the foundation of all interactive components
+interface AccessibleButtonProps {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  ariaLabel?: string; // Required when button has icon-only content
+}
+
+export function AccessibleButton({ label, onClick, disabled, ariaLabel }: AccessibleButtonProps) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel ?? label} // Screen reader reads this when no visible label
+      aria-disabled={disabled}        // Redundant but improves VoiceOver compatibility
+      className={disabled ? 'btn btn--disabled' : 'btn'}
+    >
+      {label}
+    </button>
+  );
+}
+```
+
+### Level 2 — Intermediate: Skip Links & Focus Management
+```tsx
+// Skip links — first item in DOM, invisible until focused (keyboard users skip nav)
+export function SkipLink() {
+  return (
+    <a
+      href="#main-content"
+      className="skip-link" // Positioned off-screen; visible on :focus
+      // CSS: .skip-link { position: absolute; top: -40px; } .skip-link:focus { top: 0; }
+    >
+      Skip to main content
+    </a>
+  );
+}
+
+// Focus trap for modal dialogs — prevents focus escaping to background DOM
+import { useEffect, useRef } from 'react';
+
+export function FocusTrap({ children, active }: { children: React.ReactNode; active: boolean }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!active || !containerRef.current) return;
+
+    // Collect all focusable elements inside the trap
+    const focusable = containerRef.current.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    );
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+
+    first?.focus(); // Move focus inside trap immediately
+
+    const handleTab = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return;
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last?.focus(); }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first?.focus(); }
+      }
+    };
+
+    document.addEventListener('keydown', handleTab);
+    return () => document.removeEventListener('keydown', handleTab);
+  }, [active]);
+
+  return <div ref={containerRef}>{children}</div>;
+}
+```
+
+### Level 3 — Advanced: Accessible Form with Live Validation
+```tsx
+import { useState, useId } from 'react';
+
+interface FormFieldProps {
+  label: string;
+  type?: string;
+  required?: boolean;
+  validate?: (value: string) => string | null;
+}
+
+export function FormField({ label, type = 'text', required, validate }: FormFieldProps) {
+  const [value, setValue] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState(false);
+
+  // useId generates stable, unique IDs for aria linkage without collisions
+  const fieldId = useId();
+  const errorId = useId();
+  const descId = useId();
+
+  const handleBlur = () => {
+    setTouched(true);
+    if (required && !value.trim()) {
+      setError(`${label} is required`);
+    } else if (validate) {
+      setError(validate(value));
+    } else {
+      setError(null);
+    }
+  };
+
+  return (
+    <div className="form-field" role="group">
+      <label htmlFor={fieldId} className={required ? 'label label--required' : 'label'}>
+        {label}
+        {required && <span aria-hidden="true"> *</span>} {/* Asterisk is visual only */}
+      </label>
+      <span id={descId} className="field-hint">
+        {required ? 'Required field' : 'Optional'}
+      </span>
+      <input
+        id={fieldId}
+        type={type}
+        value={value}
+        onChange={e => setValue(e.target.value)}
+        onBlur={handleBlur}
+        required={required}
+        aria-required={required}
+        aria-invalid={touched && error ? 'true' : 'false'} // Screen readers announce invalid state
+        aria-describedby={`${descId} ${error ? errorId : ''}`.trim()} // Chain IDs with space
+        className={touched && error ? 'input input--error' : 'input'}
+      />
+      {/* aria-live region: screen reader announces error without focus change */}
+      {touched && error && (
+        <span id={errorId} role="alert" aria-live="polite" className="field-error">
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+```
+
+### Level 4 — Expert / Production: Full A11y Component Audit System
+```tsx
+import { useEffect, useRef, useCallback } from 'react';
+import axe from 'axe-core'; // npm install axe-core
+
+// Production: automatically audit components in dev/test environments
+type A11yViolation = { id: string; impact: string; description: string; nodes: number };
+
+interface UseA11yAuditOptions {
+  enabled?: boolean;    // Only run in dev/test
+  onViolation?: (violations: A11yViolation[]) => void;
+}
+
+export function useA11yAudit(options: UseA11yAuditOptions = {}) {
+  const { enabled = process.env.NODE_ENV !== 'production', onViolation } = options;
+  const containerRef = useRef<HTMLElement>(null);
+
+  const runAudit = useCallback(async () => {
+    if (!enabled || !containerRef.current) return;
+    try {
+      const results = await axe.run(containerRef.current, {
+        rules: {
+          'color-contrast': { enabled: true },
+          'label': { enabled: true },
+          'aria-required-attr': { enabled: true },
+          'keyboard': { enabled: true },
+        },
+      });
+
+      const violations: A11yViolation[] = results.violations.map(v => ({
+        id: v.id,
+        impact: v.impact ?? 'unknown',
+        description: v.description,
+        nodes: v.nodes.length,
+      }));
+
+      if (violations.length > 0) {
+        console.group('%c♿ A11y Violations', 'color: red; font-weight: bold');
+        violations.forEach(v => {
+          console.warn(`[${v.impact.toUpperCase()}] ${v.id}: ${v.description} (${v.nodes} node(s))`);
+        });
+        console.groupEnd();
+        onViolation?.(violations);
+      }
+    } catch (err) {
+      console.error('axe audit failed:', err);
+    }
+  }, [enabled, onViolation]);
+
+  useEffect(() => {
+    // Debounce to avoid auditing during rapid re-renders
+    const timer = setTimeout(runAudit, 300);
+    return () => clearTimeout(timer);
+  });
+
+  return containerRef;
+}
+
+// Wrapper component: wraps any subtree, runs live audit in dev
+export function A11yBoundary({ children, label }: { children: React.ReactNode; label: string }) {
+  const ref = useA11yAudit({
+    onViolation: (violations) => {
+      if (process.env.VITEST || process.env.JEST_WORKER_ID) {
+        // In tests: fail the test on violations
+        throw new Error(`A11y violations in "${label}": ${violations.map(v => v.id).join(', ')}`);
+      }
+    },
+  });
+
+  return (
+    <section ref={ref as React.RefObject<HTMLElement>} aria-label={label}>
+      {children}
+    </section>
+  );
+}
+
+// Example: wrap your Storybook stories or test renders
+export function AccessibleFormDemo() {
+  return (
+    <A11yBoundary label="User Registration Form">
+      <form>
+        <FormField label="Email" type="email" required validate={v =>
+          /^[^s@]+@[^s@]+.[^s@]+$/.test(v) ? null : 'Enter a valid email address'
+        } />
+        <FormField label="Username" required validate={v =>
+          v.length >= 3 ? null : 'Username must be at least 3 characters'
+        } />
+        <AccessibleButton label="Create Account" onClick={() => {}} />
+      </form>
+    </A11yBoundary>
+  );
+}
+```
+## REAL_WORLD
+
+### How the UK Government Design System Enforces Accessibility
+
+The GOV.UK Design System (used by 800+ government services serving 66M citizens) mandates WCAG 2.1 AA compliance for every component. Before their systematic approach, individual teams interpreted "accessible" differently — some skipped focus indicators, others used placeholder text as labels. The failure cost was real: screen-reader users filed 11,000 accessibility complaints in one year. Their solution: bake a11y into Storybook stories with automated axe-core checks, forcing every component PR to pass before merge.
+
+```tsx
+// Production pattern — GOV.UK style accessibility enforcement
+// Context: Every interactive component ships with a11y props contract
+
+interface AccessibleButtonProps {
+  label: string;          // Visible label OR aria-label if icon-only
+  ariaLabel?: string;     // Override for icon-only buttons — REQUIRED if no label text
+  ariaDescribedBy?: string; // Links to helper text element ID
+  disabled?: boolean;
+  onClick: () => void;
+}
+
+// ❌ DANGEROUS — passes visual review but fails screen readers
+<button onClick={handleDelete}>
+  <TrashIcon />
+</button>
+
+// ✅ PRODUCTION-SAFE — axe-core passes, VoiceOver reads "Delete item, button"
+<button
+  aria-label="Delete item"
+  aria-describedby="delete-confirm-hint"
+  onClick={handleDelete}
+>
+  <TrashIcon aria-hidden="true" /> {/* aria-hidden hides decorative icon from SR */}
+</button>
+<span id="delete-confirm-hint" className="sr-only">
+  This action cannot be undone.
+</span>
+```
+
+### Production Gotcha: Focus Trap in Modals
+```tsx
+// ❌ Modal opens but focus stays on trigger — keyboard user can't reach modal content
+<Modal isOpen={open}><form>...</form></Modal>
+
+// ✅ Use focus-trap-react or manual tabIndex management
+<FocusTrap active={open} focusTrapOptions={{ initialFocus: '#modal-heading' }}>
+  <Modal role="dialog" aria-modal="true" aria-labelledby="modal-heading">
+    <h2 id="modal-heading">Confirm Delete</h2>
+    <form>...</form>
+  </Modal>
+</FocusTrap>
+```
+**Why it happens:** The browser moves focus to the document body when a modal opens unless focus is programmatically moved into the modal. Screen reader and keyboard users then cannot navigate the modal content.
+
+### Performance Characteristics
+| Check | Tool | Cost |
+|-------|------|------|
+| Automated a11y | axe-core | < 5ms per component |
+| Contrast ratio | WCAG AA: 4.5:1 | Static analysis |
+| Focus order | Manual + axe | Per page |
+
+## INTERVIEW
+
+**Q1 (Junior): What does WCAG 2.1 AA require for colour contrast?**
+A: WCAG 2.1 AA requires a contrast ratio of at least 4.5:1 for normal text (below 18pt) and 3:1 for large text (18pt+ or 14pt bold). This means the foreground colour and background colour, when run through the luminance formula, must produce a ratio meeting those thresholds. In practice, a light grey (#767676) on white (#ffffff) fails at 4.48:1, which is why many design systems reject "subtle" text styles — they look fine visually but fail automated compliance checks and real users with low vision.
+
+**Q2 (Junior): What is the difference between aria-label and aria-labelledby?**
+A: `aria-label` provides an inline accessible name directly on the element (e.g. `aria-label="Close"`), while `aria-labelledby` references another element's ID to use its text as the accessible name (e.g. `aria-labelledby="dialog-title"`). Use `aria-labelledby` when a visible label already exists in the DOM — it stays in sync automatically when the referenced text changes. Use `aria-label` for icon-only controls where no visible text label exists.
+
+**Q3 (Mid): Explain the four WCAG principles (POUR).**
+A: POUR stands for Perceivable (content is available to all senses — captions, alt text), Operable (UI is navigable by keyboard and pointer — focus management, timing), Understandable (language is clear, errors are described, behaviour is predictable — form validation), and Robust (content works with current and future assistive technologies — valid HTML semantics). A design system failing any one principle can systematically exclude millions of users across every product that consumes it.
+
+**Q4 (Mid): What is focus management and when must you implement it?**
+A: Focus management is programmatically moving browser focus to the correct element when the UI changes dynamically. Required on: modal open (move focus into modal), modal close (return focus to trigger), route change in SPAs (move to page heading or `main`), and toast/notification appearance (announce via live region, not forced focus). Without it, keyboard users lose their place in the DOM or become trapped outside interactive regions.
+
+**Q5 (Senior): How do you audit and enforce accessibility at scale across a design system?**
+A: Enforce at three layers — automated (axe-core in Storybook/Jest, Playwright accessibility checks in CI), semi-automated (eslint-plugin-jsx-a11y for static analysis on every PR), and manual (quarterly keyboard + screen-reader sessions with real AT). Write accessibility specifications as part of the component API contract (required vs optional aria props), and fail PRs that reduce axe scores. The key insight: accessibility debt is invisible until a legal complaint or a major user drops off — systematic enforcement finds violations in hours that manual review misses.
+
+**Q6 (Senior): What is a "skip link" and why does every multi-page site need one?**
+A: A skip link is a visually-hidden anchor at the very top of every page that becomes visible on focus and jumps the keyboard user directly to `main` content, bypassing repeated navigation. Without it, keyboard users must tab through every nav item on every page — 30+ tabs before reaching content. The implementation is trivial (`<a href="#main" class="sr-only focus:not-sr-only">Skip to main content</a>`) but its absence is an automatic WCAG 2.4.1 failure that appears in every automated audit.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "ConceptMap", "state": "design-system-accessibility" }
+```
+
+## FEYNMAN CHECK
+
+### Explain Accessibility Systems Like I'm 10 Years Old
+> Imagine your favourite app, but you can't see the screen — you only hear a robot reading it aloud. Accessibility means making sure that robot reads the right things in the right order, and that every button has a name so you know what it does. A design system builds accessibility IN from the start — like building ramps into a building's blueprints, not adding them after. The non-obvious part: semantic HTML is free accessibility — a `<button>` automatically gets keyboard focus, enter/space activation, and a role of "button" announced by screen readers, while a styled `<div onClick>` gets none of that. This is why "just use a div" costs an engineer two hours fixing what HTML gave you for free.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why is accessibility a design system concern, not just each app's concern?**
+> **A:** A design system's components are consumed by dozens of teams building hundreds of screens. An inaccessible Button component propagates the same violation across every product simultaneously. Fixing it at the design system level fixes it everywhere in one PR; leaving it unfixed means each team must independently patch the same bug. This multiplicative factor makes accessibility investment in a design system the highest-leverage a11y work in an organisation.
+
+**Q2: What is the ONE mental model for accessible components?**
+> **A:** "Every interactive element needs: a role (what is it?), a name (what does it do?), and a state (is it pressed/expanded/disabled?)." This is the accessible name/role/state triad. Role comes from semantic HTML or ARIA. Name comes from visible label, aria-label, or aria-labelledby. State comes from aria-* attributes or native HTML state. If any of the three is missing, the element is broken for assistive technology.
+
+**Q3: Most dangerous misconception with code.**
+> **A:** "Automated tests catch all accessibility issues."
+> ```tsx
+> // ❌ axe-core passes this — no ARIA violations
+> <div onClick={handleSubmit} className="btn">Submit</div>
+>
+> // Problems axe misses: not keyboard-focusable, no Enter key handler,
+> // no role="button", breaks on iOS VoiceOver
+>
+> // ✅ Semantic HTML — free keyboard, role, activation
+> <button type="submit" onClick={handleSubmit}>Submit</button>
+> ```
+
+**Q4: How does colour contrast interact with theming at a system level?**
+> **A:** When a design system supports theming (light/dark/brand), every colour token combination must independently meet contrast ratios. A token pair that passes in light mode may fail in dark mode if the background shifts from white to a mid-tone grey. The correct pattern: define semantic pairs (e.g. `textPrimary`/`surfacePrimary`) and verify contrast for EVERY theme at token definition time, not at component use time.
+
+**Q5: One-sentence senior definition.**
+> **A:** "An accessible design system encodes WCAG compliance as component API contracts — role, name, state, focus, and contrast — so that accessibility is opt-out impossible rather than opt-in optional across every consuming product."
+
+## BUILD
+
+### 🏗️ Mini Project: Accessible Icon Button Component
+
+**What you will build:** A fully accessible icon-only button that passes axe-core, keyboard navigation, and VoiceOver testing.
+**Why this project:** Forces you to understand the difference between decorative and meaningful icons, focus styling, and aria-label requirements.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Project Setup
+```bash
+mkdir a11y-button && cd a11y-button
+npx create-next-app@latest . --typescript --tailwind --no-src-dir --app
+npm install @axe-core/react
+touch components/IconButton.tsx components/IconButton.test.tsx
+```
+
+#### Step 2 — Core Implementation
+```tsx
+// components/IconButton.tsx
+// Accessible icon-only button — passes WCAG 2.1 AA + axe-core
+
+interface IconButtonProps {
+  icon: React.ReactNode;
+  label: string;           // Accessible name — REQUIRED for icon-only buttons
+  onClick: () => void;
+  disabled?: boolean;
+  variant?: 'primary' | 'ghost';
+}
+
+export function IconButton({
+  icon,
+  label,
+  onClick,
+  disabled = false,
+  variant = 'ghost',
+}: IconButtonProps) {
+  return (
+    <button
+      type="button"
+      aria-label={label}          // Screen readers announce this name
+      disabled={disabled}
+      onClick={onClick}
+      className={[
+        'inline-flex items-center justify-center rounded-md p-2',
+        'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2',
+        'focus-visible:outline-blue-600',  // WCAG 2.4.11 focus appearance
+        variant === 'primary'
+          ? 'bg-blue-600 text-white hover:bg-blue-700'
+          : 'text-gray-700 hover:bg-gray-100',
+        disabled ? 'opacity-40 cursor-not-allowed' : '',
+      ].join(' ')}
+    >
+      {/* aria-hidden hides decorative icon — label already names it */}
+      <span aria-hidden="true">{icon}</span>
+    </button>
+  );
+}
+```
+
+#### Step 4 — Error Handling & Edge Cases
+```tsx
+// Enforce label is non-empty at TypeScript level
+type NonEmptyString = string & { readonly __brand: 'NonEmpty' };
+
+function requireLabel(label: string): NonEmptyString {
+  if (!label.trim()) throw new Error('IconButton: label must not be empty');
+  return label as NonEmptyString;
+}
+```
+
+#### Step 5 — Tests
+```tsx
+// components/IconButton.test.tsx
+import { render, screen } from '@testing-library/react';
+import { axe } from 'jest-axe';
+import { IconButton } from './IconButton';
+
+const TestIcon = () => <svg aria-hidden="true"><path /></svg>;
+
+test('has accessible name from label', () => {
+  render(<IconButton icon={<TestIcon />} label="Close dialog" onClick={() => {}} />);
+  expect(screen.getByRole('button', { name: 'Close dialog' })).toBeInTheDocument();
+});
+
+test('passes axe accessibility check', async () => {
+  const { container } = render(
+    <IconButton icon={<TestIcon />} label="Delete item" onClick={() => {}} />
+  );
+  expect(await axe(container)).toHaveNoViolations();
+});
+
+test('is focusable by keyboard', () => {
+  render(<IconButton icon={<TestIcon />} label="Edit" onClick={() => {}} />);
+  const btn = screen.getByRole('button');
+  btn.focus();
+  expect(document.activeElement).toBe(btn);
+});
+
+test('disabled button cannot be activated', () => {
+  const handler = jest.fn();
+  render(<IconButton icon={<TestIcon />} label="Submit" onClick={handler} disabled />);
+  screen.getByRole('button').click();
+  expect(handler).not.toHaveBeenCalled();
+});
+```
+
+**Expected Output:**
+```
+✓ has accessible name from label
+✓ passes axe accessibility check
+✓ is focusable by keyboard
+✓ disabled button cannot be activated
+```
+
+**Stretch Challenges:**
+- [ ] Add tooltip on hover/focus that shows the aria-label visually
+- [ ] Test with a real screen reader (VoiceOver/NVDA) and document what you hear
+- [ ] Add `aria-pressed` state for toggle icon buttons
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before reading ahead. Review at Day 1 → 3 → 7 → 14 intervals.
+
+---
+
+### Day 1 — Recall
+
+**Q1:** Name the POUR principles and give one concrete design system violation for each.
+
+**Q2:** What three things does every interactive element need for assistive technology? What breaks when each is missing?
+
+**Q3:** Write a 10-line accessible icon button in JSX with correct ARIA. No IDE.
+
+---
+
+### Day 3 — Comprehension
+
+**Q4:** What is the difference between `aria-label`, `aria-labelledby`, and `aria-describedby`? Give one use case where each is the right choice.
+
+**Q5:** A developer replaces a `<button>` with a styled `<div onClick>`. List all the accessibility features that break and how to fix each.
+
+**Q6:** Refactor this code to be accessible:
+```tsx
+<div className="modal" style={{ display: open ? 'block' : 'none' }}>
+  <div onClick={onClose} className="close-btn">×</div>
+  <h2>Confirm Action</h2>
+</div>
+```
+
+---
+
+### Day 7 — Application
+
+**Q7:** Build a focus trap from scratch in vanilla JS. It must: trap Tab/Shift+Tab within a container, return focus on close, and skip disabled elements.
+
+**Q8:** You are reviewing a PR that adds 20 new components to a design system. None have axe-core tests. Describe the accessibility debt being created, the failure modes at scale, and what CI enforcement you'd add.
+
+**Q9:** What is the minimum contrast ratio for normal text under WCAG AA? Under WCAG AAA? How do you verify it programmatically?
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10:** ★ "How would you retrofit accessibility into a design system of 50 components that was built without a11y in mind? What is the order of operations, and how do you measure progress?"
+
+**Q11:** Map accessibility to: semantic HTML, design tokens (colour), focus management, ARIA, keyboard interaction patterns — which is the foundation and which builds on it?
+
+**Q12:** ★ "Your design system serves 200 product teams. An audit finds that 60% of pages fail WCAG 2.1 AA contrast. The failures trace back to 3 token pairs. How do you fix this without breaking existing products, and what process prevents it recurring?"

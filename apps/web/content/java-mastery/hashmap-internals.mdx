@@ -1,153 +1,619 @@
 ---
-slug: "hashmap-internals"
-title: "HashMap Internals"
-level: 3
+slug: hashmap-internals
+title: HashMap Internals — How It Really Works
+level: intermediate
 ---
 
 ## WHY
-If you need to retrieve a user's profile by their email address, searching a `List<User>` forces you to check every single user one by one (`O(n)`). If you have 10 million users, this takes millions of operations per search.
 
-A Hash Table solves this by providing `O(1)` constant-time lookups. It mathematically maps the email address directly to a memory location. In Java, `HashMap` is the absolute king of collections. It is arguably the most frequently used data structure in the entire language. Understanding exactly how it calculates hashes, resolves collisions, and dynamically resizes its internal array is a mandatory requirement for passing any senior engineering interview.
+HashMap is the most-used collection in Java. Knowing its internals is mandatory for:
+
+1. **Performance** — Default capacity, load factor, rehashing cause hidden O(n) operations
+2. **Correct equals/hashCode** — Breaking the contract corrupts all HashMap/HashSet behavior
+3. **Thread safety** — Using HashMap in concurrent code is a common source of bugs (data race, infinite loop in Java 7)
+4. **Interview** — HashMap internals is asked in 90% of Java senior interviews
+5. **Java 8 upgrade** — Treeification of buckets changed behavior for high-collision scenarios
+
+---
 
 ## THEORY
-### The Bucket Array and Hashing
-Under the hood, a `HashMap` is an array of `Node<K,V>` objects, often called "buckets". By default, the array size is 16.
-When you call `put(key, value)`:
-1. The JVM calls `key.hashCode()`.
-2. It mathematically compresses this hash to fit within the array bounds using a bitwise AND operation: `index = (n - 1) & hash`.
-3. It places the `Node` at that exact array index.
-When you call `get(key)`, it runs the exact same math, instantly calculating the index and returning the value in `O(1)` time.
 
-### Collision Resolution (Java 8 Treeify)
-What happens if two different keys calculate to the exact same array index? This is a **Collision**.
-Historically, `HashMap` handled this via a **Linked List**. The new `Node` was simply attached to the existing `Node` at that index. However, if a malicious user intentionally fed the map 10,000 keys that all collided, the list would become 10,000 nodes long, destroying performance (`O(n)` lookup).
-**Java 8 Optimization**: Once a bucket's linked list reaches 8 nodes (the `TREEIFY_THRESHOLD`), the `HashMap` dynamically transforms the linked list into a **Red-Black Tree**. This guarantees worst-case lookup performance degrades to `O(log n)` instead of `O(n)`, neutralizing Denial of Service (DoS) collision attacks.
+### Internal Data Structure
 
-### Load Factor and Rehashing
-A `HashMap` has a default `Load Factor` of 0.75. This means when the bucket array is 75% full (12 out of 16 slots), the `HashMap` will completely resize itself. It creates a brand new array double the size (32), and recalculates the hash index for every single existing element, moving them to the new array. This is a very expensive operation called **Rehashing**.
+HashMap uses an **array of buckets** (called `table`). Each bucket holds a **linked list** of entries (Java 7) or a **red-black tree** if the list gets long (Java 8+).
+
+```
+HashMap Internal Structure:
+┌─────────────────────────────────────────────┐
+│  Entry[] table  (default capacity = 16)     │
+│                                             │
+│  [0]  → null                                │
+│  [1]  → Entry("Alice", 30) → Entry("Eve", 25) → null   (collision chain)
+│  [2]  → null                                │
+│  [3]  → Entry("Bob", 28) → null             │
+│  ...                                        │
+│  [15] → null                                │
+│                                             │
+│  size = 3                                   │
+│  loadFactor = 0.75                          │
+│  threshold = 12 (capacity × loadFactor)     │
+└─────────────────────────────────────────────┘
+```
+
+### How `put(key, value)` Works — Step by Step
+
+```
+Step 1: Compute hash
+  hash = key.hashCode()
+  spread hash: hash = hash ^ (hash >>> 16)  // spread high bits to low
+
+Step 2: Compute bucket index
+  index = hash & (capacity - 1)  // equivalent to hash % capacity (fast bitwise)
+
+Step 3: Go to table[index]
+  If null → create new Entry, done
+  If not null → walk the chain/tree:
+    If key.equals(existingKey) → update value
+    If not found → append new Entry to chain
+
+Step 4: Check if resize needed
+  if (size > threshold) → resize to 2× capacity
+```
+
+### Hash Function
+
+```java
+// Java 8 HashMap hash spreading
+static final int hash(Object key) {
+    int h;
+    return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+}
+// Why? Poor hashCode implementations (like sequential IDs) cluster in low bits.
+// XOR with high bits spreads them better, reducing collisions.
+```
+
+### Collision Handling — Java 7 vs Java 8
+
+| | Java 7 | Java 8+ |
+|--|--------|---------|
+| Bucket structure | Linked list always | Linked list → tree when size > 8 |
+| Worst case get | O(n) with many collisions | O(log n) after treeification |
+| Tree threshold | N/A | TREEIFY_THRESHOLD = 8 |
+| Untreeify threshold | N/A | UNTREEIFY_THRESHOLD = 6 |
+| Minimum capacity for treeify | N/A | MIN_TREEIFY_CAPACITY = 64 |
+
+**Java 8 treeification:**
+```
+Bucket chain grows:      Chain → LinkedList (O(n) worst case)
+After 8 entries:        Chain → Red-Black Tree (O(log n) worst case)
+After shrink to 6:      Tree → LinkedList again (hysteresis prevents thrashing)
+```
+
+### Resizing (Rehashing)
+
+When `size > capacity × loadFactor`:
+1. Create new table with double capacity
+2. For each existing entry, recompute `hash & (newCapacity - 1)`
+3. Move entry to new bucket
+4. **Cost: O(n)** — all existing entries are rehashed!
+
+```
+Initial: capacity=16, threshold=12
+After 12th put: RESIZE → capacity=32, threshold=24, all entries rehashed
+After 24th put: RESIZE → capacity=64, threshold=48, all entries rehashed
+```
+
+**Pre-sizing to avoid rehashing:**
+```java
+// If you know you'll add ~100 entries:
+// threshold = capacity × 0.75, so capacity = expectedSize / 0.75
+int expectedSize = 100;
+HashMap<String, Integer> map = new HashMap<>((int)(expectedSize / 0.75) + 1);
+// = new HashMap<>(134) → capacity = 256 (next power of 2)
+// This avoids 3 rehashes that would happen with default capacity 16
+```
+
+### equals() and hashCode() Contract
+
+**The Contract (MUST follow both rules):**
+1. If `a.equals(b)` then `a.hashCode() == b.hashCode()` (REQUIRED)
+2. If `a.hashCode() == b.hashCode()` then NOT necessarily `a.equals(b)` (allowed collision)
+
+**What happens when you break the contract:**
+```java
+class BadKey {
+    int id;
+    @Override public boolean equals(Object o) {
+        return ((BadKey)o).id == this.id;
+    }
+    // NO hashCode override! Uses Object.hashCode (memory address)
+}
+
+Map<BadKey, String> map = new HashMap<>();
+BadKey k1 = new BadKey(); k1.id = 1;
+map.put(k1, "Alice");
+
+BadKey k2 = new BadKey(); k2.id = 1;  // same id, so equals() returns true
+System.out.println(map.get(k2));  // null! Different hashCode → different bucket!
+```
+
+### LinkedHashMap vs HashMap
+
+`LinkedHashMap` extends `HashMap` but adds a **doubly-linked list** through all entries to maintain insertion order (or access order for LRU cache).
+
+```
+HashMap:  Order unpredictable
+LinkedHashMap: Insertion order or LRU access order
+TreeMap:  Sorted by key (uses Red-Black tree, not hash)
+```
+
+---
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "HashMapVisualizer", "state": "treeify-threshold" }
+{
+  "type": "none"
+}
 ```
+
+---
 
 ## CODE
 
-### Level 1 — Beginner
-```java
-import java.util.HashMap;
-import java.util.Map;
+### Level 1 — Beginner: HashMap Basics
 
-public class BasicHashMap {
+```java
+// HashMapBasics.java
+import java.util.*;
+
+public class HashMapBasics {
     public static void main(String[] args) {
         Map<String, Integer> scores = new HashMap<>();
         
-        // O(1) Insert
+        // put — O(1) average
         scores.put("Alice", 95);
-        scores.put("Bob", 82);
-        
-        // O(1) Retrieval
-        System.out.println(scores.get("Alice")); // 95
-        
-        // put() overwrites if the key exists
-        scores.put("Alice", 100); 
-    }
-}
-```
+        scores.put("Bob", 87);
+        scores.put("Charlie", 92);
+        scores.put("Alice", 98);  // updates existing key
 
-### Level 2 — Building Blocks
-```java
-public class MapIteration {
-    public static void main(String[] args) {
-        Map<String, String> config = new HashMap<>();
-        config.put("host", "localhost");
-        config.put("port", "8080");
-        
-        // BEST PRACTICE: Iterate over the EntrySet (gets both key and value simultaneously)
-        for (Map.Entry<String, String> entry : config.entrySet()) {
-            System.out.println(entry.getKey() + "=" + entry.getValue());
+        // get — O(1) average
+        System.out.println(scores.get("Alice"));    // 98
+        System.out.println(scores.get("Dave"));     // null
+        System.out.println(scores.getOrDefault("Dave", 0)); // 0
+
+        // containsKey, containsValue
+        System.out.println(scores.containsKey("Bob"));   // true
+        System.out.println(scores.containsValue(100));   // false
+
+        // size, isEmpty
+        System.out.println("Size: " + scores.size());  // 3
+
+        // remove
+        scores.remove("Bob");
+        System.out.println("After remove: " + scores);
+
+        // Iteration — 3 ways
+        // 1. entrySet (most efficient)
+        for (Map.Entry<String, Integer> entry : scores.entrySet()) {
+            System.out.println(entry.getKey() + " → " + entry.getValue());
         }
-        
-        // Java 8+ lambda approach
-        config.forEach((key, value) -> {
-            System.out.println(key + "=" + value);
-        });
-    }
-}
-```
 
-### Level 3 — Intermediate
-```java
-public class CapacityTuning {
-    public static void main(String[] args) {
-        // If we know we are adding exactly 10,000 items,
-        // we should pre-size the HashMap to avoid expensive Rehashing.
-        // Math: 10,000 / 0.75 (load factor) = 13,333. 
-        // We round up to the next power of 2: 16,384.
-        
-        Map<Integer, String> optimizedMap = new HashMap<>(16384);
-        
-        for (int i = 0; i < 10000; i++) {
-            optimizedMap.put(i, "Data");
+        // 2. keySet
+        for (String key : scores.keySet()) {
+            System.out.println(key + ": " + scores.get(key));
         }
+
+        // 3. values only
+        for (int score : scores.values()) {
+            System.out.println("Score: " + score);
+        }
+
+        // 4. forEach (Java 8)
+        scores.forEach((k, v) -> System.out.println(k + "=" + v));
     }
 }
 ```
 
-### Level 4 — Advanced
+---
+
+### Level 2 — Elementary: Frequency Counter & Word Count
+
 ```java
-import java.util.Objects;
+// HashMapPatterns.java
+import java.util.*;
 
-// Defining a custom object as a HashMap Key
-public class CustomKey {
-    private final String id;
-    private final String tenant;
+public class HashMapPatterns {
 
-    public CustomKey(String id, String tenant) {
-        this.id = id; this.tenant = tenant;
+    // 1. Frequency counter — most common pattern
+    public static Map<Character, Integer> charFrequency(String s) {
+        Map<Character, Integer> freq = new HashMap<>();
+        for (char c : s.toCharArray()) {
+            freq.merge(c, 1, Integer::sum);
+            // equivalent to: freq.put(c, freq.getOrDefault(c, 0) + 1);
+        }
+        return freq;
     }
 
-    // MANDATORY: If you use a custom object as a Key, 
-    // you MUST override equals() and hashCode() perfectly.
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        CustomKey that = (CustomKey) o;
-        return Objects.equals(id, that.id) && Objects.equals(tenant, that.tenant);
+    // 2. Find duplicates
+    public static List<String> findDuplicates(String[] words) {
+        Map<String, Integer> count = new HashMap<>();
+        for (String w : words) count.merge(w, 1, Integer::sum);
+        List<String> dups = new ArrayList<>();
+        count.forEach((k, v) -> { if (v > 1) dups.add(k); });
+        return dups;
     }
 
-    @Override
-    public int hashCode() {
-        return Objects.hash(id, tenant);
+    // 3. Group anagrams
+    public static List<List<String>> groupAnagrams(String[] words) {
+        Map<String, List<String>> groups = new HashMap<>();
+        for (String word : words) {
+            char[] chars = word.toCharArray();
+            Arrays.sort(chars);
+            String key = new String(chars);  // sorted chars = canonical anagram key
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(word);
+        }
+        return new ArrayList<>(groups.values());
+    }
+
+    // 4. Two sum with HashMap
+    public static int[] twoSum(int[] nums, int target) {
+        Map<Integer, Integer> seen = new HashMap<>();
+        for (int i = 0; i < nums.length; i++) {
+            int complement = target - nums[i];
+            if (seen.containsKey(complement)) {
+                return new int[]{seen.get(complement), i};
+            }
+            seen.put(nums[i], i);
+        }
+        return new int[]{};
+    }
+
+    public static void main(String[] args) {
+        System.out.println(charFrequency("programming")); // {p=1, r=2, o=1, g=2, ...}
+        System.out.println(findDuplicates(new String[]{"a","b","a","c","b","a"})); // [a, b]
+        System.out.println(groupAnagrams(new String[]{"eat","tea","tan","ate","nat","bat"}));
+        System.out.println(Arrays.toString(twoSum(new int[]{2,7,11,15}, 9))); // [0, 1]
     }
 }
 ```
+
+---
+
+### Level 3 — Intermediate: Correct equals/hashCode
+
+```java
+// CorrectHashCode.java
+import java.util.*;
+
+public class CorrectHashCode {
+
+    // CORRECT implementation of equals + hashCode
+    static class Point {
+        final int x, y;
+
+        Point(int x, int y) { this.x = x; this.y = y; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;           // same reference
+            if (!(o instanceof Point)) return false; // null/wrong type
+            Point p = (Point) o;
+            return x == p.x && y == p.y;          // field comparison
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(x, y);  // consistent with equals
+            // Objects.hash uses prime multiplication: 31*x + y (roughly)
+        }
+
+        @Override
+        public String toString() { return "(" + x + "," + y + ")"; }
+    }
+
+    // WRONG — only equals, no hashCode
+    static class BrokenPoint {
+        int x, y;
+        BrokenPoint(int x, int y) { this.x = x; this.y = y; }
+
+        @Override
+        public boolean equals(Object o) {
+            BrokenPoint p = (BrokenPoint) o;
+            return x == p.x && y == p.y;
+        }
+        // hashCode NOT overridden → uses Object.hashCode (memory address)
+    }
+
+    public static void main(String[] args) {
+        // CORRECT — works as expected
+        Map<Point, String> grid = new HashMap<>();
+        grid.put(new Point(1, 2), "tower");
+        System.out.println(grid.get(new Point(1, 2))); // "tower" ✓
+
+        // WRONG — broken lookup
+        Map<BrokenPoint, String> brokenGrid = new HashMap<>();
+        BrokenPoint bp = new BrokenPoint(1, 2);
+        brokenGrid.put(bp, "tower");
+        System.out.println(brokenGrid.get(new BrokenPoint(1, 2))); // null! ✗
+
+        // hashCode contract: equal objects must have equal hashCodes
+        Point p1 = new Point(3, 4);
+        Point p2 = new Point(3, 4);
+        System.out.println(p1.equals(p2));   // true
+        System.out.println(p1.hashCode() == p2.hashCode()); // true ✓
+
+        // Using as Set key
+        Set<Point> visited = new HashSet<>();
+        visited.add(new Point(0, 0));
+        visited.add(new Point(1, 1));
+        System.out.println(visited.contains(new Point(0, 0))); // true ✓
+    }
+}
+```
+
+---
+
+### Level 4 — Advanced: LRU Cache with LinkedHashMap
+
+```java
+// LRUCache.java
+import java.util.*;
+
+/**
+ * LRU (Least Recently Used) Cache
+ * LinkedHashMap with access order + removeEldestEntry override
+ * O(1) get and put operations
+ */
+public class LRUCache<K, V> extends LinkedHashMap<K, V> {
+    private final int capacity;
+
+    public LRUCache(int capacity) {
+        super(capacity, 0.75f, true); // accessOrder = true (not insertion order!)
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+        return size() > capacity; // auto-remove when over capacity
+    }
+
+    public static void main(String[] args) {
+        LRUCache<Integer, String> cache = new LRUCache<>(3);
+        cache.put(1, "one");
+        cache.put(2, "two");
+        cache.put(3, "three");
+        System.out.println(cache); // {1=one, 2=two, 3=three}
+
+        cache.get(1);  // access key 1 → moves to most recent
+        cache.put(4, "four"); // exceeds capacity → evicts LRU (key 2)
+        System.out.println(cache); // {3=three, 1=one, 4=four}
+        System.out.println(cache.get(2)); // null — evicted
+    }
+}
+
+// Manual implementation without LinkedHashMap (interview version):
+class LRUCacheManual {
+    private final int capacity;
+    private final Map<Integer, Node> map;
+    private final Node head, tail; // dummy sentinel nodes
+
+    static class Node {
+        int key, val;
+        Node prev, next;
+        Node(int k, int v) { key = k; val = v; }
+    }
+
+    public LRUCacheManual(int capacity) {
+        this.capacity = capacity;
+        map = new HashMap<>();
+        head = new Node(0, 0); // most recent end
+        tail = new Node(0, 0); // least recent end
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    public int get(int key) {
+        if (!map.containsKey(key)) return -1;
+        Node node = map.get(key);
+        remove(node);
+        addToFront(node);
+        return node.val;
+    }
+
+    public void put(int key, int value) {
+        if (map.containsKey(key)) remove(map.get(key));
+        if (map.size() == capacity) {
+            Node lru = tail.prev;
+            remove(lru);
+            map.remove(lru.key);
+        }
+        Node node = new Node(key, value);
+        addToFront(node);
+        map.put(key, node);
+    }
+
+    private void remove(Node n) {
+        n.prev.next = n.next;
+        n.next.prev = n.prev;
+    }
+
+    private void addToFront(Node n) {
+        n.next = head.next;
+        n.prev = head;
+        head.next.prev = n;
+        head.next = n;
+    }
+}
+```
+
+---
+
+### Level 5 — Expert: ConcurrentHashMap & Thread-Safe Patterns
+
+```java
+// ConcurrentHashMapDemo.java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.*;
+
+public class ConcurrentHashMapDemo {
+
+    /**
+     * ConcurrentHashMap internals (Java 8):
+     * - Segment locking removed; uses CAS + synchronized on individual bins
+     * - volatile reads for get() — no locking for reads!
+     * - computeIfAbsent is atomic — safe for initializing complex values
+     */
+    public static void threadSafeWordCount(List<String> words) throws InterruptedException {
+        ConcurrentHashMap<String, AtomicInteger> wordCount = new ConcurrentHashMap<>();
+
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < 4; t++) {
+            final List<String> chunk = words.subList(
+                t * words.size() / 4, (t + 1) * words.size() / 4);
+            threads.add(new Thread(() -> {
+                for (String word : chunk) {
+                    wordCount.computeIfAbsent(word, k -> new AtomicInteger(0))
+                             .incrementAndGet();
+                }
+            }));
+        }
+
+        threads.forEach(Thread::start);
+        for (Thread t : threads) t.join();
+
+        wordCount.entrySet().stream()
+            .sorted(Map.Entry.<String, AtomicInteger>comparingByValue(
+                (a, b) -> b.get() - a.get()))
+            .limit(5)
+            .forEach(e -> System.out.println(e.getKey() + ": " + e.getValue().get()));
+    }
+
+    /**
+     * HashMap vs ConcurrentHashMap — do NOT use HashMap in multi-threaded code.
+     * Java 7 HashMap could get infinite loop during resize (concurrent put from
+     * two threads creating a cycle in the linked list). Java 8 fixed this but
+     * HashMap is still unsafe — use ConcurrentHashMap.
+     */
+    public static void demonstrateMapMerge() {
+        // merge, compute, computeIfAbsent, computeIfPresent — all atomic in CHM
+        ConcurrentHashMap<String, Integer> inventory = new ConcurrentHashMap<>();
+
+        // Thread-safe increment
+        inventory.merge("apples", 5, Integer::sum);  // apples: 5
+        inventory.merge("apples", 3, Integer::sum);  // apples: 8
+
+        // Thread-safe compute
+        inventory.compute("bananas", (k, v) -> v == null ? 1 : v + 1);
+
+        // compute a complex structure atomically
+        ConcurrentHashMap<String, List<String>> groups = new ConcurrentHashMap<>();
+        String[] items = {"a", "bb", "cc", "ddd", "e"};
+        for (String item : items) {
+            groups.computeIfAbsent(
+                String.valueOf(item.length()),
+                k -> new CopyOnWriteArrayList<>()  // thread-safe list
+            ).add(item);
+        }
+
+        System.out.println(inventory);  // {apples=8, bananas=1}
+        System.out.println(groups);     // {1=[a, e], 2=[bb, cc], 3=[ddd]}
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        List<String> words = List.of("java","python","java","go","python","java");
+        threadSafeWordCount(new ArrayList<>(words));
+        demonstrateMapMerge();
+    }
+}
+```
+
+---
 
 ## REAL_WORLD
-A legendary bug in early Java web applications was the "Mutable Key Trap". 
 
-Developers would create a complex object, put it into a `HashMap` as a Key, and then *modify* the object's fields later. 
+### Spring Cache with HashMap Under the Hood
+
 ```java
-User u = new User("alice@corp.com");
-map.put(u, "Admin Profile");
+@Service
+public class UserService {
+    // In-memory cache — HashMap wrapped in ConcurrentHashMap for thread safety
+    private final Map<Long, User> cache = new ConcurrentHashMap<>();
 
-// 100 lines later...
-u.setEmail("alice@newcorp.com"); // BUG!
+    public User getUser(Long id) {
+        return cache.computeIfAbsent(id, this::loadFromDatabase);
+    }
 
-// Attempt to fetch the profile
-map.get(u); // RETURNS NULL!
+    private User loadFromDatabase(Long id) {
+        // expensive DB call
+        return userRepository.findById(id).orElseThrow();
+    }
+
+    public void invalidate(Long id) {
+        cache.remove(id);
+    }
+}
 ```
-When `setEmail` was called, the object's `hashCode()` output changed. But the object was already placed in bucket #5 based on its old hash code. When you call `get(u)`, it calculates the new hash code, looks in bucket #12, finds nothing, and returns `null`. The object is permanently lost in the map like a ghost.
 
-**Rule for Production:** Keys in a `HashMap` must ALWAYS be Immutable (like `String` or `Integer` or a Java `Record`). Never use a mutable JPA Entity as a Map key.
+### Pre-sizing for Batch Processing
+
+```java
+// Reading 1 million records — pre-size to avoid rehashing
+int expectedRecords = 1_000_000;
+Map<String, Product> productMap = new HashMap<>(
+    (int)(expectedRecords / 0.75f) + 1
+);
+// Without pre-sizing: ~20 rehash operations
+// With pre-sizing: 0 rehash operations
+```
+
+---
 
 ## INTERVIEW
-**Q: How does `HashMap` handle collisions?**
-A: When two keys hash to the same bucket index, `HashMap` stores them in a Linked List at that bucket. When retrieving, it traverses the list and uses the `.equals()` method to find the exact key. In Java 8+, if this list grows beyond 8 elements (`TREEIFY_THRESHOLD`), the map converts the list into a Red-Black Tree, improving search performance from `O(n)` to `O(log n)`.
 
-**Q: What happens if you override `equals()` but do not override `hashCode()`?**
-A: You break the fundamental contract of `HashMap`. If two objects are `.equals()`, they MUST return the exact same `hashCode()`. If you don't override `hashCode()`, two logically equal objects will return different memory-based hashes. They will be placed in completely different buckets in the map, making it impossible to retrieve the value using a seemingly identical key.
+**Q1: How does HashMap work internally?**
 
-**Q: Why is the default `HashMap` array size (16) always a power of 2?**
-A: Because of extreme CPU optimization. The standard formula to fit a hash into an array size `n` is modulo math: `hash % n`. However, modulo operations are slow at the CPU level. If (and only if) `n` is a power of 2, you can use bitwise AND masking: `hash & (n - 1)`. This produces the exact same result as modulo but executes drastically faster in the CPU logic gates.
+> **Strong answer:** HashMap uses an array of `Node[]` (buckets). `put(key, value)` computes `hash = key.hashCode() ^ (hash >>> 16)` then `index = hash & (capacity-1)`. If no entry at that index, a new Node is created. If there's a collision (different key, same index), a linked list or red-black tree is maintained at that bucket. Java 8+ converts the list to a tree when a bucket has 8+ entries (TREEIFY_THRESHOLD), improving worst-case from O(n) to O(log n). When `size > capacity × 0.75`, the table is doubled and all entries are rehashed (O(n)).
+
+**Q2: What is the equals/hashCode contract and why does it matter for HashMap?**
+
+> **Strong answer:** The contract: if `a.equals(b)` then `a.hashCode() == b.hashCode()`. HashMap uses hashCode to determine which bucket to look in, then equals to find the exact key. If you override equals but not hashCode, two equal objects hash to different buckets — `map.get()` returns null even though the key was put in. If you override hashCode but not equals, all objects go to the same bucket but can never be found. Always override both together using `Objects.hash()` or IDE generation.
+
+**Q3: What is the default initial capacity and load factor, and why?**
+
+> **Strong answer:** Default capacity = 16 (power of 2 — allows fast bitwise `&` instead of `%`). Default load factor = 0.75 — a time/space tradeoff: lower load factor = fewer collisions but wastes memory; higher = more collisions. At 0.75, statistically a bucket with n entries has about 1 entry on average at threshold. Resize doubles capacity when `size > capacity × 0.75`. If you know the expected size, pre-size with `new HashMap<>((int)(n / 0.75) + 1)` to avoid rehashing.
+
+**Q4: How is ConcurrentHashMap different from HashMap and Hashtable?**
+
+> **Strong answer:** HashMap — not thread-safe, fastest single-threaded. Hashtable — thread-safe but uses a single lock on the whole map (`synchronized` on every method) — major bottleneck. ConcurrentHashMap (Java 8) — uses CAS (Compare-And-Swap) operations and locks only individual buckets (bins) when writing. Reads (`get`) are non-blocking (volatile reads). This allows full concurrent reads and fine-grained concurrent writes. `compute`, `merge`, `computeIfAbsent` are atomically performed. Never use HashMap in multi-threaded code; use ConcurrentHashMap.
+
+**Q5: Can you store null keys and null values in HashMap?**
+
+> **Strong answer:** Yes — HashMap allows one null key (stored at index 0) and multiple null values. Hashtable and ConcurrentHashMap do NOT allow null keys or values (ConcurrentHashMap throws NullPointerException). The reason for CHM: `map.get(key) == null` is ambiguous — does the key not exist, or does it map to null? In concurrent code this ambiguity is dangerous. TreeMap also doesn't allow null keys (can't compare null with Comparator).
+
+---
+
+## FEYNMAN CHECK
+
+HashMap is like a library with numbered shelves. When you store a book, a formula converts the title to a shelf number in milliseconds — you go straight to that shelf instead of searching all 1000 shelves. Occasionally two books get the same shelf number — that's a "collision." The library keeps them in the same shelf sorted alphabetically. When the library gets too full (>75% full), it doubles in size and rearranges all books. That rearrangement is the only expensive operation.
+
+---
+
+## BUILD
+
+**Challenge:** Build a phone directory using HashMap:
+- `addContact(name, phone)` — O(1)
+- `lookup(name)` → phone — O(1)
+- `lookupByPhone(phone)` → name — O(1) hint: maintain reverse map
+- `autocomplete(prefix)` → all names starting with prefix — O(k) where k = matches
+- Handle collision: same name, different phone numbers (store as List)
+
+---
+
+## SPACED REVIEW
+
+- Day 1: Explain HashMap put/get flow, bucket array, hash spreading
+- Day 3: Write correct equals/hashCode for a `Point(x, y)` class
+- Day 7: Implement LRU cache using LinkedHashMap
+- Day 14: Explain Java 8 treeification, ConcurrentHashMap vs Hashtable

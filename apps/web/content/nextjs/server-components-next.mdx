@@ -160,3 +160,211 @@ function LikeButton({ initialCount }: { initialCount: number }) {
 ```
 
 The key insight: you should have as many Server Components as possible (no JS bundle) and as few Client Components as possible (each adds to the bundle). Push the `'use client'` boundary as deep down the tree as possible — only the interactive leaf nodes need to be Client Components.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Server Components Like I'm 10 Years Old
+> React Server Components (RSC) are React components that run ONLY on the server — they never send their JavaScript to the browser. A regular React component ships its JS to the user; a Server Component renders HTML on the server and sends JUST THE HTML to the browser. This means: zero component JavaScript in the browser bundle, direct database access without an API layer, secrets like API keys stay server-side, and async/await works directly in the component. The non-obvious depth: Server Components and Client Components can be INTERLEAVED — a Server Component renders most of the page and passes specific interactive pieces to Client Components as children. The "server/client boundary" is determined by the 'use client' directive at the TOP of a file — everything above it in the import tree is server-only.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What can Server Components do that Client Components cannot, and vice versa?**
+> **A:** Server Components CAN: directly access databases (no API needed), read filesystem files, use environment secrets (process.env.SECRET_KEY), import large server-only libraries without bloating the client bundle, be async functions with await. Server Components CANNOT: use useState, useEffect, or any hook, attach event handlers (onClick), access browser APIs (window, document, localStorage), be used in a 'use client' file. Client Components CAN do all the above that Server Components cannot. Client Components CANNOT: be async functions (yet), directly access databases, import server-only libraries.
+
+**Q2: Mental model for the server/client boundary?**
+> **A:** The boundary is where 'use client' appears at the TOP of a file. Everything imported by a 'use client' file becomes part of the client bundle. The rule: 'use client' "infects" downward — all children components of a 'use client' component are also treated as client components. But the PARENT can still be a Server Component. Pattern: keep the page/layout as Server Component (fetch data, access DB), pass data DOWN as props to a targeted 'use client' component (the button, form, interactive widget). Never put 'use client' at the top level unless necessary.
+
+**Q3: Most dangerous misconception about Server Components?**
+> **A:** All components in app/ are Server Components by default:
+> ```typescript
+> // WRONG: thinking third-party components are Server-safe
+> import { SomeChart } from 'chart-library';  // uses useState internally
+> // ERROR: chart-library is not marked 'use server', but uses client APIs
+>
+> // CORRECT: wrap third-party components that need browser APIs
+> // components/ChartWrapper.tsx
+> 'use client';
+> import { SomeChart } from 'chart-library';
+> export function ChartWrapper(props: any) { return <SomeChart {...props} />; }
+>
+> // Now use ChartWrapper in Server Components safely:
+> import { ChartWrapper } from './ChartWrapper';
+> export default async function DashboardPage() {
+>   const data = await db.getMetrics();
+>   return <ChartWrapper data={data} />;  // data flows from server, chart renders on client
+> }
+> ```
+
+**Q4: How do Server Components affect the bundle size?**
+> **A:** Any import in a Server Component is EXCLUDED from the client bundle — it stays on the server. If a Server Component imports a 500KB markdown parser, that 500KB never reaches the browser. This is why Next.js's default Server Components model dramatically reduces bundle sizes — only the specific 'use client' components and their imports go to the browser. You can verify: next/bundle-analyzer shows zero KB for server-only imports. This enables using large server libraries (pdf generators, markdown parsers, ORMs) without any performance penalty for the user.
+
+**Q5: FAANG-grade definition of React Server Components in Next.js.**
+> **A:** "React Server Components (RSC) are React components that execute exclusively on the server — enabling async/await syntax, direct database access, server-only library imports with zero client bundle impact, and access to server-side secrets — rendered to RSC payload (a serializable description of the component tree) and streamed to the client — with the 'use client' directive marking the server/client boundary below which components receive interactivity (hooks, events, browser APIs) — and serializable props as the only data channel from Server to Client Components — enabling large portions of a React application to have zero client JavaScript while maintaining seamless composition with interactive Client Components."
+
+## BUILD
+
+### 🏗️ Mini Project: RSC Data Pipeline — Server Fetches, Client Interacts, Zero API Layer
+
+**What you will build:** A product dashboard where: a Server Component reads directly from a SQLite database, passes data as props to a 'use client' FilterBar, which updates the URL, which causes the Server Component to re-render with filtered data — demonstrating RSC's zero-API data layer.
+**Why this project:** Forces the server/client composition pattern — the most important RSC architectural decision.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest rsc-demo --typescript --tailwind --app
+npm install better-sqlite3 @types/better-sqlite3
+```
+
+#### Step 2 — Server-Only Database Module
+```typescript
+// src/lib/db.server.ts  (server-only convention — import only in Server Components)
+import 'server-only';  // throws if imported in client bundle
+import Database from 'better-sqlite3';
+
+const db = new Database('products.db');
+// ... seed data
+
+export interface Product { id: number; name: string; price: number; category: string; }
+
+export async function getProducts(filters: { category?: string; minPrice?: number } = {}): Promise<Product[]> {
+  let query = 'SELECT * FROM products WHERE 1=1';
+  const params: any[] = [];
+  if (filters.category) { query += ' AND category = ?'; params.push(filters.category); }
+  if (filters.minPrice) { query += ' AND price >= ?'; params.push(filters.minPrice); }
+  return db.prepare(query).all(...params) as Product[];
+}
+```
+
+#### Step 3 — Server Component Page
+```typescript
+// src/app/products/page.tsx  -- Server Component (no 'use client')
+import { getProducts } from '@/lib/db.server';
+import { ProductGrid } from '@/components/ProductGrid';
+import { FilterBar } from '@/components/FilterBar';  // 'use client' component
+
+interface Props {
+  searchParams: { category?: string; minPrice?: string };
+}
+
+export default async function ProductsPage({ searchParams }: Props) {
+  // Direct DB access — no fetch(), no API route needed
+  const products = await getProducts({
+    category: searchParams.category,
+    minPrice: searchParams.minPrice ? Number(searchParams.minPrice) : undefined,
+  });
+
+  const categories = ['all', 'electronics', 'books', 'tools'];
+
+  return (
+    <main className="p-8">
+      <h1 className="text-2xl font-bold mb-4">Products ({products.length})</h1>
+      {/* FilterBar is a Client Component — receives data from Server Component */}
+      <FilterBar categories={categories} />
+      {/* ProductGrid is a Server Component — renders static HTML */}
+      <ProductGrid products={products} />
+    </main>
+  );
+}
+```
+
+#### Step 4 — Client Component FilterBar
+```typescript
+// src/components/FilterBar.tsx
+'use client';
+import { useRouter, useSearchParams } from 'next/navigation';
+
+interface Props { categories: string[]; }
+
+export function FilterBar({ categories }: Props) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const setCategory = (category: string) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (category === 'all') params.delete('category');
+    else params.set('category', category);
+    // Updating URL causes Server Component to re-fetch filtered products
+    router.push(`/products?${params.toString()}`);
+  };
+
+  const currentCategory = searchParams.get('category') ?? 'all';
+
+  return (
+    <div className="flex gap-2 mb-4">
+      {categories.map(cat => (
+        <button
+          key={cat}
+          onClick={() => setCategory(cat)}
+          className={`px-3 py-1 rounded ${currentCategory === cat ? 'bg-blue-500 text-white' : 'bg-gray-100'}`}
+        >
+          {cat}
+        </button>
+      ))}
+    </div>
+  );
+}
+```
+
+#### Step 5 — Tests
+```typescript
+// Test the Server Component data fetching
+import { getProducts } from '@/lib/db.server';
+describe('getProducts', () => {
+  it('returns all products when no filter', async () => {
+    const products = await getProducts();
+    expect(Array.isArray(products)).toBe(true);
+  });
+  it('filters by category', async () => {
+    const books = await getProducts({ category: 'books' });
+    books.forEach(p => expect(p.category).toBe('books'));
+  });
+});
+
+// Test FilterBar component (client component)
+import { render } from '@testing-library/react';
+it('renders category buttons', () => {
+  const { getByText } = render(<FilterBar categories={['all', 'books']} />);
+  expect(getByText('all')).toBeTruthy();
+  expect(getByText('books')).toBeTruthy();
+});
+```
+
+**Expected Output:**
+```
+/products -> all products (server-rendered HTML, zero client JS for ProductGrid)
+Click "books" -> URL becomes /products?category=books -> Server Component re-fetches
+Network tab: NO /api/products request (direct DB access on server)
+Bundle analyzer: db.server.ts NOT in client bundle
+Tests: 3 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a Client Component AddToCart button that calls a Server Action
+- [ ] Add Suspense with a loading skeleton for the ProductGrid
+- [ ] Compare bundle sizes with and without the 'use client' boundary
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What can Server Components do that Client Components cannot?
+**Q2:** Where is the server/client boundary determined?
+**Q3:** Write a Server Component that fetches data from a database. From memory.
+
+### Day 3 — Comprehension
+**Q4:** How do Server Components affect client bundle size?
+**Q5:** A junior imports a chart library in a Server Component — what happens?
+**Q6:** How do you safely use a third-party library that requires browser APIs?
+
+### Day 7 — Application
+**Q7:** Build a product page where Server Component fetches data, Client Component handles add-to-cart.
+**Q8:** A PR puts 'use client' at the top of the root layout — explain the consequence.
+**Q9:** What is the 'server-only' package and when do you use it?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain React Server Components — what they are, what they enable, and what the server/client boundary means."
+**Q11:** Draw: RSC component tree showing server/client boundary and data flow.
+**Q12:** ★ System design: "Design the component architecture for a Next.js e-commerce site — which parts are Server Components, which are Client Components, and why?"

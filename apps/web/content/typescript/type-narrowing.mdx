@@ -158,3 +158,186 @@ A: `never` represents a state that should be impossible. In an exhaustive switch
 
 **Q: What does the `as` keyword do and when should you avoid it?**
 A: `as` is a "Type Assertion" — you tell TypeScript "Trust me, I know this is a `User`." TypeScript performs no runtime check; it simply removes the type warning. This is dangerous. If you're wrong, you get a silent runtime crash. The `as` keyword should be a last resort. Always prefer Type Guards (narrowing) over Type Assertions.
+
+## FEYNMAN CHECK
+
+### Explain Type Narrowing Like I'm 10 Years Old
+> Narrowing is when TS WATCHES your runtime checks and TIGHTENS the variable's type within that branch. You start with `x: string | number`, you write `if (typeof x === 'string')`, and inside the if-block TS now treats x as `string` — autocomplete, no errors. Outside the if, x goes back to the union. The narrowers: `typeof` (primitives), `instanceof` (classes), `in` operator (property presence), discriminant property check (kind === 'ok'), `Array.isArray`, custom type guards `function isX(v): v is X`, and assertion functions `function assertX(v): asserts v is X`. The non-obvious power: narrowing flows through assignment, so `const y = x; if (typeof y === 'string')` narrows y, not x — copy semantics.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: Why are type guards safer than type casts?**
+> **A:** A type cast (`x as User`) is a PROMISE to the compiler — "trust me, this is a User" — with zero runtime validation. A type guard (`function isUser(x): x is User`) is a FUNCTION that returns a boolean — and IF it returns true, TS narrows the type. The guard's body actually CHECKS the shape at runtime. Casts cause silent runtime crashes; guards convert "I think" into "I verified."
+
+**Q2: Mental model for narrowing?**
+> **A:** Think of TS as running a flow analysis: at every line, it has a current TYPE for every variable. Each runtime check NARROWS the type within the branch where the check is true. Assignments WIDEN it back. Closures may invalidate narrowing (the variable could change later). The narrowing is purely AT COMPILE TIME — at runtime your code looks identical to what you wrote.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Believing narrowing persists through closures:
+> ```ts
+> // ❌ Narrowing is lost in the callback
+> function setup(value: string | null) {
+>   if (value !== null) {
+>     setTimeout(() => console.log(value.length));   // TS error: 'value' possibly null
+>   }
+> }
+>
+> // ✅ Capture in a const that can't be reassigned
+> function setup(value: string | null) {
+>   if (value !== null) {
+>     const v = value;   // v is provably string
+>     setTimeout(() => console.log(v.length));   // OK
+>   }
+> }
+> ```
+
+**Q4: How do assertion functions differ from type guards?**
+> **A:** A type guard returns boolean and narrows in the if/else. An assertion function (`function assert(c): asserts c`) THROWS if the check fails — and afterward TS knows the type is narrowed for the REST of the scope. Use guards when you want to handle both paths; assertions when failure means program is broken (e.g., invariants, precondition checks). Assertion functions enable `assert(user); user.foo` patterns without nesting.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Type narrowing is TypeScript's control-flow analysis algorithm that progressively refines a variable's type within a code branch based on type guards (typeof, instanceof, in, discriminant equality, user-defined predicates, assertion functions) — purely a compile-time mechanism with zero runtime cost, governed by definite-assignment analysis and invalidated by closures, reassignments, and function boundaries that may mutate the variable."
+
+## BUILD
+
+### 🏗️ Mini Project: Runtime JSON Validator With Custom Type Guards + Assertions
+
+**What you will build:** A type-safe JSON parser that takes `unknown` input and produces typed values via user-defined type guards — no library, just TS narrowing primitives.
+**Why this project:** Forces every form of narrowing TS supports.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-narrowing && cd ts-narrowing
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/guards.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Type Guards Library
+```ts
+// src/guards.ts
+export function isString(v: unknown): v is string {
+  return typeof v === 'string';
+}
+export function isNumber(v: unknown): v is number {
+  return typeof v === 'number' && !Number.isNaN(v);
+}
+export function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+export function isArrayOf<T>(v: unknown, item: (x: unknown) => x is T): v is T[] {
+  return Array.isArray(v) && v.every(item);
+}
+export function hasProp<K extends string>(v: unknown, key: K): v is Record<K, unknown> {
+  return isObject(v) && key in v;
+}
+export function assertString(v: unknown): asserts v is string {
+  if (!isString(v)) throw new TypeError('expected string, got ' + typeof v);
+}
+```
+
+#### Step 3 — Compose Guards For a Real Shape
+```ts
+// src/main.ts
+import { isString, isNumber, isObject, isArrayOf, hasProp } from './guards.js';
+
+interface User { id: number; name: string; emails: string[] }
+
+function isUser(v: unknown): v is User {
+  return isObject(v)
+    && hasProp(v, 'id')     && isNumber(v.id)
+    && hasProp(v, 'name')   && isString(v.name)
+    && hasProp(v, 'emails') && isArrayOf(v.emails, isString);
+}
+
+function parseUser(json: string): User {
+  const data: unknown = JSON.parse(json);
+  if (!isUser(data)) throw new Error('JSON does not match User shape');
+  return data;   // narrowed to User from this point
+}
+
+console.log(parseUser('{"id":1,"name":"Ana","emails":["a@b.io"]}'));
+```
+
+#### Step 4 — Error Handling: Assertion Function For Invariants
+```ts
+function assertUser(v: unknown): asserts v is User {
+  if (!isUser(v)) throw new Error('not a User: ' + JSON.stringify(v));
+}
+
+function process(raw: unknown) {
+  assertUser(raw);
+  // From here, TS knows raw is User WITHOUT nesting
+  console.log(raw.name.toUpperCase(), raw.emails.length);
+}
+
+try { process({ id: 1, name: 'A', emails: [] }); } catch (e) { console.error(e); }
+try { process({ id: 'oops' }); }                  catch (e) { console.error('caught'); }
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expect } from 'vitest';
+import { isString, isArrayOf, isObject } from './guards.js';
+
+describe('guards', () => {
+  it('isString narrows', () => {
+    const x: unknown = 'hello';
+    expect(isString(x)).toBe(true);
+    if (isString(x)) expect(x.toUpperCase()).toBe('HELLO');
+  });
+  it('isArrayOf composes', () => {
+    expect(isArrayOf(['a', 'b'], isString)).toBe(true);
+    expect(isArrayOf(['a', 1],   isString)).toBe(false);
+  });
+  it('isObject rejects null and arrays', () => {
+    expect(isObject(null)).toBe(false);
+    expect(isObject([1])).toBe(false);
+    expect(isObject({ a: 1 })).toBe(true);
+  });
+});
+```
+
+**Expected Output:**
+```
+{ id: 1, name: 'Ana', emails: ['a@b.io'] }
+A 0
+caught
+```
+
+**Stretch Challenges:**
+- [ ] Replace your hand-written guards with zod schemas and compare DX
+- [ ] Add a discriminated-union guard for `Result<T, E>`
+- [ ] Add an `isExact` variant that rejects excess properties
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Name 4 ways TS narrows types.
+**Q2:** Difference between a type guard and an assertion function?
+**Q3:** Write `isNumber(v: unknown): v is number`. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does narrowing not survive into setTimeout callbacks?
+**Q5:** A junior uses `as User` instead of writing a guard. Show two production bugs that result.
+**Q6:** Refactor to use narrowing instead of casts:
+```ts
+function process(x: unknown) {
+  const u = x as { name: string };
+  console.log(u.name);
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a typed `partition(arr, predicate)` that narrows each output array's type.
+**Q8:** A PR adds `Array.isArray` to a generic — but TS still complains. Explain why and fix.
+**Q9:** What does `!` (non-null assertion) do vs an actual narrowing check? When is `!` acceptable?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through every narrowing mechanism and the bug it prevents."
+**Q11:** Draw: how does control-flow analysis maintain per-line types in TS?
+**Q12:** ★ System design: "Architect a runtime-validation layer for a public REST API — guards, assertions, or schemas. Pick and justify."

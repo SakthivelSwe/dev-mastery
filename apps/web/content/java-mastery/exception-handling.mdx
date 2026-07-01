@@ -5,20 +5,86 @@ level: 4
 ---
 
 ## WHY
-In C and Go, errors are handled by returning error codes (e.g., `-1` for file not found). You have to manually check `if (result == -1)` after every single function call. If you forget to check it once, the program continues executing with corrupted state until it spectacularly crashes millions of instructions later.
+In C and Go, errors are handled by returning error codes (e.g., `-1` for file not found). You must manually check `if (result == -1)` after every single function call. Miss one check and the program continues executing with corrupted state until it spectacularly crashes millions of instructions later — far from where the original problem occurred.
 
-Java solved this using Exceptions. When a catastrophic event occurs (like dividing by zero or a database timeout), Java stops normal execution immediately and "throws" an Exception object up the Call Stack. This forces the developer to handle the error explicitly (`try/catch`), or the JVM violently terminates the thread. It ensures that errors cannot be silently ignored.
+Java solved this with **Exceptions**: when a catastrophic event occurs, Java immediately stops normal execution and "throws" an Exception object that propagates up the Call Stack, forcing the developer to handle it. Errors cannot be silently ignored.
+
+Why this matters in production:
+1. **Reliability**: Unhandled exceptions crash threads, not silently corrupt data
+2. **Debugging**: Stack traces pinpoint the exact line where the error originated
+3. **API design**: Checked exceptions document what can go wrong in your API contract
+4. **Recovery**: `try/catch/finally` gives you a structured recovery mechanism
 
 ## THEORY
-### The Exception Hierarchy
-All exceptions in Java inherit from `java.lang.Throwable`.
-1. **Error**: Severe JVM-level issues that you should NEVER try to catch (e.g., `OutOfMemoryError`, `StackOverflowError`). If these happen, the JVM is already dead.
-2. **Exception**: Issues your program *can* recover from.
-   - **Checked Exceptions** (extends `Exception`): The compiler strictly forces you to handle them (e.g., `IOException`, `SQLException`). You must use a `try/catch` block, or declare `throws` on your method signature.
-   - **Unchecked Exceptions** (extends `RuntimeException`): Programming errors (e.g., `NullPointerException`, `IllegalArgumentException`). The compiler does *not* force you to handle these.
 
-### The Stack Trace
-When an exception is thrown, the JVM takes a snapshot of the current Thread Stack (every method that is currently executing) and embeds it into the Exception object. This is called the Stack Trace. It is an extremely expensive operation! Creating an exception takes microseconds (which is an eternity for a CPU) because it has to traverse and record memory frames.
+### The Exception Hierarchy
+All exceptions inherit from `java.lang.Throwable`:
+
+```
+Throwable
+├── Error                          ← JVM-level, never catch these
+│   ├── OutOfMemoryError
+│   ├── StackOverflowError
+│   └── VirtualMachineError
+└── Exception
+    ├── IOException                ← Checked
+    ├── SQLException               ← Checked
+    ├── ClassNotFoundException     ← Checked
+    └── RuntimeException           ← Unchecked (bugs in your code)
+        ├── NullPointerException
+        ├── IllegalArgumentException
+        ├── IllegalStateException
+        ├── ArrayIndexOutOfBoundsException
+        ├── ClassCastException
+        └── ArithmeticException
+```
+
+### Checked vs Unchecked Exceptions
+
+| Feature | Checked | Unchecked |
+|---------|---------|-----------|
+| Extends | `Exception` | `RuntimeException` |
+| Compiler forces handling? | ✅ Yes | ❌ No |
+| Examples | `IOException`, `SQLException` | `NullPointerException`, `IllegalArgumentException` |
+| Represents | External failure (file, network, DB) | Programming errors |
+| Spring convention | Wraps into Unchecked | Use Unchecked directly |
+
+### The Stack Trace — Why It's Expensive
+When an exception is thrown, the JVM calls the native `fillInStackTrace()` method which:
+1. Traverses the entire Thread Stack
+2. Reads every memory frame (method name, file, line number)
+3. Embeds this snapshot into the Exception object
+
+This is **extremely expensive** — typically 1–100 microseconds. Never use exceptions for normal control flow.
+
+### `try-catch-finally` Execution Flow
+```
+try {
+    // Normal execution
+    // If exception: jump to catch immediately, skip remaining try code
+} catch (ExceptionType e) {
+    // Handle exception
+    // Runs ONLY if matching exception was thrown in try
+} catch (AnotherType e) {
+    // Can have multiple catch blocks
+} finally {
+    // ALWAYS runs — exception or not, return or not
+    // Use for releasing resources
+}
+```
+
+`finally` does NOT run only if: `System.exit()` is called, or the JVM crashes, or the thread is killed.
+
+### Exception Chaining — Preserving Root Cause
+Always preserve the original exception when wrapping:
+```java
+try {
+    connect();
+} catch (IOException e) {
+    // BAD: throw new DatabaseException("Failed"); // Root cause LOST!
+    throw new DatabaseException("Failed to connect", e); // GOOD: cause preserved
+}
+```
 
 ## VISUALIZATION_CONFIG
 ```json
@@ -27,116 +93,443 @@ When an exception is thrown, the JVM takes a snapshot of the current Thread Stac
 
 ## CODE
 
-### Level 1 — Beginner
+### Level 1 — Beginner: Basic `try/catch/finally`
 ```java
-public class BasicTryCatch {
+public class BasicExceptions {
     public static void main(String[] args) {
+        // Example 1: ArithmeticException
         try {
-            int result = 10 / 0; // Throws ArithmeticException
+            int result = divide(10, 0);
+            System.out.println("Result: " + result);
         } catch (ArithmeticException e) {
-            // JVM jumps here instantly, skipping remaining try block code
-            System.out.println("Cannot divide by zero!");
+            System.out.println("Math error: " + e.getMessage()); // "/ by zero"
         } finally {
-            // The finally block ALWAYS executes, even if an exception occurs
-            // Perfect for closing resources.
-            System.out.println("Cleanup executed.");
+            System.out.println("This ALWAYS runs");
         }
+
+        // Example 2: ArrayIndexOutOfBoundsException
+        int[] numbers = {1, 2, 3};
+        try {
+            System.out.println(numbers[10]);       // Index 10 doesn't exist!
+        } catch (ArrayIndexOutOfBoundsException e) {
+            System.out.println("Array access error: " + e.getMessage());
+        }
+
+        // Example 3: NullPointerException
+        String str = null;
+        try {
+            System.out.println(str.length());      // NPE!
+        } catch (NullPointerException e) {
+            System.out.println("Null reference: cannot call length() on null");
+        }
+
+        // Example 4: Multiple exceptions
+        try {
+            String input = "not-a-number";
+            int num = Integer.parseInt(input);     // NumberFormatException
+        } catch (NumberFormatException | IllegalArgumentException e) {
+            // Multi-catch: Java 7+ — handles multiple exception types
+            System.out.println("Input error: " + e.getMessage());
+        }
+    }
+
+    static int divide(int a, int b) {
+        return a / b;
     }
 }
 ```
 
-### Level 2 — Building Blocks
+### Level 2 — Building Blocks: Checked Exceptions and Method Signatures
 ```java
-import java.io.IOException;
+import java.io.*;
+import java.nio.file.*;
 
 public class CheckedExceptions {
-    // Because IOException is Checked, we MUST declare 'throws' if we don't catch it
-    public void readFile() throws IOException {
-        throw new IOException("File not found");
+
+    // IOException is Checked — caller MUST handle it
+    public String readFileContent(String filePath) throws IOException {
+        // If we don't handle it here, we MUST declare 'throws IOException'
+        return Files.readString(Path.of(filePath));
+    }
+
+    // Handling checked exception at a higher level
+    public void processFile(String path) {
+        try {
+            String content = readFileContent(path);
+            System.out.println("File content: " + content);
+        } catch (FileNotFoundException e) {
+            System.err.println("File not found: " + path);
+        } catch (IOException e) {
+            System.err.println("IO error reading file: " + e.getMessage());
+        }
     }
     
-    public void process() {
+    // Converting checked to unchecked (Spring's approach)
+    public String readFileSafe(String filePath) {
         try {
-            readFile();
+            return Files.readString(Path.of(filePath));
         } catch (IOException e) {
-            System.out.println("Handled the checked exception.");
+            // Wrap in unchecked exception — preserves root cause
+            throw new RuntimeException("Failed to read file: " + filePath, e);
         }
+    }
+
+    public static void main(String[] args) {
+        CheckedExceptions demo = new CheckedExceptions();
+        demo.processFile("config.json");
+        demo.processFile("nonexistent.txt");
     }
 }
 ```
 
-### Level 3 — Intermediate
+### Level 3 — Intermediate: Custom Exceptions Hierarchy
 ```java
-// Custom Unchecked Exception
-public class UserNotFoundException extends RuntimeException {
-    public UserNotFoundException(String message) {
+// Base custom exception for the domain
+public class DevMasteryException extends RuntimeException {
+    private final String errorCode;
+
+    public DevMasteryException(String errorCode, String message) {
         super(message);
+        this.errorCode = errorCode;
+    }
+
+    public DevMasteryException(String errorCode, String message, Throwable cause) {
+        super(message, cause);    // Preserves original cause!
+        this.errorCode = errorCode;
+    }
+
+    public String getErrorCode() { return errorCode; }
+}
+
+// Specific domain exceptions
+public class UserNotFoundException extends DevMasteryException {
+    public UserNotFoundException(Long userId) {
+        super("USER_NOT_FOUND", "User with ID " + userId + " not found");
     }
 }
 
-public class ThrowingCustom {
-    public void findUser(String id) {
-        if (id == null) {
-            throw new UserNotFoundException("User ID cannot be null");
+public class DuplicateEmailException extends DevMasteryException {
+    public DuplicateEmailException(String email) {
+        super("DUPLICATE_EMAIL", "Email '" + email + "' is already registered");
+    }
+}
+
+public class InvalidPasswordException extends DevMasteryException {
+    public InvalidPasswordException() {
+        super("INVALID_PASSWORD", "Password must be at least 8 characters with uppercase, number and symbol");
+    }
+}
+
+// Service using custom exceptions
+public class UserService {
+    private final java.util.Map<Long, String> db = new java.util.HashMap<>();
+    private long idSeq = 1;
+
+    public Long register(String email, String password) {
+        if (db.containsValue(email)) {
+            throw new DuplicateEmailException(email);
+        }
+        if (!isValidPassword(password)) {
+            throw new InvalidPasswordException();
+        }
+        long id = idSeq++;
+        db.put(id, email);
+        System.out.println("Registered user: " + email + " with ID=" + id);
+        return id;
+    }
+
+    public String getUser(Long id) {
+        String email = db.get(id);
+        if (email == null) throw new UserNotFoundException(id);
+        return email;
+    }
+
+    private boolean isValidPassword(String password) {
+        return password != null && password.length() >= 8 &&
+               password.chars().anyMatch(Character::isUpperCase) &&
+               password.chars().anyMatch(Character::isDigit);
+    }
+
+    public static void main(String[] args) {
+        UserService service = new UserService();
+
+        try {
+            service.register("alice@example.com", "WeakPwd"); // InvalidPasswordException
+        } catch (DevMasteryException e) {
+            System.out.println("[" + e.getErrorCode() + "] " + e.getMessage());
+        }
+
+        Long id = service.register("alice@example.com", "StrongPass1");
+
+        try {
+            service.register("alice@example.com", "StrongPass2"); // DuplicateEmailException
+        } catch (DevMasteryException e) {
+            System.out.println("[" + e.getErrorCode() + "] " + e.getMessage());
+        }
+
+        System.out.println("Found: " + service.getUser(id)); // alice@example.com
+
+        try {
+            service.getUser(999L); // UserNotFoundException
+        } catch (UserNotFoundException e) {
+            System.out.println("[" + e.getErrorCode() + "] " + e.getMessage());
         }
     }
 }
 ```
 
-### Level 4 — Advanced
+### Level 4 — Advanced: Try-With-Resources and Exception Suppression
 ```java
-// Java 7+ Try-With-Resources
-import java.io.BufferedReader;
-import java.io.FileReader;
-import java.io.IOException;
+import java.io.*;
+import java.sql.*;
 
-public class AutoClose {
-    public void readData() {
-        // Any object implementing AutoCloseable can go in the () block.
-        // The JVM will automatically call .close() on it, even if exceptions occur!
-        // No finally block needed!
-        try (BufferedReader br = new BufferedReader(new FileReader("data.txt"))) {
-            System.out.println(br.readLine());
-        } catch (IOException e) {
-            e.printStackTrace();
+public class AdvancedExceptions {
+
+    // Try-With-Resources: AutoCloseable resources are closed automatically
+    // Even if an exception is thrown!
+    public String readFirstLine(String path) throws IOException {
+        // Both resources are declared — both are closed on exit
+        try (var fis = new FileInputStream(path);
+             var reader = new BufferedReader(new InputStreamReader(fis))) {
+            return reader.readLine();
         }
+        // No finally needed — JVM calls close() on both automatically
+    }
+
+    // Custom AutoCloseable resource
+    static class DatabaseTransaction implements AutoCloseable {
+        private final Connection connection;
+        private boolean committed = false;
+
+        DatabaseTransaction(Connection connection) {
+            this.connection = connection;
+            System.out.println("Transaction started");
+        }
+
+        public void commit() throws SQLException {
+            connection.commit();
+            committed = true;
+            System.out.println("Transaction committed");
+        }
+
+        @Override
+        public void close() throws SQLException {
+            if (!committed) {
+                connection.rollback();  // Auto-rollback if not committed
+                System.out.println("Transaction rolled back");
+            }
+            connection.close();
+        }
+    }
+
+    // Exception Suppression — what happens when close() also throws?
+    public static void demonstrateSuppressed() {
+        try {
+            throw new RuntimeException("Primary exception");
+        } finally {
+            RuntimeException secondary = new RuntimeException("Cleanup exception");
+            // In try-with-resources, the secondary exception is SUPPRESSED (attached to primary)
+            // You can access it via primary.getSuppressed()
+        }
+    }
+
+    // Exception chaining — always preserve root cause
+    public void connectToDb(String url) {
+        try {
+            DriverManager.getConnection(url);
+        } catch (SQLException e) {
+            // BAD: throw new RuntimeException("DB failed");  // root cause LOST!
+            throw new RuntimeException("Failed to connect to: " + url, e); // GOOD
+        }
+    }
+
+    public static void main(String[] args) {
+        AdvancedExceptions demo = new AdvancedExceptions();
+
+        try {
+            String line = demo.readFirstLine("data.txt");
+            System.out.println("First line: " + line);
+        } catch (IOException e) {
+            System.err.println("Could not read: " + e.getMessage());
+        }
+    }
+}
+```
+
+### Level 5 — Expert: Global Exception Handling in Spring Boot
+```java
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.*;
+import java.time.LocalDateTime;
+import java.util.*;
+
+// Global exception handler — catches exceptions from ALL controllers
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    // Structured error response
+    record ErrorResponse(
+        int status,
+        String code,
+        String message,
+        LocalDateTime timestamp,
+        String path
+    ) {}
+
+    // Handle specific domain exceptions
+    @ExceptionHandler(UserNotFoundException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ErrorResponse handleUserNotFound(
+            UserNotFoundException ex,
+            javax.servlet.http.HttpServletRequest request) {
+        return new ErrorResponse(
+            404, ex.getErrorCode(), ex.getMessage(),
+            LocalDateTime.now(), request.getRequestURI()
+        );
+    }
+
+    @ExceptionHandler(DuplicateEmailException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ErrorResponse handleDuplicate(
+            DuplicateEmailException ex,
+            javax.servlet.http.HttpServletRequest request) {
+        return new ErrorResponse(
+            409, ex.getErrorCode(), ex.getMessage(),
+            LocalDateTime.now(), request.getRequestURI()
+        );
+    }
+
+    // Validation errors from @Valid
+    @ExceptionHandler(org.springframework.web.bind.MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Map<String, Object> handleValidation(
+            org.springframework.web.bind.MethodArgumentNotValidException ex) {
+        Map<String, Object> errors = new LinkedHashMap<>();
+        errors.put("status", 400);
+        errors.put("code", "VALIDATION_FAILED");
+        errors.put("timestamp", LocalDateTime.now());
+
+        Map<String, String> fieldErrors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+          .forEach(fe -> fieldErrors.put(fe.getField(), fe.getDefaultMessage()));
+        errors.put("fieldErrors", fieldErrors);
+
+        return errors;
+    }
+
+    // Catch-all for unexpected exceptions
+    @ExceptionHandler(Exception.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ErrorResponse handleAll(Exception ex, javax.servlet.http.HttpServletRequest request) {
+        // Log the full stack trace for debugging — but return a safe message to the client
+        System.err.println("Unexpected error: " + ex.getMessage());
+        ex.printStackTrace();
+
+        return new ErrorResponse(
+            500, "INTERNAL_ERROR", "An unexpected error occurred",
+            LocalDateTime.now(), request.getRequestURI()
+        );
     }
 }
 ```
 
 ## REAL_WORLD
-In modern Spring Boot applications, the standard practice is to use **Unchecked Exceptions (`RuntimeException`) exclusively**.
 
-Historically, J2EE forced developers to use Checked Exceptions. This resulted in disastrous "Catch and Ignore" patterns where developers got tired of the compiler yelling at them, so they wrote `try { ... } catch (Exception e) {}` and swallowed the error silently. 
+### Spring Boot Exception Handling — The Production Pattern
+Modern Spring Boot REST APIs follow a strict pattern:
 
-Spring Data completely wraps all Checked `SQLExceptions` into Unchecked `DataAccessException`s.
-When writing a Spring Boot REST API, the production pattern is to throw Unchecked exceptions deep in your Service layer, and use a global `@RestControllerAdvice` to catch them at the top level and format them into beautiful JSON HTTP responses.
+1. **Services throw unchecked domain exceptions** — no checked exceptions in business code
+2. **One global `@RestControllerAdvice`** catches everything and formats JSON responses
+3. **Never use `catch (Exception e) {}` silently** — log everything at minimum
+4. **Never return stack traces to clients** — security risk
 
 ```java
-// 1. Service throws unchecked exception
-public void checkout() {
-    throw new OutOfStockException("Item 123 is gone");
+// BAD: Service handles exceptions locally
+@Service
+public class OrderService {
+    public Order createOrder(OrderRequest req) {
+        try {
+            // Some logic
+        } catch (Exception e) {
+            return null;  // TERRIBLE — silent failure!
+        }
+    }
 }
 
-// 2. Global Handler intercepts it automatically
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    
-    @ExceptionHandler(OutOfStockException.class)
-    @ResponseStatus(HttpStatus.CONFLICT) // Returns HTTP 409
-    public ErrorResponse handleOutOfStock(OutOfStockException ex) {
-        return new ErrorResponse("OUT_OF_STOCK", ex.getMessage());
+// GOOD: Service throws, global handler catches
+@Service
+public class OrderService {
+    private final InventoryService inventory;
+    private final OrderRepository orderRepo;
+
+    @Transactional
+    public Order createOrder(OrderRequest req) {
+        // Let exceptions propagate naturally — global handler catches them
+        Product product = inventory.findById(req.productId())
+                                   .orElseThrow(() -> new ProductNotFoundException(req.productId()));
+
+        if (product.getStock() < req.quantity()) {
+            throw new InsufficientStockException(product.getSku(), req.quantity(), product.getStock());
+        }
+
+        inventory.reserveStock(product.getId(), req.quantity());
+        return orderRepo.save(new Order(req));
     }
 }
 ```
-Furthermore, you should NEVER use Exceptions for normal business control flow (e.g., throwing an exception just to exit a loop). Because generating the Stack Trace is incredibly slow, using Exceptions for normal logic will destroy the performance of your application.
+
+### Performance: Exception Creation is Expensive
+```java
+// ANTI-PATTERN: Using exceptions for normal control flow
+public boolean isEmailValid(String email) {
+    try {
+        new InternetAddress(email).validate();
+        return true;
+    } catch (AddressException e) {
+        return false;  // Exception used as a boolean — extremely slow!
+    }
+}
+
+// CORRECT: Use regular logic, reserve exceptions for truly exceptional cases
+public boolean isEmailValid(String email) {
+    return email != null && email.matches("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
+}
+```
 
 ## INTERVIEW
-**Q: What is the difference between a Checked and Unchecked Exception?**
-A: Checked exceptions extend `Exception` and must be handled explicitly at compile time using `try-catch` or the `throws` keyword. Unchecked exceptions extend `RuntimeException` and represent programming errors; the compiler does not force you to handle them.
+
+**Q: What is the difference between Checked and Unchecked exceptions?**
+A: Checked exceptions extend `Exception` directly and must be handled at compile time via `try-catch` or `throws` declaration. They represent external failures (file missing, network timeout) that the caller should anticipate. Unchecked exceptions extend `RuntimeException` and represent programming errors (null pointer, array index out of bounds) — the compiler doesn't force you to handle them.
 
 **Q: Does a `finally` block always execute?**
-A: Almost always. It will execute even if a `return` statement is inside the `try` block or an Exception is thrown. The only scenarios where `finally` does NOT execute is if you call `System.exit(0)`, if the JVM crashes entirely, or if the thread executing the block is violently killed by the OS.
+A: Almost always — even if a `return` statement or exception occurs in `try`. The only exceptions: `System.exit()` is called, the JVM crashes (hardware failure), or the executing thread is forcefully killed. Important: if both `try` and `finally` contain `return` statements, the `finally`'s `return` overrides the `try`'s `return`.
 
-**Q: Why are Exceptions slow to instantiate?**
-A: When you instantiate an Exception using `new Exception()`, the JVM calls the native `fillInStackTrace()` method. This method has to traverse the entire Thread Stack, reading the memory frames to figure out exactly which methods were called to get to this exact line of code. This memory traversal is highly expensive for the CPU.
+**Q: Why are Exceptions expensive to create?**
+A: When `new Exception()` is called, `fillInStackTrace()` traverses the entire Thread Stack and records every method frame — this is a native memory operation that takes 1–100 microseconds. Never use exceptions for normal control flow. Use them only for truly exceptional, error conditions.
+
+**Q: What is Try-With-Resources and how does it work?**
+A: Java 7+ feature. Any `AutoCloseable` object declared in the `try(...)` block is automatically `close()`d when the block exits — whether normally, via `return`, or via exception. If both the body and `close()` throw exceptions, the body's exception propagates and the `close()` exception becomes a "suppressed exception" accessible via `getCause().getSuppressed()`.
+
+**Q: How should you design a custom exception hierarchy?**
+A: Start with a base domain exception (`extends RuntimeException`) that holds an `errorCode` String and optionally `cause`. Create specific exceptions for each business scenario (`UserNotFoundException`, `DuplicateEmailException`). Always call `super(message, cause)` to preserve the root cause chain. Use unchecked exceptions in Spring — checked exceptions cause "catch and ignore" anti-patterns.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Imagine you're playing a video game. The game has a rule: if your character falls off a cliff, a BIG red alarm goes off and the game pauses. It doesn't silently let you keep playing with a dead character — it forces you to notice the problem. That's an Exception. The `catch` block is like the "continue from last save point" option. `finally` is like the autosave that always happens, no matter what.
+
+## BUILD
+
+**Challenge**: Build an exception-safe file parser:
+1. Custom exceptions: `FileParseException`, `EmptyFileException`, `InvalidFormatException`.
+2. `CSVParser.parse(String filePath)` — reads CSV, throws appropriate exceptions.
+3. `BatchProcessor.processFiles(List<String> paths)` — processes each file, collects results, never stops on one failure (catches per-file, collects errors).
+4. A Spring `@RestControllerAdvice` that maps each exception type to the correct HTTP status.
+5. Demonstrate exception chaining: `IOException` → `FileParseException` (preserving root cause).
+
+## SPACED REVIEW
+
+**Day 1**: Draw the Exception hierarchy. What is the difference between Error and Exception?
+**Day 3**: Write a method that reads a JSON file and wraps IOException in a domain exception with cause chaining.
+**Day 7**: Implement a complete Spring `@RestControllerAdvice` for a user management API.
+**Day 14**: What happens when both `try` and `finally` have `return` statements? What about Try-With-Resources when both body and `close()` throw exceptions?

@@ -114,3 +114,270 @@ A: The crash occurs because Next.js Middleware **must** run on the Edge Runtime.
 You must use a JWT library that is designed for the Edge, relying on the standard Web Crypto API rather than Node.js native modules. 
 
 The industry standard solution for this is to switch from `jsonwebtoken` to the `jose` npm package. `jose` is a lightweight library built entirely on Web Standards and works perfectly in Next.js Middleware, Cloudflare Workers, and Deno.
+
+## FEYNMAN CHECK
+
+### Explain Next.js Edge Runtime Like I'm 10 Years Old
+> The Edge Runtime runs your code on Vercel/Cloudflare's GLOBAL EDGE NETWORK — physically close to every user, in any of 100+ cities worldwide. A user in Tokyo hits Tokyo edge; a user in Berlin hits Berlin edge. Latency drops from ~200ms (transcontinental) to ~20ms (local). Edge Runtime uses V8 ISOLATES (NOT Node.js) — same engine as browsers, instant cold start (<1ms vs 200-1000ms for Lambda), but limited APIs (no fs, no native modules, no Node.js crypto). Available in: middleware (always Edge), API routes (export const runtime = 'edge'), and Server Components/pages. The non-obvious depth: Edge Runtime is GEOGRAPHICALLY DISTRIBUTED but STATELESS — each request might hit a different region. Don't store user-specific state in module variables (each region has its own instance). Use Redis/KV/database for shared state. Best for: auth checks (read JWT), A/B testing (random assignment), geolocation routing, AI streaming (OpenAI/Anthropic), redirects, security headers — anything fast that doesn't need persistent storage.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What APIs are available in Edge Runtime vs Node.js Runtime?**
+> **A:** EDGE RUNTIME (Web Standards APIs only): fetch, Request/Response, Headers, URL, URLSearchParams, FormData, ReadableStream, TextEncoder/Decoder, crypto (Web Crypto API, not Node.js crypto), btoa/atob, AbortController. NOT AVAILABLE: fs (no filesystem), child_process, net, http (use fetch), Node.js Buffer (use Uint8Array), most npm packages with native modules. NODE.JS RUNTIME: everything in Edge PLUS all Node.js built-ins (fs, Buffer, crypto, child_process), full npm ecosystem, larger memory limits. Choose based on dependencies — if you need any Node.js-only API or library, use Node.js runtime.
+
+**Q2: Mental model for cold start vs Node.js Lambda?**
+> **A:** NODE.JS LAMBDA cold start: container boots, Node.js runtime initializes, dependencies load — ~200-1000ms before your code runs. EDGE RUNTIME cold start: V8 isolate instantiates from snapshot — ~1-10ms. The difference is 100x. For request-heavy APIs (rate limit checks, auth verification, geo routing) where most requests are short, Edge wins massively on p99 latency. For long-running requests (heavy DB queries, AI generation, file processing), the cold start advantage matters less — the bulk of time is the actual work. Combination strategy: middleware in Edge (auth, redirects), main route handler in Node.js (DB-heavy work).
+
+**Q3: Most dangerous misconception about Edge Runtime?**
+> **A:** All npm packages work in Edge Runtime:
+> ```typescript
+> // WRONG: importing Node.js-only packages in Edge
+> export const runtime = 'edge';
+>
+> import bcrypt from 'bcrypt';                    // Uses Node.js native crypto → CRASH
+> import jwt from 'jsonwebtoken';                  // Uses Node.js Buffer/crypto → CRASH
+> import prisma from '@/lib/prisma';               // Uses Node.js fs/net → CRASH
+> import { writeFile } from 'fs/promises';         // No fs in Edge → CRASH
+>
+> // CORRECT: use Edge-compatible alternatives
+> import { jwtVerify, SignJWT } from 'jose';      // Web Crypto API → works
+> import { hash, verify } from '@node-rs/bcrypt'; // WASM bcrypt → works in Edge
+> // For DB: use HTTP-based drivers (Neon serverless, Turso, Vercel KV)
+>
+> // Check package compatibility:
+> // - "edge-compatible" or "isomorphic" badges in README
+> // - No "node:" prefix imports
+> // - Uses Web Standards APIs (fetch, crypto, Uint8Array)
+> ```
+
+**Q4: How does geographic routing work?**
+> **A:** Vercel's edge network has 100+ regions. Each user's request is routed to the NEAREST edge by their DNS resolver — usually within the same country. The Edge function receives the request, executes locally, and sends the response. The edge function can READ the user's region via request.geo (Vercel) or request.cf (Cloudflare): { country: 'JP', city: 'Tokyo', latitude: '35.6', longitude: '139.6' }. Use this for: localised pricing (USD for US, EUR for EU), legal compliance (GDPR consent for EU only), language detection (override Accept-Language with geo), region-specific A/B tests.
+
+**Q5: FAANG-grade definition of Next.js Edge Runtime.**
+> **A:** "Next.js Edge Runtime executes Server Components, Route Handlers, and middleware on V8 isolates distributed across global edge POPs (100+ locations on Vercel, 300+ on Cloudflare Workers) — providing sub-10ms cold starts via isolate snapshotting vs 200-1000ms for traditional Node.js Lambda — restricted to Web Standards APIs (fetch, Web Crypto, ReadableStream) and prohibiting Node.js built-ins (fs, Buffer, native crypto) and packages depending on them — enabled per route via export const runtime = 'edge' or globally for middleware — supporting geographic request routing via request.geo for region-aware logic — and best suited for low-latency auth verification, geolocation routing, AI/SSE streaming, security middleware, and A/B testing — paired with Node.js runtime for heavier server-side workloads requiring full ecosystem access."
+
+## BUILD
+
+### 🏗️ Mini Project: Edge-Powered API Gateway — Auth + Geo Routing + AI Streaming + Rate Limit
+
+**What you will build:** An edge-runtime API gateway that: verifies JWT (jose), routes by geo (different content per region), streams AI responses (SSE), and rate-limits via Vercel KV — all in <10ms cold start.
+**Why this project:** Forces every Edge-compatible pattern.
+**Time estimate:** 45 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+npx create-next-app@latest edge-demo --typescript --tailwind --app
+npm install jose @vercel/kv @vercel/edge
+```
+
+#### Step 2 — Edge Middleware (Already Edge by Default)
+```typescript
+// src/middleware.ts -- runs in Edge Runtime
+import { NextRequest, NextResponse } from 'next/server';
+import { jwtVerify } from 'jose';
+import { geolocation } from '@vercel/edge';
+
+const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET ?? 'dev-secret');
+
+export const config = {
+  matcher: '/api/protected/:path*',
+};
+
+export async function middleware(request: NextRequest) {
+  // Auth check using jose (Edge-compatible)
+  const token = request.cookies.get('session')?.value;
+  if (!token) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWT_SECRET);
+    // Pass user info via headers to downstream handler
+    const response = NextResponse.next();
+    response.headers.set('x-user-id', String(payload.sub));
+
+    // Geographic enhancement
+    const geo = geolocation(request);
+    if (geo.country) response.headers.set('x-user-country', geo.country);
+    if (geo.city) response.headers.set('x-user-city', geo.city);
+
+    return response;
+  } catch {
+    return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
+  }
+}
+```
+
+#### Step 3 — Edge API Route With AI Streaming
+```typescript
+// src/app/api/ai/stream/route.ts
+export const runtime = 'edge';  // explicit Edge Runtime
+
+export async function POST(request: Request) {
+  const { prompt } = await request.json();
+
+  // Stream from OpenAI/Anthropic (or simulate)
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const tokens = (`This is a streamed response to: ${prompt}. `.repeat(5)).split(' ');
+
+      for (const token of tokens) {
+        await new Promise(r => setTimeout(r, 50));  // simulate token-by-token
+        controller.enqueue(encoder.encode(`data: {"token": "${token}"}\n\n`));
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
+}
+```
+
+#### Step 4 — Geographic Content Routing
+```typescript
+// src/app/api/pricing/route.ts
+export const runtime = 'edge';
+
+import { NextRequest, NextResponse } from 'next/server';
+import { geolocation } from '@vercel/edge';
+
+const PRICING: Record<string, { currency: string; amount: number; symbol: string }> = {
+  US: { currency: 'USD', amount: 29.99, symbol: '$' },
+  GB: { currency: 'GBP', amount: 24.99, symbol: '£' },
+  EU: { currency: 'EUR', amount: 27.99, symbol: '€' },
+  IN: { currency: 'INR', amount: 999, symbol: '₹' },
+  JP: { currency: 'JPY', amount: 4500, symbol: '¥' },
+};
+
+const EU_COUNTRIES = ['DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'PL', 'IE'];
+
+export async function GET(request: NextRequest) {
+  const geo = geolocation(request);
+  const country = geo.country ?? 'US';
+
+  let pricing = PRICING[country];
+  if (!pricing && EU_COUNTRIES.includes(country)) pricing = PRICING['EU'];
+  if (!pricing) pricing = PRICING['US'];
+
+  return NextResponse.json({
+    country, city: geo.city,
+    pricing,
+    formatted: `${pricing.symbol}${pricing.amount}/mo`,
+  }, {
+    headers: {
+      // Cache for 1 hour, but vary by country
+      'Cache-Control': 'public, max-age=3600',
+      'Vary': 'CF-IPCountry, X-Vercel-IP-Country',
+    },
+  });
+}
+```
+
+#### Step 5 — Rate Limiting With Vercel KV + Tests
+```typescript
+// src/app/api/limited/route.ts
+export const runtime = 'edge';
+
+import { NextRequest, NextResponse } from 'next/server';
+import { kv } from '@vercel/kv';
+import { ipAddress } from '@vercel/edge';
+
+const RATE_LIMIT = 10;          // requests
+const WINDOW_SECONDS = 60;       // per minute
+
+async function checkRateLimit(identifier: string): Promise<{ allowed: boolean; remaining: number; reset: number }> {
+  const key = `rate:${identifier}:${Math.floor(Date.now() / 1000 / WINDOW_SECONDS)}`;
+  const count = (await kv.incr(key)) as number;
+  if (count === 1) await kv.expire(key, WINDOW_SECONDS);
+
+  return {
+    allowed: count <= RATE_LIMIT,
+    remaining: Math.max(0, RATE_LIMIT - count),
+    reset: (Math.floor(Date.now() / 1000 / WINDOW_SECONDS) + 1) * WINDOW_SECONDS,
+  };
+}
+
+export async function GET(request: NextRequest) {
+  const ip = ipAddress(request) ?? 'unknown';
+  const { allowed, remaining, reset } = await checkRateLimit(ip);
+
+  const headers = {
+    'X-RateLimit-Limit': String(RATE_LIMIT),
+    'X-RateLimit-Remaining': String(remaining),
+    'X-RateLimit-Reset': String(reset),
+  };
+
+  if (!allowed) {
+    return NextResponse.json(
+      { error: 'Rate limit exceeded', retryAfter: reset - Math.floor(Date.now() / 1000) },
+      { status: 429, headers },
+    );
+  }
+
+  return NextResponse.json(
+    { message: 'Request allowed', remaining },
+    { headers },
+  );
+}
+
+// Tests
+import { GET as pricingGET } from '@/app/api/pricing/route';
+it('returns USD for US visitors', async () => {
+  const req = new Request('http://localhost/api/pricing');
+  // Mock geolocation header (Vercel sets x-vercel-ip-country)
+  req.headers.set('x-vercel-ip-country', 'US');
+  const res = await pricingGET(req as any);
+  const data = await res.json();
+  expect(data.pricing.currency).toBe('USD');
+});
+```
+
+**Expected Output:**
+```
+Vercel deploy: routes deployed to global edge network
+US visitor /api/pricing -> {"currency":"USD","amount":29.99}
+EU visitor /api/pricing -> {"currency":"EUR","amount":27.99}
+POST /api/ai/stream -> SSE stream, token-by-token
+GET /api/limited (11th request) -> 429 with X-RateLimit headers
+Cold start: <10ms (V8 isolate)
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add CIDR-based IP allowlist for enterprise endpoints
+- [ ] Integrate real OpenAI API with streaming
+- [ ] Add edge caching headers with Cache-Control: s-maxage + stale-while-revalidate
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between Edge Runtime and Node.js Runtime?
+**Q2:** Three APIs available in Edge but not Node, or vice versa?
+**Q3:** Write export const runtime = 'edge' for a route. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does Edge Runtime have <10ms cold start vs ~500ms for Lambda?
+**Q5:** A PR imports bcrypt in an Edge route — explain the error.
+**Q6:** What is request.geo and when do you use it?
+
+### Day 7 — Application
+**Q7:** Build a JWT verification middleware using jose (Edge-compatible).
+**Q8:** A PR's Edge route uses Prisma — diagnose and suggest alternatives.
+**Q9:** When should middleware be Edge vs Node.js?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Explain Edge Runtime — when to use it, what it can't do, and how it improves UX."
+**Q11:** Draw: request flow — user → DNS → edge POP → V8 isolate → response.
+**Q12:** ★ System design: "Design a global API gateway in Edge Runtime — auth, rate limiting, geo routing, observability."

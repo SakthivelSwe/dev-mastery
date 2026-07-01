@@ -178,3 +178,219 @@ A: **Yes, order is strictly chronological!**
 Interceptors form a pipeline (a chain of responsibility). The request passes through them in the exact order they are defined in the array.
 If the `LoggingInterceptor` is first, it will log the request *before* the `AuthInterceptor` has a chance to attach the JWT token. The log will show a request with no Authorization header.
 Conversely, on the way *back* (the response), the pipeline executes in reverse! The `AuthInterceptor` will see the response first, and the `LoggingInterceptor` will see the response last. Understanding this bidirectional execution order is critical for debugging complex network issues.
+
+## FEYNMAN CHECK
+
+### Explain Angular HTTP Interceptors Like I'm 10 Years Old
+> An HTTP interceptor is a MIDDLEWARE function that sits between your service code and the actual network — it can inspect, modify, or cancel every HTTP request and response. When you call http.get('/api/users'), Angular passes the request through a pipeline of interceptors before it leaves the browser. Typical uses: add Authorization headers to every request (auth interceptor), log all requests for debugging (logging interceptor), show a loading spinner while requests are pending (loading interceptor), retry on failure (retry interceptor), cache responses (cache interceptor). The non-obvious point: interceptors are a CHAIN — each interceptor calls next(request) to pass to the next interceptor. If an interceptor doesn't call next(), the request never reaches the server.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: How does the interceptor chain work?**
+> **A:** provideHttpClient(withInterceptors([authInterceptor, loggingInterceptor])) registers interceptors in ORDER. Each interceptor receives the request and a next function. When you call next(req), it passes to the next interceptor. The last interceptor's next() hits the actual HTTP backend. On the way back, each interceptor can tap/modify the response Observable. So for [auth, logging]: auth wraps logging, logging wraps the HTTP backend. Request flows: auth → logging → network. Response flows: network → logging → auth → subscriber.
+
+**Q2: Mental model for functional interceptors vs class interceptors?**
+> **A:** The old class-based interceptors implemented HttpInterceptor with an intercept() method. The new functional interceptors (Angular 15+) are plain functions: (req: HttpRequest, next: HttpHandlerFn) => Observable<HttpEvent>. Functional interceptors are more composable (no class boilerplate), easier to test (just call the function), and work naturally with inject() for dependencies. Both are equivalent in capability; functional is the recommended approach for new code.
+
+**Q3: Most dangerous misconception about interceptors?**
+> **A:** You can mutate the request object directly:
+> ```typescript
+> // WRONG: HttpRequest is IMMUTABLE — mutation is silently ignored
+> export const authInterceptor: HttpInterceptorFn = (req, next) => {
+>   req.headers.set('Authorization', 'Bearer ' + getToken());  // silently does nothing!
+>   return next(req);
+> };
+>
+> // CORRECT: clone the request with modifications
+> export const authInterceptor: HttpInterceptorFn = (req, next) => {
+>   const authReq = req.clone({
+>     headers: req.headers.set('Authorization', 'Bearer ' + inject(AuthService).getToken()),
+>   });
+>   return next(authReq);
+> };
+> ```
+
+**Q4: How do you implement a token refresh interceptor?**
+> **A:** On 401 response, the interceptor should: (1) Call the refresh token endpoint to get a new access token. (2) Retry the original failed request with the new token. (3) If refresh also fails, log the user out. This requires: catchError on the response Observable, checking status === 401, calling authService.refresh() (returns an Observable), then switchMap to retry the original request with the new token. The tricky part: prevent infinite loops (don't retry the refresh call itself) and handle concurrent requests (queue them while refresh is in progress using a BehaviorSubject).
+
+**Q5: FAANG-grade definition of Angular interceptors.**
+> **A:** "Angular HTTP interceptors are middleware functions registered via withInterceptors([...]) that intercept every HttpRequest/HttpResponse in the application — running as a chain where each interceptor calls next(req) to delegate to the next, with the ability to clone and modify requests (add headers, transform body), tap responses for logging, handle errors (retry, token refresh), cache responses, show loading indicators, and modify URLs — all without changing service-level HTTP code — with functional interceptors (HttpInterceptorFn) being the modern, testable, DI-compatible pattern."
+
+## BUILD
+
+### 🏗️ Mini Project: Complete Interceptor Pipeline — Auth, Loading, Retry, Logging
+
+**What you will build:** A 4-interceptor pipeline: (1) auth — adds Bearer token to every request, (2) loading — increments/decrements a loading counter, (3) retry — retries failed requests up to 3 times with backoff, (4) logging — logs request URL and response time.
+**Why this project:** Forces the complete production interceptor pattern with proper chaining and request cloning.
+**Time estimate:** 35 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new interceptors-demo --standalone --routing false
+cd interceptors-demo
+ng generate service auth
+ng generate service loading
+```
+
+#### Step 2 — Auth Interceptor
+```typescript
+// auth.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { AuthService } from './auth.service';
+
+export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  const token = inject(AuthService).getToken();
+  if (!token) return next(req);
+
+  const authReq = req.clone({
+    headers: req.headers.set('Authorization', 'Bearer ' + token),
+  });
+  return next(authReq);
+};
+```
+
+#### Step 3 — Loading Interceptor
+```typescript
+// loading.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { LoadingService } from './loading.service';
+import { finalize } from 'rxjs/operators';
+
+export const loadingInterceptor: HttpInterceptorFn = (req, next) => {
+  const loadingService = inject(LoadingService);
+  loadingService.increment();
+  return next(req).pipe(
+    finalize(() => loadingService.decrement()),
+  );
+};
+
+// loading.service.ts
+import { Injectable, signal, computed } from '@angular/core';
+@Injectable({ providedIn: 'root' })
+export class LoadingService {
+  private count = signal(0);
+  isLoading = computed(() => this.count() > 0);
+  increment() { this.count.update(n => n + 1); }
+  decrement() { this.count.update(n => Math.max(0, n - 1)); }
+}
+```
+
+#### Step 4 — Retry + Logging Interceptors
+```typescript
+// retry.interceptor.ts
+import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
+import { retry, timer } from 'rxjs';
+
+export const retryInterceptor: HttpInterceptorFn = (req, next) => {
+  return next(req).pipe(
+    retry({
+      count: 3,
+      delay: (err: HttpErrorResponse, attempt) => {
+        // Only retry on server errors, not client errors or auth errors
+        if (err.status === 0 || err.status >= 500) {
+          return timer(Math.pow(2, attempt) * 300);
+        }
+        throw err;  // propagate 4xx errors immediately
+      },
+    }),
+  );
+};
+
+// logging.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { tap } from 'rxjs/operators';
+
+export const loggingInterceptor: HttpInterceptorFn = (req, next) => {
+  const start = Date.now();
+  return next(req).pipe(
+    tap({
+      next: event => {
+        if (event.type === 4) {  // HttpEventType.Response
+          console.log('[HTTP]', req.method, req.url, Date.now() - start + 'ms');
+        }
+      },
+      error: err => console.error('[HTTP ERROR]', req.url, err.status, err.message),
+    }),
+  );
+};
+```
+
+#### Step 5 — Register and Test
+```typescript
+// main.ts
+bootstrapApplication(AppComponent, {
+  providers: [
+    provideHttpClient(
+      withInterceptors([loggingInterceptor, loadingInterceptor, retryInterceptor, authInterceptor])
+    ),
+  ],
+});
+
+// interceptors.spec.ts
+describe('authInterceptor', () => {
+  it('adds Authorization header when token available', () => {
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: AuthService, useValue: { getToken: () => 'test-token' } },
+        provideHttpClient(withInterceptors([authInterceptor])),
+        provideHttpClientTesting(),
+      ],
+    });
+    const http = TestBed.inject(HttpClient);
+    const httpMock = TestBed.inject(HttpTestingController);
+
+    http.get('/api/test').subscribe();
+    const req = httpMock.expectOne('/api/test');
+    expect(req.request.headers.get('Authorization')).toBe('Bearer test-token');
+    req.flush({});
+  });
+});
+```
+
+**Expected Output:**
+```
+[HTTP] GET https://api.example.com/users 234ms
+Loading spinner visible during request
+Auth header added to every request
+Server 500 -> retried 3 times with backoff
+Tests: 1 passed
+```
+
+**Stretch Challenges:**
+- [ ] Add a cache interceptor that returns cached responses for GET requests
+- [ ] Add a token refresh interceptor with queue for concurrent requests
+- [ ] Add a XSRF token interceptor for POST/PUT/DELETE
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** What does an HTTP interceptor do?
+**Q2:** Why is HttpRequest immutable and how do you modify it?
+**Q3:** Write the minimal functional interceptor that adds a header. From memory.
+
+### Day 3 — Comprehension
+**Q4:** In what order do interceptors process requests vs responses?
+**Q5:** A junior's interceptor doesn't call next(req) — what happens?
+**Q6:** Refactor class-based interceptor to functional:
+```typescript
+@Injectable()
+export class LoggingInterceptor implements HttpInterceptor {
+  intercept(req: HttpRequest<any>, next: HttpHandler) { return next.handle(req).pipe(tap(() => console.log(req.url))); }
+}
+```
+
+### Day 7 — Application
+**Q7:** Build a cache interceptor for GET requests with 60-second TTL.
+**Q8:** A PR adds a retry interceptor that retries 401 errors — why is this dangerous?
+**Q9:** How would you implement request deduplication across concurrent identical requests?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Walk me through building a JWT token refresh interceptor — all edge cases."
+**Q11:** Draw: request/response flow through a 4-interceptor pipeline.
+**Q12:** ★ System design: "Design the HTTP middleware layer for an Angular app with auth, caching, analytics, and error reporting."

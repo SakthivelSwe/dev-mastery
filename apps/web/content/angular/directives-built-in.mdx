@@ -149,3 +149,210 @@ A: It is "Syntactic Sugar." The Angular compiler physically cannot attach logic 
 
 **Q: Why did Angular 17 introduce `@if` and `@for` if `*ngIf` worked perfectly fine?**
 A: Performance and Developer Experience. The legacy `*ngIf` required importing `CommonModule` into every single file, bloating the bundle. Furthermore, implementing an `else if` or an `else` block using `*ngIf` was notoriously confusing (requiring `<ng-template #elseBlock>`). The new `@if` syntax parses directly at the compiler level without needing module imports, rendering significantly faster and drastically improving code readability.
+
+## FEYNMAN CHECK
+
+### Explain Angular Built-in Directives Like I'm 10 Years Old
+> Directives are Angular's way of adding behaviour to HTML elements. STRUCTURAL directives change the DOM structure (add/remove elements): *ngIf, *ngFor, *ngSwitch. ATTRIBUTE directives change the appearance or behaviour of existing elements: NgClass, NgStyle, NgModel. The modern alternatives are @if, @for, @switch control flow blocks (Angular 17+) which are more type-safe and performant. The non-obvious depth: *ngFor without a trackBy function causes Angular to destroy and recreate EVERY DOM node in the list when the array changes — even if only one item changed. With trackBy (or @for track), Angular reuses existing DOM nodes and only updates the changed ones — critical for performance with large lists.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What is the performance cost of *ngFor without trackBy?**
+> **A:** Without trackBy, Angular compares list items by object reference (===). When the data arrives from an API, it creates NEW JavaScript objects — even if the data is the same. Angular sees all references as different, destroys all existing DOM nodes, and recreates them. For a list of 100 items, this is 100 DOM node destructions + 100 creations + 100 change detection runs. With trackBy, Angular identifies items by a unique field (like id) and reuses DOM nodes for items that haven't changed. The new @for syntax makes track mandatory, preventing this pitfall.
+
+**Q2: Mental model for NgClass and NgStyle?**
+> **A:** NgClass is an object binding where keys are CSS class names and values are booleans — truthy adds the class, falsy removes it. [class.active]="isActive" is the simple shorthand for single classes. NgStyle is an object of CSS property-value pairs applied inline. [style.color]="textColor" is the shorthand for single styles. Prefer [class.X] and [style.X] shorthand for single bindings — they're more readable; use NgClass/NgStyle when binding multiple classes/styles from an expression.
+
+**Q3: Most dangerous misconception about built-in directives?**
+> **A:** *ngIf hides the element like CSS display:none:
+> ```html
+> <!-- WRONG mental model: *ngIf hides elements -->
+> <!-- CORRECT: *ngIf REMOVES the element from the DOM entirely -->
+>
+> <!-- This component is DESTROYED when showPanel is false -->
+> <!-- All state, subscriptions, lifecycle hooks — gone -->
+> <app-expensive-panel *ngIf="showPanel"/>
+>
+> <!-- To preserve component state while hiding visually, use CSS: -->
+> <app-expensive-panel [style.display]="showPanel ? 'block' : 'none'"/>
+>
+> <!-- Or use @if vs [hidden] consciously based on whether you want destruction -->
+> ```
+
+**Q4: How does ngSwitch work and when do you use it over ngIf chains?**
+> **A:** ngSwitch evaluates one expression and matches it against ngSwitchCase values — semantically equivalent to a JavaScript switch statement in the template. It's more efficient than multiple *ngIf chains over the same expression because it avoids re-evaluating the expression multiple times. Use ngSwitch (or the new @switch) when you have 3+ mutually exclusive conditions based on the same value — user role rendering, step wizard, status-based views.
+
+**Q5: FAANG-grade definition of Angular built-in directives.**
+> **A:** "Angular built-in directives are compiler-understood HTML extensions — structural directives (*ngIf, *ngFor, *ngSwitch / @if, @for, @switch) that add or remove DOM subtrees based on expressions, and attribute directives (NgClass, NgStyle, NgModel) that modify element behaviour or appearance — with the new @-syntax control flow (Angular 17+) compiling to more efficient code, enabling block-level type narrowing, and making track mandatory in @for to prevent the trackBy omission performance pitfall."
+
+## BUILD
+
+### 🏗️ Mini Project: Directive Showcase — Performance Cost of Missing trackBy Measured
+
+**What you will build:** A side-by-side comparison of a list WITHOUT and WITH trackBy, using console.time and DOM mutation observer to measure the render cost difference — plus all built-in directives demonstrated.
+**Why this project:** Makes the trackBy performance difference OBSERVABLE with real numbers rather than theory.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+ng new directive-demo --standalone --routing false
+ng generate component directive-showcase --standalone
+```
+
+#### Step 2 — Directive Showcase
+```typescript
+// directive-showcase.component.ts
+import { Component, signal, computed } from '@angular/core';
+import { NgClass, NgStyle, NgFor, NgIf, NgSwitch, NgSwitchCase, NgSwitchDefault } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+
+interface Product { id: number; name: string; price: number; category: string; inStock: boolean; }
+
+@Component({
+  standalone: true,
+  selector: 'app-directive-showcase',
+  imports: [NgClass, NgStyle, NgFor, NgIf, NgSwitch, NgSwitchCase, NgSwitchDefault, FormsModule],
+  template: `
+    <h2>*ngIf / @if</h2>
+    <button (click)="showDetails.set(!showDetails())">Toggle Details</button>
+    <div *ngIf="showDetails()">
+      <p>Details visible — component fully mounted</p>
+    </div>
+
+    <h2>NgClass + NgStyle</h2>
+    <div [ngClass]="{ 'highlight': isHighlighted(), 'error': hasError() }"
+         [ngStyle]="{ 'font-size': fontSize() + 'px', 'color': textColor() }">
+      Dynamic styling demo
+    </div>
+    <button (click)="isHighlighted.set(!isHighlighted())">Toggle Highlight</button>
+
+    <h2>ngSwitch / @switch</h2>
+    <select [(ngModel)]="userRole">
+      <option *ngFor="let role of roles" [value]="role">{{ role }}</option>
+    </select>
+    <div [ngSwitch]="userRole">
+      <p *ngSwitchCase="'admin'">Admin Panel access granted</p>
+      <p *ngSwitchCase="'editor'">Editor tools available</p>
+      <p *ngSwitchCase="'viewer'">Read-only mode</p>
+      <p *ngSwitchDefault>Unknown role</p>
+    </div>
+
+    <h2>*ngFor WITHOUT trackBy (slow)</h2>
+    <button (click)="refreshProducts()">Refresh (destroys ALL DOM nodes)</button>
+    <li *ngFor="let p of products()">{{ p.name }} - {{ p.price | currency }}</li>
+
+    <h2>@for WITH track (fast)</h2>
+    <button (click)="refreshProducts()">Refresh (reuses DOM nodes)</button>
+    @for (p of products(); track p.id) {
+      <li [class.out-of-stock]="!p.inStock">{{ p.name }}</li>
+    }
+  `,
+})
+export class DirectiveShowcaseComponent {
+  showDetails = signal(true);
+  isHighlighted = signal(false);
+  hasError = signal(false);
+  fontSize = signal(14);
+  textColor = signal('#333');
+  userRole = 'admin';
+  roles = ['admin', 'editor', 'viewer'];
+
+  products = signal<Product[]>(this.generateProducts());
+
+  refreshProducts() {
+    console.time('refresh');
+    this.products.set(this.generateProducts());
+    console.timeEnd('refresh');
+  }
+
+  private generateProducts(): Product[] {
+    return Array.from({ length: 50 }, (_, i) => ({
+      id: i + 1, name: 'Product ' + (i + 1), price: 9.99 + i,
+      category: ['Electronics', 'Books', 'Clothing'][i % 3],
+      inStock: i % 4 !== 0,
+    }));
+  }
+}
+```
+
+#### Step 3 — TrackBy Performance Test
+```typescript
+// Measure DOM mutations with MutationObserver
+const list = document.querySelector('#no-track-list');
+let mutations = 0;
+new MutationObserver(() => mutations++).observe(list, { childList: true, subtree: true });
+
+// Click refresh — compare mutations count with vs without track
+```
+
+#### Step 4 — Error Handling: NgIf vs [hidden]
+```html
+<!-- Use *ngIf when you want component DESTRUCTION on hide -->
+<app-complex-form *ngIf="showForm"/>   <!-- form state lost when hidden -->
+
+<!-- Use [hidden] when you want to PRESERVE component state -->
+<app-complex-form [hidden]="!showForm"/>   <!-- form state preserved -->
+
+<!-- Use @defer when component loads lazily only when first shown -->
+@defer (when isVisible) {
+  <app-heavy-chart/>   <!-- loaded and rendered only when isVisible becomes true -->
+}
+```
+
+#### Step 5 — Tests
+```typescript
+it('shows details when showDetails is true', () => {
+  const fixture = TestBed.createComponent(DirectiveShowcaseComponent);
+  fixture.componentInstance.showDetails.set(true);
+  fixture.detectChanges();
+  expect(fixture.nativeElement.textContent).toContain('Details visible');
+});
+
+it('hides details when showDetails is false', () => {
+  const fixture = TestBed.createComponent(DirectiveShowcaseComponent);
+  fixture.componentInstance.showDetails.set(false);
+  fixture.detectChanges();
+  expect(fixture.nativeElement.textContent).not.toContain('Details visible');
+});
+```
+
+**Expected Output:**
+```
+Toggle Details -> component mounted/destroyed
+Refresh (no-track) -> 50 DOM destructions + 50 creations
+Refresh (@for track) -> 0 DOM destructions (nodes reused)
+```
+
+**Stretch Challenges:**
+- [ ] Replace all *ngFor with @for and measure build output size difference
+- [ ] Add virtual scrolling (CDK) to the product list for 10k items
+- [ ] Build a custom *appTrackByField directive that auto-generates trackBy
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Difference between structural and attribute directives?
+**Q2:** What does *ngIf do to the DOM? (hint: not just hide)
+**Q3:** Write ngFor with a trackBy function. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why is omitting trackBy in *ngFor a performance problem?
+**Q5:** Difference between [class.active]="x" and [ngClass]="{'active': x}"?
+**Q6:** Refactor to @if/@for syntax:
+```html
+<div *ngIf="user"><li *ngFor="let item of items">{{ item }}</li></div>
+```
+
+### Day 7 — Application
+**Q7:** When would you use [hidden] instead of *ngIf?
+**Q8:** A PR has *ngSwitch with 8 cases — any better alternatives?
+**Q9:** What is the performance difference between *ngFor and virtual scrolling?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "What are structural directives and how does the asterisk (*) syntax work internally?"
+**Q11:** Draw: how *ngFor desugars into ng-template and ViewContainerRef.
+**Q12:** ★ System design: "Render a virtualized tree with 100k nodes in Angular — directives, CDK, performance."

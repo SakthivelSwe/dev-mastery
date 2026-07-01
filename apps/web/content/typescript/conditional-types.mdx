@@ -121,3 +121,180 @@ type ReturnType<T> = T extends (...args: any[]) => infer R ? R : any;
 ```
 Explanation: The condition asks, "Is `T` a function that takes any arguments and returns *something* (`infer R`)?" If true, it returns `R` (the extracted return type). If `T` is not a function at all, it just falls back to `any`.
 This is exactly how the built-in global `ReturnType` utility works in TypeScript!
+
+## FEYNMAN CHECK
+
+### Explain Conditional Types Like I'm 10 Years Old
+> Conditional types are IF-ELSE for types. `T extends U ? X : Y` means: at compile time, check if T is assignable to U; if yes, produce X; if no, produce Y. Combined with `infer` (to extract sub-types), conditional types let you write `Returntype<F>`, `Parameters<F>`, `Awaited<T>`. The crucial subtlety: when T is a UNION and appears NAKED on the left of extends, the conditional DISTRIBUTES — `('a' | 'b') extends string ? true : false` becomes `true | true` = `true`, but `('a' | 1) extends string ? true : false` becomes `true | false`. Wrap in brackets to disable: `[('a'|1)] extends [string] ? true : false` evaluates once = `false`.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: What problem do conditional types solve?**
+> **A:** Type-level conditional logic. Without them, you cannot express "this function returns T if input is X, else Y." Conditional types are the foundation of every utility type and most production TS libraries — Redux Toolkit's createSlice, tRPC's procedure builders, zod's z.infer, Drizzle ORM's typed queries — all depend on conditional + infer to derive output types from input shapes.
+
+**Q2: Mental model for distribution?**
+> **A:** A NAKED type parameter on the LEFT of extends triggers DISTRIBUTION over unions. `T extends string ? T[] : T` applied to T = 'a' | 1 produces `('a' extends string ? 'a'[] : 'a') | (1 extends string ? 1[] : 1)` = `'a'[] | 1`. To EVALUATE ONCE for the whole union, bracket both sides: `[T] extends [string]` — now the whole T is checked as a single unit.
+
+**Q3: Most dangerous misconception? Show with code.**
+> **A:** Forgetting distribution turns simple conditionals into surprising unions:
+> ```ts
+> // ❌ Trying to check "is T exactly string?"
+> type IsString<T> = T extends string ? true : false;
+> IsString<'a' | number>;   // = true | false (distributes) — WRONG
+>
+> // ✅ Disable distribution with brackets
+> type IsStringStrict<T> = [T] extends [string] ? true : false;
+> IsStringStrict<'a' | number>;   // = false (entire union is not string)
+> ```
+
+**Q4: How does `infer` interact with conditional types?**
+> **A:** `infer` is only allowed inside the EXTENDS clause of a conditional. It pattern-matches part of the type and binds a name. `T extends Promise<infer U> ? U : T` says "if T is a Promise<something>, give that something the name U and use it." You can have multiple infers, even in nested positions: `T extends (...args: infer A) => infer R ? { args: A; returns: R } : never`.
+
+**Q5: FAANG-grade definition?**
+> **A:** "Conditional types are TypeScript's type-level ternary expressions `T extends U ? X : Y` — distributing over union members when T is a naked type parameter, supporting type extraction via the `infer` keyword inside the extends clause — collectively enabling the implementation of every utility type and the type-derivation patterns underpinning production ORMs, routers, and validators."
+
+## BUILD
+
+### 🏗️ Mini Project: Implement `Returntype`, `Parameters`, And `Awaited` From Scratch
+
+**What you will build:** Re-implement TS's built-in utility types using only conditional types + infer, then build a type-level mini-VM that evaluates JSON Schema-style rules at compile time.
+**Why this project:** Forces deep understanding of infer and distribution.
+**Time estimate:** 30 minutes
+
+---
+
+#### Step 1 — Setup
+```bash
+mkdir ts-conditional && cd ts-conditional
+npm init -y && npm install -D typescript vitest
+npx tsc --init --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ni src/utils.ts, src/main.ts -ItemType File
+```
+
+#### Step 2 — Build Utility Types From Scratch
+```ts
+// src/utils.ts
+// 1. ReturnType
+export type MyReturnType<F> = F extends (...args: any[]) => infer R ? R : never;
+
+// 2. Parameters
+export type MyParameters<F> = F extends (...args: infer A) => any ? A : never;
+
+// 3. Awaited (TS 4.5+)
+export type MyAwaited<T> =
+  T extends Promise<infer U>
+    ? MyAwaited<U>                       // recurse for Promise<Promise<X>>
+    : T;
+
+// 4. First and Last in a tuple
+export type First<T extends unknown[]> = T extends [infer F, ...unknown[]] ? F : never;
+export type Last<T extends unknown[]>  = T extends [...unknown[], infer L] ? L : never;
+
+// 5. NonNullable from scratch
+export type MyNonNullable<T> = T extends null | undefined ? never : T;
+```
+
+#### Step 3 — Use Them With Real Functions
+```ts
+// src/main.ts
+import type {
+  MyReturnType, MyParameters, MyAwaited,
+  First, Last, MyNonNullable,
+} from './utils.js';
+
+function greet(name: string, age: number): { hi: string } { return { hi: name }; }
+
+type R = MyReturnType<typeof greet>;        // { hi: string }
+type P = MyParameters<typeof greet>;        // [string, number]
+type A = MyAwaited<Promise<Promise<number>>>;   // number
+type F = First<[1, 2, 3]>;                  // 1
+type L = Last<['a', 'b', 'c']>;            // 'c'
+type N = MyNonNullable<string | null>;      // string
+
+console.log('Types compile cleanly!');
+```
+
+#### Step 4 — Error Handling: Distribution Demo
+```ts
+// Distributive (default)
+type ToArray<T> = T extends any ? T[] : never;
+type Distributed = ToArray<string | number>;   // string[] | number[]
+
+// Non-distributive
+type ToArrayStrict<T> = [T] extends [any] ? T[] : never;
+type Single = ToArrayStrict<string | number>;   // (string | number)[]
+
+// Common bug fix: NonNullable wrongly distributing
+type WrongNonNull<T> = T extends null ? never : T;   // distributes — for T=null|undefined this is undefined
+type RightNonNull<T> = T extends null | undefined ? never : T;
+```
+
+#### Step 5 — Tests
+```ts
+import { describe, it, expectTypeOf } from 'vitest';
+import type {
+  MyReturnType, MyParameters, MyAwaited, First, Last,
+} from './utils.js';
+
+describe('conditional utility types', () => {
+  it('ReturnType extracts return', () => {
+    expectTypeOf<MyReturnType<() => number>>().toEqualTypeOf<number>();
+  });
+  it('Parameters extracts argument tuple', () => {
+    expectTypeOf<MyParameters<(a: string, b: number) => void>>()
+      .toEqualTypeOf<[string, number]>();
+  });
+  it('Awaited unwraps nested Promises', () => {
+    expectTypeOf<MyAwaited<Promise<Promise<Promise<string>>>>>()
+      .toEqualTypeOf<string>();
+  });
+  it('First and Last on tuples', () => {
+    expectTypeOf<First<[1, 2, 3]>>().toEqualTypeOf<1>();
+    expectTypeOf<Last<[1, 2, 3]>>().toEqualTypeOf<3>();
+  });
+});
+```
+
+**Expected Output:**
+```
+Types compile cleanly!
+
+# Test summary:
+ReturnType extracts return     ✓
+Parameters extracts arg tuple  ✓
+Awaited unwraps Promises       ✓
+First and Last on tuples       ✓
+```
+
+**Stretch Challenges:**
+- [ ] Implement `ConstructorParameters<C>` from scratch
+- [ ] Build `Flatten<T>` that converts `Array<Array<T>>` to `Array<T>` recursively
+- [ ] Build a type-level JSON parser that validates a literal string at compile time
+
+## SPACED REVIEW
+
+### Day 1 — Recall
+**Q1:** Syntax for a conditional type?
+**Q2:** When does a conditional type DISTRIBUTE? How do you prevent it?
+**Q3:** Write `ReturnType<F>` from scratch. From memory.
+
+### Day 3 — Comprehension
+**Q4:** Why does `type IsString<T> = T extends string ? true : false; IsString<'a'|number>` give `true | false`?
+**Q5:** A junior writes `NonNullable<T> = T extends null ? never : T` and misses undefined. Diagnose.
+**Q6:** Implement `UnwrapArray<T>` that returns the element type:
+```ts
+type X = UnwrapArray<number[]>;   // number
+type Y = UnwrapArray<string>;     // string
+```
+
+### Day 7 — Application
+**Q7:** Build a type that converts `{ a: string; b: number }` to `{ a: () => string; b: () => number }`.
+**Q8:** A PR has a deeply recursive conditional type — TS errors with "type instantiation excessively deep." Fix.
+**Q9:** What is the compile-time cost of conditional types on a 1000-file project?
+
+### Day 14 — Synthesis
+**Q10:** ★ Interview: "Implement `Pick<T, K>` using only conditional and mapped types."
+**Q11:** Draw: evaluation tree for `ConditionalA<ConditionalB<X>>`.
+**Q12:** ★ System design: "Design a tRPC-style API where input/output types are inferred from middleware composition. What conditional + infer patterns are needed?"
