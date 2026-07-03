@@ -21,7 +21,262 @@ Each `FROM` statement starts a new build stage. You can name stages with `AS sta
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeVisualizer", "state": "multi-stage-build" }
+{
+  "language": "dockerfile",
+  "fileName": "Dockerfile",
+  "steps": [
+    {
+      "title": "Multi-stage build overview",
+      "description": "Use multiple FROM statements. Each is a stage. Copy only what you need from earlier stages to final image. Result: tiny production images.",
+      "code": "# ONE Dockerfile, MULTIPLE stages\n# Stage 1: build\nFROM node:18 AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build\n\n# Stage 2: production\nFROM node:18-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --only=production && npm cache clean --force\nCOPY --from=builder /app/dist ./dist    # copy artifacts only!\nUSER node\nCMD [\"node\", \"dist/server.js\"]\n\n# Result:\n# - Full node:18 (900MB) for build\n# - Alpine + production deps + built code (150MB) for prod\n# - Build tools NOT in final image\n\n# Build\n$ docker build -t myapp .\n\n# Only the LAST stage is the final image",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        19,
+        20,
+        21,
+        22
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Stage 1 (builder): full toolchain",
+            "done": true
+          },
+          {
+            "label": "Stage 1 builds artifacts",
+            "done": true
+          },
+          {
+            "label": "Stage 2 (final): minimal runtime",
+            "active": true
+          },
+          {
+            "label": "COPY --from=builder /app/dist ./dist"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Java multi-stage example",
+      "description": "Java is a perfect fit — Maven/Gradle for build, JRE-only for runtime. Cuts image size dramatically.",
+      "code": "# Java Spring Boot multi-stage\n\n# Stage 1: build with Maven\nFROM eclipse-temurin:17-jdk AS builder\nWORKDIR /app\n\n# Cache Maven deps separately (rarely change)\nCOPY pom.xml .\nCOPY mvnw ./\nCOPY .mvn ./.mvn\nRUN ./mvnw dependency:go-offline\n\n# Then build\nCOPY src ./src\nRUN ./mvnw package -DskipTests && \\\n    java -Djarmode=layertools -jar target/*.jar extract\n\n# Stage 2: production with JRE only\nFROM eclipse-temurin:17-jre-alpine\nWORKDIR /app\n\n# Copy Spring layered jar layers separately\nCOPY --from=builder /app/dependencies/         ./\nCOPY --from=builder /app/spring-boot-loader/   ./\nCOPY --from=builder /app/snapshot-dependencies/ ./\nCOPY --from=builder /app/application/          ./\n\nUSER 1000:1000\nEXPOSE 8080\nENTRYPOINT [\"java\", \"org.springframework.boot.loader.JarLauncher\"]\n\n# Size: 200MB (vs 850MB with full JDK)",
+      "highlight": [
+        4,
+        5,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Java build stages",
+        "items": [
+          {
+            "label": "JDK for build",
+            "color": "#10b981",
+            "value": "Full Maven + JDK",
+            "highlight": true
+          },
+          {
+            "label": "JRE for runtime",
+            "color": "#818cf8",
+            "value": "JRE only — half the size"
+          },
+          {
+            "label": "Alpine base",
+            "color": "#f59e0b",
+            "value": "JRE + alpine = ~180 MB"
+          },
+          {
+            "label": "Spring layered jar",
+            "color": "#60a5fa",
+            "value": "Better layer caching"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Go static binary example",
+      "description": "Go compiles to a single static binary. Multi-stage → scratch or distroless produces images under 10 MB.",
+      "code": "# Stage 1: build\nFROM golang:1.22-alpine AS builder\nWORKDIR /app\n\n# Cache modules\nCOPY go.mod go.sum ./\nRUN go mod download\n\nCOPY . .\n# Static binary — no dynamic linking\nRUN CGO_ENABLED=0 GOOS=linux go build \\\n    -ldflags=\"-w -s\" \\               # strip debug info\n    -o /app/server ./cmd/server\n\n# Stage 2: minimal runtime\nFROM scratch\nCOPY --from=builder /app/server /server\nCOPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/\nUSER 1000:1000\nEXPOSE 8080\nENTRYPOINT [\"/server\"]\n\n# Result: ~10 MB image\n# scratch = empty image, only the binary\n\n# Alternative: distroless (has CA certs, easier)\nFROM gcr.io/distroless/static-debian12:nonroot\nCOPY --from=builder /app/server /server\nENTRYPOINT [\"/server\"]",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Go image sizes",
+        "items": [
+          {
+            "label": "golang:1.22 (build)",
+            "color": "#818cf8",
+            "value": "~900 MB with toolchain"
+          },
+          {
+            "label": "scratch (runtime)",
+            "color": "#10b981",
+            "value": "~10 MB — just the binary",
+            "highlight": true
+          },
+          {
+            "label": "distroless",
+            "color": "#f59e0b",
+            "value": "~20 MB with CA certs"
+          },
+          {
+            "label": "CGO_ENABLED=0",
+            "color": "#60a5fa",
+            "value": "Fully static — no libc"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Test and build in stages",
+      "description": "Add a test stage. Docker will fail build if tests fail. Use --target to build up to specific stage.",
+      "code": "FROM node:18-alpine AS deps\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\n\n# Test stage\nFROM deps AS test\nCOPY . .\nRUN npm run lint && npm test\n\n# Build stage\nFROM deps AS builder\nCOPY . .\nRUN npm run build\n\n# Production stage\nFROM node:18-alpine AS production\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --only=production && npm cache clean --force\nCOPY --from=builder /app/dist ./dist\nUSER node\nCMD [\"node\", \"dist/server.js\"]\n\n# Full build (runs tests too — CI!)\n$ docker build -t myapp .\n\n# Build only up to test stage\n$ docker build --target=test .\n\n# Build only up to builder (for debugging)\n$ docker build --target=builder .",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        26,
+        29,
+        32
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "deps → test → builder → production",
+            "done": true
+          },
+          {
+            "label": "Test stage runs npm test — build fails if tests fail",
+            "done": true
+          },
+          {
+            "label": "--target=test builds only test stage",
+            "active": true
+          },
+          {
+            "label": "Perfect for CI: docker build validates + tests + builds"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Copy between stages patterns",
+      "description": "COPY --from=stage or --from=image. Can copy from external images too. Use for hardened base + custom binaries.",
+      "code": "# Copy from earlier named stage\nCOPY --from=builder /app/dist ./dist\n\n# Copy from external image (no stage needed)\nCOPY --from=nginx:latest /usr/share/nginx/html/index.html /public/\n\n# Copy from specific target platform\nFROM --platform=$BUILDPLATFORM node:18-alpine AS builder\nCOPY . .\nRUN npm run build\n\nFROM --platform=$TARGETPLATFORM node:18-alpine\nCOPY --from=builder /app/dist ./dist\n\n# Multiple builders for compilation matrix\nFROM node:18-alpine AS test-linux\nRUN echo \"test on linux\"\n\nFROM node:18-alpine AS test-alpine\nRUN echo \"test on alpine\"\n\nFROM node:18-alpine AS final\nCOPY --from=test-linux /result /\nCOPY --from=test-alpine /result /\n\n# Real example: distroless for maximum security\nFROM node:18 AS builder\n# ... build ...\n\nFROM gcr.io/distroless/nodejs18-debian12\nCOPY --from=builder --chown=nonroot:nonroot /app /app\nWORKDIR /app\nUSER nonroot\nCMD [\"dist/server.js\"]",
+      "highlight": [
+        2,
+        5,
+        8,
+        9,
+        10,
+        12,
+        13,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        24,
+        27,
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Copy source patterns",
+        "items": [
+          {
+            "label": "--from=stagename",
+            "color": "#10b981",
+            "value": "From earlier named stage",
+            "highlight": true
+          },
+          {
+            "label": "--from=image:tag",
+            "color": "#818cf8",
+            "value": "From any registry image"
+          },
+          {
+            "label": "--platform",
+            "color": "#f59e0b",
+            "value": "BUILDPLATFORM vs TARGETPLATFORM"
+          },
+          {
+            "label": "--chown",
+            "color": "#60a5fa",
+            "value": "Set ownership during copy"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

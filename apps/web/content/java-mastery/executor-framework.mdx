@@ -1,0 +1,518 @@
+---
+slug: "executor-framework"
+title: "Executor Framework — ExecutorService & ThreadPoolExecutor"
+level: 3
+---
+
+## WHY
+
+You would never `new Connection()` for every database query — you use a connection pool. Threads deserve the same discipline. Every `new Thread()` costs ~1 ms and ~1 MB of stack; a burst of 10 000 requests spawning 10 000 threads OOMs a modestly-sized JVM. The Executor Framework is Java's canonical answer: **create N threads once, keep them alive, feed them a queue of tasks**. The `main` thread submits work and gets a `Future` back; the pool serializes execution across the reused workers. Every mature Java application — Spring Boot, Kafka clients, Netty, Cassandra — sits on top of `ExecutorService`.
+
+## THEORY
+
+### Core Types (java.util.concurrent)
+
+```
+Executor                          Executor.execute(Runnable) — fire-and-forget
+   ▲
+   │
+ExecutorService                   submit / invokeAll / invokeAny / shutdown
+   ▲
+   │
+ScheduledExecutorService          schedule / scheduleAtFixedRate / WithFixedDelay
+```
+
+### The Executors factory (convenient but partially unsafe)
+
+| Factory method | Under the hood | Watch out for |
+|----------------|----------------|---------------|
+| `newFixedThreadPool(n)` | `ThreadPoolExecutor(n, n, 0, MS, new LinkedBlockingQueue<>())` | **Unbounded queue** — pending tasks pile up until OOM |
+| `newCachedThreadPool()` | `ThreadPoolExecutor(0, MAX_VALUE, 60s, new SynchronousQueue<>())` | **Unbounded threads** — burst → thousands of threads → OOM |
+| `newSingleThreadExecutor()` | Fixed(1) with unbounded queue | Same unbounded-queue trap |
+| `newScheduledThreadPool(n)` | `ScheduledThreadPoolExecutor` | See `spring-scheduled` topic |
+| `newVirtualThreadPerTaskExecutor()` (21+) | One virtual thread per task | Great for I/O-bound work |
+| `newWorkStealingPool()` | `ForkJoinPool` with parallelism = cores | Good for CPU-bound recursive tasks |
+
+**Rule**: for anything production-critical, construct `ThreadPoolExecutor` directly so you control the queue size and the rejection policy.
+
+### The 7 constructor parameters of `ThreadPoolExecutor`
+
+```java
+new ThreadPoolExecutor(
+    int corePoolSize,               // 1. always-alive workers
+    int maximumPoolSize,            // 2. upper bound
+    long keepAliveTime,             // 3. how long above-core workers idle before dying
+    TimeUnit unit,                  // 4. unit for keepAliveTime
+    BlockingQueue<Runnable> queue,  // 5. buffer between submitters and workers
+    ThreadFactory factory,          // 6. name/priority/daemon control
+    RejectedExecutionHandler policy // 7. what to do when queue full AND at max threads
+);
+```
+
+### The 4 built-in rejection policies
+
+| Policy | Behavior |
+|--------|----------|
+| `AbortPolicy` (default) | Throws `RejectedExecutionException` — caller sees the error |
+| `CallerRunsPolicy` | The submitting thread runs the task itself — natural back-pressure |
+| `DiscardPolicy` | Silently drop the new task — dangerous but sometimes right |
+| `DiscardOldestPolicy` | Drop the head of the queue and re-try submit |
+
+`CallerRunsPolicy` is usually the right default for web services — instead of losing traffic, the caller (Tomcat worker) executes the work itself, slowing the OS TCP accept rate and giving downstream time to catch up.
+
+### The interplay between core/max/queue
+
+The execution order when a task is submitted:
+
+```
+                ┌── queue not full? ──┐
+task arrives ── │                     │
+                └── #workers < core? ─┼── create new worker, run task
+                                      │
+                                      └── enqueue
+   queue full AND #workers < max ──── create new worker
+   queue full AND #workers == max ─── rejection policy
+```
+Common misconception: "extra threads are created when queue fills up". Actually: **new threads beyond `corePoolSize` are only created when the QUEUE IS FULL**. If you use an unbounded `LinkedBlockingQueue`, `maximumPoolSize` is effectively ignored — the pool never grows past `corePoolSize`.
+
+### Shutting down cleanly — the canonical dance
+
+```java
+executor.shutdown();                        // stop accepting new tasks
+try {
+    if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+        executor.shutdownNow();            // interrupt running tasks
+        if (!executor.awaitTermination(10, TimeUnit.SECONDS))
+            log.error("pool did not terminate cleanly");
+    }
+} catch (InterruptedException e) {
+    executor.shutdownNow();
+    Thread.currentThread().interrupt();
+}
+```
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "Executors.java",
+  "steps": [
+    {
+      "title": "Submit → queue",
+      "description": "Caller calls pool.submit(task). If a worker is free (below corePoolSize) it runs immediately; otherwise the task goes into the queue.",
+      "code": "ExecutorService pool = new ThreadPoolExecutor(\n    2, 4, 60, TimeUnit.SECONDS,\n    new LinkedBlockingQueue<>(3));\npool.submit(() -> handle(request));",
+      "highlight": [
+        4
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 3,
+        "workers": [
+          {
+            "name": "worker-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-2",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T3"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Queue full → grow pool up to max",
+      "description": "When the queue is FULL AND submissions keep arriving, the executor spawns extra workers up to maximumPoolSize.",
+      "code": "new ThreadPoolExecutor(\n    2,        // core\n    4,        // max — extra 2 workers when queue is full\n    60, TimeUnit.SECONDS,\n    new LinkedBlockingQueue<>(3));",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 3,
+        "workers": [
+          {
+            "name": "worker-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-3",
+            "state": "RUNNABLE",
+            "note": "spawned (queue full)"
+          },
+          {
+            "name": "worker-4",
+            "state": "RUNNABLE",
+            "note": "spawned (queue full)"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T3"
+          },
+          {
+            "label": "T4"
+          },
+          {
+            "label": "T5"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Beyond max → rejection policy",
+      "description": "Queue is full AND all max workers are busy → the RejectedExecutionHandler decides: abort (throw), callerRuns (submit thread does the work), discard, or discardOldest.",
+      "code": "new ThreadPoolExecutor(\n    ...,\n    new ThreadPoolExecutor.CallerRunsPolicy());   // back-pressure",
+      "highlight": [
+        3
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Rejection policies",
+        "items": [
+          {
+            "label": "AbortPolicy",
+            "color": "#ef4444",
+            "value": "throws"
+          },
+          {
+            "label": "CallerRunsPolicy",
+            "color": "#10b981",
+            "value": "submitter runs it",
+            "highlight": true
+          },
+          {
+            "label": "DiscardPolicy",
+            "color": "#f59e0b",
+            "value": "silently drop new"
+          },
+          {
+            "label": "DiscardOldestPolicy",
+            "color": "#f59e0b",
+            "value": "drop head, retry submit"
+          }
+        ]
+      }
+    },
+    {
+      "title": "submit vs execute — the Future",
+      "description": "execute(Runnable) is fire-and-forget. submit(Callable<T>) returns a Future<T> — .get() blocks until the result arrives OR the task throws (wrapped in ExecutionException).",
+      "code": "Future<Integer> f = pool.submit(() -> 6 * 7);\nint result = f.get();   // 42\ntry { pool.submit(this::mightFail).get(); }\ncatch (ExecutionException ee) { log.error(\"task failed\", ee.getCause()); }",
+      "highlight": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "caller",
+          "pool",
+          "worker"
+        ],
+        "messages": [
+          {
+            "from": "caller",
+            "to": "pool",
+            "label": "submit(callable)"
+          },
+          {
+            "from": "pool",
+            "to": "worker",
+            "label": "run"
+          },
+          {
+            "from": "worker",
+            "to": "pool",
+            "label": "return 42"
+          },
+          {
+            "from": "pool",
+            "to": "caller",
+            "label": "future.get() → 42"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Graceful shutdown",
+      "description": "shutdown() → stop accepting new; awaitTermination → wait for in-flight to finish; shutdownNow() → interrupt what's still running.",
+      "code": "pool.shutdown();\nif (!pool.awaitTermination(30, SECONDS)) {\n    pool.shutdownNow();\n    pool.awaitTermination(10, SECONDS);\n}",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "shutdown() — reject new tasks",
+            "done": true
+          },
+          {
+            "label": "await 30s for in-flight",
+            "done": true
+          },
+          {
+            "label": "still running? shutdownNow() — interrupt",
+            "active": true
+          },
+          {
+            "label": "await 10s for cleanup"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Fire-and-forget with a fixed pool
+```java
+import java.util.concurrent.*;
+
+public class FixedPoolDemo {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+
+        for (int i = 0; i < 10; i++) {
+            final int id = i;
+            pool.execute(() -> System.out.printf("[%s] task %d%n",
+                    Thread.currentThread().getName(), id));
+        }
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+        // Only 4 worker threads reused — you'll see pool-1-thread-1..4 handle all 10 tasks.
+    }
+}
+```
+
+### Level 2 — `submit` + `Future` + `invokeAll`
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+public class InvokeAllDemo {
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        List<Callable<Integer>> tasks = List.of(
+                () -> { Thread.sleep(200); return 10; },
+                () -> { Thread.sleep(300); return 20; },
+                () -> { Thread.sleep(100); return 30; }
+        );
+
+        // Blocks until ALL finish, then returns Futures in submission order
+        List<Future<Integer>> futures = pool.invokeAll(tasks);
+
+        int sum = 0;
+        for (Future<Integer> f : futures) sum += f.get();
+        System.out.println("sum = " + sum);          // 60
+
+        // invokeAny: returns the first successful result, cancels the rest
+        Integer first = pool.invokeAny(tasks);
+        System.out.println("first = " + first);
+
+        pool.shutdown();
+    }
+}
+```
+
+### Level 3 — Production `ThreadPoolExecutor` (bounded queue + naming + back-pressure)
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ProductionPool {
+    public static ExecutorService build(String prefix,
+                                        int core, int max, int queueSize) {
+        AtomicInteger idx = new AtomicInteger();
+        ThreadFactory tf = r -> {
+            Thread t = new Thread(r);
+            t.setName(prefix + "-" + idx.incrementAndGet());
+            t.setDaemon(false);
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    System.err.println("[" + th.getName() + "] " + ex));
+            return t;
+        };
+        return new ThreadPoolExecutor(
+                core, max,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueSize),   // BOUNDED
+                tf,
+                new ThreadPoolExecutor.CallerRunsPolicy()); // back-pressure
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = build("outbound", 10, 20, 100);
+        for (int i = 0; i < 50; i++) {
+            final int id = i;
+            pool.submit(() -> System.out.printf("[%s] processing %d%n",
+                    Thread.currentThread().getName(), id));
+        }
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+}
+```
+
+### Level 4 — Handling task failures WITHOUT losing them
+```java
+import java.util.concurrent.*;
+
+public class FailureAware extends ThreadPoolExecutor {
+    public FailureAware(int core) {
+        super(core, core, 0, TimeUnit.MILLISECONDS,
+              new LinkedBlockingQueue<>());
+    }
+
+    // Called by every worker AFTER the task runs — even if it threw
+    @Override
+    protected void afterExecute(Runnable r, Throwable t) {
+        super.afterExecute(r, t);
+        if (t == null && r instanceof Future<?> f && f.isDone()) {
+            try { f.get(); }                    // extract the wrapped exception
+            catch (CancellationException ce) { /* fine */ }
+            catch (ExecutionException ee) { t = ee.getCause(); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
+        if (t != null) System.err.println("task failed: " + t);
+    }
+
+    public static void main(String[] args) throws Exception {
+        FailureAware pool = new FailureAware(2);
+        pool.submit(() -> { throw new RuntimeException("silent otherwise"); });
+        pool.shutdown();
+        pool.awaitTermination(1, TimeUnit.SECONDS);
+    }
+}
+```
+Without `afterExecute()`, a task submitted via `submit()` that throws stores the exception in the `Future` — if nobody calls `future.get()`, it's silently lost.
+
+### Level 5 — `ExecutorCompletionService` — process results as they finish
+```java
+import java.util.concurrent.*;
+
+public class CompletionExample {
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        CompletionService<Integer> cs = new ExecutorCompletionService<>(pool);
+
+        int[] delays = {500, 100, 300, 200, 50};
+        for (int d : delays) {
+            cs.submit(() -> { Thread.sleep(d); return d; });
+        }
+
+        // Take results in the order they complete — 50, 100, 200, 300, 500
+        for (int i = 0; i < delays.length; i++) {
+            Integer result = cs.take().get();
+            System.out.println("finished: " + result + " ms");
+        }
+        pool.shutdown();
+    }
+}
+```
+This is much better than iterating a `List<Future>` from `invokeAll`, which forces you to process in submission order and blocks on the slowest task first.
+
+## REAL_WORLD
+
+**Order-processing pipeline with three isolated pools.** In a production Spring Boot service, you never want a slow third-party API call to starve the fast internal work. Solution: separate pools per failure domain.
+
+```java
+@Configuration
+public class Executors {
+
+    @Bean("dbExecutor")
+    public ExecutorService db() {
+        return new ThreadPoolExecutor(
+                20, 40, 60, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(500),
+                named("db"),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
+    @Bean("emailExecutor")
+    public ExecutorService email() {
+        // Emails are slow (external SMTP) — small pool, big queue, drop-old if flooded
+        return new ThreadPoolExecutor(
+                5, 5, 0, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(10_000),
+                named("email"),
+                new ThreadPoolExecutor.DiscardOldestPolicy());
+    }
+
+    @Bean("cpuExecutor")
+    public ExecutorService cpu() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        return new ThreadPoolExecutor(
+                cores, cores, 0, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(100),
+                named("cpu"),
+                new ThreadPoolExecutor.AbortPolicy());
+    }
+    /* ... named() as before ... */
+    private static ThreadFactory named(String s) { /* ... */ return null; }
+}
+```
+Now if SMTP hangs, only email tasks pile up. Database and CPU work keep flowing. This is the pattern used inside Netflix, Uber, and Cassandra: **bulkhead pattern**.
+
+## INTERVIEW
+
+**Q: Why is `Executors.newFixedThreadPool(n)` risky in production?**
+A: It uses an **unbounded** `LinkedBlockingQueue`. Under load, pending tasks accumulate indefinitely — eventually you OOM before any rejection policy fires. Always construct `ThreadPoolExecutor` directly with a bounded queue and a sensible rejection policy (usually `CallerRunsPolicy`).
+
+**Q: When does `ThreadPoolExecutor` create threads above `corePoolSize`?**
+A: Only when the queue is **full** AND another task is submitted. That is: extra threads (up to `maximumPoolSize`) act as an emergency valve to drain a full queue. With an unbounded queue, that valve never opens — `maximumPoolSize` is dead code.
+
+**Q: What's the difference between `execute` and `submit`?**
+A: `execute` accepts a `Runnable` and returns void — exceptions propagate to the `UncaughtExceptionHandler` and print to stderr. `submit` accepts a `Runnable` or `Callable` and returns a `Future` — exceptions are silently captured in the Future until someone calls `future.get()`.
+
+**Q: What is `CallerRunsPolicy`?**
+A: When the queue is full AND max threads are busy, the rejection is handled by the SUBMITTING thread — it runs the task itself, synchronously. This creates natural back-pressure: the submitter slows down until the pool catches up. Excellent default for HTTP servers.
+
+**Q: How do you shut down an ExecutorService cleanly?**
+A: `shutdown()` (stop accepting new) → `awaitTermination(t, unit)` (wait for running to finish) → if that returns false, `shutdownNow()` (interrupt running tasks) → `awaitTermination` again. Always restore the interrupt flag if you catch InterruptedException.
+
+**Q: `newCachedThreadPool` — why is it dangerous?**
+A: `maximumPoolSize = Integer.MAX_VALUE`. Under a burst of blocking tasks (e.g., 10 000 slow HTTP calls arrive at once), it will happily spawn 10 000 OS threads and OOM the JVM in seconds. Only safe for short-lived, CPU-bound bursts.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> A thread pool is like a small team of taxi drivers waiting at the airport. When passengers arrive (tasks), the first free driver takes one and drives. Instead of hiring a new driver for every passenger (expensive), the same drivers keep returning to the queue. If everyone is busy AND the waiting-room bench is full, the terminal manager decides what to do — send the passenger to a bus (`CallerRunsPolicy`), tell them "sorry, try later" (`AbortPolicy`), or send home the person who's been waiting the longest (`DiscardOldestPolicy`).
+
+## BUILD
+
+Build a **crawl coordinator** using an ExecutorService:
+1. `ExecutorService pool` — 8 workers, bounded queue (200), `CallerRunsPolicy`.
+2. Method `void crawl(URL start, int maxPages)` — starts at `start`, fetches HTML, extracts links, submits each unseen link to the pool.
+3. Use a `ConcurrentHashMap<URL, Boolean>` visited-set to avoid re-fetching.
+4. `AtomicInteger` counts fetched pages; stop enqueuing when reaching `maxPages`.
+5. Call `pool.shutdown()` + `awaitTermination()` to detect completion.
+6. **Bonus**: wrap each Runnable in an `afterExecute` handler that logs exceptions instead of silently swallowing them.
+
+## SPACED REVIEW
+
+**Day 1**: List the 7 constructor parameters of `ThreadPoolExecutor` in order.
+**Day 3**: Explain why `maximumPoolSize` is meaningless with `newFixedThreadPool`.
+**Day 7**: Show the canonical two-stage `shutdown()` + `shutdownNow()` template.
+**Day 14**: Describe the "bulkhead" pattern using multiple `ExecutorService` instances.
+

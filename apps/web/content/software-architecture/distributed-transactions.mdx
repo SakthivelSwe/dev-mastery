@@ -22,7 +22,215 @@ If a step fails, you cannot "rollback" the previous databases (because they alre
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "saga-pattern" }
+{
+  "language": "java",
+  "fileName": "DistributedTx.java",
+  "steps": [
+    {
+      "title": "Why distributed transactions are hard",
+      "description": "In a distributed system, two-phase commit (2PC) works but is slow and blocks resources. Network partitions cause coordinator failures — all participants block indefinitely.",
+      "code": "// 2PC: prepare → commit\n// Phase 1: Coordinator asks all to PREPARE\n// All lock resources, respond OK\n// Phase 2: Coordinator sends COMMIT to all\n// ALL commit atomically\n\n// Problem 1: Coordinator crash after PREPARE\n// All participants hold locks indefinitely!\n\n// Problem 2: Participant crash during COMMIT\n// System in inconsistent state — manual recovery needed\n\n// Problem 3: Network partition\n// Some committed, some didn't — split-brain!\n\n// CAP theorem: in distributed systems\n// you can have Consistency OR Availability, not both during partition",
+      "highlight": [
+        7,
+        8,
+        10,
+        11,
+        13,
+        16
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "2PC problems",
+        "items": [
+          {
+            "label": "Blocking",
+            "color": "#ef4444",
+            "value": "All participants wait for coordinator",
+            "highlight": true
+          },
+          {
+            "label": "Coordinator failure",
+            "color": "#ef4444",
+            "value": "Locks held indefinitely"
+          },
+          {
+            "label": "Network partition",
+            "color": "#ef4444",
+            "value": "Split-brain inconsistency"
+          },
+          {
+            "label": "Solution: Saga pattern",
+            "color": "#10b981",
+            "value": "Compensating transactions instead"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Saga pattern overview",
+      "description": "A Saga is a sequence of local transactions, each publishing an event. If any step fails, compensating transactions undo previous steps. Eventual consistency.",
+      "code": "// Order saga steps:\n// 1. CreateOrder → SUCCESS → publish OrderCreated\n// 2. ReserveInventory → SUCCESS → publish Reserved\n// 3. ChargePayment → FAIL → publish PaymentFailed\n\n// Compensation:\n// 3. FAIL → publish PaymentFailed\n// 2. ReleaseInventory (compensate step 2)\n// 1. CancelOrder (compensate step 1)\n\n// Key: each step is LOCAL TRANSACTION (ACID within service)\n// Across services: EVENTUAL CONSISTENCY via events\n\n// Choreography: services react to each other's events\n// Orchestration: saga orchestrator calls services in order",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        11,
+        12,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Step 1: CreateOrder (local tx)",
+            "done": true
+          },
+          {
+            "label": "Step 2: ReserveInventory (local tx)",
+            "done": true
+          },
+          {
+            "label": "Step 3: ChargePayment FAILS",
+            "active": true
+          },
+          {
+            "label": "Compensate: ReleaseInventory → CancelOrder"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Outbox pattern",
+      "description": "The Outbox Pattern ensures events are reliably published. Write the event to an outbox table in the same DB transaction as the domain change. A relay process publishes events asynchronously.",
+      "code": "@Transactional\npublic TopicId publishTopic(TopicId id) {\n    Topic topic = repo.findById(id).orElseThrow();\n    topic.publish();\n    repo.save(topic);\n\n    // Write event to outbox in SAME transaction\n    outboxRepo.save(new OutboxEvent(\n        \"TopicPublished\",\n        topic.id().value(),\n        objectMapper.writeValueAsString(new TopicPublished(id))\n    ));\n    // If DB tx commits: both topic + event saved\n    // If DB tx fails: both rolled back = ATOMIC\n    return id;\n}\n\n// Relay: polls outbox, publishes to Kafka\n// Debezium: CDC approach — reads DB WAL directly",
+      "highlight": [
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        18,
+        19
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Service",
+          "DB",
+          "Relay",
+          "Kafka"
+        ],
+        "messages": [
+          {
+            "from": "Service",
+            "to": "DB",
+            "label": "BEGIN TX: update + insert outbox"
+          },
+          {
+            "from": "DB",
+            "to": "Service",
+            "label": "COMMIT (atomic)"
+          },
+          {
+            "from": "Relay",
+            "to": "DB",
+            "label": "poll outbox table"
+          },
+          {
+            "from": "Relay",
+            "to": "Kafka",
+            "label": "publish event"
+          },
+          {
+            "from": "Relay",
+            "to": "DB",
+            "label": "mark as published"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Idempotency in distributed systems",
+      "description": "Network failures cause retries — the same message may be processed twice. Idempotent operations produce the same result regardless of how many times they are called.",
+      "code": "// Idempotency key: deduplicate requests\n@PostMapping(\"/orders\")\npublic ResponseEntity<Order> createOrder(\n    @RequestHeader(\"Idempotency-Key\") String idempotencyKey,\n    @RequestBody CreateOrderRequest req\n) {\n    // Check if already processed\n    return idempotencyStore.findByKey(idempotencyKey)\n        .map(cached -> ResponseEntity.ok(cached.result()))\n        .orElseGet(() -> {\n            Order order = orderService.create(req);\n            idempotencyStore.save(idempotencyKey, order, TTL_24H);\n            return ResponseEntity.status(201).body(order);\n        });\n}",
+      "highlight": [
+        4,
+        8,
+        9,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Idempotency patterns",
+        "items": [
+          {
+            "label": "Idempotency Key header",
+            "color": "#10b981",
+            "value": "Client sends unique key per operation",
+            "highlight": true
+          },
+          {
+            "label": "Deduplication store",
+            "color": "#818cf8",
+            "value": "Redis/DB stores key → result mapping"
+          },
+          {
+            "label": "Natural idempotency",
+            "color": "#f59e0b",
+            "value": "PUT (replace) is idempotent, POST is not"
+          },
+          {
+            "label": "Event deduplication",
+            "color": "#60a5fa",
+            "value": "Store processed event IDs, skip duplicates"
+          }
+        ]
+      }
+    },
+    {
+      "title": "TCC — Try-Confirm-Cancel",
+      "description": "TCC is an alternative to 2PC. Try: reserve resources. Confirm: make permanent. Cancel: release reserved resources. Each service implements all three phases.",
+      "code": "// TCC pattern\n// Try: reserve but don't commit\npublic InventoryReservation tryReserve(String productId, int qty) {\n    InventoryItem item = inventory.findById(productId);\n    if (item.available() < qty) throw new InsufficientInventory();\n    // Reserve (soft lock) — not yet committed\n    InventoryReservation res = new InventoryReservation(productId, qty);\n    reservations.save(res);\n    return res;\n}\n\n// Confirm: make reservation permanent\npublic void confirm(String reservationId) {\n    InventoryReservation res = reservations.findById(reservationId);\n    inventory.decrement(res.productId(), res.qty());\n    reservations.delete(reservationId);\n}",
+      "highlight": [
+        3,
+        6,
+        7,
+        8,
+        12,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "TRY: reserve resources (soft lock)",
+            "done": true
+          },
+          {
+            "label": "All services TRY OK → proceed",
+            "done": true
+          },
+          {
+            "label": "CONFIRM: make all permanent",
+            "active": true
+          },
+          {
+            "label": "Any FAIL → CANCEL all reservations"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

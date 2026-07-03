@@ -20,7 +20,302 @@ When you UPDATE a row in Postgres, it does NOT overwrite the existing row. It cr
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-locks" }
+{
+  "language": "sql",
+  "fileName": "locks.sql",
+  "steps": [
+    {
+      "title": "Lock types in PostgreSQL",
+      "description": "PostgreSQL has table locks (8 modes), row locks, and page locks. Most operations acquire minimum lock needed. Explicit LOCK TABLE for edge cases.",
+      "code": "-- Table lock modes (from least to most restrictive)\n-- ACCESS SHARE          (SELECT)\n-- ROW SHARE             (SELECT FOR UPDATE/SHARE)\n-- ROW EXCLUSIVE         (INSERT/UPDATE/DELETE)\n-- SHARE UPDATE EXCLUSIVE (VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY)\n-- SHARE                 (CREATE INDEX)\n-- SHARE ROW EXCLUSIVE   (rare)\n-- EXCLUSIVE             (REFRESH MATERIALIZED VIEW CONCURRENTLY)\n-- ACCESS EXCLUSIVE      (ALTER TABLE, DROP, VACUUM FULL)\n\n-- Row-level locks\nSELECT * FROM accounts WHERE id = 42 FOR UPDATE;\n-- Locks the row against concurrent UPDATE/DELETE\n\nSELECT * FROM accounts WHERE id = 42 FOR SHARE;\n-- Weaker: prevents modification but allows other SHARE locks\n\nSELECT * FROM accounts WHERE id = 42 FOR UPDATE SKIP LOCKED;\n-- Skip rows other transactions have locked (queue pattern)\n\nSELECT * FROM accounts WHERE id = 42 FOR UPDATE NOWAIT;\n-- Error immediately if row is locked\n\n-- Advisory locks (application-defined)\nSELECT pg_advisory_lock(12345);\n-- ... critical section ...\nSELECT pg_advisory_unlock(12345);",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        13,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Lock granularity",
+        "items": [
+          {
+            "label": "Table locks (8 modes)",
+            "color": "#10b981",
+            "value": "DDL, VACUUM, etc.",
+            "highlight": true
+          },
+          {
+            "label": "Row locks",
+            "color": "#818cf8",
+            "value": "SELECT FOR UPDATE/SHARE"
+          },
+          {
+            "label": "Advisory locks",
+            "color": "#f59e0b",
+            "value": "App-defined coordination"
+          },
+          {
+            "label": "SKIP LOCKED",
+            "color": "#60a5fa",
+            "value": "Perfect for queue workers"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Deadlocks and how to prevent them",
+      "description": "Deadlock = two transactions waiting on each other. PostgreSQL detects and kills one. Prevent by consistent lock ordering.",
+      "code": "-- Deadlock example\n-- Transaction A            Transaction B\n-- BEGIN;                    BEGIN;\n-- UPDATE users WHERE id=1;  UPDATE users WHERE id=2;\n-- UPDATE users WHERE id=2;  UPDATE users WHERE id=1;\n-- <waiting>                 <waiting>\n-- → PostgreSQL detects deadlock, kills one:\n-- ERROR: deadlock detected\n-- DETAIL: Process 1234 waits for ShareLock on transaction 5678\n\n-- Prevention: acquire locks in consistent order\n-- ✅ ALWAYS lock rows in ID order\nBEGIN;\n  SELECT * FROM users WHERE id IN (1, 2) ORDER BY id FOR UPDATE;\n  -- Now safe to update either\n  UPDATE users SET balance = balance - 100 WHERE id = 1;\n  UPDATE users SET balance = balance + 100 WHERE id = 2;\nCOMMIT;\n\n-- Detect deadlocks in logs\ndeadlock_timeout = 1s          -- how long before checking\nlog_lock_waits = on\n\n-- Log will show:\n-- LOG:  process 1234 detected deadlock while waiting for ShareLock\n-- DETAIL:  Process 1234 waits for ShareLock on transaction 5678;\n--          blocked by process 5678.\n\n-- Retry transaction on deadlock (application code)\nfor (let attempt = 0; attempt < 3; attempt++) {\n  try {\n    await tx();\n    break;\n  } catch (e) {\n    if (e.code !== \"40P01\") throw e;  // 40P01 = deadlock\n    await sleep(100 * (attempt + 1));\n  }\n}",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Detected via deadlock_timeout scan",
+            "done": true
+          },
+          {
+            "label": "PostgreSQL kills one transaction",
+            "done": true
+          },
+          {
+            "label": "App must retry on error code 40P01",
+            "active": true
+          },
+          {
+            "label": "Prevent: consistent lock order (ORDER BY id)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Investigating lock waits",
+      "description": "pg_locks + pg_stat_activity show what's blocking what. Common cause of slowdowns in production.",
+      "code": "-- Blocked queries and blockers\nSELECT blocked.pid AS blocked_pid,\n       blocked.query AS blocked_query,\n       blocking.pid AS blocking_pid,\n       blocking.query AS blocking_query,\n       blocked.wait_event_type, blocked.wait_event\nFROM pg_stat_activity blocked\nJOIN pg_stat_activity blocking\n  ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))\nWHERE blocked.wait_event IS NOT NULL;\n\n-- View all current locks\nSELECT locktype, relation::regclass, mode, granted, pid,\n       pg_stat_activity.query\nFROM pg_locks\nJOIN pg_stat_activity USING (pid)\nWHERE NOT granted;\n\n-- Simple check\nSELECT pid, now() - query_start AS duration, state, query\nFROM pg_stat_activity\nWHERE state = 'active'\nORDER BY duration DESC;\n\n-- Terminate a query (careful!)\nSELECT pg_cancel_backend(pid);       -- graceful\nSELECT pg_terminate_backend(pid);     -- kills connection\n\n-- Auto-cancel long queries\nALTER DATABASE devmastery SET statement_timeout = '30s';\nALTER DATABASE devmastery SET lock_timeout = '5s';        -- wait max 5s for lock\nALTER DATABASE devmastery SET idle_in_transaction_session_timeout = '2min';",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "pg_blocking_pids(pid): who blocks whom",
+            "done": true
+          },
+          {
+            "label": "pg_stat_activity: current queries",
+            "done": true
+          },
+          {
+            "label": "pg_locks: mode + granted flag",
+            "active": true
+          },
+          {
+            "label": "statement_timeout kills runaway queries"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transaction isolation levels",
+      "description": "READ COMMITTED (default): sees committed data at each query. REPEATABLE READ: consistent snapshot. SERIALIZABLE: strictest, may fail with retry.",
+      "code": "-- Set isolation level\nBEGIN ISOLATION LEVEL READ COMMITTED;    -- default\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nBEGIN ISOLATION LEVEL SERIALIZABLE;\n\n-- READ COMMITTED (default)\n-- Each SELECT sees latest committed data\nBEGIN;\n  SELECT balance FROM accounts WHERE id = 1;  -- 100\n  -- (someone else commits deposit)\n  SELECT balance FROM accounts WHERE id = 1;  -- 200 (changed!)\nCOMMIT;\n\n-- REPEATABLE READ\n-- Snapshot at first statement — SELECTs see same data\nBEGIN ISOLATION LEVEL REPEATABLE READ;\n  SELECT balance FROM accounts WHERE id = 1;  -- 100\n  -- (someone else commits deposit)\n  SELECT balance FROM accounts WHERE id = 1;  -- 100 (unchanged in view)\nCOMMIT;\n\n-- SERIALIZABLE\n-- Guarantees serial-equivalent execution\n-- May fail with:\n-- ERROR: could not serialize access due to concurrent update (40001)\nBEGIN ISOLATION LEVEL SERIALIZABLE;\n  -- ... complex reads + writes ...\n  -- If PostgreSQL detects conflict, aborts\nCOMMIT;\n\n-- Application must retry on 40001\ntry:\n  run_transaction()\nexcept SerializationError:\n  time.sleep(random.random() * 0.1)\n  run_transaction()",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        15,
+        16,
+        17,
+        18,
+        19,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Isolation levels",
+        "items": [
+          {
+            "label": "READ COMMITTED",
+            "color": "#10b981",
+            "value": "Default — see latest committed",
+            "highlight": true
+          },
+          {
+            "label": "REPEATABLE READ",
+            "color": "#818cf8",
+            "value": "Snapshot at start of transaction"
+          },
+          {
+            "label": "SERIALIZABLE",
+            "color": "#f59e0b",
+            "value": "Strictest — retry on conflict"
+          },
+          {
+            "label": "READ UNCOMMITTED",
+            "color": "#60a5fa",
+            "value": "Same as READ COMMITTED in PG"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Long transactions and their impact",
+      "description": "Long-running transactions prevent VACUUM from cleaning newer rows. Bloat + txid pressure. Kill them or design shorter transactions.",
+      "code": "-- Find long-running transactions\nSELECT pid, usename, state, xact_start,\n       now() - xact_start AS duration,\n       LEFT(query, 80) AS query\nFROM pg_stat_activity\nWHERE state IN ('active', 'idle in transaction')\n  AND xact_start < now() - INTERVAL '5 minutes'\nORDER BY xact_start;\n\n-- Why they hurt:\n-- - Hold snapshot: VACUUM can't clean rows newer than snapshot\n-- - Hold locks: block other operations\n-- - Increase txid age: wraparound risk\n\n-- Kill\nSELECT pg_terminate_backend(pid)\nFROM pg_stat_activity\nWHERE state = 'idle in transaction'\n  AND state_change < now() - INTERVAL '10 minutes';\n\n-- Auto-timeout (put in config)\nALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';\nALTER SYSTEM SET statement_timeout = '60s';\nSELECT pg_reload_conf();\n\n-- Design: short transactions\n-- ❌ Bad: transaction spans user interaction\nBEGIN;\nSELECT * FROM cart WHERE user_id = 1;\n-- user thinks about it for 10 minutes\nCOMMIT;\n\n-- ✅ Good: transaction only wraps actual writes\nSELECT * FROM cart WHERE user_id = 1;   -- outside transaction\n-- ... user acts ...\nBEGIN;\nUPDATE cart SET checked_out = true WHERE user_id = 1;\nINSERT INTO orders ...;\nCOMMIT;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Long transaction damage",
+        "items": [
+          {
+            "label": "Blocks VACUUM",
+            "color": "#ef4444",
+            "value": "Dead tuples accumulate",
+            "highlight": true
+          },
+          {
+            "label": "Holds locks",
+            "color": "#f59e0b",
+            "value": "Other transactions wait"
+          },
+          {
+            "label": "Bloat + wraparound",
+            "color": "#818cf8",
+            "value": "Long-term database health hit"
+          },
+          {
+            "label": "Auto-timeouts",
+            "color": "#10b981",
+            "value": "Kill idle_in_transaction fast"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

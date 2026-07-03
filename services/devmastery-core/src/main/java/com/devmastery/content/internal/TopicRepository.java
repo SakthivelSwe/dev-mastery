@@ -31,4 +31,18 @@ interface TopicRepository extends JpaRepository<TopicEntity, UUID> {
                              Pageable pageable);
 
     List<TopicEntity> findByPathIdAndPublishedTrueOrderByDisplayOrder(UUID pathId);
+
+    /**
+     * Case-insensitive search on {@code title} using LIKE. Cheap, works without
+     * tsvector columns, and is more than good enough for the &lt;500-topic corpus.
+     * Results ordered by shortest title first (so an exact match ranks above a
+     * partial match) then by {@code displayOrder}.
+     */
+    @Query("""
+           select t from TopicEntity t
+           where t.published = true
+             and lower(t.title) like lower(concat('%', :q, '%'))
+           order by length(t.title), t.displayOrder
+           """)
+    List<TopicEntity> searchByTitle(@Param("q") String query, Pageable pageable);
 }

@@ -21,7 +21,381 @@ Pods are ephemeral — when a Pod dies, all its data disappears. For stateful ap
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "persistent-volumes" }
+{
+  "language": "yaml",
+  "fileName": "pv.yaml",
+  "steps": [
+    {
+      "title": "PV, PVC, StorageClass",
+      "description": "PersistentVolume = piece of storage in cluster. PVC = pod's request for storage. StorageClass = template for dynamic PVs.",
+      "code": "# The trio:\n# StorageClass  — defines how to provision (cloud disks, NFS, etc.)\n# PersistentVolume (PV) — actual storage resource (cluster-scoped)\n# PersistentVolumeClaim (PVC) — pod's request (namespaced)\n\n# StorageClass (typically pre-configured)\napiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: ebs.csi.aws.com          # or kubernetes.io/gce-pd, etc.\nparameters:\n  type: gp3\n  iops: \"3000\"\n  throughput: \"125\"\n  encrypted: \"true\"\nreclaimPolicy: Delete                  # or Retain\nvolumeBindingMode: WaitForFirstConsumer  # bind when pod is scheduled\nallowVolumeExpansion: true              # allow resize\n\n# PVC (what pod asks for)\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\nspec:\n  accessModes: [ReadWriteOnce]\n  storageClassName: fast-ssd\n  resources:\n    requests:\n      storage: 100Gi\n\n# When you apply this PVC:\n# - K8s creates a PV automatically (dynamic provisioning)\n# - PV is bound to PVC\n# - Pod mounts the PVC\n\n# Pod using PVC\napiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - name: app\n      image: myapp\n      volumeMounts:\n        - name: storage\n          mountPath: /data\n  volumes:\n    - name: storage\n      persistentVolumeClaim:\n        claimName: data",
+      "highlight": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "StorageClass: how to provision",
+            "done": true
+          },
+          {
+            "label": "PVC: pod's request",
+            "done": true
+          },
+          {
+            "label": "PV created dynamically",
+            "active": true
+          },
+          {
+            "label": "Pod mounts PVC by name"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Access modes and reclaim policies",
+      "description": "AccessModes: RWO (one node), ROX (many readers), RWX (many writers), RWOP (one pod). ReclaimPolicy: Delete or Retain.",
+      "code": "# Access modes\n# ReadWriteOnce (RWO)     — mounted by ONE node RW (most common, EBS, GCP PD)\n# ReadOnlyMany (ROX)       — mounted by many nodes read-only\n# ReadWriteMany (RWX)      — mounted by many nodes RW (NFS, EFS, CephFS)\n# ReadWriteOncePod (RWOP)  — mounted by ONE POD only (K8s 1.29+)\n\nspec:\n  accessModes:\n    - ReadWriteOnce\n\n# RWX example (EFS on AWS, Filestore on GCP)\napiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  accessModes: [ReadWriteMany]\n  storageClassName: efs-sc\n  resources: { requests: { storage: 500Gi } }\n\n# Use case: shared uploads folder across many replicas\n\n# Reclaim policies (on the StorageClass or PV)\n# Delete  — PV + underlying disk deleted when PVC deleted\n# Retain  — PV kept (manual cleanup)\n# Recycle — deprecated\n\nreclaimPolicy: Retain          # for production DBs\n# Set on StorageClass for new PVs\n# Or on existing PV:\n$ kubectl patch pv <name> -p '{\"spec\":{\"persistentVolumeReclaimPolicy\":\"Retain\"}}'\n\n# When PVC deleted:\n# Delete  → PV + disk immediately gone\n# Retain  → PV kept in \"Released\" state, data preserved but not usable\n\n# To reuse Retained PV, clear claimRef:\n$ kubectl patch pv <name> -p '{\"spec\":{\"claimRef\":null}}'\n\n# Then bind a new PVC to it (matching size + access mode)\n\n# Volume binding mode\n# Immediate           — bind PV as soon as PVC created\n# WaitForFirstConsumer — wait until pod scheduled (best for zoned disks)\n\n# WaitForFirstConsumer avoids: PV in zone A, pod scheduled zone B → can't mount",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        44
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Access + reclaim",
+        "items": [
+          {
+            "label": "RWO",
+            "color": "#10b981",
+            "value": "One node — most cloud disks",
+            "highlight": true
+          },
+          {
+            "label": "RWX",
+            "color": "#818cf8",
+            "value": "Many nodes — NFS, EFS"
+          },
+          {
+            "label": "Retain",
+            "color": "#f59e0b",
+            "value": "Keep data on PVC delete"
+          },
+          {
+            "label": "WaitForFirstConsumer",
+            "color": "#60a5fa",
+            "value": "Avoid zone mismatch"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Dynamic vs static provisioning",
+      "description": "Dynamic (common): StorageClass creates PVs on demand. Static (rare): admin pre-creates PVs manually.",
+      "code": "# Dynamic provisioning (default, 99% of cases)\n# - StorageClass defines \"how\"\n# - PVC comes → PV auto-created\n# - Cloud disk provisioned + attached\n\n# Just create a PVC, done\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata: { name: data }\nspec:\n  accessModes: [ReadWriteOnce]\n  storageClassName: fast-ssd\n  resources: { requests: { storage: 100Gi } }\n\n# Static provisioning (legacy / special cases)\n# Admin creates PV manually first (e.g., NFS mount, imported disk)\n# PVC binds to matching PV\n\napiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: pv-nfs-1\nspec:\n  capacity: { storage: 100Gi }\n  accessModes: [ReadWriteMany]\n  persistentVolumeReclaimPolicy: Retain\n  storageClassName: nfs-manual\n  nfs:\n    server: nfs.example.com\n    path: /exports/data1\n\n# PVC matches\napiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  storageClassName: nfs-manual\n  accessModes: [ReadWriteMany]\n  resources: { requests: { storage: 100Gi } }\n\n# View PVs\n$ kubectl get pv\nNAME         CAPACITY   ACCESS MODES   RECLAIM   STATUS    CLAIM              STORAGECLASS\npvc-abc123   100Gi      RWO            Delete    Bound     default/data       fast-ssd\npv-nfs-1     100Gi      RWX            Retain    Bound     shared/uploads      nfs-manual\n\n# PV status:\n# Available — free\n# Bound     — attached to a PVC\n# Released  — PVC deleted, but PV kept (Retain)\n# Failed    — provisioning failed\n\n# Default StorageClass\n# One SC can be marked as cluster default (PVCs without storageClassName use it)\n$ kubectl patch storageclass fast-ssd -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Provisioning types",
+        "items": [
+          {
+            "label": "Dynamic (StorageClass)",
+            "color": "#10b981",
+            "value": "Auto-provision on PVC",
+            "highlight": true
+          },
+          {
+            "label": "Static (manual PV)",
+            "color": "#818cf8",
+            "value": "Admin pre-creates PVs"
+          },
+          {
+            "label": "PV status: Available/Bound",
+            "color": "#f59e0b",
+            "value": "Track binding state"
+          },
+          {
+            "label": "Default StorageClass",
+            "color": "#60a5fa",
+            "value": "Fallback when PVC omits SC"
+          }
+        ]
+      }
+    },
+    {
+      "title": "CSI drivers and cloud storage",
+      "description": "CSI = Container Storage Interface. Each cloud/backend has its own driver. AWS EBS, GCP PD, Azure Disk, Ceph, Longhorn, etc.",
+      "code": "# CSI drivers standardize storage integration\n# Installed as DaemonSet + Controller pods\n\n# List installed drivers\n$ kubectl get csidrivers\nNAME                    ATTACHREQUIRED\nebs.csi.aws.com         true\nefs.csi.aws.com         false\n\n# AWS EBS CSI\n# Storage classes shipped:\n$ kubectl get sc\nNAME                 PROVISIONER         RECLAIMPOLICY\ngp3                  ebs.csi.aws.com     Delete\ngp3-encrypted        ebs.csi.aws.com     Delete\nio2                  ebs.csi.aws.com     Delete\n\n# Custom parameters\napiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata: { name: gp3-fast }\nprovisioner: ebs.csi.aws.com\nparameters:\n  type: gp3\n  iops: \"16000\"\n  throughput: \"1000\"\n  encrypted: \"true\"\n  kmsKeyId: arn:aws:kms:...\nreclaimPolicy: Delete\nvolumeBindingMode: WaitForFirstConsumer\nallowVolumeExpansion: true\n\n# GCP Persistent Disk\nprovisioner: pd.csi.storage.gke.io\nparameters:\n  type: pd-ssd\n  replication-type: none\n\n# Azure Disk\nprovisioner: disk.csi.azure.com\nparameters:\n  skuName: Premium_LRS\n\n# Longhorn (open-source, on-prem)\nprovisioner: driver.longhorn.io\nparameters:\n  numberOfReplicas: \"3\"\n\n# CSI snapshots (backup)\napiVersion: snapshot.storage.k8s.io/v1\nkind: VolumeSnapshot\nmetadata: { name: data-snap-1 }\nspec:\n  volumeSnapshotClassName: csi-snapshot-class\n  source:\n    persistentVolumeClaimName: data\n\n# Restore\napiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  storageClassName: gp3\n  dataSource:\n    name: data-snap-1\n    kind: VolumeSnapshot\n    apiGroup: snapshot.storage.k8s.io\n  resources: { requests: { storage: 100Gi } }",
+      "highlight": [
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        34,
+        35,
+        36,
+        37,
+        39,
+        40,
+        41,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "CSI ecosystem",
+        "items": [
+          {
+            "label": "Cloud drivers",
+            "color": "#10b981",
+            "value": "EBS, PD, Disk, EFS...",
+            "highlight": true
+          },
+          {
+            "label": "On-prem/self-host",
+            "color": "#818cf8",
+            "value": "Longhorn, Rook, OpenEBS"
+          },
+          {
+            "label": "Snapshots",
+            "color": "#f59e0b",
+            "value": "CSI VolumeSnapshot resource"
+          },
+          {
+            "label": "Expansion",
+            "color": "#60a5fa",
+            "value": "allowVolumeExpansion: true"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Resizing and snapshots",
+      "description": "Expand PVCs when allowVolumeExpansion=true. Snapshots for backup. Both are CSI features.",
+      "code": "# Resize a PVC (must have allowVolumeExpansion: true on SC)\n$ kubectl edit pvc data\n# Change resources.requests.storage: 100Gi → 200Gi\n\n# Or patch\n$ kubectl patch pvc data -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"200Gi\"}}}}'\n\n# What happens:\n# 1. K8s resizes the underlying disk\n# 2. Filesystem resized (needs pod restart on some drivers)\n# 3. New size visible\n\n# Check status\n$ kubectl get pvc data\nNAME  STATUS   VOLUME     CAPACITY   ACCESS MODES\ndata  Bound    pvc-abc    200Gi      RWO\n\n# ⚠️ Cannot shrink — only grow\n\n# Snapshots\napiVersion: snapshot.storage.k8s.io/v1\nkind: VolumeSnapshotClass\nmetadata: { name: csi-snapshot-class }\ndriver: ebs.csi.aws.com\ndeletionPolicy: Delete\n\n---\napiVersion: snapshot.storage.k8s.io/v1\nkind: VolumeSnapshot\nmetadata: { name: nightly-2026-07-01 }\nspec:\n  volumeSnapshotClassName: csi-snapshot-class\n  source:\n    persistentVolumeClaimName: data\n\n# Schedule regular snapshots\n# - CronJob that creates VolumeSnapshot resources\n# - Or use Velero for cluster-wide backup\n# - Or use cloud-native (AWS Backup, EBS lifecycle)\n\n# Velero for cluster backups\n$ velero install --provider aws --bucket my-backups\n$ velero backup create nightly --include-namespaces=api-prod --ttl 720h\n$ velero restore create --from-backup nightly\n\n# Best practice:\n# - Snapshot before major schema/data changes\n# - Automated daily snapshots + 30 day retention\n# - Test restore procedures quarterly\n# - Store cross-region for DR",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        42,
+        43,
+        44,
+        45,
+        47,
+        48,
+        49,
+        50,
+        51
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "allowVolumeExpansion on SC",
+            "done": true
+          },
+          {
+            "label": "Update PVC size — grow only",
+            "done": true
+          },
+          {
+            "label": "VolumeSnapshot for point-in-time",
+            "active": true
+          },
+          {
+            "label": "Velero / AWS Backup for cluster backup"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

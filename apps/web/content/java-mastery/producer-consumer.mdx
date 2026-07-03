@@ -1,0 +1,504 @@
+---
+slug: "producer-consumer"
+title: "Producer-Consumer Pattern"
+level: 3
+---
+
+## WHY
+
+Almost every real system has one component that generates work faster than another can process it — an HTTP endpoint accepting orders faster than the payment gateway can charge them, a Kafka consumer decoding messages faster than the database can persist them, a log collector receiving events faster than the disk can flush them. Left unbuffered, the fast component either blocks (throughput dies) or drops work (data lost).
+
+The **producer-consumer pattern** places a bounded buffer between the two. Producers put items in; consumers take them out. The buffer smooths bursts and provides **back-pressure** — when it's full, producers block; when it's empty, consumers block. This one pattern is the foundation of every thread pool, every messaging queue, every reactive stream in Java.
+
+## THEORY
+
+### The three building blocks
+
+```
+      ┌──────────┐       ┌───────────┐       ┌──────────┐
+      │ Producer │ ────▶ │  Buffer   │ ────▶ │ Consumer │
+      │ (N of)   │       │ (bounded) │       │ (M of)   │
+      └──────────┘       └───────────┘       └──────────┘
+        push item          fixed size          take item
+        blocks if full                         blocks if empty
+```
+
+### Three implementation styles
+
+| Approach | API | When to use |
+|----------|-----|-------------|
+| `synchronized + wait/notify` | `Object.wait()` / `notifyAll()` | Learn the mechanics; rarely needed in prod |
+| `ReentrantLock + Condition` | `notFull.await()` / `notEmpty.signal()` | When you need timeouts, fairness, multiple waiting sets |
+| `BlockingQueue` (canonical) | `queue.put()` / `queue.take()` | 99% of production code |
+
+### `BlockingQueue` — the four method families
+
+| Operation | Throws exception | Returns special | Blocks | Blocks with timeout |
+|-----------|------------------|-----------------|--------|--------------------|
+| Insert    | `add(e)` (throws when full) | `offer(e)` (returns false) | `put(e)` | `offer(e, timeout, unit)` |
+| Remove    | `remove()` (throws when empty) | `poll()` (returns null) | `take()` | `poll(timeout, unit)` |
+| Examine   | `element()` (throws when empty) | `peek()` (returns null) | (n/a) | (n/a) |
+
+For producer-consumer, use the **blocking** variants (`put`, `take`) — they naturally implement back-pressure. `poll` and `offer` are the escape hatch when you must not block (e.g., a UI event loop).
+
+### Back-pressure is the reason for BOUNDED queues
+
+An unbounded queue is a leak waiting to happen: the producer never sees a full queue, so it keeps producing. If the consumer slows down (GC pause, DB stall), the queue grows unboundedly until OOM. A bounded queue converts a memory problem into a latency signal: the producer starts blocking, which either slows upstream (good) or trips a rate-limiter/timeout (also good).
+
+### The graceful-shutdown problem — the "poison pill"
+
+How do you stop consumers cleanly? Two idioms:
+
+1. **Poison pill**: Producers put N sentinel objects into the queue (one per consumer). Each consumer, on seeing a poison pill, exits its loop. Simple, no shared flag.
+2. **Interrupt + volatile shutdown flag**: `queue.take()` throws `InterruptedException` when the consumer thread is interrupted. Combine with a `volatile boolean running`.
+
+### Choose the right BlockingQueue implementation
+
+| Class | Ordering | Bounded | Best for |
+|-------|----------|---------|----------|
+| `ArrayBlockingQueue` | FIFO | Yes (fixed) | Fixed-size, predictable memory |
+| `LinkedBlockingQueue` | FIFO | Optional | Default general-purpose choice |
+| `PriorityBlockingQueue` | Priority | No | When some items are more urgent |
+| `DelayQueue` | Delay time | No | Scheduled tasks — element available only after delay |
+| `SynchronousQueue` | Direct hand-off | 0 capacity | Zero buffering, rendezvous |
+| `LinkedTransferQueue` | FIFO | No | High-throughput producer/consumer with optional hand-off |
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "PC.java",
+  "steps": [
+    {
+      "title": "Bounded buffer",
+      "description": "A fixed-capacity BlockingQueue between producer(s) and consumer(s). It smooths bursts AND provides back-pressure — full queue blocks the producer.",
+      "code": "BlockingQueue<Order> q = new LinkedBlockingQueue<>(100);",
+      "highlight": [
+        1
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 10,
+        "workers": [
+          {
+            "name": "producer",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "consumer",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "A"
+          },
+          {
+            "label": "B"
+          },
+          {
+            "label": "C"
+          },
+          {
+            "label": "D"
+          }
+        ]
+      }
+    },
+    {
+      "title": "put() — blocks if full",
+      "description": "Producer calls q.put(item). If the queue is full, put blocks until a consumer removes one — natural back-pressure.",
+      "code": "while (true) {\n    Order o = accept();\n    q.put(o);           // blocks when q.size() == capacity\n}",
+      "highlight": [
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "producer",
+            "state": "WAITING",
+            "note": "q full, put() blocks"
+          },
+          {
+            "name": "consumer",
+            "state": "RUNNABLE",
+            "note": "processing 1 item"
+          }
+        ]
+      }
+    },
+    {
+      "title": "take() — blocks if empty",
+      "description": "Consumer calls q.take(). If the queue is empty, take blocks until a producer adds one.",
+      "code": "while (running) {\n    Order o = q.take();   // blocks when empty\n    charge(o);\n}",
+      "highlight": [
+        2
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "producer",
+            "state": "RUNNABLE",
+            "note": "idle"
+          },
+          {
+            "name": "consumer",
+            "state": "WAITING",
+            "note": "q empty, take() blocks"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Poison pill for clean shutdown",
+      "description": "Producers push N sentinel objects (one per consumer). Each consumer, on seeing a poison pill, exits its loop. No shared flag needed.",
+      "code": "static final Order POISON = new Order(-1);\n\n// producer done\nfor (int i = 0; i < nConsumers; i++) q.put(POISON);\n\n// consumer\nOrder o = q.take();\nif (o == POISON) return;   // clean exit",
+      "highlight": [
+        1,
+        4,
+        8
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Queue",
+        "items": [
+          {
+            "label": "A"
+          },
+          {
+            "label": "B"
+          },
+          {
+            "label": "💊",
+            "highlight": true,
+            "color": "#ef4444",
+            "value": "poison"
+          },
+          {
+            "label": "💊",
+            "highlight": true,
+            "color": "#ef4444",
+            "value": "poison"
+          }
+        ]
+      }
+    },
+    {
+      "title": "The pattern IS a thread pool",
+      "description": "The ThreadPoolExecutor + LinkedBlockingQueue combination is exactly the producer-consumer pattern. Every executor.submit() is a producer; every worker is a consumer.",
+      "code": "ThreadPoolExecutor pool = new ThreadPoolExecutor(\n    4, 4, 0, TimeUnit.MILLISECONDS,\n    new LinkedBlockingQueue<>(50),\n    new ThreadPoolExecutor.CallerRunsPolicy());\npool.submit(task);   // producer",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 8,
+        "workers": [
+          {
+            "name": "worker-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-3",
+            "state": "WAITING",
+            "note": "idle"
+          },
+          {
+            "name": "worker-4",
+            "state": "WAITING",
+            "note": "idle"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T5"
+          },
+          {
+            "label": "T6"
+          },
+          {
+            "label": "T7"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Textbook producer-consumer with BlockingQueue
+```java
+import java.util.concurrent.*;
+
+public class BasicPC {
+    public static void main(String[] args) throws Exception {
+        BlockingQueue<Integer> queue = new ArrayBlockingQueue<>(10);
+
+        Thread producer = new Thread(() -> {
+            try {
+                for (int i = 1; i <= 25; i++) {
+                    queue.put(i);                                   // blocks when full
+                    System.out.println("produced " + i + " (queue=" + queue.size() + ")");
+                    Thread.sleep(30);
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }, "producer");
+
+        Thread consumer = new Thread(() -> {
+            try {
+                while (true) {
+                    Integer v = queue.take();                        // blocks when empty
+                    Thread.sleep(80);                                // slower than producer
+                    System.out.println("  consumed " + v);
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }, "consumer");
+
+        producer.start(); consumer.start();
+        producer.join();
+        Thread.sleep(500);                                           // drain
+        consumer.interrupt();
+    }
+}
+```
+
+### Level 2 — Multiple producers + multiple consumers with poison pill
+```java
+import java.util.concurrent.*;
+
+public class MultiPC {
+    private static final Integer POISON = Integer.MIN_VALUE;
+
+    public static void main(String[] args) throws Exception {
+        BlockingQueue<Integer> q = new LinkedBlockingQueue<>(50);
+        int nProducers = 3, nConsumers = 4;
+
+        // Consumers
+        Thread[] consumers = new Thread[nConsumers];
+        for (int i = 0; i < nConsumers; i++) {
+            consumers[i] = new Thread(() -> {
+                try {
+                    while (true) {
+                        Integer v = q.take();
+                        if (v.equals(POISON)) return;                // graceful stop
+                        System.out.printf("[%s] processed %d%n",
+                                Thread.currentThread().getName(), v);
+                    }
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }, "consumer-" + i);
+            consumers[i].start();
+        }
+
+        // Producers
+        Thread[] producers = new Thread[nProducers];
+        for (int i = 0; i < nProducers; i++) {
+            final int pid = i;
+            producers[i] = new Thread(() -> {
+                try {
+                    for (int j = 0; j < 20; j++) q.put(pid * 100 + j);
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }, "producer-" + i);
+            producers[i].start();
+        }
+
+        for (Thread t : producers) t.join();
+
+        // Poison pills — one per consumer
+        for (int i = 0; i < nConsumers; i++) q.put(POISON);
+        for (Thread t : consumers) t.join();
+        System.out.println("all consumers done cleanly");
+    }
+}
+```
+
+### Level 3 — With `ExecutorService` (idiomatic modern form)
+```java
+import java.util.concurrent.*;
+
+public class ExecutorPC {
+    public static void main(String[] args) throws Exception {
+        // Bounded queue IS the buffer — the pool provides consumer threads.
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                4, 4, 0, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(50),
+                new ThreadPoolExecutor.CallerRunsPolicy());       // back-pressure on submit
+
+        for (int i = 0; i < 100; i++) {
+            final int id = i;
+            pool.execute(() -> {
+                try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+                System.out.printf("[%s] processed %d%n",
+                        Thread.currentThread().getName(), id);
+            });
+        }
+        pool.shutdown();
+        pool.awaitTermination(30, TimeUnit.SECONDS);
+    }
+}
+```
+Notice: the thread-pool + its `LinkedBlockingQueue` IS the producer-consumer setup. `execute()` is the producer; the workers are the consumers.
+
+### Level 4 — `ReentrantLock + Condition` version (educational)
+```java
+import java.util.*;
+import java.util.concurrent.locks.*;
+
+public class LockConditionPC<T> {
+    private final Queue<T> queue = new ArrayDeque<>();
+    private final int capacity;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notFull  = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    public LockConditionPC(int capacity) { this.capacity = capacity; }
+
+    public void put(T item) throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.size() == capacity) notFull.await();
+            queue.add(item);
+            notEmpty.signal();                                   // wake one consumer
+        } finally { lock.unlock(); }
+    }
+
+    public T take() throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.isEmpty()) notEmpty.await();
+            T item = queue.remove();
+            notFull.signal();                                    // wake one producer
+            return item;
+        } finally { lock.unlock(); }
+    }
+}
+```
+Different from `wait/notify`: producers only signal consumers (`notEmpty`) and vice versa. Fewer spurious wake-ups.
+
+### Level 5 — Bounded event log with `DelayQueue` (scheduled reminders)
+```java
+import java.util.concurrent.*;
+
+public class ScheduledReminders {
+    static class Reminder implements Delayed {
+        private final long fireAtNanos;
+        private final String msg;
+        Reminder(long delayMs, String msg) {
+            this.fireAtNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs);
+            this.msg = msg;
+        }
+        public long getDelay(TimeUnit unit) {
+            return unit.convert(fireAtNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+        }
+        public int compareTo(Delayed o) {
+            return Long.compare(this.fireAtNanos, ((Reminder) o).fireAtNanos);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        DelayQueue<Reminder> q = new DelayQueue<>();
+        q.put(new Reminder(1000, "check inventory"));
+        q.put(new Reminder(300,  "send heartbeat"));
+        q.put(new Reminder(700,  "flush metrics"));
+
+        while (!q.isEmpty()) {
+            Reminder r = q.take();              // blocks until an item's delay elapses
+            System.out.println("fired: " + r.msg + " @" + System.currentTimeMillis());
+        }
+        // Prints in order: heartbeat (300ms), metrics (700ms), inventory (1000ms)
+    }
+}
+```
+
+## REAL_WORLD
+
+**Kafka consumer with a persistent-write buffer.** A service reads events from Kafka at 5 000 msg/s but the database can only ingest 2 000/s in bursts.
+
+```java
+public class KafkaWriter {
+    private final BlockingQueue<Event> buffer = new LinkedBlockingQueue<>(10_000);
+    private final ExecutorService dbWorkers  = Executors.newFixedThreadPool(4);
+    private final AtomicBoolean running      = new AtomicBoolean(true);
+
+    // Called from Kafka poll-loop thread
+    public void onMessage(Event e) throws InterruptedException {
+        if (!buffer.offer(e, 100, TimeUnit.MILLISECONDS)) {
+            metrics.increment("kafka.backpressure");
+            // Buffer full for > 100ms — pause Kafka consumer partition
+            consumer.pause(activePartitions);
+        }
+    }
+
+    // 4 consumer threads drain the buffer into the DB
+    public void start() {
+        for (int i = 0; i < 4; i++) {
+            dbWorkers.submit(() -> {
+                while (running.get() || !buffer.isEmpty()) {
+                    try {
+                        Event e = buffer.poll(1, TimeUnit.SECONDS);
+                        if (e != null) db.insert(e);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            });
+        }
+    }
+    // Fields omitted: metrics, consumer, db, activePartitions
+}
+```
+The `BlockingQueue` decouples Kafka's poll cadence from the database's ingestion rate. When the DB stalls, the buffer fills up, and the Kafka consumer proactively pauses — no data loss, no OOM.
+
+## INTERVIEW
+
+**Q: What is the producer-consumer pattern and why is it useful?**
+A: A design where producers add items to a shared BOUNDED buffer and consumers remove them. It decouples the rates of producers and consumers and provides back-pressure — a full buffer blocks producers, protecting the system from unbounded memory growth or dropped work.
+
+**Q: What's the difference between `put/take` and `offer/poll`?**
+A: `put` and `take` block indefinitely — producers wait if the queue is full, consumers if it's empty. `offer` and `poll` never block; they return `false`/`null` immediately, or with a timeout variant, wait up to a specified duration. Use blocking variants for throughput, non-blocking for latency-sensitive paths.
+
+**Q: Why must the queue be bounded?**
+A: An unbounded queue eliminates back-pressure. If the consumer slows for any reason (GC, DB stall), the queue grows without limit, eventually OOM-ing the JVM. Bounded queues expose the slowdown as latency — producers block, which triggers upstream retries, rate-limiting, or alerts.
+
+**Q: How do you shut down consumer threads cleanly?**
+A: Two approaches. (a) Poison pill: producers put N sentinel items (one per consumer); consumers exit on seeing a sentinel. (b) `volatile boolean running` flag combined with thread interruption — `queue.take()` throws `InterruptedException` when the thread is interrupted.
+
+**Q: What's `SynchronousQueue` and when is it useful?**
+A: A queue with **zero capacity** — every `put` must be paired with a `take` on another thread; they rendezvous directly. Used inside `newCachedThreadPool` to force direct hand-off: if no worker is free, spawn a new thread rather than buffer.
+
+**Q: Producer is faster than consumer — what should happen?**
+A: The bounded queue fills up. `put()` blocks the producer, which propagates back-pressure upstream. If producers can't block (e.g., handling an SLA-bounded HTTP request), use `offer(timeout)` and on failure trigger a retry, drop, or rate-limit response — never quietly grow the buffer.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> A conveyor belt in a factory. On one side, workers put boxes ON the belt (producers). On the other side, workers TAKE boxes off (consumers). The belt has room for maybe 10 boxes at a time. If it's full, the loaders wait. If it's empty, the unloaders wait. Neither side ever has to yell at the other — the belt itself makes them line up correctly.
+
+## BUILD
+
+Build a **log-file tailer**:
+1. One producer thread reads a growing log file line-by-line (`RandomAccessFile.seek` + poll).
+2. It `put`s each line into a `LinkedBlockingQueue<String>(1000)`.
+3. Four consumer threads `take` lines and index them into an in-memory `ConcurrentHashMap<String, LongAdder>` (word frequency).
+4. On SIGTERM: producer puts 4 poison pills, waits for consumers to drain, then prints top-10 words.
+5. **Bonus**: if the queue is > 90% full, sleep the producer for 100 ms — measure how often that happens under a burst.
+
+## SPACED REVIEW
+
+**Day 1**: Sketch a producer-consumer diagram with 2 producers, a bounded buffer of 5, and 3 consumers.
+**Day 3**: Write the code for a poison-pill graceful shutdown.
+**Day 7**: Explain why bounded queues are essential and unbounded queues are a bug.
+**Day 14**: Give one case where `SynchronousQueue` is the correct choice.
+

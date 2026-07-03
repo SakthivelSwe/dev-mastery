@@ -19,7 +19,301 @@ The `ANALYZE` command is responsible for sampling a random subset of rows from a
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "pg-statistics" }
+{
+  "language": "sql",
+  "fileName": "statistics.sql",
+  "steps": [
+    {
+      "title": "Column statistics fundamentals",
+      "description": "PostgreSQL keeps stats per column in pg_statistic. n_distinct, null_frac, most_common_vals, histogram_bounds. Planner uses these for row estimates.",
+      "code": "-- View column statistics\nSELECT tablename, attname,\n       null_frac, avg_width, n_distinct,\n       most_common_vals, most_common_freqs\nFROM pg_stats\nWHERE tablename = 'users';\n\n-- Key fields:\n-- null_frac       : fraction of NULLs\n-- avg_width       : avg bytes per value\n-- n_distinct      : approximate distinct values\n--                   > 0: absolute count\n--                   < 0: fraction of table (e.g., -1 = all unique)\n-- most_common_vals: top-N frequent values\n-- histogram_bounds: value distribution\n-- correlation     : physical order vs sort order (-1 to 1)\n\n-- Example: skewed column stats\nSELECT tablename, attname, most_common_vals, most_common_freqs\nFROM pg_stats\nWHERE tablename = 'events' AND attname = 'type';\n-- most_common_vals: {'view', 'click', 'purchase'}\n-- most_common_freqs: {0.80, 0.15, 0.05}\n-- Planner knows 80% of rows are 'view'\n\n-- Statistics target (per column resolution)\nSELECT attname, attstattarget FROM pg_attribute WHERE attrelid = 'users'::regclass;\n\n-- Default: 100 (100 histogram buckets)\nALTER TABLE users ALTER COLUMN role SET STATISTICS 1000;\nANALYZE users;\n\n-- Higher = more accurate estimates, slower ANALYZE",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Statistics content",
+        "items": [
+          {
+            "label": "n_distinct",
+            "color": "#10b981",
+            "value": "Cardinality estimate",
+            "highlight": true
+          },
+          {
+            "label": "most_common_vals",
+            "color": "#818cf8",
+            "value": "Skewed values + frequency"
+          },
+          {
+            "label": "histogram_bounds",
+            "color": "#f59e0b",
+            "value": "Uniform-region boundaries"
+          },
+          {
+            "label": "correlation",
+            "color": "#60a5fa",
+            "value": "Physical order vs sort order"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Extended statistics",
+      "description": "Multivariate stats capture correlations between columns. Critical when combinations of columns have non-random relationships.",
+      "code": "-- Problem: correlated columns\n-- WHERE role = 'admin' AND country = 'US'\n-- If 90% of admins live in US, but planner assumes independence:\n--   expected rows = total × 0.05 × 0.10 = 0.5% \n--   actual rows = 4.5% (~10x off!)\n\n-- Create extended statistics\nCREATE STATISTICS stat_users_role_country (dependencies, ndistinct, mcv)\nON role, country FROM users;\n\nANALYZE users;\n\n-- Types:\n-- dependencies: functional dependencies (role → country)\n-- ndistinct:    n_distinct for combinations of columns\n-- mcv:          most common (role, country) combinations\n\n-- View extended stats\nSELECT * FROM pg_stats_ext WHERE tablename = 'users';\n\n-- Now query estimates are accurate:\nEXPLAIN SELECT * FROM users WHERE role = 'admin' AND country = 'US';\n-- Before: rows=50\n-- After:  rows=4500  (matches reality)\n\n-- When to create extended stats:\n-- - Multi-column WHERE with correlated columns\n-- - Multi-column GROUP BY\n-- - Row estimate off by >10x\n\n-- Drop\nDROP STATISTICS stat_users_role_country;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        13,
+        14,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Planner assumes column independence",
+            "done": true
+          },
+          {
+            "label": "Correlated columns → wrong estimates",
+            "done": true
+          },
+          {
+            "label": "CREATE STATISTICS captures relationship",
+            "active": true
+          },
+          {
+            "label": "Estimates match reality → better plans"
+          }
+        ]
+      }
+    },
+    {
+      "title": "pg_stat_statements",
+      "description": "Track query execution statistics. Which queries are slow, called most often, total time consumed. Essential for performance tuning.",
+      "code": "-- Enable extension\nCREATE EXTENSION pg_stat_statements;\n\n-- In postgresql.conf\nshared_preload_libraries = 'pg_stat_statements'\npg_stat_statements.max = 10000\npg_stat_statements.track = all\n\n-- Restart Postgres to load\n\n-- Top 10 slowest queries by total time\nSELECT round(total_exec_time::numeric, 2) AS total_ms,\n       calls,\n       round((total_exec_time / calls)::numeric, 2) AS avg_ms,\n       round((100.0 * total_exec_time / sum(total_exec_time) OVER())::numeric, 2) AS pct,\n       LEFT(query, 100) AS query\nFROM pg_stat_statements\nORDER BY total_exec_time DESC\nLIMIT 10;\n\n-- Slowest average\nSELECT round((total_exec_time / calls)::numeric, 2) AS avg_ms, calls, LEFT(query, 80)\nFROM pg_stat_statements\nWHERE calls > 100\nORDER BY avg_ms DESC LIMIT 10;\n\n-- Queries with high I/O\nSELECT shared_blks_read, shared_blks_hit, LEFT(query, 80)\nFROM pg_stat_statements\nORDER BY shared_blks_read DESC LIMIT 10;\n\n-- Reset stats\nSELECT pg_stat_statements_reset();\n\n-- Combined with planner\nSELECT queryid, LEFT(query, 60), plans, planning_time, calls, mean_exec_time\nFROM pg_stat_statements\nORDER BY mean_exec_time DESC LIMIT 10;",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        31,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Query analytics",
+        "items": [
+          {
+            "label": "total_exec_time",
+            "color": "#10b981",
+            "value": "Sum of all executions — biggest wins",
+            "highlight": true
+          },
+          {
+            "label": "mean_exec_time",
+            "color": "#818cf8",
+            "value": "Average — slow queries to optimize"
+          },
+          {
+            "label": "shared_blks_read",
+            "color": "#f59e0b",
+            "value": "Cache miss / disk I/O"
+          },
+          {
+            "label": "plans (PG 13+)",
+            "color": "#60a5fa",
+            "value": "Number of plans generated"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Custom statistics targets",
+      "description": "Increase statistics target for skewed or important columns. Trade-off: better plans vs longer ANALYZE.",
+      "code": "-- Default statistics target: 100 (100 histogram buckets)\nSHOW default_statistics_target;\n\n-- Increase globally (rare — high ANALYZE cost)\nALTER SYSTEM SET default_statistics_target = 500;\n\n-- Per-column (better)\nALTER TABLE events ALTER COLUMN user_id SET STATISTICS 1000;\nALTER TABLE events ALTER COLUMN type SET STATISTICS 500;\nANALYZE events;\n\n-- When to increase target:\n-- - Columns with wide value distributions (many distinct + skewed)\n-- - Foreign key columns used in joins\n-- - Columns with 10x+ row estimate errors\n\n-- Verify\nSELECT attname, attstattarget\nFROM pg_attribute\nWHERE attrelid = 'events'::regclass AND attstattarget > 0;\n\n-- Cost: ANALYZE reads more rows for higher target\nEXPLAIN ANALYZE ANALYZE events;\n-- More time with higher target\n\n-- Sampling behavior\n-- - Target 100: samples ~30k rows per column\n-- - Target 1000: samples ~300k rows per column\n\n-- Best practice: default 100, boost individual problem columns",
+      "highlight": [
+        2,
+        5,
+        8,
+        9,
+        10,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Statistics target",
+        "items": [
+          {
+            "label": "default 100",
+            "color": "#10b981",
+            "value": "Sensible for most columns",
+            "highlight": true
+          },
+          {
+            "label": "boost skewed columns",
+            "color": "#818cf8",
+            "value": "1000 for JOIN/GROUP BY keys"
+          },
+          {
+            "label": "ANALYZE cost scales",
+            "color": "#f59e0b",
+            "value": "Higher target = longer analyze"
+          },
+          {
+            "label": "Per-column tuning",
+            "color": "#60a5fa",
+            "value": "Global 100 + individual boosts"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Table statistics from pg_stat_all_tables",
+      "description": "Table-level activity: tuples inserted, updated, deleted, dead tuples, last vacuum/analyze. Foundation for autovacuum tuning.",
+      "code": "-- Table activity stats\nSELECT relname,\n       n_tup_ins,   n_tup_upd,  n_tup_del,\n       n_live_tup,  n_dead_tup,\n       last_vacuum, last_autovacuum,\n       last_analyze, last_autoanalyze,\n       vacuum_count, autovacuum_count\nFROM pg_stat_user_tables\nORDER BY n_dead_tup DESC LIMIT 10;\n\n-- HOT update efficiency\nSELECT relname,\n       n_tup_upd, n_tup_hot_upd,\n       round(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 1) AS hot_pct\nFROM pg_stat_user_tables\nORDER BY n_tup_upd DESC LIMIT 10;\n-- Aim for >80% HOT — if lower, tune fillfactor or remove index\n\n-- Sequential vs index scan usage\nSELECT relname, seq_scan, seq_tup_read, idx_scan, idx_tup_fetch\nFROM pg_stat_user_tables\nORDER BY seq_tup_read DESC LIMIT 10;\n-- High seq_scan on large table → likely missing index\n\n-- I/O stats per table (needs track_io_timing = on)\nSELECT relname, heap_blks_read, heap_blks_hit,\n       round(100.0 * heap_blks_hit / NULLIF(heap_blks_hit + heap_blks_read, 0), 1) AS cache_pct\nFROM pg_statio_user_tables\nORDER BY heap_blks_read DESC LIMIT 10;\n\n-- Aim for cache_pct > 95%\n-- Low ratio → increase shared_buffers or add missing indexes\n\n-- Reset\nSELECT pg_stat_reset();",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Table stats to watch",
+        "items": [
+          {
+            "label": "n_dead_tup",
+            "color": "#10b981",
+            "value": "Autovacuum needed?",
+            "highlight": true
+          },
+          {
+            "label": "HOT update %",
+            "color": "#818cf8",
+            "value": "Aim > 80% — tune fillfactor"
+          },
+          {
+            "label": "seq_scan on big table",
+            "color": "#ef4444",
+            "value": "Missing index!"
+          },
+          {
+            "label": "heap_blks cache %",
+            "color": "#f59e0b",
+            "value": ">95% healthy; shared_buffers OK"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

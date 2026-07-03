@@ -18,7 +18,450 @@ Though they sound similar, they have strict differences in SQL:
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "SQLVisualizer", "state": "stored-procedures" }
+{
+  "language": "sql",
+  "fileName": "procedures.sql",
+  "steps": [
+    {
+      "title": "Functions vs procedures",
+      "description": "Functions return values (usable in SELECT). Procedures use CALL, can commit inside. PL/pgSQL is Postgres's dialect.",
+      "code": "-- Function — returns a value, used in SELECT\nCREATE OR REPLACE FUNCTION add_numbers(a INTEGER, b INTEGER)\nRETURNS INTEGER AS $$\nBEGIN\n  RETURN a + b;\nEND $$ LANGUAGE plpgsql;\n\nSELECT add_numbers(5, 3);      -- 8\nSELECT add_numbers(price, 10) FROM products;\n\n-- SQL function (simpler for one-liners)\nCREATE OR REPLACE FUNCTION add_sql(a INTEGER, b INTEGER)\nRETURNS INTEGER AS $$\n  SELECT a + b;\n$$ LANGUAGE sql;\n\n-- Procedure (PG 11+) — called with CALL, can COMMIT inside\nCREATE OR REPLACE PROCEDURE archive_old_orders() AS $$\nBEGIN\n  INSERT INTO archived_orders SELECT * FROM orders WHERE created_at < NOW() - INTERVAL '1 year';\n  DELETE FROM orders WHERE created_at < NOW() - INTERVAL '1 year';\n  COMMIT;                     -- procedures can commit; functions cannot\n\n  INSERT INTO audit_log (event) VALUES ('archived old orders');\n  COMMIT;\nEND $$ LANGUAGE plpgsql;\n\nCALL archive_old_orders();\n\n-- Volatility categories (affect planner)\n-- IMMUTABLE — same input always same output, no side effects (upper, length)\n-- STABLE    — same input, same output within a query (NOW(), current_user)\n-- VOLATILE  — anything can happen (random(), nextval())\n\nCREATE FUNCTION full_name(u users) RETURNS TEXT AS $$\n  SELECT u.first_name || ' ' || u.last_name;\n$$ LANGUAGE sql IMMUTABLE;    -- planner can inline / cache\n\n-- SECURITY DEFINER vs INVOKER\nCREATE FUNCTION cleanup() RETURNS void AS $$\n  DELETE FROM logs WHERE created_at < NOW() - INTERVAL '1 year';\n$$ LANGUAGE sql SECURITY DEFINER;\n-- Runs with function owner's permissions (like sudo)\n-- INVOKER (default): runs with caller's permissions\n\n-- Drop\nDROP FUNCTION add_numbers(INTEGER, INTEGER);    -- specify arg types\nDROP FUNCTION IF EXISTS add_numbers(INTEGER, INTEGER);\n\n-- Function metadata\n\\df                     -- list functions (psql)\n\\df add_numbers          -- specific\nSELECT proname, prosrc FROM pg_proc WHERE proname = 'add_numbers';",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        49,
+        50
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Function vs procedure",
+        "items": [
+          {
+            "label": "Function",
+            "color": "#10b981",
+            "value": "Returns value, in SELECT",
+            "highlight": true
+          },
+          {
+            "label": "Procedure",
+            "color": "#818cf8",
+            "value": "CALL, can COMMIT inside"
+          },
+          {
+            "label": "IMMUTABLE / STABLE",
+            "color": "#f59e0b",
+            "value": "Planner optimization"
+          },
+          {
+            "label": "SECURITY DEFINER",
+            "color": "#60a5fa",
+            "value": "Runs as owner"
+          }
+        ]
+      }
+    },
+    {
+      "title": "PL/pgSQL basics",
+      "description": "DECLARE variables, IF/ELSE, LOOP, FOR, EXCEPTION. Procedural code inside the database.",
+      "code": "-- Full-featured function\nCREATE OR REPLACE FUNCTION calculate_discount(user_id BIGINT, base_price NUMERIC)\nRETURNS NUMERIC AS $$\nDECLARE\n  is_vip BOOLEAN;\n  discount_pct NUMERIC;\n  final_price NUMERIC;\nBEGIN\n  -- Get VIP status\n  SELECT COALESCE(vip, false) INTO is_vip\n  FROM users WHERE id = user_id;\n\n  -- Determine discount\n  IF is_vip THEN\n    discount_pct := 0.20;\n  ELSIF base_price > 1000 THEN\n    discount_pct := 0.10;\n  ELSE\n    discount_pct := 0.05;\n  END IF;\n\n  final_price := base_price * (1 - discount_pct);\n\n  -- Log the calculation\n  INSERT INTO discount_log (user_id, base_price, discount_pct, final_price)\n  VALUES (user_id, base_price, discount_pct, final_price);\n\n  RETURN final_price;\nEND $$ LANGUAGE plpgsql;\n\n-- Loops\nCREATE OR REPLACE FUNCTION count_up() RETURNS void AS $$\nDECLARE\n  i INTEGER;\nBEGIN\n  FOR i IN 1..10 LOOP\n    RAISE NOTICE 'i = %', i;\n  END LOOP;\n\n  -- While loop\n  i := 100;\n  WHILE i > 0 LOOP\n    i := i - 10;\n  END LOOP;\n\n  -- For over query results\n  DECLARE r RECORD;\n  BEGIN\n    FOR r IN SELECT id, name FROM users LIMIT 10\n    LOOP\n      RAISE NOTICE 'user: %', r.name;\n    END LOOP;\n  END;\nEND $$ LANGUAGE plpgsql;\n\n-- Exception handling\nCREATE FUNCTION safe_divide(a NUMERIC, b NUMERIC) RETURNS NUMERIC AS $$\nBEGIN\n  RETURN a / b;\nEXCEPTION\n  WHEN division_by_zero THEN\n    RAISE NOTICE 'Cannot divide by zero';\n    RETURN NULL;\n  WHEN OTHERS THEN\n    RAISE NOTICE 'Error: %', SQLERRM;\n    RETURN NULL;\nEND $$ LANGUAGE plpgsql;\n\n-- RAISE for logging / errors\nRAISE NOTICE 'value: %', x;        -- log\nRAISE WARNING 'unusual: %', x;      -- log at higher level\nRAISE EXCEPTION 'invalid: %', x     -- abort transaction\n  USING ERRCODE = '22023';\n\n-- Variables can hold rows\nDECLARE u users%ROWTYPE;\nSELECT * INTO u FROM users WHERE id = 42;\nRAISE NOTICE 'name: %', u.name;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        24,
+        25,
+        26,
+        27,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        52,
+        53,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        69,
+        70,
+        71,
+        72,
+        74,
+        75,
+        76,
+        77
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "DECLARE variables",
+            "done": true
+          },
+          {
+            "label": "IF / LOOP / FOR",
+            "done": true
+          },
+          {
+            "label": "EXCEPTION handlers",
+            "active": true
+          },
+          {
+            "label": "RAISE for logs + errors"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Returning sets and tables",
+      "description": "RETURNS SETOF, RETURNS TABLE, RETURN NEXT/QUERY. Table-valued functions for parameterized views.",
+      "code": "-- SETOF — return multiple rows of a type\nCREATE OR REPLACE FUNCTION recent_orders(uid BIGINT)\nRETURNS SETOF orders AS $$\n  SELECT * FROM orders\n  WHERE user_id = uid\n  ORDER BY created_at DESC LIMIT 10;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM recent_orders(42);\n\n-- RETURNS TABLE — inline row shape\nCREATE OR REPLACE FUNCTION user_stats(uid BIGINT)\nRETURNS TABLE (\n  order_count INTEGER,\n  total_spent NUMERIC,\n  last_order_at TIMESTAMPTZ\n) AS $$\n  SELECT count(*)::INTEGER, coalesce(sum(total), 0), max(created_at)\n  FROM orders WHERE user_id = uid;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM user_stats(42);\n\n-- RETURN NEXT + RETURN QUERY (PL/pgSQL)\nCREATE OR REPLACE FUNCTION top_customers(n INTEGER)\nRETURNS TABLE (id BIGINT, email TEXT, total NUMERIC) AS $$\nDECLARE r RECORD;\nBEGIN\n  FOR r IN\n    SELECT u.id, u.email, SUM(o.total) AS spend\n    FROM users u JOIN orders o ON o.user_id = u.id\n    GROUP BY u.id, u.email\n    ORDER BY spend DESC LIMIT n\n  LOOP\n    id := r.id; email := r.email; total := r.spend;\n    RETURN NEXT;\n  END LOOP;\nEND $$ LANGUAGE plpgsql STABLE;\n\n-- RETURN QUERY (streams result of query)\nCREATE OR REPLACE FUNCTION filter_orders(uid BIGINT, min_total NUMERIC)\nRETURNS SETOF orders AS $$\nBEGIN\n  RETURN QUERY\n    SELECT * FROM orders\n    WHERE user_id = uid AND total >= min_total;\nEND $$ LANGUAGE plpgsql STABLE;\n\n-- Use in JOINs\nSELECT u.name, s.*\nFROM users u\nCROSS JOIN LATERAL user_stats(u.id) s\nWHERE u.country = 'IN';\n\n-- Or normal FROM\nSELECT * FROM top_customers(10);\n\n-- Anonymous types via OUT parameters\nCREATE FUNCTION user_info(uid BIGINT, OUT name TEXT, OUT email TEXT)\nAS $$\n  SELECT name, email FROM users WHERE id = uid;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM user_info(42);   -- returns record",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        52,
+        54,
+        55,
+        57,
+        58,
+        59,
+        60,
+        61,
+        63
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Table-returning",
+        "items": [
+          {
+            "label": "SETOF",
+            "color": "#10b981",
+            "value": "Multiple rows of a type",
+            "highlight": true
+          },
+          {
+            "label": "RETURNS TABLE",
+            "color": "#818cf8",
+            "value": "Inline row shape"
+          },
+          {
+            "label": "RETURN NEXT",
+            "color": "#f59e0b",
+            "value": "Row-by-row build"
+          },
+          {
+            "label": "LATERAL to join",
+            "color": "#60a5fa",
+            "value": "Per-row parameterized"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Practical use cases",
+      "description": "Business rules, complex updates, computed views, backfills, admin tasks. When NOT to use.",
+      "code": "-- Use case 1: enforce complex business rule\nCREATE OR REPLACE FUNCTION apply_bonus(user_id BIGINT, amount NUMERIC)\nRETURNS void AS $$\nBEGIN\n  IF amount <= 0 THEN\n    RAISE EXCEPTION 'Bonus must be positive';\n  END IF;\n\n  UPDATE users SET balance = balance + amount WHERE id = user_id;\n\n  INSERT INTO ledger (user_id, type, amount, ts)\n  VALUES (user_id, 'bonus', amount, NOW());\nEND $$ LANGUAGE plpgsql;\n\n-- Use case 2: complex reporting query as function\nCREATE OR REPLACE FUNCTION monthly_revenue(mo DATE)\nRETURNS TABLE (country TEXT, revenue NUMERIC) AS $$\n  SELECT u.country, sum(o.total)\n  FROM orders o JOIN users u ON u.id = o.user_id\n  WHERE date_trunc('month', o.created_at) = date_trunc('month', mo)\n  GROUP BY u.country;\n$$ LANGUAGE sql STABLE;\n\n-- Use case 3: batch backfill\nCREATE OR REPLACE PROCEDURE backfill_column() AS $$\nDECLARE r RECORD; batch_size INTEGER := 10000;\nBEGIN\n  LOOP\n    UPDATE users SET display_name = COALESCE(nickname, name)\n    WHERE id IN (\n      SELECT id FROM users WHERE display_name IS NULL LIMIT batch_size\n    );\n    EXIT WHEN NOT FOUND;\n    COMMIT;\n    PERFORM pg_sleep(0.1);      -- gentle on load\n  END LOOP;\nEND $$ LANGUAGE plpgsql;\n\nCALL backfill_column();\n\n-- Use case 4: audit trigger (see triggers lesson)\n\n-- Use case 5: transaction retry helper (in Postgres, rarely — usually app side)\n\n-- When NOT to use stored procedures:\n-- ❌ Business logic that should live in app (harder to test, deploy, log)\n-- ❌ Anything version control-sensitive across many services\n-- ❌ Long-running compute (blocks DB connection)\n-- ❌ Simple CRUD (app can do it)\n\n-- When YES:\n-- ✅ Data-intensive: batch backfills, bulk updates (avoid round trips)\n-- ✅ Complex constraints not expressible declaratively\n-- ✅ Encapsulation for security (grant EXECUTE, revoke direct table access)\n-- ✅ Legacy: existing systems built this way\n\n-- Deployment / versioning\n-- Migrations tool (Flyway, Liquibase, sqlx, etc.)\n-- Version controlled SQL files: V1__create_fn.sql, V2__update_fn.sql\n\n-- Testing\n-- pgTAP for unit tests in SQL\n-- Or app-side tests that call the function + verify\n\n-- Debugging\nRAISE NOTICE for print-debug\n-- Or: SELECT * INTO log_table for step-by-step\n-- pg_stat_user_functions for profile",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        40,
+        42,
+        44,
+        45,
+        46,
+        47,
+        48,
+        50,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        58,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "When to use",
+        "items": [
+          {
+            "label": "Data-intensive batch",
+            "color": "#10b981",
+            "value": "No round trips",
+            "highlight": true
+          },
+          {
+            "label": "Complex constraints",
+            "color": "#818cf8",
+            "value": "Not expressible in DDL"
+          },
+          {
+            "label": "Encapsulate security",
+            "color": "#f59e0b",
+            "value": "Function as API"
+          },
+          {
+            "label": "Not business logic",
+            "color": "#ef4444",
+            "value": "Keep in app"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Performance and pitfalls",
+      "description": "STABLE/IMMUTABLE marks. Avoid dynamic SQL where possible. Watch for N+1. Test at scale.",
+      "code": "-- Volatility affects planner\nSELECT * FROM users WHERE age > add_numbers(18, 5);\n-- If add_numbers is IMMUTABLE → planner inlines, uses index\n-- If VOLATILE → runs per row, no index use\n\nCREATE FUNCTION add_numbers(a INT, b INT) RETURNS INT AS $$\n  SELECT a + b;\n$$ LANGUAGE sql IMMUTABLE;    -- ✅\n\n-- Dynamic SQL (EXECUTE) — powerful but slower + security risk\nCREATE OR REPLACE FUNCTION dynamic_query(tbl TEXT, col TEXT)\nRETURNS TABLE (n BIGINT) AS $$\nBEGIN\n  RETURN QUERY EXECUTE format('SELECT count(*) FROM %I WHERE %I IS NOT NULL', tbl, col);\nEND $$ LANGUAGE plpgsql;\n\n-- ⚠️ SQL injection: use format('%I', ident) for identifiers, %L for literals\n-- NEVER concat user input directly\n\n-- Prepared plans (usually good — cached after 5th execution)\n-- Sometimes bad: generic plan can't optimize per parameter\n-- Fix: PARALLEL SAFE, or SET LOCAL plan_cache_mode = force_custom_plan\n\n-- Watch for N+1 in functions\nCREATE FUNCTION bad(uid BIGINT) RETURNS RECORD AS $$\nDECLARE r RECORD;\nBEGIN\n  FOR r IN SELECT id FROM orders WHERE user_id = uid\n  LOOP\n    -- per iteration query — N+1\n    UPDATE orders SET status = 'processed' WHERE id = r.id;\n  END LOOP;\nEND $$ LANGUAGE plpgsql;\n\n-- Fix: single set-based operation\nUPDATE orders SET status = 'processed' WHERE user_id = uid;\n\n-- Function overhead\n-- - Small functions inline OK\n-- - PL/pgSQL has parse + plan overhead\n-- - Simple SQL functions inline into caller's plan (IMMUTABLE / STABLE)\n\n-- Profiling\nCREATE EXTENSION pg_stat_statements;\nSELECT * FROM pg_stat_user_functions ORDER BY total_time DESC LIMIT 20;\n\n-- Access control\nCREATE FUNCTION admin_op() ... SECURITY DEFINER;\n-- Grant EXECUTE to specific role\nGRANT EXECUTE ON FUNCTION admin_op() TO manager_role;\nREVOKE EXECUTE ON FUNCTION admin_op() FROM PUBLIC;\n\n-- Common pitfalls:\n-- ❌ Long transactions in functions block VACUUM\n-- ❌ External calls (dblink, HTTP) inside functions\n-- ❌ Recursive functions without limit\n-- ❌ Business logic split between DB + app (hard to change)\n-- ❌ Functions that trigger other functions/triggers (cascades)\n\n-- Best practices:\n-- - Mark IMMUTABLE / STABLE when safe\n-- - Prefer SQL functions over PL/pgSQL when possible (inlineable)\n-- - Use set-based ops (not row-by-row loops)\n-- - Handle exceptions explicitly\n-- - Version control + migrations\n-- - Unit tests (pgTAP or app-level)\n\n-- Composite: SET based UPDATE using function result\nUPDATE users SET score = calc_score(user_metrics(id))\nWHERE last_active > NOW() - INTERVAL '7 days';\n-- One statement — planner optimizes",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        52,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        70,
+        71,
+        72
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Function perf",
+        "items": [
+          {
+            "label": "IMMUTABLE / STABLE",
+            "color": "#10b981",
+            "value": "Planner optimization",
+            "highlight": true
+          },
+          {
+            "label": "Set-based, not loops",
+            "color": "#818cf8",
+            "value": "Avoid N+1"
+          },
+          {
+            "label": "format(%I, %L)",
+            "color": "#f59e0b",
+            "value": "SQL injection safe"
+          },
+          {
+            "label": "pg_stat_user_functions",
+            "color": "#60a5fa",
+            "value": "Profile function time"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

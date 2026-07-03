@@ -17,7 +17,309 @@ The Standby server (Subscriber) receives the SQL commands and simply executes th
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-logical-replication" }
+{
+  "language": "sql",
+  "fileName": "logical-rep.sql",
+  "steps": [
+    {
+      "title": "Logical vs physical replication",
+      "description": "Physical: byte-exact copy. Logical: row-level SQL changes. Logical enables cross-version, cross-schema, and selective replication.",
+      "code": "-- Physical replication:\n-- + Fast, byte-exact, catches all changes\n-- - Standby is read-only + same PG version + same schema\n-- - Cannot replicate subset of database\n\n-- Logical replication:\n-- + Cross-version (PG 14 → PG 15)\n-- + Selective tables/schemas\n-- + Target can be writable (different columns, additional indexes)\n-- + Zero-downtime upgrades\n-- - Slower (parses WAL into row changes)\n-- - No DDL replication (schema changes manual)\n-- - No sequence advancement (must sync manually)\n\n-- Requirements on publisher\nwal_level = logical              -- restart required\nmax_replication_slots = 10\nmax_wal_senders = 10\n\n-- On publisher: create publication\nCREATE PUBLICATION my_pub FOR TABLE users, orders;\n\n-- Or all tables in a schema (PG 15+)\nCREATE PUBLICATION my_pub FOR TABLES IN SCHEMA public;\n\n-- Or with filter (PG 15+ row filter)\nCREATE PUBLICATION active_users FOR TABLE users WHERE (active = true);\n\n-- Or column filter (PG 15+)\nCREATE PUBLICATION user_summary FOR TABLE users (id, name, email);\n\n-- On subscriber: create subscription\nCREATE SUBSCRIPTION my_sub\nCONNECTION 'host=publisher dbname=devmastery user=repluser password=...'\nPUBLICATION my_pub;\n\n-- Publisher creates a replication slot automatically\n-- Publisher starts streaming changes → subscriber applies",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        23,
+        24,
+        26,
+        27,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "wal_level = logical on publisher",
+            "done": true
+          },
+          {
+            "label": "CREATE PUBLICATION selects tables",
+            "done": true
+          },
+          {
+            "label": "CREATE SUBSCRIPTION on target",
+            "active": true
+          },
+          {
+            "label": "Initial copy + continuous replay"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Logical replication use cases",
+      "description": "Zero-downtime upgrade, DB migration, data warehouse feeds, split monolith into microservices, replicate to different schemas.",
+      "code": "-- Use case 1: Zero-downtime PG 14 → PG 15 upgrade\n-- 1. Set up PG 15 instance as subscriber\n-- 2. CREATE PUBLICATION on PG 14 primary\n-- 3. CREATE SUBSCRIPTION on PG 15 (initial copy + follow)\n-- 4. Wait until subscriber catches up\n-- 5. Stop writes on PG 14 (brief)\n-- 6. Point app to PG 15\n-- 7. Drop subscription, decommission PG 14\n\n-- Use case 2: Splitting a monolith\n-- Old service DB → publish table\n-- New microservice subscribes to just its tables\n-- Both work with same data until migration complete\n\n-- Use case 3: Multi-region async replicas (with logic changes)\n-- Publisher in US, subscriber in EU\n-- Subscriber has extra local indexes\n-- Subscriber runs local analytics without impacting publisher\n\n-- Use case 4: ETL / Data warehouse feed\n-- Publish operational DB tables\n-- Subscriber = warehouse (Postgres or use pg_logical_decoding to feed Kafka)\n\n-- Use case 5: A/B testing schema changes\n-- Subscribe with different column set / additional derived tables\n-- Test new schema without impacting primary\n\n-- Initial sync (COPY of table data)\nSELECT srsubstate, srsublsn FROM pg_subscription_rel;\n-- state: i (initial), d (data copy), s (sync done), r (ready/streaming)\n\n-- Track lag\nSELECT subname, received_lsn, latest_end_lsn,\n       EXTRACT(EPOCH FROM now() - latest_end_time) AS lag_sec\nFROM pg_stat_subscription;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Logical replication uses",
+        "items": [
+          {
+            "label": "Zero-downtime upgrade",
+            "color": "#10b981",
+            "value": "Between PG versions",
+            "highlight": true
+          },
+          {
+            "label": "Monolith split",
+            "color": "#818cf8",
+            "value": "Feed microservices from tables"
+          },
+          {
+            "label": "Cross-region + custom schema",
+            "color": "#f59e0b",
+            "value": "Add indexes on subscriber"
+          },
+          {
+            "label": "ETL to warehouse",
+            "color": "#60a5fa",
+            "value": "Or feed Kafka via decoder"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Conflict handling and constraints",
+      "description": "Logical replication doesn't detect conflicts by default — subscriber writes cause errors. Design one-way replication, or use conflict resolution.",
+      "code": "-- Constraint: without DDL replication, schema on subscriber must match\n-- (or be a superset — extra columns OK, but publisher columns must exist)\n\n-- Common conflict: subscriber has row with same PK\n-- Subscriber fails to apply the INSERT/UPDATE\n-- Sub goes into failed state → must resolve manually\n\n-- View conflict errors\nSELECT * FROM pg_stat_subscription;\n-- error_count > 0 → check logs\n\n-- Log looks like:\n-- ERROR:  duplicate key value violates unique constraint \"users_pkey\"\n\n-- Solutions:\n-- 1. Truncate/reset subscriber table before initial sync\nTRUNCATE users;\nALTER SUBSCRIPTION my_sub REFRESH PUBLICATION;\n\n-- 2. Skip a problematic transaction (PG 15+)\nALTER SUBSCRIPTION my_sub SKIP (lsn = '0/1A2B3C4D');\n\n-- 3. Use conflict-free schema (append-only, unique keys per source)\n\n-- 4. Two-way replication needs conflict resolution\n-- - BDR (Bi-Directional Replication) — 3rd party\n-- - pglogical extension\n-- - Application-level conflict detection\n\n-- Disable replica identity issues\n-- Tables with no PK need REPLICA IDENTITY FULL for UPDATE/DELETE\nALTER TABLE events REPLICA IDENTITY FULL;\n-- Sends entire old row for UPDATE — slower but works without PK\n\n-- Sequences don't replicate — must sync manually\n-- After failover:\nSELECT setval('users_id_seq', (SELECT MAX(id) FROM users));",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Conflict scenarios",
+        "items": [
+          {
+            "label": "Duplicate PK",
+            "color": "#ef4444",
+            "value": "Subscriber TRUNCATE before initial",
+            "highlight": true
+          },
+          {
+            "label": "Missing PK",
+            "color": "#f59e0b",
+            "value": "REPLICA IDENTITY FULL"
+          },
+          {
+            "label": "Sequences",
+            "color": "#818cf8",
+            "value": "Manual setval after failover"
+          },
+          {
+            "label": "DDL changes",
+            "color": "#10b981",
+            "value": "Apply to publisher + subscriber both"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Change Data Capture (CDC)",
+      "description": "Logical decoding = read WAL as row-level changes. Feed Kafka/RabbitMQ/S3. Debezium is the standard integration.",
+      "code": "-- Logical replication slot with output plugin\nSELECT pg_create_logical_replication_slot('my_slot', 'pgoutput');\n-- pgoutput: built-in, used by CREATE SUBSCRIPTION\n-- Others: wal2json, decoderbufs, etc.\n\n-- test_decoding for debugging\nSELECT pg_create_logical_replication_slot('test_slot', 'test_decoding');\nSELECT * FROM pg_logical_slot_get_changes('test_slot', NULL, NULL);\n-- Shows SQL-like output of changes\n\n-- Debezium (Kafka Connect connector):\n{\n  \"name\": \"postgres-source\",\n  \"config\": {\n    \"connector.class\": \"io.debezium.connector.postgresql.PostgresConnector\",\n    \"database.hostname\": \"postgres\",\n    \"database.port\": \"5432\",\n    \"database.user\": \"cdc_user\",\n    \"database.dbname\": \"devmastery\",\n    \"plugin.name\": \"pgoutput\",\n    \"slot.name\": \"debezium_slot\",\n    \"publication.name\": \"cdc_pub\",\n    \"table.include.list\": \"public.users,public.orders\"\n  }\n}\n\n-- Debezium publishes events to Kafka:\n{\n  \"op\": \"u\",                       -- c=insert, u=update, d=delete\n  \"before\": {\"id\": 42, \"name\": \"Alice\"},\n  \"after\":  {\"id\": 42, \"name\": \"Alice2\"},\n  \"source\": {\"lsn\": \"...\"}\n}\n\n-- Common CDC uses:\n-- - Materialize search indexes (Elastic, Meilisearch)\n-- - Feed data lake (S3 + Snowflake/BigQuery)\n-- - Real-time analytics dashboards\n-- - Event-driven microservices",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "CREATE PUBLICATION + logical slot",
+            "done": true
+          },
+          {
+            "label": "Debezium subscribes as consumer",
+            "done": true
+          },
+          {
+            "label": "Row changes → Kafka events",
+            "active": true
+          },
+          {
+            "label": "Consumers: search, analytics, cache invalidation"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Managing logical replication in production",
+      "description": "Track lag, restart replay on errors, handle version differences, backup slots. Slots retain WAL — inactive slots fill disk.",
+      "code": "-- Monitor subscription health\nSELECT s.subname, s.subenabled,\n       ss.received_lsn, ss.latest_end_lsn,\n       EXTRACT(EPOCH FROM now() - ss.latest_end_time) AS lag_sec,\n       ss.error_count\nFROM pg_subscription s\nLEFT JOIN pg_stat_subscription ss ON s.oid = ss.subid;\n\n-- Restart subscription\nALTER SUBSCRIPTION my_sub DISABLE;\nALTER SUBSCRIPTION my_sub ENABLE;\n\n-- Refresh publication (pick up new tables)\nALTER PUBLICATION my_pub ADD TABLE new_table;\nALTER SUBSCRIPTION my_sub REFRESH PUBLICATION;\n\n-- Change target connection\nALTER SUBSCRIPTION my_sub CONNECTION 'host=new-publisher ...';\n\n-- Drop subscription (keeps replication slot on publisher — clean up separately!)\nDROP SUBSCRIPTION my_sub;\n\n-- On publisher: drop leftover slot\nSELECT pg_drop_replication_slot('sub_slot_abc');\n\n-- ⚠️ Common issue: inactive slot fills disk\n-- If subscriber is down, WAL is retained on publisher → disk fills up\n-- Monitor:\nSELECT slot_name, active,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots\nWHERE NOT active AND slot_type = 'logical';\n\n-- Bound retention (PG 13+)\nALTER SYSTEM SET max_slot_wal_keep_size = '10GB';\n-- Slot becomes \"lost\" if it lags more than 10GB\n\n-- Backup: replication slots are NOT included in pg_basebackup by default\n-- Restore: recreate slots on new primary",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        14,
+        15,
+        18,
+        21,
+        24,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Ops checklist",
+        "items": [
+          {
+            "label": "Monitor lag",
+            "color": "#10b981",
+            "value": "received_lsn vs current_lsn",
+            "highlight": true
+          },
+          {
+            "label": "Inactive slot = disk fill",
+            "color": "#ef4444",
+            "value": "Alert on retained WAL"
+          },
+          {
+            "label": "max_slot_wal_keep_size",
+            "color": "#818cf8",
+            "value": "Bound damage from broken slots"
+          },
+          {
+            "label": "Clean up on drop",
+            "color": "#f59e0b",
+            "value": "DROP SUBSCRIPTION → drop slot too"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

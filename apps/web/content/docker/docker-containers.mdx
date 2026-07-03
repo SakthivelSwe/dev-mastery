@@ -20,7 +20,252 @@ Every container gets a random hex ID (e.g., `abc123def456`) and optionally a hum
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "container-lifecycle" }
+{
+  "language": "bash",
+  "fileName": "containers.sh",
+  "steps": [
+    {
+      "title": "Container lifecycle",
+      "description": "A container transitions through states: created → running → paused → stopped → removed. Each state has commands to reach it.",
+      "code": "# States and transitions:\n\n# CREATED (not started)\n$ docker create --name web nginx\nabc123...\n$ docker ps -a\nSTATUS: Created\n\n# RUNNING\n$ docker start web\n$ docker ps\nSTATUS: Up 5 seconds\n\n# PAUSED (freeze all processes)\n$ docker pause web\nSTATUS: Up 30 seconds (Paused)\n\n$ docker unpause web\n\n# STOPPED (exited)\n$ docker stop web\nSTATUS: Exited (0) 2 seconds ago\n\n# REMOVED\n$ docker rm web\n(container gone)\n\n# All-in-one: run = create + start\n$ docker run --name web nginx",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        17,
+        20,
+        21,
+        22,
+        24,
+        25
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "create → CREATED",
+            "done": true
+          },
+          {
+            "label": "start → RUNNING",
+            "done": true
+          },
+          {
+            "label": "stop → EXITED (state preserved)",
+            "active": true
+          },
+          {
+            "label": "rm → gone forever"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Container filesystem layers",
+      "description": "Container filesystem = image layers (read-only) + writable container layer on top. Copy-on-write: writes create new files in top layer.",
+      "code": "# Layered filesystem\n#\n# ┌─── Container layer (writable) ────┐  ← this container's changes\n# │                                    │\n# ├─── Image layer 4: CMD              │\n# ├─── Image layer 3: COPY . .         │\n# ├─── Image layer 2: RUN npm install  │  ← shared across containers\n# ├─── Image layer 1: FROM node:18     │\n# └────────────────────────────────────┘\n\n# Copy-on-write: modifying a file copies it to the top layer\n$ docker run -it --name c1 alpine sh\n/ # echo \"modified\" > /etc/hosts\n/ # cat /etc/hosts\nmodified\n/ # exit\n\n# Container c1 has its own writable /etc/hosts\n# Original in image layer is untouched\n\n# Inspect layers\n$ docker history nginx:latest\nIMAGE          SIZE     CREATED BY\nabc123         0B       CMD [\"nginx\" ...]\ndef456         0B       EXPOSE 80\nghi789         5MB      RUN nginx conf ...\njkl012         137MB    <base image>\n\n# Committed writable layer becomes new image\n$ docker commit c1 mycustom:v1  # (rarely done — use Dockerfile instead)",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Layer benefits",
+        "items": [
+          {
+            "label": "Shared layers",
+            "color": "#10b981",
+            "value": "Same base = shared disk + memory",
+            "highlight": true
+          },
+          {
+            "label": "Copy-on-write",
+            "color": "#818cf8",
+            "value": "Fast start, minimal duplication"
+          },
+          {
+            "label": "Cache friendly",
+            "color": "#f59e0b",
+            "value": "Rebuild only changed layers"
+          },
+          {
+            "label": "Container layer",
+            "color": "#60a5fa",
+            "value": "Lost on rm — use volumes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Container init and PID 1",
+      "description": "The main process is PID 1 inside the container. If it crashes or exits, container stops. PID 1 must handle signals correctly (SIGTERM).",
+      "code": "# Main process = PID 1\n$ docker run -it alpine sh\n/ # ps\nPID   USER     COMMAND\n1     root     sh              ← PID 1 (the CMD)\n5     root     ps\n\n# When PID 1 exits, container exits\n$ docker run alpine echo \"hi\"\nhi\n# Container immediately exits (PID 1 = echo finished)\n\n# CMD as shell form runs \"sh -c ...\"\nCMD npm start        # actually runs: sh -c \"npm start\" — PID 1 is sh!\n\n# CMD as exec form (preferred)\nCMD [\"npm\", \"start\"]  # PID 1 is node directly\n\n# Problem: PID 1 must reap zombie children + handle signals\n# Solution: use tini or dumb-init\n\nFROM node:18\nRUN apk add --no-cache tini\nENTRYPOINT [\"/sbin/tini\", \"--\"]\nCMD [\"node\", \"server.js\"]\n\n# Or --init flag on run\n$ docker run --init myapp\n# Docker injects init process automatically",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        14,
+        17,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "CMD becomes PID 1 in container",
+            "done": true
+          },
+          {
+            "label": "PID 1 exits → container exits",
+            "done": true
+          },
+          {
+            "label": "PID 1 must handle SIGTERM for graceful shutdown",
+            "active": true
+          },
+          {
+            "label": "Use tini/init for zombie reaping"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Environment variables and secrets",
+      "description": "Env vars configure containers. Never bake secrets into images. Use env files, --env, or secret managers.",
+      "code": "# Set env at run time\n$ docker run -e NODE_ENV=production -e PORT=3000 myapp\n\n# Read from .env file\n# .env file:\n#   NODE_ENV=production\n#   DATABASE_URL=postgres://...\n#   API_KEY=secret\n\n$ docker run --env-file .env myapp\n\n# In Dockerfile (only for defaults!)\nENV NODE_ENV=production\nENV PORT=3000\n\n# ⚠️ NEVER bake secrets into Dockerfile — image layers preserve them!\n# ❌ ENV DATABASE_PASSWORD=hunter2       # LEAKED FOREVER\n# ❌ COPY .env /app/.env                  # LEAKED FOREVER\n\n# ✅ Docker secrets (Swarm) or K8s secrets\n$ echo \"hunter2\" | docker secret create db-pass -\n$ docker service create --secret db-pass myapp\n\n# ✅ Runtime env from secret manager\nCMD [\"sh\", \"-c\", \"export DB_PASS=$(aws ssm get-parameter --name db-pass --query Value); node server.js\"]",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        8,
+        10,
+        13,
+        14,
+        17,
+        18,
+        19,
+        22,
+        23,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Env & secrets",
+        "items": [
+          {
+            "label": "ENV in Dockerfile",
+            "color": "#10b981",
+            "value": "Defaults, non-secrets only",
+            "highlight": true
+          },
+          {
+            "label": "-e / --env-file",
+            "color": "#818cf8",
+            "value": "Runtime — per environment"
+          },
+          {
+            "label": "Never bake secrets",
+            "color": "#ef4444",
+            "value": "Image layers preserve everything"
+          },
+          {
+            "label": "Secret manager",
+            "color": "#f59e0b",
+            "value": "Vault, AWS SM, K8s Secrets"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Health checks and restart policies",
+      "description": "HEALTHCHECK tells Docker if the app is healthy. Restart policies auto-recover from crashes.",
+      "code": "# In Dockerfile\nHEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\\n  CMD curl -f http://localhost:3000/health || exit 1\n\n# Docker checks:\n# Every 30s, run curl. If it exits non-zero 3 times → unhealthy\n\n# View status\n$ docker ps\nSTATUS: Up 5 minutes (healthy)\n$ docker inspect --format '{{.State.Health.Status}}' web\nhealthy\n\n# Restart policies (survives daemon restart too)\n$ docker run --restart=no myapp             # never restart (default)\n$ docker run --restart=always myapp         # always restart\n$ docker run --restart=unless-stopped myapp # unless manually stopped\n$ docker run --restart=on-failure:5 myapp   # only on non-zero exit, up to 5x\n\n# Combined: healthy + auto-restart\n$ docker run -d \\\n    --restart=unless-stopped \\\n    --health-cmd=\"curl -f http://localhost:3000/health\" \\\n    --health-interval=30s \\\n    myapp",
+      "highlight": [
+        2,
+        3,
+        6,
+        10,
+        11,
+        12,
+        15,
+        16,
+        17,
+        18,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Reliability features",
+        "items": [
+          {
+            "label": "HEALTHCHECK",
+            "color": "#10b981",
+            "value": "Docker knows healthy vs sick",
+            "highlight": true
+          },
+          {
+            "label": "--restart=unless-stopped",
+            "color": "#818cf8",
+            "value": "Auto-recover from crashes"
+          },
+          {
+            "label": "--start-period",
+            "color": "#f59e0b",
+            "value": "Grace period for slow starters"
+          },
+          {
+            "label": "K8s uses these",
+            "color": "#60a5fa",
+            "value": "Same concepts: liveness / readiness"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

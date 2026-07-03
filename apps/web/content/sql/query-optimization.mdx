@@ -17,7 +17,412 @@ The absolute most important command in all of SQL is `EXPLAIN`. Prefixing any qu
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "SQLVisualizer", "state": "query-explain" }
+{
+  "language": "sql",
+  "fileName": "optimization.sql",
+  "steps": [
+    {
+      "title": "EXPLAIN and EXPLAIN ANALYZE",
+      "description": "EXPLAIN shows plan. ANALYZE runs it + shows real timing. BUFFERS reveals cache behavior. Read bottom-up.",
+      "code": "-- EXPLAIN — planned execution\nEXPLAIN SELECT * FROM users WHERE email = 'a@x.com';\n\n-- EXPLAIN ANALYZE — actually run it + measure\nEXPLAIN ANALYZE SELECT * FROM users WHERE email = 'a@x.com';\n\n-- Full detail\nEXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON)\nSELECT * FROM users WHERE email = 'a@x.com';\n\n-- Sample output:\n-- Index Scan using idx_users_email on users\n--   (cost=0.42..8.44 rows=1 width=64)\n--   (actual time=0.032..0.033 rows=1 loops=1)\n--   Index Cond: (email = 'a@x.com'::text)\n--   Buffers: shared hit=3\n-- Planning Time: 0.123 ms\n-- Execution Time: 0.056 ms\n\n-- Key parts:\n-- cost=start..total    — planner estimate (arbitrary units)\n-- rows                 — estimated rows returned\n-- width                — estimated bytes per row\n-- actual time          — real wall-clock (with ANALYZE)\n-- loops                — how many times this node ran\n-- Buffers: shared hit  — cached page reads (fast)\n-- Buffers: shared read — disk reads (slow)\n\n-- Read the plan bottom-up (leaves first, root last)\n-- Each node either produces or consumes rows\n\n-- Common node types:\n-- Seq Scan           — full table scan\n-- Index Scan         — B-tree lookup + heap fetch\n-- Index Only Scan    — served entirely from index (covering)\n-- Bitmap Heap Scan   — many matching rows, batched\n-- Nested Loop        — for each A, look up in B\n-- Hash Join          — build hash table on smaller side\n-- Merge Join         — sorted inputs, merge streams\n-- Sort               — explicit sort (memory or disk)\n-- Aggregate          — GROUP BY collapse\n-- HashAggregate      — hash-based GROUP BY\n\n-- Warning signs:\n-- - Rows estimate WILDLY off from actual (run ANALYZE)\n-- - Seq Scan on large table with WHERE (missing index?)\n-- - Sort with disk (increase work_mem)\n-- - Nested loop with high loops (should be hash?)\n-- - Sequential index build order but random heap access (correlated? BRIN candidate?)\n\n-- Save + share plans\nEXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT ...;\n-- Paste into explain.dalibo.com for visual analysis",
+      "highlight": [
+        2,
+        5,
+        8,
+        9,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        52,
+        53,
+        54
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "EXPLAIN = planned",
+            "done": true
+          },
+          {
+            "label": "EXPLAIN ANALYZE = actual",
+            "done": true
+          },
+          {
+            "label": "BUFFERS shows cache/disk",
+            "active": true
+          },
+          {
+            "label": "Read plan bottom-up"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Common plan problems",
+      "description": "Wrong cardinality estimates, Nested Loop explosion, sort spills, missing indexes, bad join order.",
+      "code": "-- Problem 1: Cardinality estimate way off\nEXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'x';\n-- (cost estimate rows=1 vs actual rows=100000)\n\n-- Cause: outdated statistics\n-- Fix:\nANALYZE orders;\nALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;\n\n-- Problem 2: Nested Loop with high loops\n-- Nested Loop  loops=1  actual=1200s\n--   -> Seq Scan on orders (rows=1M)\n--   -> Index Scan on users\n-- For each order → user lookup: 1M × index scan = slow!\n\n-- Fix: hash join instead\nSET enable_nestloop = off;    -- test\n-- Or fix stats so planner picks Hash Join\n\n-- Problem 3: Sort spilling to disk\n-- Sort Method: external merge  Disk: 512MB\n\n-- Fix: increase work_mem or add better index\nSET work_mem = '256MB';\n-- Or add index matching ORDER BY to avoid sort entirely\nCREATE INDEX ON orders (created_at DESC);\n\n-- Problem 4: Missing index\n-- Seq Scan on huge table with WHERE\n\n-- Fix:\nCREATE INDEX ON orders (user_id);\nANALYZE orders;\n\n-- Problem 5: Bad join order\n-- Planner might join large tables first\n-- Fix: use JOIN with filter to prune early\nSELECT ...\nFROM users u JOIN orders o USING (user_id)\nWHERE u.country = 'IN';\n-- Ensure u.country is indexed for early filter\n\n-- Problem 6: OR clauses inhibit index use\nWHERE email = 'x' OR username = 'y'\n-- Rewrite as UNION for two index scans\n\n-- Problem 7: subquery per row\nSELECT u.*, (SELECT count(*) FROM orders WHERE user_id = u.id)\nFROM users u;\n-- Rewrite as LEFT JOIN with aggregate\n\n-- Problem 8: LIMIT with ORDER BY without matching index\n-- Sort → Limit reads all rows first\n-- Fix: index on ORDER BY columns\nCREATE INDEX ON orders (created_at DESC);\n\n-- Problem 9: implicit type casts on JOIN\nJOIN users u ON u.id::text = o.user_id_str\n-- Fix: match types at design time\n\n-- Problem 10: reading unnecessary columns\nSELECT * FROM huge_table WHERE id = 1;\n-- Fix: SELECT only needed columns → index-only scan possible\n\n-- Statistics tools\nSELECT * FROM pg_stat_user_tables WHERE relname = 'orders';\nSELECT * FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        58,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Plan diagnostics",
+        "items": [
+          {
+            "label": "Bad cardinality → ANALYZE",
+            "color": "#10b981",
+            "value": "Refresh stats",
+            "highlight": true
+          },
+          {
+            "label": "Nested loop explosion",
+            "color": "#ef4444",
+            "value": "Rewrite as Hash Join"
+          },
+          {
+            "label": "Sort on disk → work_mem",
+            "color": "#818cf8",
+            "value": "Or index matching ORDER BY"
+          },
+          {
+            "label": "pg_stat_statements",
+            "color": "#f59e0b",
+            "value": "Find slow queries in prod"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Statistics and planner tuning",
+      "description": "ANALYZE keeps stats fresh. autovacuum handles most. Tune statistics_target for hot columns.",
+      "code": "-- Planner uses statistics to estimate costs\n-- Bad stats → bad plans\n\n-- Manual analyze (updates statistics)\nANALYZE users;\nANALYZE users(email);       -- single column\nANALYZE;                     -- all tables\n\n-- Autovacuum handles this automatically (usually)\n-- Trigger: 20% of table rows changed since last analyze\n\n-- Tune per-table\nALTER TABLE users\n  SET (autovacuum_analyze_scale_factor = 0.05);  -- more aggressive\n\n-- Statistics detail level\nALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;\n-- Default 100; higher = better estimates on skewed data\n\nANALYZE orders;    -- re-analyze after changing target\n\n-- View statistics\nSELECT tablename, attname, n_distinct, most_common_vals, most_common_freqs\nFROM pg_stats\nWHERE tablename = 'users';\n\n-- Extended statistics (multi-column correlations, PG 10+)\nCREATE STATISTICS orders_stats (ndistinct, dependencies) ON user_id, status FROM orders;\nANALYZE orders;\n-- Now planner knows user_id and status are correlated (or not)\n\n-- Planner cost parameters (postgresql.conf)\n-- random_page_cost = 4.0      → lower for SSDs (1.1)\n-- seq_page_cost    = 1.0\n-- effective_cache_size = 4GB   → tell planner OS cache size\n-- work_mem = 4MB               → per sort/hash op memory\n\n-- Global session tuning\nSET random_page_cost = 1.1;\nSET work_mem = '256MB';\nSET effective_cache_size = '8GB';\n\n-- Show config\nSHOW work_mem;\nSHOW random_page_cost;\n\n-- Force specific plan (mostly for debugging)\nSET enable_seqscan = off;\nSET enable_hashjoin = off;\nSET enable_nestloop = off;\nRESET ALL;    -- return to defaults\n\n-- Track query performance history\nCREATE EXTENSION pg_stat_statements;\n\nSELECT query, calls, total_exec_time, mean_exec_time, rows\nFROM pg_stat_statements\nORDER BY total_exec_time DESC LIMIT 20;\n\n-- Reset counters\nSELECT pg_stat_statements_reset();",
+      "highlight": [
+        2,
+        4,
+        5,
+        6,
+        7,
+        10,
+        12,
+        13,
+        15,
+        16,
+        17,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Fresh stats via ANALYZE",
+            "done": true
+          },
+          {
+            "label": "Autovacuum handles most",
+            "done": true
+          },
+          {
+            "label": "STATISTICS N for hot cols",
+            "active": true
+          },
+          {
+            "label": "Extended stats for correlations"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Query rewrites",
+      "description": "Rewrite subqueries as JOINs. Push filters early. LIMIT with index. Use CTEs judiciously.",
+      "code": "-- 1. Correlated subquery → JOIN + aggregate\n-- Slow:\nSELECT u.name, (SELECT count(*) FROM orders WHERE user_id = u.id) FROM users u;\n\n-- Fast:\nSELECT u.name, COALESCE(o.cnt, 0)\nFROM users u\nLEFT JOIN (SELECT user_id, count(*) AS cnt FROM orders GROUP BY user_id) o\n  ON o.user_id = u.id;\n\n-- 2. NOT IN → NOT EXISTS (NULL-safe + often faster)\n-- Slow + buggy with NULL:\nSELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned);\n-- Fast + safe:\nSELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM banned WHERE user_id = u.id);\n\n-- 3. OR across cols → UNION\nSELECT * FROM users WHERE email = 'x' OR username = 'y';\n-- Rewrite:\nSELECT * FROM users WHERE email = 'x'\nUNION\nSELECT * FROM users WHERE username = 'y';\n\n-- 4. DISTINCT for dedup → EXISTS\nSELECT DISTINCT u.* FROM users u JOIN orders o ON o.user_id = u.id;\n-- Better:\nSELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id);\n\n-- 5. Pagination: LIMIT OFFSET → keyset\n-- Slow at page 10000:\nSELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 200000;\n-- Fast:\nSELECT * FROM orders WHERE id > $last_id ORDER BY id LIMIT 20;\n\n-- 6. Top-N per group\n-- With window:\nSELECT * FROM (\n  SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY total DESC) rn\n  FROM orders\n) t WHERE rn <= 3;\n-- Or LATERAL:\nSELECT u.id, r.*\nFROM users u,\nLATERAL (SELECT * FROM orders WHERE user_id = u.id ORDER BY total DESC LIMIT 3) r;\n\n-- 7. Push filter into JOIN (early filter)\n-- Delays filter:\nSELECT * FROM users u JOIN orders o ON u.id = o.user_id\nWHERE u.country = 'IN';\n-- Same result, but planner sees intent\n-- Better: index on users.country so early filter reduces JOIN input\n\n-- 8. Avoid SELECT *\n-- Reading unused columns costs I/O\n-- Explicit columns can enable index-only scans\n\n-- 9. Batch DELETE / UPDATE\nDELETE FROM logs WHERE created_at < NOW() - INTERVAL '90 days';\n-- Instead, batch in loops:\nDELETE FROM logs WHERE id IN (\n  SELECT id FROM logs WHERE created_at < NOW() - INTERVAL '90 days'\n  LIMIT 10000\n);\n\n-- 10. Materialize expensive subqueries\nWITH heavy AS MATERIALIZED (SELECT ...)\nSELECT * FROM heavy WHERE ...\nUNION ALL SELECT * FROM heavy WHERE ...;",
+      "highlight": [
+        3,
+        6,
+        7,
+        8,
+        9,
+        12,
+        13,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Rewrites",
+        "items": [
+          {
+            "label": "Subquery → JOIN",
+            "color": "#10b981",
+            "value": "Aggregate once",
+            "highlight": true
+          },
+          {
+            "label": "NOT IN → NOT EXISTS",
+            "color": "#818cf8",
+            "value": "NULL-safe"
+          },
+          {
+            "label": "OFFSET → keyset",
+            "color": "#f59e0b",
+            "value": "Fast pagination"
+          },
+          {
+            "label": "LATERAL top-N",
+            "color": "#60a5fa",
+            "value": "Per-row limit"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Server-level tuning basics",
+      "description": "shared_buffers, work_mem, effective_cache_size, wal, checkpoints — the big Postgres knobs.",
+      "code": "-- Key postgresql.conf settings\n-- (Values below assume 16GB RAM server)\n\n-- Memory\nshared_buffers = 4GB           -- 25% RAM\nwork_mem = 32MB                 -- per sort/hash op (per connection!)\nmaintenance_work_mem = 512MB    -- VACUUM, CREATE INDEX\neffective_cache_size = 12GB     -- planner hint, 75% RAM\n\n-- Checkpoints (write behavior)\nmax_wal_size = 4GB\ncheckpoint_completion_target = 0.9\n\n-- Query planner\nrandom_page_cost = 1.1          -- SSD (default 4.0 for HDD)\ndefault_statistics_target = 100  -- histogram detail\n\n-- Autovacuum (keep stats + reclaim space)\nautovacuum = on\nautovacuum_max_workers = 4\nautovacuum_naptime = 30s\n\n-- Connections\nmax_connections = 200           -- prefer pooler if higher\n\n-- WAL\nwal_level = replica\nwal_compression = on\n\n-- Logging (find slow queries)\nlog_min_duration_statement = 500ms   -- log queries > 500ms\nlog_temp_files = 10MB\nlog_lock_waits = on\n\n-- Reload without restart (most settings)\n$ pg_ctl reload\nSELECT pg_reload_conf();\n\n-- Requires restart\nshared_buffers\nmax_connections\nwal_level\n\n-- Check current values\nSHOW work_mem;\nSHOW ALL;\n\n-- Per-session override (temp)\nSET work_mem = '256MB';\n\n-- Per-role default\nALTER ROLE analyst SET work_mem = '256MB';\n\n-- Per-database\nALTER DATABASE reporting SET work_mem = '256MB';\n\n-- Monitor with pg_stat_activity\nSELECT pid, state, query, wait_event, backend_start\nFROM pg_stat_activity\nWHERE state = 'active';\n\n-- Kill runaway query\nSELECT pg_cancel_backend(pid);      -- gentle\nSELECT pg_terminate_backend(pid);   -- forceful\n\n-- Connection pooler (essential at scale)\n-- PgBouncer: transaction mode, thousands of clients → few DB connections\n\n-- Managed DB (RDS, Cloud SQL, Supabase):\n-- Most tuning in the panel or parameter groups\n-- Right-size the instance FIRST (RAM, IOPS)",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        43,
+        45,
+        46,
+        47,
+        49,
+        50,
+        52,
+        53,
+        55,
+        56,
+        58,
+        59,
+        60,
+        61,
+        63,
+        64,
+        65,
+        67,
+        68,
+        70,
+        71,
+        72
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Server tuning",
+        "items": [
+          {
+            "label": "shared_buffers 25%",
+            "color": "#10b981",
+            "value": "Cached data pages",
+            "highlight": true
+          },
+          {
+            "label": "work_mem",
+            "color": "#818cf8",
+            "value": "Per sort/hash — care with N conns"
+          },
+          {
+            "label": "random_page_cost = 1.1",
+            "color": "#f59e0b",
+            "value": "SSD hint"
+          },
+          {
+            "label": "Log slow queries",
+            "color": "#60a5fa",
+            "value": "log_min_duration_statement"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

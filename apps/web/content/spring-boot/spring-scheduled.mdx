@@ -1,0 +1,465 @@
+---
+slug: "spring-scheduled"
+title: "Spring @Scheduled — Timers, Cron & Fixed Rate"
+level: 3
+---
+
+## WHY
+
+Every real system needs periodic work: nightly report generation, health-check pings, session-cleanup, retry queues, cache refresh, metrics flushes. You could hand-roll a `ScheduledExecutorService` in every service — but Spring's `@Scheduled` gives you a declarative annotation, integration with the Spring container (so your beans are injected), lifecycle-aware (starts after Spring startup, stops on shutdown), and thread-pool-managed. Getting `@Scheduled` right — pool sizing, cron syntax, distributed coordination — is the difference between "reliable nightly job" and "database corrupted at 2 AM because five instances ran the batch simultaneously".
+
+## THEORY
+
+### Enable and use — the two lines
+
+```java
+@SpringBootApplication
+@EnableScheduling                       // add this once, on any @Configuration or main class
+class Application { ... }
+
+@Component
+class HealthPinger {
+    @Scheduled(fixedRate = 30_000)      // every 30 seconds
+    public void ping() { ... }
+}
+```
+
+### The three timing strategies
+
+| Attribute | Meaning | Behavior when task slow |
+|-----------|---------|-------------------------|
+| `fixedRate = N` | Trigger every `N` ms from the START of the previous run | If task > N, next run queues immediately after — can overlap unless serialized |
+| `fixedDelay = N` | Wait `N` ms AFTER the previous run finished | No overlap; long tasks push out subsequent runs |
+| `cron = "..."` | Fire at times matching a cron expression | Same as fixedRate — missed windows fire immediately |
+
+Time units default to milliseconds; from Spring 6 you can use `Duration`-style strings: `@Scheduled(fixedDelayString = "PT30S")` or `timeUnit = TimeUnit.SECONDS`.
+
+### Spring cron syntax — 6 fields (NOT the standard Unix 5)
+
+```
+second minute hour day-of-month month day-of-week
+  *      *     *       *         *        *
+```
+
+| Example | Meaning |
+|---------|---------|
+| `0 0 * * * *` | Top of every hour |
+| `0 */5 * * * *` | Every 5 minutes |
+| `0 0 2 * * *` | 02:00 daily |
+| `0 0 2 * * MON-FRI` | 02:00 weekdays |
+| `0 0 0 1 * *` | Midnight on the 1st of each month |
+| `0 0 0 1 1 *` | Midnight New Year's Day |
+| `0 0 12 L * *` | Noon on the LAST day of each month |
+
+Since Spring 5.3 you can use MACROS: `@yearly`, `@monthly`, `@weekly`, `@daily`, `@hourly`.
+
+### Default scheduler is single-threaded — a common footgun
+
+Without configuration, Spring uses a **single-threaded** `ThreadPoolTaskScheduler`. If you have two `@Scheduled` methods and one takes 60 seconds, the OTHER one is blocked for 60 seconds even if it should have fired 30 times. Always define a pool:
+
+```java
+@Bean
+public ThreadPoolTaskScheduler taskScheduler() {
+    ThreadPoolTaskScheduler s = new ThreadPoolTaskScheduler();
+    s.setPoolSize(10);
+    s.setThreadNamePrefix("sched-");
+    s.setRemoveOnCancelPolicy(true);
+    return s;
+}
+```
+Or via `application.yml`:
+```yaml
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 10
+      thread-name-prefix: sched-
+```
+
+### Timezones
+
+By default `@Scheduled(cron = ...)` uses the server's local timezone — a bug generator when your servers span regions. ALWAYS specify:
+
+```java
+@Scheduled(cron = "0 0 2 * * *", zone = "UTC")
+public void nightlyBatch() { ... }
+```
+
+### Exception handling
+
+An uncaught exception from a `@Scheduled` method does NOT stop future executions — Spring logs it and moves on. BUT: if the exception propagates past `ScheduledExecutorService` behavior for `fixedDelay` schedules, the next run may not fire. Best practice: wrap every scheduled method body in try/catch that at least logs, then decides whether to rethrow.
+
+### The distributed problem: N instances → N runs
+
+If you run three replicas of the service, each `@Scheduled` job runs three times. For idempotent work (health pings), that's fine. For non-idempotent work (charge invoices, send emails), it is catastrophic. Solutions:
+
+- **ShedLock** (github.com/lukas-krecan/ShedLock): a distributed-lock annotation `@SchedulerLock(name = "sendInvoices", lockAtMostFor = "PT30M")` backed by a shared DB / Redis. Only one replica runs at a time.
+- **Kubernetes CronJob**: don't schedule inside the service; run a separate `Job` pod on schedule.
+- **Leader election**: run scheduling only on the leader replica (Spring Integration `LeaderInitiator` or Zookeeper).
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "Scheduler.java",
+  "steps": [
+    {
+      "title": "Enable and annotate",
+      "description": "Add @EnableScheduling once. Then any @Component method annotated @Scheduled(...) becomes a timer.",
+      "code": "@SpringBootApplication\n@EnableScheduling\nclass App { public static void main(String[] a) { SpringApplication.run(App.class, a); } }\n\n@Component\nclass Jobs {\n    @Scheduled(fixedRate = 30_000)   // every 30s\n    public void heartbeat() { metrics.gauge(\"up\", 1); }\n}",
+      "highlight": [
+        2,
+        6,
+        7,
+        8
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "@EnableScheduling",
+            "done": true
+          },
+          {
+            "label": "@Scheduled(fixedRate = 30_000)",
+            "active": true
+          },
+          {
+            "label": "ThreadPoolTaskScheduler fires it"
+          }
+        ]
+      }
+    },
+    {
+      "title": "fixedRate vs fixedDelay",
+      "description": "fixedRate: start every N ms — successive runs can queue if the task takes longer than N. fixedDelay: wait N ms AFTER the previous run finishes — no queueing.",
+      "code": "@Scheduled(fixedRate  = 5000)    // start every 5s (may overlap)\npublic void fast() { }\n\n@Scheduled(fixedDelay = 5000)    // wait 5s after finish\npublic void slow() throws Exception { Thread.sleep(3000); }",
+      "highlight": [
+        1,
+        4
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "fixedRate",
+          "fixedDelay"
+        ],
+        "messages": [
+          {
+            "from": "fixedRate",
+            "to": "fixedRate",
+            "label": "t=0 · start"
+          },
+          {
+            "from": "fixedRate",
+            "to": "fixedRate",
+            "label": "t=5 · start (regardless of prev)"
+          },
+          {
+            "from": "fixedDelay",
+            "to": "fixedDelay",
+            "label": "t=0 · start"
+          },
+          {
+            "from": "fixedDelay",
+            "to": "fixedDelay",
+            "label": "t=8 · start (3s work + 5s delay)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Spring cron — SIX fields, not five",
+      "description": "Spring cron has `second minute hour day-of-month month day-of-week` — six fields. Copy-pasting a Unix cron (5 fields) is a classic bug. Always specify a timezone.",
+      "code": "@Scheduled(cron = \"0 0 2 * * *\", zone = \"UTC\")   // 02:00 UTC daily\npublic void nightlyBatch() { ... }\n\n@Scheduled(cron = \"0 */5 * * * MON-FRI\", zone = \"UTC\")   // every 5min · weekdays\npublic void reconcile() { ... }",
+      "highlight": [
+        1,
+        4
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Cron fields",
+        "items": [
+          {
+            "label": "second"
+          },
+          {
+            "label": "minute"
+          },
+          {
+            "label": "hour"
+          },
+          {
+            "label": "day-of-month"
+          },
+          {
+            "label": "month"
+          },
+          {
+            "label": "day-of-week"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Sizing the scheduler pool",
+      "description": "The DEFAULT scheduler is single-threaded — a slow @Scheduled method blocks ALL others. Always configure pool size = at least the number of concurrent scheduled methods.",
+      "code": "spring:\n  task:\n    scheduling:\n      pool:\n        size: 10\n      thread-name-prefix: sched-",
+      "language": "yaml",
+      "highlight": [
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 0,
+        "workers": [
+          {
+            "name": "sched-1",
+            "state": "RUNNABLE",
+            "note": "nightlyBatch"
+          },
+          {
+            "name": "sched-2",
+            "state": "RUNNABLE",
+            "note": "reconcile"
+          },
+          {
+            "name": "sched-3",
+            "state": "WAITING",
+            "note": "idle"
+          }
+        ],
+        "queue": []
+      }
+    },
+    {
+      "title": "Distributed lock — ShedLock",
+      "description": "With N replicas, a @Scheduled method fires N times. ShedLock writes a row to a shared DB — exactly ONE replica wins and runs. The others skip. Idempotency requires this.",
+      "code": "@Scheduled(cron = \"0 0 2 * * *\", zone = \"UTC\")\n@SchedulerLock(name = \"sendInvoices\", lockAtMostFor = \"PT2H\", lockAtLeastFor = \"PT10M\")\npublic void sendMonthlyInvoices() { ... }",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "replica-1",
+            "state": "RUNNABLE",
+            "note": "holds ShedLock row"
+          },
+          {
+            "name": "replica-2",
+            "state": "TERMINATED",
+            "active": false,
+            "note": "sees row locked → skip"
+          },
+          {
+            "name": "replica-3",
+            "state": "TERMINATED",
+            "active": false,
+            "note": "sees row locked → skip"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — the three variants
+```java
+@Configuration
+@EnableScheduling
+class SchedulerConfig {}
+
+@Component
+class Jobs {
+
+    @Scheduled(fixedRate = 5_000)              // every 5s from start of previous
+    public void heartbeat() {
+        System.out.println("heartbeat " + Instant.now());
+    }
+
+    @Scheduled(fixedDelay = 10_000)            // 10s AFTER previous finishes
+    public void slowWork() throws InterruptedException {
+        Thread.sleep(3_000);
+        System.out.println("slow work done at " + Instant.now());
+    }
+
+    @Scheduled(cron = "0 */5 * * * *", zone = "UTC")   // every 5 mins on the clock
+    public void reconcile() { System.out.println("cron reconcile"); }
+}
+```
+
+### Level 2 — Custom scheduler pool
+```java
+@Configuration
+@EnableScheduling
+class SchedulerConfig implements SchedulingConfigurer {
+
+    @Bean(destroyMethod = "shutdown")
+    public ThreadPoolTaskScheduler taskScheduler() {
+        ThreadPoolTaskScheduler s = new ThreadPoolTaskScheduler();
+        s.setPoolSize(10);
+        s.setThreadNamePrefix("sched-");
+        s.setRemoveOnCancelPolicy(true);
+        s.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        s.setErrorHandler(t -> LoggerFactory.getLogger("sched").error("uncaught", t));
+        s.initialize();
+        return s;
+    }
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar registrar) {
+        registrar.setTaskScheduler(taskScheduler());
+    }
+}
+```
+
+### Level 3 — Externalized config for cron/interval
+```yaml
+app:
+  jobs:
+    invoice-batch-cron: "0 0 3 * * MON-FRI"
+    session-cleanup-interval-ms: 60000
+```
+```java
+@Component
+class ExternallyConfigured {
+    @Scheduled(cron = "${app.jobs.invoice-batch-cron}", zone = "UTC")
+    public void invoiceBatch() { /* ... */ }
+
+    @Scheduled(fixedDelayString = "${app.jobs.session-cleanup-interval-ms}")
+    public void sessionCleanup() { /* ... */ }
+}
+```
+Now the DevOps team can tweak schedules via config without recompiling.
+
+### Level 4 — Distributed lock via ShedLock
+```java
+// build.gradle:  implementation 'net.javacrumbs.shedlock:shedlock-spring:5.13.0'
+//                implementation 'net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.13.0'
+
+@EnableSchedulerLock(defaultLockAtMostFor = "PT30M")
+@Configuration class LockConfig {
+    @Bean
+    public LockProvider lockProvider(DataSource ds) {
+        return new JdbcTemplateLockProvider(new JdbcTemplate(ds));
+    }
+}
+
+@Component
+class InvoiceJobs {
+    @Scheduled(cron = "0 0 3 * * *", zone = "UTC")
+    @SchedulerLock(name = "sendMonthlyInvoices",
+                   lockAtMostFor = "PT2H",
+                   lockAtLeastFor = "PT10M")
+    public void send() {
+        // Guaranteed: exactly one instance in the cluster runs this
+    }
+}
+```
+Under the hood: ShedLock writes a row into `shedlock (name, lock_until, locked_at, locked_by)` — the first replica to `INSERT` wins; the others see the row is locked and skip this invocation.
+
+### Level 5 — Dynamic scheduling with `TaskScheduler` (bypass `@Scheduled`)
+```java
+@Component
+class DynamicScheduler {
+    private final TaskScheduler scheduler;
+    private final Map<String, ScheduledFuture<?>> handles = new ConcurrentHashMap<>();
+
+    DynamicScheduler(TaskScheduler scheduler) { this.scheduler = scheduler; }
+
+    public void scheduleFor(String key, String cron, Runnable task) {
+        cancel(key);
+        ScheduledFuture<?> h = scheduler.schedule(
+                task, new CronTrigger(cron, TimeZone.getTimeZone("UTC")));
+        handles.put(key, h);
+    }
+
+    public void cancel(String key) {
+        ScheduledFuture<?> old = handles.remove(key);
+        if (old != null) old.cancel(false);
+    }
+}
+// Use when the schedule is decided at runtime — e.g., per-tenant SLA reports.
+```
+
+## REAL_WORLD
+
+**Nightly report pipeline in a SaaS platform** — three replicas of the service, each pod behind a load balancer. Without coordination, three copies of the nightly-batch would run at 02:00 UTC, triple-charging every customer.
+
+```java
+@Component
+class NightlyPipeline {
+
+    @Scheduled(cron = "${app.nightly.report-cron}", zone = "UTC")
+    @SchedulerLock(name = "nightlyReport", lockAtMostFor = "PT3H")
+    public void run() {
+        try {
+            var accounts = accountRepo.findAllActive();
+            for (var acct : accounts) {
+                metering.close(acct.id());        // idempotent
+                var report = reportBuilder.build(acct.id());
+                mailer.send(acct.email(), report);
+            }
+        } catch (Exception e) {
+            log.error("nightly failed — will retry tomorrow", e);
+            alerting.page("nightly-report-failure", e);
+        }
+    }
+}
+```
+- `ShedLock` guarantees exactly one replica runs.
+- All work is idempotent — if the pod dies mid-run, the next night resumes cleanly.
+- Any exception is caught, logged, alerted — future runs unaffected.
+
+## INTERVIEW
+
+**Q: What's the difference between `fixedRate` and `fixedDelay`?**
+A: `fixedRate = N` starts a new invocation every N ms from the START of the previous run — successive runs can queue if the task takes longer than N. `fixedDelay = N` waits N ms AFTER the previous run FINISHES — no queuing; slow tasks push out subsequent runs.
+
+**Q: What is Spring's cron format and how is it different from standard Unix cron?**
+A: Spring uses SIX fields: `second minute hour day-of-month month day-of-week`. Standard Unix cron has FIVE (no seconds). You cannot copy a Unix `0 2 * * *` and paste it into `@Scheduled` — it will be misinterpreted.
+
+**Q: What's the default scheduler in Spring Boot and why is it dangerous?**
+A: A single-threaded `ThreadPoolTaskScheduler`. If you have multiple `@Scheduled` methods and one is slow, others miss their windows. Always configure `spring.task.scheduling.pool.size` (or a `ThreadPoolTaskScheduler` bean) to at least the number of concurrent schedules you have.
+
+**Q: You run 3 replicas of your service — a `@Scheduled` job runs 3 times. How do you fix that?**
+A: Distributed lock. The de-facto standard is ShedLock (`@SchedulerLock`) backed by a shared table in Postgres, Redis, or MongoDB. Alternatives: Kubernetes CronJob (schedule outside the service), or leader election so only one instance runs schedulers.
+
+**Q: What happens if a `@Scheduled` method throws?**
+A: Spring's `ErrorHandler` logs the exception and moves on — future executions still fire on schedule. But you can configure a custom `ErrorHandler` on `ThreadPoolTaskScheduler` to route errors to metrics/alerting. Best practice: wrap the body in try/catch so business exceptions don't rely on framework defaults.
+
+**Q: I need to change a cron schedule at runtime without redeploying. How?**
+A: Don't use `@Scheduled` — inject `TaskScheduler` and call `taskScheduler.schedule(runnable, new CronTrigger(cron, zone))` yourself, keeping the returned `ScheduledFuture` for cancellation. Store the cron string in the DB or config server.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> `@Scheduled` is a timer you tape to a method. "Every 30 seconds, please do this." "At 3 AM every Monday, please do this." Spring sets an alarm and rings it — the method runs on its own. `fixedRate` is "start every 30 seconds no matter what"; `fixedDelay` is "wait 30 seconds AFTER you finish before starting again"; `cron` is "run at exactly 3 AM on Mondays." When you have three copies of the same service running, they'd all set the alarm — you need `@SchedulerLock` (like passing a single alarm clock around) so only ONE actually runs.
+
+## BUILD
+
+Build a **cache-warmer service**:
+1. `@Scheduled(fixedDelayString = "${app.warmer.delay-ms:60000}")` reloads a shared `AtomicReference<Map<K,V>>` from the DB.
+2. `@Scheduled(cron = "0 0 4 * * *", zone = "UTC")` runs the "full rebuild" job.
+3. Configure a `ThreadPoolTaskScheduler` with `poolSize = 5`.
+4. Add `@SchedulerLock` on the daily rebuild so only one pod in the cluster runs it.
+5. Wrap each scheduled method body in try/catch — publish metrics on success and failure via Micrometer.
+6. **Bonus**: expose an `/admin/warmer/rerun` endpoint that triggers the reload immediately, out of schedule.
+
+## SPACED REVIEW
+
+**Day 1**: Write `@Scheduled(fixedRate = 5_000)` and explain why the default single-threaded scheduler is a problem.
+**Day 3**: Show Spring's 6-field cron format vs standard Unix's 5-field. Convert "top of every hour" to Spring's format.
+**Day 7**: Explain the difference between `fixedRate` and `fixedDelay` with a slow-task example.
+**Day 14**: Given 3 replicas of a service with a `@Scheduled` invoice-charging job, describe the ShedLock table structure that prevents multi-run.
+

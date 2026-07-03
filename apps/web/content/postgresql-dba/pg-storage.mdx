@@ -15,7 +15,268 @@ When you insert a row, Postgres packs it into a Page. When the Page is full (rea
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "postgres-pages" }
+{
+  "language": "sql",
+  "fileName": "storage.sql",
+  "steps": [
+    {
+      "title": "Pages, tuples, and heap files",
+      "description": "PostgreSQL stores data in 8KB pages. Each page has a header + tuples (rows). Tables are heap files — pages appended, TOAST for large values.",
+      "code": "-- 8KB page (default block size)\n-- ┌─── Page (8KB) ─────────────────┐\n-- │ Page header (24 bytes)          │\n-- │ ItemIds → point to tuples       │\n-- │ ...                             │\n-- │ [free space]                    │\n-- │ ...                             │\n-- │ Tuple N (bottom)                │\n-- │ Tuple N-1                       │\n-- │ Tuple 1                         │\n-- └─────────────────────────────────┘\n\n-- Show pages of a table\nSELECT pg_relation_size('users') / 8192 AS pages;\n\n-- Inspect page-level info (extension: pageinspect)\nCREATE EXTENSION pageinspect;\nSELECT * FROM heap_page_items(get_raw_page('users', 0)) LIMIT 5;\n\n-- Row identifier: (page, offset) = ctid\nSELECT ctid, id, name FROM users LIMIT 5;\n ctid  | id | name\n-------+----+------\n (0,1) |  1 | Alice\n (0,2) |  2 | Bob\n (0,3) |  3 | Carol\n (1,1) |  4 | Dave   -- 2nd page starts",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        17,
+        18,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Page anatomy",
+        "items": [
+          {
+            "label": "8KB block size",
+            "color": "#10b981",
+            "value": "Default; unit of I/O + caching",
+            "highlight": true
+          },
+          {
+            "label": "Header at top",
+            "color": "#818cf8",
+            "value": "ItemIds grow down"
+          },
+          {
+            "label": "Tuples at bottom",
+            "color": "#f59e0b",
+            "value": "Grow up — free space in middle"
+          },
+          {
+            "label": "ctid = (page, offset)",
+            "color": "#60a5fa",
+            "value": "Physical row location"
+          }
+        ]
+      }
+    },
+    {
+      "title": "TOAST — The Oversized-Attribute Storage Technique",
+      "description": "Values larger than ~2KB are compressed and/or stored out-of-line in a TOAST table. Transparent to queries. Big text/bytea/jsonb columns.",
+      "code": "-- Every table has a TOAST relation for oversized attributes\nSELECT relname, reltoastrelid::regclass AS toast_table\nFROM pg_class WHERE relname = 'articles';\n-- relname | toast_table\n-- articles | pg_toast.pg_toast_16401\n\n-- TOAST kicks in when tuple > TOAST_TUPLE_THRESHOLD (~2KB)\n-- Strategies:\n-- MAIN     — try compression, keep inline\n-- EXTENDED — compress + move out-of-line (default for varlena)\n-- EXTERNAL — no compression, out-of-line\n-- PLAIN    — no TOAST\n\n-- Set strategy\nALTER TABLE articles ALTER COLUMN body SET STORAGE MAIN;\nALTER TABLE files ALTER COLUMN blob SET STORAGE EXTERNAL;    -- e.g., already compressed\n\n-- TOAST size vs main size\nSELECT pg_size_pretty(pg_relation_size('articles')) AS main,\n       pg_size_pretty(pg_total_relation_size('articles') - pg_relation_size('articles')) AS toast_and_indexes;\n\n-- Compression algorithms (PG 14+)\nALTER TABLE articles ALTER COLUMN body SET COMPRESSION lz4;    -- faster\n-- Options: pglz (default), lz4",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Row > 2KB triggers TOAST",
+            "done": true
+          },
+          {
+            "label": "Try compression (pglz or lz4)",
+            "done": true
+          },
+          {
+            "label": "Still too big? Split into TOAST chunks",
+            "active": true
+          },
+          {
+            "label": "Main tuple holds pointer to TOAST rows"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Tablespaces — multiple storage locations",
+      "description": "Tablespaces let you place tables/indexes on different filesystems (SSD vs HDD). Rarely used in cloud — but valuable for hybrid storage.",
+      "code": "-- Create tablespace on fast SSD\nCREATE TABLESPACE fast_ssd LOCATION '/mnt/nvme/pgdata';\nCREATE TABLESPACE slow_hdd LOCATION '/mnt/hdd/pgdata';\n\n-- Place table on specific tablespace\nCREATE TABLE hot_data (...) TABLESPACE fast_ssd;\nCREATE TABLE archive (...) TABLESPACE slow_hdd;\n\n-- Move existing table\nALTER TABLE users SET TABLESPACE fast_ssd;\n-- ⚠️ Locks table exclusive during move!\n\n-- Move indexes separately\nALTER INDEX users_email_idx SET TABLESPACE fast_ssd;\n\n-- Set default tablespace for user/db\nALTER DATABASE devmastery SET default_tablespace = 'fast_ssd';\n\n-- List tablespaces\nSELECT spcname, pg_tablespace_location(oid), pg_size_pretty(pg_tablespace_size(oid))\nFROM pg_tablespace;\n\n-- View which tables are where\nSELECT n.nspname, c.relname, t.spcname\nFROM pg_class c\nJOIN pg_namespace n ON c.relnamespace = n.oid\nLEFT JOIN pg_tablespace t ON c.reltablespace = t.oid\nWHERE c.relkind = 'r'\nORDER BY t.spcname;",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        10,
+        11,
+        14,
+        17,
+        20,
+        21,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Tablespace use cases",
+        "items": [
+          {
+            "label": "Hot data on SSD",
+            "color": "#10b981",
+            "value": "High-traffic tables on NVMe",
+            "highlight": true
+          },
+          {
+            "label": "Archive on HDD",
+            "color": "#818cf8",
+            "value": "Old data on cheap storage"
+          },
+          {
+            "label": "Isolation",
+            "color": "#f59e0b",
+            "value": "Separate I/O for different workloads"
+          },
+          {
+            "label": "Cloud reality",
+            "color": "#60a5fa",
+            "value": "Usually one volume — RDS uses managed storage"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Fillfactor and bloat",
+      "description": "Fillfactor reserves free space in each page for HOT (Heap-Only Tuple) updates. Lower fillfactor = less bloat on frequent updates.",
+      "code": "-- Default fillfactor: 100 for tables (leaves no free space)\n-- For indexes: 90 by default\n\n-- Set lower fillfactor for high-update tables\nCREATE TABLE sessions (\n  id BIGSERIAL PRIMARY KEY,\n  last_seen TIMESTAMPTZ,\n  data JSONB\n) WITH (fillfactor = 80);\n\n-- Existing table\nALTER TABLE sessions SET (fillfactor = 80);\nVACUUM FULL sessions;    -- rewrites with new fillfactor\n\n-- HOT updates: keep new row on same page → no index update needed!\n-- Prerequisite: updated columns are NOT indexed\n-- Fillfactor 80: 20% free space on each page → higher HOT update chance\n\n-- Check HOT update ratio\nSELECT relname, n_tup_upd, n_tup_hot_upd,\n       round(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 1) AS hot_pct\nFROM pg_stat_user_tables\nORDER BY n_tup_upd DESC;\n\n-- Bloat query (approximate)\nSELECT schemaname, tablename,\n  pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS size,\n  n_dead_tup\nFROM pg_stat_user_tables\nWHERE n_dead_tup > 1000\nORDER BY n_dead_tup DESC;",
+      "highlight": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Fillfactor benefit",
+        "items": [
+          {
+            "label": "Fillfactor 100 (default)",
+            "color": "#818cf8",
+            "value": "Max density, more bloat on updates"
+          },
+          {
+            "label": "Fillfactor 80",
+            "color": "#10b981",
+            "value": "20% free space → HOT updates possible",
+            "highlight": true
+          },
+          {
+            "label": "HOT update",
+            "color": "#f59e0b",
+            "value": "New row same page, no index churn"
+          },
+          {
+            "label": "Use case",
+            "color": "#60a5fa",
+            "value": "Sessions, counters — high update, no index on changed cols"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Storage compression and CLUSTER",
+      "description": "PostgreSQL 14+ supports LZ4 compression. CLUSTER reorders table by an index. Both improve read performance for specific access patterns.",
+      "code": "-- Compression per column (PG 14+)\nALTER TABLE events ALTER COLUMN payload SET COMPRESSION lz4;\nALTER TABLE events ALTER COLUMN payload SET COMPRESSION pglz;   -- default\n\n-- Show compression method\nSELECT attname, attcompression\nFROM pg_attribute\nWHERE attrelid = 'events'::regclass AND attnum > 0;\n\n-- CLUSTER: reorder rows on disk by index\nCREATE INDEX idx_orders_created_at ON orders (created_at);\nCLUSTER orders USING idx_orders_created_at;\n\n-- After CLUSTER: rows physically ordered by created_at\n-- Range queries on created_at → sequential I/O (fast!)\n\n-- Repeat clustering (not automatic, must re-run)\n-- ⚠️ Locks the table exclusive during CLUSTER\n\n-- pg_repack extension — cluster without exclusive lock!\nCREATE EXTENSION pg_repack;\n-- $ pg_repack -t orders -o created_at devmastery\n\n-- Reclaim space + optimize\nVACUUM FULL orders;           -- rewrites table, locks exclusive\nCLUSTER orders;               -- also rewrites, needs previous CLUSTER\npg_repack -t orders           -- online, uses trigger + swap",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "LZ4/pglz compress TOAST values",
+            "done": true
+          },
+          {
+            "label": "CLUSTER reorders table by index",
+            "done": true
+          },
+          {
+            "label": "Range scans → sequential I/O",
+            "active": true
+          },
+          {
+            "label": "pg_repack: cluster without exclusive lock"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

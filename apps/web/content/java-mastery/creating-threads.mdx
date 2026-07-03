@@ -1,0 +1,470 @@
+---
+slug: "creating-threads"
+title: "Creating Threads — Thread, Runnable, Callable, Future"
+level: 2
+---
+
+## WHY
+
+There are FIVE ways to run code on another thread in modern Java, and choosing the wrong one is a source of endless bugs and wasted resources:
+
+1. `extends Thread` — beginner tutorials only; couples business logic to a framework class.
+2. `implements Runnable` + `new Thread(r).start()` — the classic; no return value, no checked exceptions.
+3. `Callable<T>` + `ExecutorService.submit` — has a return value AND can throw checked exceptions.
+4. `CompletableFuture.supplyAsync(...)` — composable async pipelines (see its own topic).
+5. `Thread.startVirtualThread(...)` — Java 21+, millions of cheap threads.
+
+If you `new Thread()` inside a request handler, you have committed a "thread leak" — you'll create thousands of unmanaged threads under load. Knowing WHICH mechanism to reach for is the difference between a production system that scales and one that OOMs at 3 AM.
+
+## THEORY
+
+### Runnable vs Callable — the fundamental distinction
+
+| | `Runnable` | `Callable<V>` |
+|--|-----------|---------------|
+| Signature | `void run()` | `V call() throws Exception` |
+| Can return a value? | No | Yes |
+| Can throw checked exception? | No (must catch or wrap) | Yes |
+| Usable with `new Thread(...)`? | Yes | **No** — only via an `ExecutorService` |
+| Usable with `ExecutorService.submit`? | Yes | Yes |
+
+### The Future contract
+`ExecutorService.submit(callable)` returns a `Future<V>`. The Future is a handle to a result that MAY not exist yet.
+
+| Method | Meaning |
+|--------|---------|
+| `get()` | Block until done — return the value OR throw `ExecutionException` wrapping whatever `call()` threw |
+| `get(timeout, unit)` | Block up to timeout — throw `TimeoutException` if not done |
+| `isDone()` | Non-blocking check |
+| `cancel(mayInterrupt)` | Try to cancel. If `mayInterrupt=true`, interrupts the executing thread |
+
+### ThreadFactory — control naming, priority, daemon flag
+Never accept the default thread names (`pool-1-thread-1`, `pool-1-thread-2`). Every log line and every thread dump becomes unreadable. Provide a `ThreadFactory`:
+```java
+ThreadFactory tf = r -> {
+    Thread t = new Thread(r);
+    t.setName("payment-worker-" + counter.incrementAndGet());
+    t.setDaemon(false);
+    t.setUncaughtExceptionHandler((th, ex) -> log.error("Uncaught in {}", th.getName(), ex));
+    return t;
+};
+```
+
+### The trap: exceptions in `Runnable.run()`
+If a `Runnable` submitted via `Thread(runnable).start()` throws, the exception goes to the **UncaughtExceptionHandler** (default: prints stack to stderr and dies). If submitted via `executor.submit(runnable)`, the exception is **swallowed and stored in the Future** — you'll never see it unless you call `future.get()`. This is the #1 reason "why does my scheduled task silently stop after a week?" — an uncaught exception ate the run.
+
+### Never `new Thread()` in a request handler
+Every request spawns → OOM. Instead, inject a pre-sized `ExecutorService` and submit to it. Under load, the pool queues excess work rather than spawning unbounded threads.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "CreatingThreads.java",
+  "steps": [
+    {
+      "title": "Way 1 — extends Thread (avoid)",
+      "description": "Subclass Thread and override run(). Works, but couples your domain class to the framework and blocks single inheritance for anything else.",
+      "code": "class DownloadThread extends Thread {\n    @Override public void run() { fetch(url); }\n}\nnew DownloadThread().start();",
+      "highlight": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "extends Thread",
+        "items": [
+          {
+            "label": "Thread",
+            "value": "framework class"
+          },
+          {
+            "label": "DownloadThread",
+            "value": "your class",
+            "highlight": true
+          },
+          {
+            "label": ".start()",
+            "value": "→ new OS thread"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Way 2 — implements Runnable (idiomatic)",
+      "description": "A Runnable is any (void, no-args) function. Decoupled from Thread. Same class can be scheduled by ANY executor.",
+      "code": "Runnable r = () -> fetch(url);\nnew Thread(r, \"download-1\").start();",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Runnable = a lambda / class",
+        "items": [
+          {
+            "label": "Runnable",
+            "value": "void run()",
+            "highlight": true
+          },
+          {
+            "label": "new Thread(r)"
+          },
+          {
+            "label": ".start()",
+            "value": "→ new OS thread"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Way 3 — Callable<T> + Future<T>",
+      "description": "Callable can RETURN a value and throw checked exceptions — unlike Runnable. Submit to an ExecutorService; get a Future<T> handle.",
+      "code": "ExecutorService exec = Executors.newFixedThreadPool(4);\nFuture<Integer> f = exec.submit(() -> {\n    Thread.sleep(200);\n    return 6 * 7;\n});\nint result = f.get();   // blocks until done, returns 42",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "caller",
+          "ExecutorService",
+          "worker"
+        ],
+        "messages": [
+          {
+            "from": "caller",
+            "to": "ExecutorService",
+            "label": "submit(callable)"
+          },
+          {
+            "from": "ExecutorService",
+            "to": "worker",
+            "label": "run task"
+          },
+          {
+            "from": "worker",
+            "to": "ExecutorService",
+            "label": "return 42"
+          },
+          {
+            "from": "ExecutorService",
+            "to": "caller",
+            "label": "future.get() → 42"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Way 4 — ExecutorService (prod default)",
+      "description": "Reuses a fixed pool of threads. NEVER call `new Thread()` in a request handler — it uncaps concurrency and OOMs under load.",
+      "code": "ExecutorService pool = Executors.newFixedThreadPool(8);\nfor (Url url : urls) pool.submit(() -> fetch(url));\npool.shutdown();",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 6,
+        "workers": [
+          {
+            "name": "worker-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker-4",
+            "state": "WAITING",
+            "note": "idle"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T5",
+            "value": "fetch(url5)"
+          },
+          {
+            "label": "T6",
+            "value": "fetch(url6)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Way 5 — Virtual thread (Java 21+)",
+      "description": "Cheap. Millions per JVM. Use for I/O-bound blocking work. See the \"virtual-threads\" topic for full details.",
+      "code": "try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (Url url : urls) exec.submit(() -> fetch(url));\n}   // shuts down cleanly",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "vt-#31",
+            "state": "RUNNABLE",
+            "note": "virtual"
+          },
+          {
+            "name": "vt-#32",
+            "state": "RUNNABLE",
+            "note": "virtual"
+          },
+          {
+            "name": "vt-#33",
+            "state": "WAITING",
+            "note": "parked · cheap"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — The four classic ways side-by-side
+```java
+public class FourWays {
+    public static void main(String[] args) throws Exception {
+        // 1) extends Thread — DO NOT DO THIS IN REAL CODE
+        Thread t1 = new Thread() {
+            @Override public void run() { System.out.println("via extends Thread"); }
+        };
+        t1.start(); t1.join();
+
+        // 2) implements Runnable + new Thread
+        Runnable r = () -> System.out.println("via Runnable lambda");
+        Thread t2 = new Thread(r, "via-runnable");
+        t2.start(); t2.join();
+
+        // 3) Runnable + ExecutorService (better than #2)
+        java.util.concurrent.ExecutorService exec =
+                java.util.concurrent.Executors.newFixedThreadPool(2);
+        exec.submit(() -> System.out.println("via ExecutorService"));
+
+        // 4) Callable — has a return value
+        java.util.concurrent.Future<Integer> f =
+                exec.submit(() -> {
+                    Thread.sleep(200);
+                    return 6 * 7;
+                });
+        System.out.println("callable result = " + f.get());   // 42
+        exec.shutdown();
+    }
+}
+```
+
+### Level 2 — Runnable with proper naming & error handler
+```java
+public class NamedRunnable {
+    public static void main(String[] args) throws Exception {
+        Runnable job = () -> {
+            System.out.println(Thread.currentThread().getName() + " starting job");
+            if (Math.random() < 0.5) throw new RuntimeException("boom");
+            System.out.println(Thread.currentThread().getName() + " done");
+        };
+
+        Thread t = new Thread(job, "email-sender-1");
+        t.setUncaughtExceptionHandler((thread, ex) ->
+                System.err.println("[handler] " + thread.getName() + " died: " + ex.getMessage()));
+        t.start();
+        t.join();
+    }
+}
+```
+
+### Level 3 — Callable + Future + timeout + cancellation
+```java
+import java.util.concurrent.*;
+
+public class CallableDemo {
+    public static void main(String[] args) throws Exception {
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+
+        Callable<String> slowLookup = () -> {
+            for (int i = 0; i < 10; i++) {
+                if (Thread.currentThread().isInterrupted())
+                    throw new InterruptedException("cancelled at step " + i);
+                Thread.sleep(200);
+            }
+            return "USER_FOUND";
+        };
+
+        Future<String> future = exec.submit(slowLookup);
+
+        try {
+            // I only wait up to 500 ms — otherwise I'll cancel
+            String result = future.get(500, TimeUnit.MILLISECONDS);
+            System.out.println("got: " + result);
+        } catch (TimeoutException t) {
+            boolean cancelled = future.cancel(true);  // true = interrupt the worker
+            System.out.println("timed out — cancel attempted = " + cancelled);
+        }
+        exec.shutdown();
+    }
+}
+```
+
+### Level 4 — Named ThreadFactory for production
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class NamedFactory {
+    public static ThreadFactory named(String prefix) {
+        AtomicInteger idx = new AtomicInteger();
+        return runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName(prefix + "-" + idx.incrementAndGet());
+            t.setDaemon(false);
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    System.err.println("[" + th.getName() + "] uncaught: " + ex));
+            return t;
+        };
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService exec = Executors.newFixedThreadPool(3, named("report-worker"));
+        for (int i = 0; i < 5; i++) {
+            final int id = i;
+            exec.submit(() -> System.out.printf("[%s] running task %d%n",
+                    Thread.currentThread().getName(), id));
+        }
+        exec.shutdown();
+        exec.awaitTermination(2, TimeUnit.SECONDS);
+        // Thread names in logs are now: report-worker-1, report-worker-2, report-worker-3
+    }
+}
+```
+
+### Level 5 — The uncaught-exception silent-swallow trap (and the fix)
+```java
+import java.util.concurrent.*;
+
+public class SilentSwallowFix {
+    public static void main(String[] args) throws Exception {
+        ExecutorService exec = Executors.newSingleThreadScheduledExecutor();
+
+        // BAD: exception disappears into a Future nobody reads
+        exec.submit(() -> { throw new RuntimeException("silent"); });
+
+        // GOOD Option A: wrap the Runnable
+        exec.submit(wrap(() -> { throw new RuntimeException("logged option A"); }));
+
+        // GOOD Option B: check the Future
+        Future<?> f = exec.submit(() -> { throw new RuntimeException("logged option B"); });
+        try { f.get(); }
+        catch (ExecutionException e) {
+            System.err.println("caught via future: " + e.getCause().getMessage());
+        }
+
+        exec.shutdown();
+    }
+
+    static Runnable wrap(Runnable r) {
+        return () -> {
+            try { r.run(); }
+            catch (Throwable t) { System.err.println("wrap caught: " + t.getMessage()); }
+        };
+    }
+}
+```
+
+## REAL_WORLD
+
+**Order-processing pipeline in a Spring Boot service** — three distinct executors, each with a named factory and bounded queue, isolate failure domains:
+
+```java
+@Configuration
+public class ExecutorsConfig {
+
+    @Bean("fastIoExecutor")           // Small, quick calls (Redis, S3 uploads)
+    public ExecutorService fastIo() {
+        return new ThreadPoolExecutor(
+                10, 20, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(200),
+                named("fast-io"),
+                new ThreadPoolExecutor.CallerRunsPolicy());   // back-pressure
+    }
+
+    @Bean("reportExecutor")          // Slow CPU-heavy PDF generation
+    public ExecutorService reports() {
+        return new ThreadPoolExecutor(
+                2, 4, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(50),
+                named("report"),
+                new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    @Bean("outboundExecutor")        // Third-party API calls (may hang)
+    public ExecutorService outbound() {
+        return new ThreadPoolExecutor(
+                50, 50, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(1000),
+                named("outbound"),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+}
+```
+The controller then does `outboundExecutor.submit(() -> shippingApi.call(order))` instead of `new Thread(...)`. If the shipping API hangs, at most 50 threads pile up, and further requests queue rather than spawning boundless threads.
+
+## INTERVIEW
+
+**Q: What's the difference between `Runnable` and `Callable`?**
+A: `Runnable.run()` returns `void` and cannot throw checked exceptions. `Callable<V>.call()` returns a value of type `V` and can throw any checked exception. `Runnable` works with `new Thread(...)`; `Callable` only works via an `ExecutorService`.
+
+**Q: If I do `new Thread(callable).start()`, does it compile?**
+A: No. The `Thread` constructor only accepts `Runnable`. You must go through `ExecutorService.submit(callable)`, which returns a `Future<V>`.
+
+**Q: How do I return a value from a thread?**
+A: (a) Wrap a mutable holder (`AtomicReference`) and update it from inside the Runnable — the caller polls or joins. (b) Use `Callable` + `ExecutorService.submit` — the caller calls `future.get()`. Option (b) is idiomatic.
+
+**Q: My scheduled task stops running silently after a few days. Why?**
+A: A `Runnable` submitted to `ScheduledExecutorService` that throws an uncaught exception will cause the scheduler to STOP scheduling further executions of that task, with no log message. Wrap the Runnable in a try/catch that logs, or call `future.get()` to observe the error.
+
+**Q: When should I extend `Thread` vs implement `Runnable`?**
+A: Almost never extend `Thread`. It couples your business logic to a framework class and blocks single-inheritance for domain modeling. Use `Runnable` (or `Callable`) so the same class can be scheduled, unit-tested standalone, or repurposed in any executor.
+
+**Q: What does `ExecutorService.submit(runnable)` return?**
+A: A `Future<?>` whose `get()` returns `null` on success — but throws `ExecutionException(cause)` if the Runnable threw. Always call `get()` or wrap the Runnable in a logging try/catch to avoid silent swallowed exceptions.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> `Runnable` is like saying "please go to the store" — the person walks off, does the job, and you don't expect them to bring anything back. `Callable` is "please go to the store AND bring me the receipt" — they promise you a receipt when they return, and if they get robbed on the way they'll tell you about it too. The `Future` is the little ticket you got when you asked, which you can trade in later for the receipt (or hear the bad news). Nobody would ever hire a runner directly ("new Thread") when a delivery agency ("ExecutorService") can keep the same runners reused and disciplined.
+
+## BUILD
+
+Build a **web-page fetcher**:
+1. Given a `List<URL>`, return a `Map<URL, String>` (page content).
+2. Use `Executors.newFixedThreadPool(8, namedFactory("http-fetch"))`.
+3. Submit each URL as a `Callable<Map.Entry<URL,String>>` → collect `Future`s.
+4. Iterate the Futures; use `get(3, TimeUnit.SECONDS)` per URL — on timeout, call `future.cancel(true)`.
+5. `shutdown()` and `awaitTermination()` cleanly.
+6. **Bonus**: replace step 4 with `ExecutorCompletionService` so you process results in the order they arrive, not the order you submitted.
+
+## SPACED REVIEW
+
+**Day 1**: Write the two-line definitions of `Runnable` vs `Callable`.
+**Day 3**: Given `future.get()`, list every exception it can throw and what triggers each.
+**Day 7**: Show the smallest possible program that PROVES a `Runnable` throwing an exception inside `ExecutorService.submit` is silently swallowed unless the `Future` is read.
+**Day 14**: Explain why "extends Thread" is considered a code smell in modern Java.
+

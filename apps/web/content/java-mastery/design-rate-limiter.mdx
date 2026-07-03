@@ -82,9 +82,168 @@ This exceeds the intended 100 requests/min limit!
 **Reality:** Naive `if (count > N)` has three production problems: (1) **race conditions** — two threads can both pass the check before either increments the counter, allowing N+1 requests through; (2) **clock-skew issues** in distributed systems — the "current window" depends on each server's clock; (3) **persistence challenges** — counters must survive restarts and be shared across instances. Production rate limiters use atomic operations (`Redis INCR` or Java `AtomicLong.incrementAndGet()`), time-bucketed keys with TTLs, and distributed consensus on the time window boundaries.
 
 ## VISUALIZATION_CONFIG
-
 ```json
-{ "component": "SequenceDiagram", "state": "java-mastery-design-rate-limiter" }
+{
+  "language": "java",
+  "fileName": "RateLimiter.java",
+  "steps": [
+    {
+      "title": "Why rate limiting?",
+      "description": "Without rate limiting, a single misbehaving client, bot, or DDOS attack can exhaust your resources and degrade service for all users.",
+      "code": "// Rate limit: 100 requests per user per minute\n// Without it: one client can make 10,000 req/s → your server crashes\n// With it: client gets 429 Too Many Requests after limit exceeded",
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "request arrives",
+            "done": true
+          },
+          {
+            "label": "check: has this user exceeded their quota?",
+            "active": true
+          },
+          {
+            "label": "NO → process request normally"
+          },
+          {
+            "label": "YES → 429 Too Many Requests"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Token bucket algorithm",
+      "description": "A bucket holds N tokens. Each request consumes 1 token. Tokens replenish at R/sec. Allows burst up to N, sustained rate R.",
+      "code": "class TokenBucket {\n    private final long capacity, refillRate;\n    private long tokens;\n    private long lastRefill = System.currentTimeMillis();\n\n    synchronized boolean tryConsume() {\n        long now = System.currentTimeMillis();\n        tokens = Math.min(capacity, tokens + (now - lastRefill) * refillRate / 1000);\n        lastRefill = now;\n        if (tokens < 1) return false;\n        tokens--; return true;\n    }\n}",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Token bucket",
+        "items": [
+          {
+            "label": "capacity (burst)",
+            "color": "#818cf8"
+          },
+          {
+            "label": "current tokens",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "refill: R/sec",
+            "color": "#818cf8"
+          },
+          {
+            "label": "request: consume 1 token",
+            "color": "#f59e0b"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Sliding window counter in Redis",
+      "description": "For distributed rate limiting: store a sorted set in Redis with timestamps. Count requests in the last window.",
+      "code": "// Redis sorted set per user key\n// Add: ZADD user:alice:reqs <timestamp> <timestamp>\n// Count: ZCOUNT user:alice:reqs <now-60s> <now>\n// Trim old entries: ZREMRANGEBYSCORE user:alice:reqs 0 <now-60s>\n// If count > limit: reject",
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "API",
+          "RateLimiter",
+          "Redis"
+        ],
+        "messages": [
+          {
+            "from": "API",
+            "to": "RateLimiter",
+            "label": "check(userId)"
+          },
+          {
+            "from": "RateLimiter",
+            "to": "Redis",
+            "label": "ZADD + ZCOUNT + ZREMRANGE"
+          },
+          {
+            "from": "Redis",
+            "to": "RateLimiter",
+            "label": "count = 47"
+          },
+          {
+            "from": "RateLimiter",
+            "to": "API",
+            "label": "47 < 100 → ALLOW"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Leaky bucket — smooth output",
+      "description": "Requests queue up; the bucket leaks at a constant rate. Caps burst. Unlike token bucket, output is always smooth.",
+      "code": "// Leaky bucket: output rate = constant R\n// Requests enter at any rate → queue\n// Processor drains queue at R per second\n// Queue full → reject (burst protection)\nnew ThreadPoolExecutor(\n    1, 1, 0, SECONDS,\n    new LinkedBlockingQueue<>(100),  // leaky bucket = bounded queue\n    new ThreadPoolExecutor.DiscardPolicy());",
+      "highlight": [
+        5,
+        6,
+        7,
+        8
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Leaky bucket",
+        "items": [
+          {
+            "label": "requests (variable)",
+            "color": "#818cf8"
+          },
+          {
+            "label": "queue (bounded)",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "output: constant R",
+            "color": "#10b981"
+          },
+          {
+            "label": "queue full → drop",
+            "color": "#ef4444"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Spring + Resilience4j rate limiter",
+      "description": "Production-ready rate limiter with Resilience4j: request-level limits with fallback behaviour.",
+      "code": "@RateLimiter(name=\"searchApi\", fallbackMethod=\"fallbackSearch\")\npublic List<Product> search(String q) {\n    return externalSearchService.query(q);\n}\npublic List<Product> fallbackSearch(String q, RequestNotPermitted ex) {\n    return cachedResults.get(q);   // serve stale cached results\n}",
+      "highlight": [
+        1,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "@RateLimiter checks permit",
+            "done": true
+          },
+          {
+            "label": "permit available → call search()",
+            "done": true
+          },
+          {
+            "label": "RequestNotPermitted → fallbackSearch()",
+            "active": true
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

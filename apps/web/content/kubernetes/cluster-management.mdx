@@ -16,7 +16,419 @@ A Kubernetes cluster requires ongoing maintenance: node upgrades, cluster upgrad
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "cluster-management" }
+{
+  "language": "bash",
+  "fileName": "cluster-ops.sh",
+  "steps": [
+    {
+      "title": "Cluster upgrade strategy",
+      "description": "Skew rules: kubelet ≤ apiserver. Upgrade control plane first, then nodes. Managed K8s handles this — self-hosted, use kubeadm/eksctl/etc.",
+      "code": "# Version skew (K8s rules):\n# - kubelet: N-3 (can be 3 versions behind apiserver)\n# - kube-proxy: same as kubelet\n# - controller-manager, scheduler: same as apiserver\n# - kubectl: N-1 or N+1 of apiserver\n\n# Rule: NEVER downgrade\n# Only upgrade forward — one minor version at a time\n# 1.28 → 1.29 → 1.30 (not 1.28 → 1.30)\n\n# Upgrade order:\n# 1. Read release notes (deprecations!)\n# 2. Backup: etcd snapshot, cluster manifest export\n# 3. Upgrade control plane (one node at a time)\n# 4. Upgrade node pools (one at a time)\n# 5. Verify workloads\n\n# EKS example\n$ aws eks update-cluster-version \\\n    --name devmastery \\\n    --kubernetes-version 1.30\n\n# Wait for control plane update...\n\n# Update node groups (rolling)\n$ aws eks update-nodegroup-version \\\n    --cluster-name devmastery \\\n    --nodegroup-name workers \\\n    --force-upgrade\n\n# GKE\n$ gcloud container clusters upgrade devmastery --master --cluster-version=1.30\n$ gcloud container clusters upgrade devmastery --node-pool=default-pool --cluster-version=1.30\n\n# kubeadm (self-hosted)\n# On control plane 1:\n$ kubeadm upgrade plan\n$ kubeadm upgrade apply v1.30.0\n$ kubectl drain cp-1 --ignore-daemonsets\n$ apt install kubelet=1.30.0-* kubectl=1.30.0-*\n$ systemctl restart kubelet\n$ kubectl uncordon cp-1\n\n# On other control planes:\n$ kubeadm upgrade node\n$ apt install kubelet=1.30.0-*\n$ systemctl restart kubelet\n\n# On workers (one at a time):\n$ kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data\n$ apt install kubelet=1.30.0-*\n$ systemctl restart kubelet\n$ kubectl uncordon worker-1\n\n# Pre-upgrade checklist:\n# ✅ CRDs support new version (removed APIs?)\n# ✅ Deprecated APIs migrated (pluto tool checks)\n# ✅ PDBs in place (don't stop drains)\n# ✅ Add-ons compatible (ingress-nginx, cert-manager, CNI)\n# ✅ Application health probes correct\n# ✅ Non-prod cluster upgraded first + soaked",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        25,
+        26,
+        27,
+        28,
+        29,
+        32,
+        33,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        45,
+        46,
+        47,
+        48,
+        50,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Read release notes + backup",
+            "done": true
+          },
+          {
+            "label": "Upgrade control plane first",
+            "done": true
+          },
+          {
+            "label": "Rolling node upgrade (drain each)",
+            "active": true
+          },
+          {
+            "label": "Verify workloads before continuing"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Backup and disaster recovery",
+      "description": "etcd backups (self-hosted). Velero for cluster-wide backup (manifests + PVs). Test restores!",
+      "code": "# etcd backup (self-hosted)\n# Run periodically from control plane\nETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%F).db \\\n    --endpoints=https://127.0.0.1:2379 \\\n    --cacert=/etc/kubernetes/pki/etcd/ca.crt \\\n    --cert=/etc/kubernetes/pki/etcd/server.crt \\\n    --key=/etc/kubernetes/pki/etcd/server.key\n\n# Ship to S3 daily via cron\n0 2 * * * /usr/local/bin/backup-etcd.sh && aws s3 cp /backup/etcd-*.db s3://k8s-backups/etcd/\n\n# etcd restore (fresh cluster)\netcdctl snapshot restore /backup/etcd-2026-07-01.db \\\n    --data-dir=/var/lib/etcd-new\n\n# For managed K8s (EKS, GKE, AKS): etcd is managed for you\n# But YOUR YAML is not — that's where Velero or GitOps helps\n\n# Velero — cluster-wide backup\n$ velero install \\\n    --provider aws \\\n    --plugins velero/velero-plugin-for-aws:v1.9.0 \\\n    --bucket k8s-backups \\\n    --secret-file ./aws-credentials \\\n    --backup-location-config region=us-east-1 \\\n    --snapshot-location-config region=us-east-1\n\n# Backup everything\n$ velero backup create nightly-full --ttl 720h\n\n# Namespace-scoped\n$ velero backup create api-prod --include-namespaces api-prod\n\n# Scheduled\n$ velero schedule create nightly --schedule=\"0 2 * * *\" --ttl 168h\n\n# Backup includes:\n# - K8s manifests (all namespaced + cluster resources)\n# - PersistentVolume snapshots (via CSI)\n# - Optional: pod filesystem via Restic/Kopia (for RWX volumes)\n\n# Restore\n$ velero restore create --from-backup nightly-full\n$ velero restore create restore-api --from-backup api-prod-2026-07-01\n\n# GitOps as backup:\n# If everything is in git → cluster is disposable\n# Recovery: create new cluster + point ArgoCD at git → done in ~15 min\n# Data still needs Velero + PV snapshots\n\n# DR strategy:\n# 1. Cluster-configs in git (GitOps)\n# 2. Velero daily backup → S3 cross-region\n# 3. Cross-region PV replication (or async DB replica)\n# 4. Quarterly DR drills",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        13,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        32,
+        33,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        53,
+        54,
+        55,
+        56,
+        57
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Backup layers",
+        "items": [
+          {
+            "label": "GitOps repo",
+            "color": "#10b981",
+            "value": "Manifests = source of truth",
+            "highlight": true
+          },
+          {
+            "label": "Velero",
+            "color": "#818cf8",
+            "value": "K8s objects + PV snapshots"
+          },
+          {
+            "label": "etcd snapshot (self-hosted)",
+            "color": "#f59e0b",
+            "value": "Managed handles for you"
+          },
+          {
+            "label": "Quarterly DR drill",
+            "color": "#ef4444",
+            "value": "Untested = not a backup"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Multi-cluster patterns",
+      "description": "Cluster per env, cluster per region, or federated. Tools: ArgoCD (multi-cluster), Karmada, Cluster API.",
+      "code": "# When to have multiple clusters:\n# ✅ Blast radius (prod vs dev separation)\n# ✅ Region proximity (users in EU + US)\n# ✅ Compliance (data residency)\n# ✅ Team autonomy at scale\n# ✅ Version testing (canary cluster)\n\n# Common patterns:\n\n# 1. Environment per cluster\n# dev-cluster, staging-cluster, prod-cluster\n\n# 2. Region per cluster\n# prod-us-east, prod-eu-west, prod-ap-south\n# → global load balancer (Cloudflare, GLB, Route53 latency)\n\n# 3. Cell-based (multi-tenant SaaS)\n# cell-1 (customers A-M), cell-2 (customers N-Z)\n\n# 4. Cluster fleet\n# Many small clusters vs few big ones\n# Tradeoffs: isolation vs mgmt overhead\n\n# Tools:\n\n# ArgoCD multi-cluster\n$ argocd cluster add prod-eu-west --name eu-west\n$ argocd cluster add prod-us-east --name us-east\n\napiVersion: argoproj.io/v1alpha1\nkind: ApplicationSet\nspec:\n  generators:\n    - clusters:\n        selector:\n          matchLabels: { env: prod }\n  template:\n    metadata: { name: \"api-{{name}}\" }\n    spec:\n      destination:\n        server: \"{{server}}\"\n\n# Cluster API — declarative cluster lifecycle\napiVersion: cluster.x-k8s.io/v1beta1\nkind: Cluster\nmetadata: { name: prod-eu-west }\nspec:\n  clusterNetwork:\n    pods: { cidrBlocks: [10.100.0.0/16] }\n  infrastructureRef:\n    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\n    kind: AWSCluster\n    name: prod-eu-west\n\n# Karmada — cross-cluster scheduling\n# Karmada = \"K8s of K8s\" — schedules workloads across clusters\n\n# Service discovery across clusters:\n# - Submariner (network mesh between clusters)\n# - Istio multi-cluster\n# - External DNS + Global LB\n# - Consul federation\n\n# Cost considerations:\n# - Each cluster = 3+ control plane nodes (managed = ~$70/mo each)\n# - Cross-region data transfer costs\n# - Duplicate infra (Prometheus, ingress, etc.)",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        63,
+        64,
+        65,
+        66
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Multi-cluster reasons",
+        "items": [
+          {
+            "label": "Blast radius",
+            "color": "#10b981",
+            "value": "Prod vs non-prod isolation",
+            "highlight": true
+          },
+          {
+            "label": "Region proximity",
+            "color": "#818cf8",
+            "value": "Latency for global users"
+          },
+          {
+            "label": "Compliance",
+            "color": "#f59e0b",
+            "value": "Data residency requirements"
+          },
+          {
+            "label": "Federation tools",
+            "color": "#60a5fa",
+            "value": "ArgoCD, Karmada, Cluster API"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cluster costs and optimization",
+      "description": "Right-size nodes, spot instances, autoscaling, image cleanup, orphaned resources. Kubecost/OpenCost show breakdown.",
+      "code": "# Where cluster money goes:\n# 1. Node compute (usually biggest)\n# 2. LoadBalancers (each = $16-25/mo AWS NLB, more for ALB)\n# 3. Storage (PVCs, snapshots)\n# 4. Data transfer (cross-AZ, egress)\n# 5. Managed control plane ($70-150/mo)\n\n# Optimization strategies:\n\n# 1. Right-size requests/limits\n# Use VPA recommendations, kubectl top over time\n# Over-provisioning = wasted spend\n\n# 2. Use spot/preemptible instances\n# 60-90% discount vs on-demand\n# Great for: batch, stateless replicas, dev/staging\n# Use Karpenter for smart mix + fallback\n\n# 3. Cluster autoscaler / Karpenter\n# Scale down at night (dev clusters)\n# Consolidate underused nodes\n\n# 4. Bin-packing: pack pods efficiently\n# ARM (Graviton, Ampere) — 20-40% cheaper\n\n# 5. Ingress consolidation\n# One Ingress → many services (vs LoadBalancer per service)\n\n# 6. Delete unused resources\n$ kubectl get pvc -A | grep -v Bound      # orphaned PVCs\n$ kubectl get svc -A --field-selector spec.type=LoadBalancer\n$ kubectl get pods -A --field-selector status.phase=Failed\n\n# 7. Image cleanup on nodes\n# imageGC handles this (kubelet)\n# But: run node janitor if disk fills\n\n# 8. Log/metric retention\n# Prometheus 30d → S3 cold storage\n# Loki: label carefully, don't over-index\n\n# 9. Data transfer\n# Cross-AZ: ~$0.01/GB\n# Cross-region: ~$0.02/GB\n# Internet egress: ~$0.09/GB\n# → keep chatty services in same AZ; use CDN\n\n# 10. Right cluster count\n# Consolidate small clusters if fleet cost > isolation value\n\n# Tools:\n# Kubecost — namespace-level cost + savings recommendations\n# OpenCost — open-source (CNCF)\n# Cast.ai — auto-optimize node pools\n# StormForge — right-size via ML\n\n$ helm install kubecost oci://public.ecr.aws/kubecost/cost-analyzer -n kubecost\n\n# Common wins:\n# - Move dev to spot: -70%\n# - Right-size prod: -30%\n# - Consolidate LBs via Ingress: -$500/mo per 30 removed LBs\n# - Migrate to ARM: -20% node cost",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39,
+        41,
+        42,
+        43,
+        44,
+        45,
+        47,
+        48,
+        49,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Cost levers",
+        "items": [
+          {
+            "label": "Spot / preemptible",
+            "color": "#10b981",
+            "value": "60-90% cheaper",
+            "highlight": true
+          },
+          {
+            "label": "Right-size requests",
+            "color": "#818cf8",
+            "value": "VPA recommendations"
+          },
+          {
+            "label": "Ingress consolidation",
+            "color": "#f59e0b",
+            "value": "Kill per-service LBs"
+          },
+          {
+            "label": "Kubecost / OpenCost",
+            "color": "#60a5fa",
+            "value": "See where money goes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cluster hygiene checklist",
+      "description": "Regular tasks: cert rotation, upgrade, cleanup, RBAC review, security scan. Keep the cluster healthy.",
+      "code": "# Weekly / monthly hygiene\n\n# ✅ Certificate rotation (self-hosted)\n$ kubeadm certs check-expiration\n$ kubeadm certs renew all\n# Managed K8s handles this automatically\n\n# ✅ Node maintenance\n$ kubectl cordon worker-1                          # mark unschedulable\n$ kubectl drain worker-1 --ignore-daemonsets       # move pods off\n# ... apply OS patches, reboot ...\n$ kubectl uncordon worker-1\n\n# ✅ Delete orphaned resources\n$ kubectl get pv | grep Released                    # unbound PVs\n$ kubectl get replicasets -A | awk '$3==0 {print}'  # empty RS\n$ kubectl get evicted -A                            # evicted pods\n\n# One-liner: delete evicted pods\n$ kubectl get pods -A -o json | jq -r '.items[] | select(.status.reason==\"Evicted\") | \"\\(.metadata.namespace) \\(.metadata.name)\"' | xargs -n2 kubectl delete pod -n\n\n# ✅ Review RBAC\n$ kubectl get clusterrolebindings -o json | \\\n    jq -r '.items[] | select(.roleRef.name==\"cluster-admin\") | .subjects[].name'\n\n# ✅ Update add-ons\n# ingress-nginx, cert-manager, ArgoCD, Prometheus\n$ helm repo update\n$ helm upgrade ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx\n\n# ✅ Security scans\n$ kube-bench run                                    # CIS benchmark\n$ kubescape scan --format json > scan.json\n$ trivy k8s --report summary cluster\n\n# ✅ Cleanup images on nodes\n# kubelet imageGC handles most cases automatically\n# For stubborn issues: crictl rmi --prune (each node)\n\n# ✅ Check for deprecated APIs before K8s upgrade\n$ pluto detect-all-in-cluster --target-versions k8s=v1.30\n\n# ✅ Backup verification\n$ velero backup describe nightly-full\n$ velero restore create test-restore --from-backup nightly-full --namespace-mappings api-prod:test-restore\n# Then verify data\n\n# ✅ Monitor cluster metrics\n$ kubectl top nodes\n$ kubectl top pods --sort-by=memory\n$ kubectl get events --sort-by=.metadata.creationTimestamp | tail -30\n\n# Recommended automation:\n# - GitOps for all cluster config\n# - Renovate/Dependabot for image + Helm bumps\n# - Kube-hunter, Trivy in CI + cron\n# - Backup verification via CronJob (restore to test NS)\n# - Alerts on: node pressure, cert expiry < 30d, deprecated APIs",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Cluster ops rhythm",
+        "items": [
+          {
+            "label": "Weekly upgrades",
+            "color": "#10b981",
+            "value": "add-ons + patch",
+            "highlight": true
+          },
+          {
+            "label": "Monthly RBAC review",
+            "color": "#818cf8",
+            "value": "Prune stale access"
+          },
+          {
+            "label": "Quarterly DR drill",
+            "color": "#f59e0b",
+            "value": "Restore test"
+          },
+          {
+            "label": "Continuous scan",
+            "color": "#60a5fa",
+            "value": "kube-bench, trivy"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

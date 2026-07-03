@@ -22,7 +22,345 @@ Docker can periodically run a test command inside the container. If the test fai
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "docker-production" }
+{
+  "language": "yaml",
+  "fileName": "production.yml",
+  "steps": [
+    {
+      "title": "Production Docker checklist",
+      "description": "Small image, non-root user, healthcheck, resource limits, restart policy, log rotation, secure secrets, image signing.",
+      "code": "# Production Dockerfile checklist:\nFROM node:18-alpine   # ✅ pinned, small\n\n# ✅ Non-root user\nRUN addgroup -S app && adduser -S -G app app\nWORKDIR /app\n\n# ✅ Copy with ownership\nCOPY --chown=app:app package*.json ./\nRUN npm ci --only=production && npm cache clean --force\nCOPY --chown=app:app . .\n\nUSER app\n\n# ✅ Health check\nHEALTHCHECK --interval=30s --timeout=3s --retries=3 \\\n  CMD wget -qO- http://localhost:3000/health || exit 1\n\nEXPOSE 3000\nCMD [\"node\", \"server.js\"]\n\n# ✅ Production run\n$ docker run -d \\\n    --name api \\\n    --restart=unless-stopped \\\n    --memory 512m --cpus 1.0 \\\n    --pids-limit 100 \\\n    --read-only \\\n    --tmpfs /tmp \\\n    --cap-drop=ALL \\\n    --security-opt no-new-privileges \\\n    --log-driver=json-file \\\n    --log-opt max-size=10m --log-opt max-file=3 \\\n    -p 3000:3000 \\\n    myapp:v1.2.3\n\n# Production compose deploy config\nservices:\n  api:\n    image: myregistry/api:${TAG}\n    deploy:\n      replicas: 3\n      restart_policy: { condition: on-failure, max_attempts: 5 }\n      resources: { limits: { cpus: \"1\", memory: 512M } }\n      update_config: { parallelism: 1, delay: 30s }",
+      "highlight": [
+        2,
+        4,
+        5,
+        7,
+        8,
+        10,
+        12,
+        14,
+        15,
+        16,
+        19,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Production essentials",
+        "items": [
+          {
+            "label": "Immutable tags",
+            "color": "#10b981",
+            "value": "v1.2.3 or SHA — never :latest",
+            "highlight": true
+          },
+          {
+            "label": "Non-root + read-only FS",
+            "color": "#818cf8",
+            "value": "Defense in depth"
+          },
+          {
+            "label": "Resource limits",
+            "color": "#f59e0b",
+            "value": "Prevent noisy neighbors"
+          },
+          {
+            "label": "Health check + restart",
+            "color": "#60a5fa",
+            "value": "Auto-recovery"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Zero-downtime deploys",
+      "description": "Rolling updates: replace instances one at a time. Blue-green: two environments, switch traffic. Canary: gradual rollout.",
+      "code": "# Rolling update (Swarm/K8s)\n# 1. Start new version instance\n# 2. Wait for healthy\n# 3. Stop old instance\n# 4. Repeat for each replica\n\n# Swarm rolling update\n$ docker service update \\\n    --image myapp:v2 \\\n    --update-parallelism 1 \\\n    --update-delay 30s \\\n    --update-order start-first \\\n    --update-failure-action rollback \\\n    api\n\n# K8s rolling update (default)\napiVersion: apps/v1\nkind: Deployment\nspec:\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1        # 1 extra during update\n      maxUnavailable: 0   # never drop below desired count\n\n# Blue-green (two full environments)\n# Blue = current, Green = new\n# Point LB at green, keep blue for instant rollback\n\n# Canary (gradual traffic shift)\n# 5% of users get new version → 25% → 100%\n# Roll back if metrics degrade\n\n# Feature flags — decouple deploy from release\n// Deploy new code (feature flag OFF)\n// Enable feature for 1% of users\n// Watch metrics\n// Ramp to 10%, 50%, 100%\nif (featureFlag.isEnabled(\"new-checkout\", userId)) {\n  return newCheckoutFlow();\n}",
+      "highlight": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Deploy strategies",
+        "items": [
+          {
+            "label": "Rolling update",
+            "color": "#10b981",
+            "value": "Replace one at a time — most common",
+            "highlight": true
+          },
+          {
+            "label": "Blue-green",
+            "color": "#818cf8",
+            "value": "Two envs, instant switch"
+          },
+          {
+            "label": "Canary",
+            "color": "#f59e0b",
+            "value": "Gradual traffic shift"
+          },
+          {
+            "label": "Feature flags",
+            "color": "#60a5fa",
+            "value": "Decouple deploy from release"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Graceful shutdown",
+      "description": "App must handle SIGTERM — finish in-flight requests, close DB connections, drain queues. K8s/Swarm sends SIGTERM before force-killing.",
+      "code": "# Docker/K8s shutdown sequence:\n# 1. SIGTERM sent to PID 1\n# 2. Wait for grace period (default 10s Docker, 30s K8s)\n# 3. SIGKILL if still running\n\n# Node.js graceful shutdown\nlet server;\nconst shutdown = async () => {\n  console.log(\"SIGTERM received, closing server...\");\n\n  // Stop accepting new connections\n  server.close(() => {\n    console.log(\"HTTP server closed\");\n  });\n\n  // Finish in-flight requests (existing connections)\n  await new Promise(r => setTimeout(r, 5000));\n\n  // Close DB pool\n  await db.end();\n\n  // Close Redis\n  await redis.quit();\n\n  console.log(\"Bye!\");\n  process.exit(0);\n};\n\nprocess.on(\"SIGTERM\", shutdown);\nprocess.on(\"SIGINT\", shutdown);\n\nserver = app.listen(3000);\n\n# Increase Docker grace period if needed\n$ docker stop --time=30 api\n\n# K8s: terminationGracePeriodSeconds\nspec:\n  terminationGracePeriodSeconds: 60\n  containers:\n    - name: api\n      lifecycle:\n        preStop:\n          exec: { command: [\"sleep\", \"10\"] }    # give LB time to remove pod",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        25,
+        26,
+        28,
+        29,
+        31,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Docker",
+          "App",
+          "Clients",
+          "DB"
+        ],
+        "messages": [
+          {
+            "from": "Docker",
+            "to": "App",
+            "label": "SIGTERM"
+          },
+          {
+            "from": "App",
+            "to": "App",
+            "label": "server.close() — stop accepting"
+          },
+          {
+            "from": "Clients",
+            "to": "App",
+            "label": "existing requests finish"
+          },
+          {
+            "from": "App",
+            "to": "DB",
+            "label": "close pool"
+          },
+          {
+            "from": "App",
+            "to": "Docker",
+            "label": "exit 0"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Backup and disaster recovery",
+      "description": "Backup volumes, database dumps, and images. Test restores regularly. Multi-region for critical services.",
+      "code": "# Database backup (native tool)\n$ docker exec db pg_dump -Fc -U postgres devmastery > /backups/$(date +%F).dump\n\n# Automate with cron\n0 3 * * * /scripts/backup-db.sh\n\n# backup-db.sh\n#!/bin/bash\nBACKUP_DIR=/backups\nDATE=$(date +%F)\ndocker exec db pg_dump -Fc -U postgres devmastery | \\\n  gzip > $BACKUP_DIR/db-$DATE.dump.gz\n\n# Upload to S3\naws s3 cp $BACKUP_DIR/db-$DATE.dump.gz s3://backups/db/\n\n# Rotate: delete older than 30 days locally\nfind $BACKUP_DIR -name \"db-*.dump.gz\" -mtime +30 -delete\n\n# S3 lifecycle: move to Glacier after 30d, delete after 1y\n\n# Test restore (monthly!)\n$ docker exec -i db psql -U postgres postgres -c \"DROP DATABASE devmastery_test\"\n$ docker exec -i db psql -U postgres postgres -c \"CREATE DATABASE devmastery_test\"\n$ gunzip -c backup.dump.gz | docker exec -i db pg_restore -U postgres -d devmastery_test\n\n# Multi-region setup\n# Primary: us-east-1\n# Replica: eu-west-1 (streaming replication)\n# Backups: cross-region S3\n\n# RPO/RTO targets\n# RPO (Recovery Point Objective): 1 hour data loss max\n# RTO (Recovery Time Objective): 30 min to restore\n\n# → Continuous WAL archiving + hourly base backup\n# → Snapshot standby ready to promote",
+      "highlight": [
+        2,
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        15,
+        18,
+        20,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Daily automated DB dumps",
+            "done": true
+          },
+          {
+            "label": "Upload to S3 (versioned bucket)",
+            "done": true
+          },
+          {
+            "label": "Monthly restore test",
+            "active": true
+          },
+          {
+            "label": "Cross-region replica for DR"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Migration from Docker to Kubernetes",
+      "description": "Compose → K8s manifests. Use Kompose or write manually. Learn one concept at a time: Deployment, Service, ConfigMap, Secret.",
+      "code": "# 1. Convert with Kompose\n$ kompose convert -f docker-compose.yml\nINFO Kubernetes file \"api-deployment.yaml\" created\nINFO Kubernetes file \"api-service.yaml\" created\n\n# 2. Or write manually\n# api-deployment.yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata: { name: api }\nspec:\n  replicas: 3\n  selector: { matchLabels: { app: api } }\n  template:\n    metadata: { labels: { app: api } }\n    spec:\n      containers:\n        - name: api\n          image: myregistry/api:v1.2.3\n          ports: [{ containerPort: 3000 }]\n          resources:\n            limits: { memory: \"512Mi\", cpu: \"1\" }\n          env:\n            - name: DATABASE_URL\n              valueFrom:\n                secretKeyRef: { name: db-url, key: url }\n          livenessProbe:\n            httpGet: { path: /health, port: 3000 }\n            initialDelaySeconds: 30\n\n# api-service.yaml\napiVersion: v1\nkind: Service\nmetadata: { name: api }\nspec:\n  selector: { app: api }\n  ports:\n    - port: 80\n      targetPort: 3000\n\n# Concept mapping:\n# Compose service   → K8s Deployment + Service\n# volumes:          → PersistentVolumeClaim\n# environment:      → env + ConfigMap + Secret\n# networks:         → Namespace + NetworkPolicy\n# healthcheck:      → livenessProbe + readinessProbe\n# depends_on:       → InitContainers or wait-for scripts",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "K8s learning path",
+        "items": [
+          {
+            "label": "Deployment",
+            "color": "#10b981",
+            "value": "Manages replicas of a container",
+            "highlight": true
+          },
+          {
+            "label": "Service",
+            "color": "#818cf8",
+            "value": "Load balancer / DNS for pods"
+          },
+          {
+            "label": "ConfigMap / Secret",
+            "color": "#f59e0b",
+            "value": "Config + secrets"
+          },
+          {
+            "label": "Ingress",
+            "color": "#60a5fa",
+            "value": "External HTTP routing"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

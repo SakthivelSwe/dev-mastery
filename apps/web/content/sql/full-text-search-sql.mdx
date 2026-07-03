@@ -18,7 +18,419 @@ By comparing the lexemes of the search query against the lexemes of the database
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeRunner", "state": "sql-fts" }
+{
+  "language": "sql",
+  "fileName": "fts.sql",
+  "steps": [
+    {
+      "title": "Full-text basics",
+      "description": "tsvector = document. tsquery = search. @@ = match. Beats LIKE %word% for real search.",
+      "code": "-- Convert text to tsvector (search document)\nSELECT to_tsvector('english', 'PostgreSQL is a powerful database');\n-- Result: 'databas':6 'postgresql':1 'power':4\n-- (stopwords removed, words stemmed)\n\n-- Convert query to tsquery\nSELECT to_tsquery('english', 'postgres & database');\n-- Result: 'postgr' & 'databas'\n\n-- Match with @@\nSELECT to_tsvector('english', 'PostgreSQL is a powerful database')\n    @@ to_tsquery('english', 'postgres & database');\n-- Result: TRUE\n\n-- Search in a table\nSELECT id, title FROM articles\nWHERE to_tsvector('english', title || ' ' || body)\n    @@ to_tsquery('english', 'sql & performance');\n\n-- Query operators (tsquery)\n-- & AND\n-- | OR\n-- ! NOT\n-- <-> phrase (adjacent)\n-- <N> within N tokens\n\nSELECT to_tsquery('english', 'quick & brown');\nSELECT to_tsquery('english', 'quick | slow');\nSELECT to_tsquery('english', 'quick & !slow');\nSELECT to_tsquery('english', 'quick <-> brown');    -- phrase\n\n-- Or use plainto_tsquery (parse natural query, all AND)\nSELECT plainto_tsquery('english', 'quick brown fox');\n-- Result: 'quick' & 'brown' & 'fox'\n\n-- websearch_to_tsquery (parses like a search engine)\nSELECT websearch_to_tsquery('english', '\"exact phrase\" quick -slow');\n-- Supports quoted phrases, minus for exclude\n\n-- Configurations\n-- english, simple, spanish, german, french, etc.\n-- \\dF        -- list configs\n\n-- Stemming demo\nSELECT to_tsvector('english', 'running runs ran runner');\n-- All stem to 'run'\n\n-- Case + punctuation ignored automatically\nSELECT to_tsvector('english', 'The QUICK, brown-fox!');\n-- Result: 'brown':3 'fox':4 'quick':2 ('the' is stopword)",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        11,
+        12,
+        13,
+        16,
+        17,
+        18,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "FTS basics",
+        "items": [
+          {
+            "label": "tsvector",
+            "color": "#10b981",
+            "value": "Parsed document",
+            "highlight": true
+          },
+          {
+            "label": "tsquery",
+            "color": "#818cf8",
+            "value": "Search expression"
+          },
+          {
+            "label": "@@ matches",
+            "color": "#f59e0b",
+            "value": "Boolean result"
+          },
+          {
+            "label": "websearch_to_tsquery",
+            "color": "#60a5fa",
+            "value": "Google-like syntax"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Index and generated column",
+      "description": "GIN index on tsvector for fast search. Generated column + trigger keep it in sync.",
+      "code": "-- Method 1: index on to_tsvector expression\nCREATE INDEX idx_articles_fts ON articles\nUSING gin (to_tsvector('english', title || ' ' || body));\n\nSELECT * FROM articles\nWHERE to_tsvector('english', title || ' ' || body)\n    @@ to_tsquery('sql');\n-- Query must match the index expression exactly\n\n-- Method 2: generated column (cleaner)\nALTER TABLE articles ADD COLUMN search_tsv tsvector\nGENERATED ALWAYS AS (\n  to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body,''))\n) STORED;\n\nCREATE INDEX idx_articles_search ON articles USING gin (search_tsv);\n\nSELECT * FROM articles WHERE search_tsv @@ to_tsquery('sql');\n\n-- Method 3: trigger (for pre-PG 12 or complex logic)\nALTER TABLE articles ADD COLUMN search_tsv tsvector;\n\nCREATE OR REPLACE FUNCTION update_search_tsv() RETURNS TRIGGER AS $$\nBEGIN\n  NEW.search_tsv := setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A')\n                 || setweight(to_tsvector('english', coalesce(NEW.body,  '')), 'B')\n                 || setweight(to_tsvector('english', coalesce(NEW.tags,  '')), 'C');\n  RETURN NEW;\nEND $$ LANGUAGE plpgsql;\n\nCREATE TRIGGER articles_search_update\nBEFORE INSERT OR UPDATE ON articles\nFOR EACH ROW EXECUTE FUNCTION update_search_tsv();\n\n-- Weights: A > B > C > D\n-- Use for ranking (title matches rank higher than body)\n\n-- Backfill after adding\nUPDATE articles SET search_tsv =\n  setweight(to_tsvector('english', coalesce(title, '')), 'A') ||\n  setweight(to_tsvector('english', coalesce(body,  '')), 'B');\n\n-- Multi-language\nALTER TABLE articles ADD COLUMN language TEXT DEFAULT 'english';\n\nALTER TABLE articles ADD COLUMN search_tsv tsvector\nGENERATED ALWAYS AS (to_tsvector(language::regconfig, title || ' ' || body)) STORED;\n\n-- Check index usage\nEXPLAIN ANALYZE\nSELECT * FROM articles WHERE search_tsv @@ to_tsquery('sql');\n-- Should see: Bitmap Index Scan on idx_articles_search",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        35,
+        36,
+        38,
+        39,
+        40,
+        42,
+        43,
+        45,
+        46,
+        49,
+        50,
+        51
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Add tsvector column (generated)",
+            "done": true
+          },
+          {
+            "label": "CREATE INDEX ... USING gin",
+            "done": true
+          },
+          {
+            "label": "setweight A/B/C/D for ranking",
+            "active": true
+          },
+          {
+            "label": "Query search_tsv @@ ..."
+          }
+        ]
+      }
+    },
+    {
+      "title": "Ranking and highlighting",
+      "description": "ts_rank / ts_rank_cd for relevance. ts_headline for highlighted snippets.",
+      "code": "-- Rank by relevance\nSELECT id, title, ts_rank(search_tsv, query) AS rank\nFROM articles, to_tsquery('english', 'sql & index') query\nWHERE search_tsv @@ query\nORDER BY rank DESC LIMIT 10;\n\n-- ts_rank_cd (cover density) — considers proximity\nSELECT id, title, ts_rank_cd(search_tsv, query, 32) AS rank\nFROM articles, to_tsquery('english', 'sql & index') query\nWHERE search_tsv @@ query\nORDER BY rank DESC LIMIT 10;\n\n-- Normalization flag\n-- 32 = divide by rank+1 (log)\n-- 4 = mean word length\n-- 2 = document length\n\n-- Highlighted snippet\nSELECT id, title,\n  ts_headline('english', body, query,\n    'StartSel=<mark>, StopSel=</mark>, MaxWords=30, MinWords=15')\n  AS snippet\nFROM articles, to_tsquery('english', 'sql & index') query\nWHERE search_tsv @@ query;\n-- Returns: '... <mark>SQL</mark> ... <mark>index</mark> ...'\n\n-- Custom headline options\nts_headline('english', body, query,\n  'MaxFragments=3, MinWords=5, MaxWords=20, ShortWord=3, StartSel=**, StopSel=**')\n\n-- Combine with weights (rank title matches higher)\nSELECT id, title, body,\n  ts_rank(\n    setweight(to_tsvector('english', title), 'A') ||\n    setweight(to_tsvector('english', body),  'B'),\n    query\n  ) AS rank\nFROM articles, to_tsquery('english', 'sql') query\nWHERE search_tsv @@ query\nORDER BY rank DESC;\n\n-- Query suggestions / autocomplete\n-- Use pg_trgm for typo-tolerant prefix search\nCREATE INDEX ON articles USING gin (title gin_trgm_ops);\n\nSELECT title, similarity(title, 'postgress')\nFROM articles\nWHERE title % 'postgress'                       -- fuzzy\nORDER BY similarity(title, 'postgress') DESC\nLIMIT 10;\n\n-- Combine FTS + trigram (recall + precision)\nSELECT id, title,\n  ts_rank(search_tsv, plainto_tsquery('sql performance')) +\n  0.5 * similarity(title, 'sql performance') AS combined_score\nFROM articles\nWHERE search_tsv @@ plainto_tsquery('sql performance')\n   OR title % 'sql performance'\nORDER BY combined_score DESC LIMIT 10;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Search UX",
+        "items": [
+          {
+            "label": "ts_rank",
+            "color": "#10b981",
+            "value": "Score results",
+            "highlight": true
+          },
+          {
+            "label": "ts_headline",
+            "color": "#818cf8",
+            "value": "Highlighted snippet"
+          },
+          {
+            "label": "setweight A>B>C>D",
+            "color": "#f59e0b",
+            "value": "Title beats body"
+          },
+          {
+            "label": "FTS + pg_trgm",
+            "color": "#60a5fa",
+            "value": "Recall + typos"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Beyond basic FTS",
+      "description": "Synonyms + dictionaries. Faceted search with filters. When to use dedicated search (Elasticsearch, Meilisearch).",
+      "code": "-- Custom dictionary + synonyms\n-- 1. Create synonym file (postgres share dir: tsearch_data/mysyn.syn)\n-- postgres = postgresql\n-- pg = postgres\n\n-- 2. Reload configuration\nCREATE TEXT SEARCH DICTIONARY mysyn (\n  TEMPLATE = synonym,\n  SYNONYMS = mysyn\n);\n\nCREATE TEXT SEARCH CONFIGURATION en_syn (COPY = english);\nALTER TEXT SEARCH CONFIGURATION en_syn\n  ALTER MAPPING FOR asciiword WITH mysyn, english_stem;\n\nSELECT to_tsvector('en_syn', 'PostgreSQL');\n-- Both 'postgres' and 'postgresql' searchable\n\n-- Language-specific searches\nCREATE INDEX ... USING gin (to_tsvector('french', body));\nSELECT * FROM articles_fr WHERE to_tsvector('french', body) @@ to_tsquery('french', 'système');\n\n-- Faceted search (combine FTS with filters)\nSELECT id, title\nFROM articles\nWHERE search_tsv @@ plainto_tsquery('sql')\n  AND published_at > NOW() - INTERVAL '1 year'\n  AND 'tutorial' = ANY(tags)\nORDER BY ts_rank(search_tsv, plainto_tsquery('sql')) DESC;\n\n-- Category facets (count per category matching search)\nSELECT category_id, count(*)\nFROM articles\nWHERE search_tsv @@ plainto_tsquery('sql')\nGROUP BY category_id;\n\n-- Multi-field weighted with rank\nSELECT id, title,\n  ts_rank(\n    setweight(to_tsvector('english', title), 'A') ||\n    setweight(to_tsvector('english', tags::text), 'B') ||\n    setweight(to_tsvector('english', body), 'C'),\n    plainto_tsquery('sql performance')\n  ) AS rank\nFROM articles\nWHERE search_tsv @@ plainto_tsquery('sql performance')\nORDER BY rank DESC;\n\n-- When Postgres FTS is enough:\n-- ✅ Simple to moderate search needs\n-- ✅ Small to mid-size corpus (millions)\n-- ✅ Language stemming built-in\n-- ✅ Combined with SQL filters/joins\n-- ✅ Single source of truth (no sync)\n\n-- When to use dedicated search:\n-- ❌ 100M+ documents\n-- ❌ Complex relevance tuning (learned ranking, BM25 flavors)\n-- ❌ Advanced fuzzy / typo tolerance\n-- ❌ Search-as-you-type at scale\n-- ❌ Sub-100ms latency at scale\n-- ❌ Vector / semantic search (though pgvector helps here)\n\n-- Popular alternatives:\n-- - Elasticsearch (comprehensive)\n-- - Meilisearch (typo-tolerant, fast)\n-- - Typesense (open source, easy)\n-- - Algolia (managed, expensive)\n-- - OpenSearch (AWS fork of Elasticsearch)\n-- - pgvector for semantic search inside Postgres\n\n-- Sync patterns:\n-- - Trigger on insert → publish to search service\n-- - Debezium / logical replication for CDC\n-- - Reindex nightly\n-- - Materialized view refreshed periodically",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        72,
+        73,
+        74,
+        75,
+        76
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "FTS scope",
+        "items": [
+          {
+            "label": "Postgres FTS",
+            "color": "#10b981",
+            "value": "Millions of docs, simple UX",
+            "highlight": true
+          },
+          {
+            "label": "Elasticsearch",
+            "color": "#818cf8",
+            "value": "100M+ docs, advanced"
+          },
+          {
+            "label": "Meilisearch/Typesense",
+            "color": "#f59e0b",
+            "value": "Typo-tolerant SaaS"
+          },
+          {
+            "label": "pgvector",
+            "color": "#60a5fa",
+            "value": "Semantic search in PG"
+          }
+        ]
+      }
+    },
+    {
+      "title": "FTS performance and tips",
+      "description": "Index size, update cost, GIN fastupdate, plan verification, refresh strategy.",
+      "code": "-- Check FTS index size\nSELECT pg_size_pretty(pg_relation_size('idx_articles_search'));\n\n-- GIN update behavior\n-- Default: pending list (fast updates, slower reads until flushed)\n-- fastupdate = on (default)\n\n-- Force GIN to flush pending list (rare)\nSELECT gin_clean_pending_list('idx_articles_search');\n\n-- Tune fastupdate\nALTER INDEX idx_articles_search SET (fastupdate = off);\n-- Slower writes but more predictable read perf\n\n-- Verify plan uses index\nEXPLAIN ANALYZE\nSELECT * FROM articles WHERE search_tsv @@ to_tsquery('sql');\n-- Expected: Bitmap Index Scan on idx_articles_search\n\n-- If Seq Scan: check config, expression matches index, statistics\n\n-- Multi-lang gotcha: tsvector must be built with same config as query\n-- Bad:\nCREATE INDEX ... USING gin (to_tsvector('english', body));\nWHERE to_tsvector('french', body) @@ to_tsquery('french', 'x');\n-- Different config → index not used\n\n-- Stopwords\n-- 'the', 'a', 'is' etc. are ignored per language dictionary\n-- Check: SELECT ts_debug('english', 'the quick brown fox');\n\n-- Custom stopword list\n-- Edit postgres share dir: tsearch_data/english.stop\n-- Or create custom dictionary\n\n-- Text length limits\n-- tsvector max size ~1MB per document\n-- Long articles: chunk into paragraphs, index separately\n\n-- Testing dictionaries\nSELECT ts_debug('english', 'PostgreSQL is running fast');\n-- Shows tokenization + stemming step by step\n\n-- Refresh strategies\n-- Generated column: auto-updated on write (no maintenance)\n-- Trigger: same, more control\n-- Batch reindex: after big changes\nREINDEX INDEX CONCURRENTLY idx_articles_search;\n\n-- Materialized view for pre-computed complex FTS\nCREATE MATERIALIZED VIEW mv_search AS\nSELECT id, title, body,\n  setweight(to_tsvector('english', title), 'A') ||\n  setweight(to_tsvector('english', body),  'B') AS tsv,\n  category_id, published_at\nFROM articles WHERE published;\n\nCREATE INDEX ON mv_search USING gin (tsv);\nCREATE INDEX ON mv_search (category_id, published_at DESC);\n\nREFRESH MATERIALIZED VIEW CONCURRENTLY mv_search;\n\n-- Debugging queries\nSELECT to_tsquery('english', 'sql!! & @index');    -- shows parse\nSELECT ts_lexize('english_stem', 'running');       -- shows stem\n\n-- Common perf issues:\n-- - Index doesn't match query config → verify with EXPLAIN\n-- - Very common terms (matches many docs) → dominant cost, filter first\n-- - Long tsvector building → materialize + refresh\n\n-- Combine with structured filters (usually fast)\nSELECT * FROM articles\nWHERE search_tsv @@ to_tsquery('sql')\n  AND published_at > NOW() - INTERVAL '1 year'\n  AND category_id = 5\nORDER BY ts_rank(search_tsv, to_tsquery('sql')) DESC LIMIT 20;",
+      "highlight": [
+        2,
+        4,
+        5,
+        6,
+        8,
+        9,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        47,
+        48,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        59,
+        60,
+        62,
+        63,
+        64,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        73,
+        74,
+        75,
+        76,
+        77
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "FTS ops",
+        "items": [
+          {
+            "label": "GIN fastupdate",
+            "color": "#10b981",
+            "value": "Fast writes, pending list",
+            "highlight": true
+          },
+          {
+            "label": "ts_debug",
+            "color": "#818cf8",
+            "value": "Debug tokenization"
+          },
+          {
+            "label": "Materialized view",
+            "color": "#f59e0b",
+            "value": "Pre-computed corpus"
+          },
+          {
+            "label": "Config must match",
+            "color": "#ef4444",
+            "value": "Index + query same config"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

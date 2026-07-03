@@ -20,7 +20,258 @@ To limit a user, you must know who they are.
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "api-rate-limiting" }
+{
+  "language": "http",
+  "fileName": "rate-limit.http",
+  "steps": [
+    {
+      "title": "Why rate limiting matters",
+      "description": "Prevents abuse, brute-force attacks, and runaway costs. Protects backend from overload. Ensures fair usage across all clients.",
+      "code": "# Without rate limiting:\n# - Bot scrapes all data in seconds\n# - Attacker brute-forces login (millions/hour)\n# - One buggy client hammers API → outage\n# - AI API costs explode overnight\n\n# With rate limiting:\n# - 100 requests per 15 min per IP\n# - 5 login attempts per minute per email\n# - 1000 requests per day per API key\n# - Backoff on 429 response\n\n# Response headers inform client:\nX-RateLimit-Limit:     100\nX-RateLimit-Remaining: 42\nX-RateLimit-Reset:     1720003200\nRetry-After:           58",
+      "highlight": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        15,
+        16,
+        17
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Rate limit protection",
+        "items": [
+          {
+            "label": "Abuse prevention",
+            "color": "#10b981",
+            "value": "Bots, scrapers, brute force",
+            "highlight": true
+          },
+          {
+            "label": "Cost control",
+            "color": "#818cf8",
+            "value": "AI/API cost per user cap"
+          },
+          {
+            "label": "Fair usage",
+            "color": "#f59e0b",
+            "value": "One user cannot starve others"
+          },
+          {
+            "label": "SLA protection",
+            "color": "#60a5fa",
+            "value": "Prevent noisy neighbor"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rate limit algorithms",
+      "description": "Token bucket: smooth, allows bursts. Leaky bucket: constant rate. Fixed window: simple but bursty at edges. Sliding window: accurate but expensive.",
+      "code": "# Token bucket (most common)\n# - Bucket holds up to N tokens\n# - Refills at R tokens/second\n# - Each request consumes 1 token\n# - No tokens → 429\n\n# Example: 100 tokens capacity, refill 10/sec\n# Burst: allowed up to 100 rapid requests\n# Sustained: 10 requests/sec max\n\n# Fixed window\n# - Reset counter every 60 sec\n# - Problem: 100 in last sec of window + 100 in first sec = 200 in 2 sec!\n\n# Sliding window log\n# - Store timestamp of each request\n# - Count requests in last 60 sec\n# - Accurate but memory-heavy\n\n# Sliding window counter (compromise)\n# - Approximate using weighted current + previous window",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Algorithm comparison",
+        "items": [
+          {
+            "label": "Token bucket",
+            "color": "#10b981",
+            "value": "Allows bursts, smooth long-term",
+            "highlight": true
+          },
+          {
+            "label": "Fixed window",
+            "color": "#f59e0b",
+            "value": "Simple but bursty at boundaries"
+          },
+          {
+            "label": "Sliding window log",
+            "color": "#818cf8",
+            "value": "Accurate but memory-heavy"
+          },
+          {
+            "label": "Sliding window counter",
+            "color": "#60a5fa",
+            "value": "Approximate — good default"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rate limiting with Redis",
+      "description": "Redis is ideal for rate limiting: fast, atomic operations, TTL for expiration. Distributed rate limit across app instances.",
+      "code": "# Redis: INCR + EXPIRE (fixed window)\nasync function checkRateLimit(userId: string): Promise<boolean> {\n  const key = `ratelimit:${userId}:${Math.floor(Date.now() / 60000)}`;\n  const count = await redis.incr(key);\n  if (count === 1) await redis.expire(key, 60);  # 60 sec TTL\n  return count <= 100;  # max 100/min\n}\n\n# Redis: sorted set (sliding window)\nasync function slidingWindow(userId: string): Promise<boolean> {\n  const key = `ratelimit:${userId}`;\n  const now = Date.now();\n  const windowStart = now - 60000;\n\n  # Remove old entries\n  await redis.zremrangebyscore(key, 0, windowStart);\n  # Count current window\n  const count = await redis.zcard(key);\n  if (count >= 100) return false;\n  # Add this request\n  await redis.zadd(key, now, `${now}-${Math.random()}`);\n  await redis.expire(key, 60);\n  return true;\n}",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Client",
+          "App",
+          "Redis"
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "App",
+            "label": "GET /api/data"
+          },
+          {
+            "from": "App",
+            "to": "Redis",
+            "label": "INCR ratelimit:user42:min"
+          },
+          {
+            "from": "Redis",
+            "to": "App",
+            "label": "count = 42"
+          },
+          {
+            "from": "App",
+            "to": "Client",
+            "label": "200 (under limit)"
+          },
+          {
+            "from": "Client",
+            "to": "App",
+            "label": "GET /api/data (101st)"
+          },
+          {
+            "from": "App",
+            "to": "Redis",
+            "label": "INCR → 101"
+          },
+          {
+            "from": "App",
+            "to": "Client",
+            "label": "429 Retry-After: 30"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rate limit tiers and API keys",
+      "description": "Different tiers for different plans. API keys carry tier info. Anonymous users get lowest limits.",
+      "code": "# Tiered rate limits\nconst tiers = {\n  anonymous: { rpm: 10, rpd: 100 },\n  free:      { rpm: 60, rpd: 1000 },\n  pro:       { rpm: 300, rpd: 50000 },\n  enterprise:{ rpm: 3000, rpd: 500000 }\n};\n\nasync function getLimits(req) {\n  const apiKey = req.header(\"X-API-Key\");\n  if (!apiKey) return tiers.anonymous;\n  const keyData = await lookupKey(apiKey);\n  return tiers[keyData.tier];\n}\n\n# Response tells clients their limits\nX-RateLimit-Tier: pro\nX-RateLimit-Limit: 300\nX-RateLimit-Remaining: 42\nX-RateLimit-Reset: 1720003200\n\n# Prevent key sharing: bind to origin or IP range",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        17,
+        18,
+        19,
+        20
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Tier design",
+        "items": [
+          {
+            "label": "Anonymous",
+            "color": "#818cf8",
+            "value": "IP-based, very low limits"
+          },
+          {
+            "label": "Free tier",
+            "color": "#10b981",
+            "value": "API key required, modest limits",
+            "highlight": true
+          },
+          {
+            "label": "Pro/Enterprise",
+            "color": "#f59e0b",
+            "value": "Higher limits, priority routing"
+          },
+          {
+            "label": "Enforcement",
+            "color": "#60a5fa",
+            "value": "Per-key + per-account limits"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Client backoff strategy",
+      "description": "Well-behaved clients handle 429 responses gracefully. Exponential backoff with jitter avoids thundering herd on retries.",
+      "code": "# Exponential backoff with jitter\nasync function fetchWithRetry(url: string, maxRetries = 5) {\n  for (let attempt = 0; attempt < maxRetries; attempt++) {\n    const response = await fetch(url);\n    if (response.status !== 429) return response;\n\n    # Respect Retry-After header\n    const retryAfter = parseInt(response.headers.get(\"Retry-After\") ?? \"1\");\n    # Add jitter to avoid thundering herd\n    const jitter = Math.random() * 1000;\n    const delay = (retryAfter * 1000) + (2 ** attempt * 100) + jitter;\n\n    console.log(`429, retrying in ${delay}ms`);\n    await new Promise(r => setTimeout(r, delay));\n  }\n  throw new Error(\"Max retries exceeded\");\n}",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "429 Too Many Requests received",
+            "done": true
+          },
+          {
+            "label": "Read Retry-After header",
+            "done": true
+          },
+          {
+            "label": "Wait Retry-After + exponential + jitter",
+            "active": true
+          },
+          {
+            "label": "Retry — until success or max attempts"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

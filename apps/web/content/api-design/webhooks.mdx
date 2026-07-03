@@ -20,7 +20,297 @@ You could write a `setInterval` loop that calls `GET /stripe/payment/status` eve
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "webhooks" }
+{
+  "language": "http",
+  "fileName": "webhooks.http",
+  "steps": [
+    {
+      "title": "Webhook basics",
+      "description": "Webhooks are HTTP callbacks. Provider sends POST to your URL when an event happens. Push model — no polling needed.",
+      "code": "# 1. Consumer registers webhook URL\nPOST /api/webhooks\nAuthorization: Bearer ...\n{\n  \"url\": \"https://myapp.com/hooks/topics\",\n  \"events\": [\"topic.created\", \"topic.published\"],\n  \"secret\": \"whsec_abc123\"\n}\n→ 201 { \"id\": \"wh_42\" }\n\n# 2. Event occurs in provider → POST to consumer\nPOST https://myapp.com/hooks/topics\nContent-Type: application/json\nX-Webhook-Event: topic.published\nX-Webhook-Signature: sha256=abc123...\nX-Webhook-Id: evt_12345\nX-Webhook-Timestamp: 1720003200\n\n{\n  \"id\": \"evt_12345\",\n  \"type\": \"topic.published\",\n  \"created\": 1720003200,\n  \"data\": {\n    \"topicId\": \"42\",\n    \"title\": \"Java Threads\"\n  }\n}\n\n# 3. Consumer processes + responds 200\n→ 200 OK  (must respond quickly, < 5 sec)",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Consumer",
+          "Provider",
+          "User"
+        ],
+        "messages": [
+          {
+            "from": "Consumer",
+            "to": "Provider",
+            "label": "register webhook URL"
+          },
+          {
+            "from": "User",
+            "to": "Provider",
+            "label": "action (publishes topic)"
+          },
+          {
+            "from": "Provider",
+            "to": "Consumer",
+            "label": "POST /hooks (event data)"
+          },
+          {
+            "from": "Consumer",
+            "to": "Provider",
+            "label": "200 OK (acknowledge)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Webhook signature verification",
+      "description": "Providers sign webhook bodies with HMAC. Consumers must verify signature to prevent spoofing. Include timestamp to prevent replay attacks.",
+      "code": "# Provider signs the body\nconst payload = JSON.stringify(event);\nconst timestamp = Math.floor(Date.now() / 1000);\nconst signedPayload = `${timestamp}.${payload}`;\nconst signature = crypto\n  .createHmac(\"sha256\", webhookSecret)\n  .update(signedPayload)\n  .digest(\"hex\");\n\n# Sent as header\nX-Webhook-Timestamp: 1720003200\nX-Webhook-Signature: sha256=abc123...\n\n# Consumer verifies\napp.post(\"/hooks/topics\", express.raw({ type: \"*/*\" }), (req, res) => {\n  const timestamp = req.header(\"X-Webhook-Timestamp\");\n  const signature = req.header(\"X-Webhook-Signature\");\n\n  # Reject old requests (replay protection)\n  if (Math.abs(Date.now()/1000 - Number(timestamp)) > 300) {\n    return res.status(400).send(\"Timestamp too old\");\n  }\n\n  const expected = crypto\n    .createHmac(\"sha256\", process.env.WEBHOOK_SECRET)\n    .update(`${timestamp}.${req.body.toString()}`)\n    .digest(\"hex\");\n\n  if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature.replace(\"sha256=\", \"\")))) {\n    return res.status(401).send(\"Invalid signature\");\n  }\n\n  # Signature OK — process event\n  processEvent(JSON.parse(req.body.toString()));\n  res.status(200).send(\"OK\");\n});",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Provider HMACs timestamp + body with secret",
+            "done": true
+          },
+          {
+            "label": "Consumer recomputes HMAC",
+            "done": true
+          },
+          {
+            "label": "timingSafeEqual to prevent timing attacks",
+            "active": true
+          },
+          {
+            "label": "Reject if timestamp > 5 min old (replay)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Retries and idempotency",
+      "description": "Consumer may be temporarily down. Provider retries with exponential backoff. Include unique event ID for idempotent processing.",
+      "code": "# Provider retry policy\n# Attempt 1: immediate\n# Attempt 2: 30 sec later\n# Attempt 3: 5 min later\n# Attempt 4: 30 min later\n# Attempt 5: 2 hours later\n# Then: mark as failed, alert user\n\n# Response codes\n# 2xx           → success, no retry\n# 4xx           → permanent failure, no retry (client bug)\n# 5xx / timeout → retry with backoff\n\n# Idempotent processing on consumer side\nasync function handleWebhook(event: WebhookEvent) {\n  # Check if event already processed\n  const existing = await db.query(\n    \"SELECT id FROM processed_events WHERE event_id = $1\",\n    [event.id]\n  );\n  if (existing.rows.length) {\n    return { status: \"already_processed\" };\n  }\n\n  # Process + mark as processed atomically\n  await db.transaction(async (tx) => {\n    await processEvent(event, tx);\n    await tx.query(\n      \"INSERT INTO processed_events (event_id, processed_at) VALUES ($1, NOW())\",\n      [event.id]\n    );\n  });\n}",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Reliability patterns",
+        "items": [
+          {
+            "label": "Exponential backoff",
+            "color": "#10b981",
+            "value": "Retry: 30s, 5m, 30m, 2h, ...",
+            "highlight": true
+          },
+          {
+            "label": "Idempotency",
+            "color": "#818cf8",
+            "value": "Use event.id — process each once"
+          },
+          {
+            "label": "Dead letter queue",
+            "color": "#f59e0b",
+            "value": "After N failures, alert + store"
+          },
+          {
+            "label": "Retry only 5xx",
+            "color": "#60a5fa",
+            "value": "4xx = permanent failure, skip"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Webhook dashboard and delivery logs",
+      "description": "Provide a dashboard where users can see deliveries, failures, and manually retry. Log all delivery attempts for debugging.",
+      "code": "# Webhook delivery log entry\n{\n  \"id\": \"delivery_abc\",\n  \"webhookId\": \"wh_42\",\n  \"eventId\": \"evt_12345\",\n  \"eventType\": \"topic.published\",\n  \"url\": \"https://myapp.com/hooks/topics\",\n  \"attempt\": 3,\n  \"requestBody\": \"...\",\n  \"requestHeaders\": { ... },\n  \"responseStatus\": 502,\n  \"responseBody\": \"Bad Gateway\",\n  \"responseHeaders\": { ... },\n  \"duration_ms\": 1523,\n  \"success\": false,\n  \"nextRetryAt\": \"2026-07-03T09:30:00Z\"\n}\n\n# Dashboard shows:\n# - Recent deliveries (success rate, latency)\n# - Failed deliveries with response body\n# - \"Retry now\" button\n# - Full request/response logs for debugging\n\n# API for consumers to fetch logs\nGET /api/webhooks/wh_42/deliveries?status=failed&limit=50\n→ [ { ... delivery details ... } ]",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Log every delivery attempt",
+            "done": true
+          },
+          {
+            "label": "Show dashboard: success rate, latency",
+            "done": true
+          },
+          {
+            "label": "Failed deliveries: full request/response",
+            "active": true
+          },
+          {
+            "label": "Manual retry button for one-off fixes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Testing webhooks locally",
+      "description": "Use ngrok or webhook.site to expose localhost. Test with provider's replay/resend feature. Local mock servers for CI.",
+      "code": "# Expose localhost with ngrok\n$ ngrok http 3000\nForwarding: https://abc123.ngrok.io → http://localhost:3000\n\n# Register the ngrok URL as webhook\nPOST /api/webhooks\n{ \"url\": \"https://abc123.ngrok.io/hooks\" }\n\n# webhook.site — no code needed, just a URL to inspect\n# https://webhook.site/#!/abc-123\n\n# Stripe CLI: local webhook forwarding\n$ stripe listen --forward-to localhost:3000/webhook\n> Ready! You are using Stripe API...\n\n# Test event from Stripe\n$ stripe trigger payment_intent.succeeded\n\n# Mock server for unit tests\ntest(\"processes topic.published event\", async () => {\n  const event = {\n    id: \"evt_test\",\n    type: \"topic.published\",\n    data: { topicId: \"42\" }\n  };\n\n  const response = await request(app)\n    .post(\"/hooks/topics\")\n    .set(\"X-Webhook-Signature\", signPayload(event))\n    .send(event);\n\n  expect(response.status).toBe(200);\n  expect(await db.query(\"SELECT ...\")).toContain(event.id);\n});",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        10,
+        11,
+        13,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Testing tools",
+        "items": [
+          {
+            "label": "ngrok",
+            "color": "#10b981",
+            "value": "Expose localhost via HTTPS tunnel",
+            "highlight": true
+          },
+          {
+            "label": "webhook.site",
+            "color": "#818cf8",
+            "value": "Inspect webhooks without server"
+          },
+          {
+            "label": "Stripe CLI",
+            "color": "#f59e0b",
+            "value": "Forward + trigger test events"
+          },
+          {
+            "label": "Mock server in tests",
+            "color": "#60a5fa",
+            "value": "Unit test webhook handlers"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

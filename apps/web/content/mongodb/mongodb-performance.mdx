@@ -16,7 +16,191 @@ If your Working Set is larger than the amount of RAM available on your server, M
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "mongo-performance" }
+{
+  "language": "javascript",
+  "fileName": "perf.js",
+  "steps": [
+    {
+      "title": "Query optimisation checklist",
+      "description": "Performance starts with the right indexes, query shape, and projection. Profile first, then optimise.",
+      "code": "// 1. Add index for frequent query\nawait col.createIndex({ userId: 1, createdAt: -1 });\n\n// 2. Use projection — return only needed fields\nawait col.find({ userId }, { projection: { title: 1, _id: 0 } });\n\n// 3. Use limit/skip for pagination — prefer range pagination\nawait col.find({ userId, _id: { $gt: lastId } }).limit(20);\n// Better than: .skip(1000).limit(20) — skip scans N docs\n\n// 4. Check indexes used\nawait col.find({ userId }).explain(\"executionStats\");\n\n// 5. Hint to force index\nawait col.find({ userId }).hint({ userId: 1, createdAt: -1 });",
+      "highlight": [
+        2,
+        5,
+        7,
+        11,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Profile: find slow queries (explain)",
+            "done": true
+          },
+          {
+            "label": "Add index for high-impact queries",
+            "done": true
+          },
+          {
+            "label": "Project only needed fields",
+            "active": true
+          },
+          {
+            "label": "Prefer range pagination over .skip()"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Connection pooling",
+      "description": "The MongoDB driver maintains a connection pool. Default pool size is 100. Tune minPoolSize and maxPoolSize for your workload.",
+      "code": "const client = new MongoClient(uri, {\n  maxPoolSize: 100,    // max concurrent connections\n  minPoolSize: 10,     // keep warm connections\n  maxIdleTimeMS: 60000, // close idle connections after 60s\n  serverSelectionTimeoutMS: 5000, // fail fast\n  socketTimeoutMS: 45000,\n  connectTimeoutMS: 10000,\n});\n\n// Anti-pattern: creating new client per request!\n// BAD:\napp.get('/data', async (req, res) => {\n  const c = new MongoClient(uri);  // ← new pool per request\n  await c.connect();\n  // ...\n});\n// GOOD: share single client instance",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        12,
+        13,
+        17
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Connection pool settings",
+        "items": [
+          {
+            "label": "maxPoolSize: 100",
+            "color": "#10b981",
+            "value": "Max concurrent connections",
+            "highlight": true
+          },
+          {
+            "label": "minPoolSize: 10",
+            "color": "#818cf8",
+            "value": "Keep pre-warmed connections"
+          },
+          {
+            "label": "One client per app",
+            "color": "#f59e0b",
+            "value": "Share pool across all requests"
+          },
+          {
+            "label": "serverSelectionTimeout",
+            "color": "#60a5fa",
+            "value": "Fail fast on connection issue"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Aggregation pipeline optimisation",
+      "description": "The query planner can push $match and $sort before $project and $unwind. But you must help by ordering stages correctly.",
+      "code": "// BAD: $project before $match (loses index)\nawait col.aggregate([\n  { $project: { category: 1, level: 1 } },  // shrinks doc\n  { $match: { category: \"java\" } }           // no index!\n]);\n\n// GOOD: $match as first stage\nawait col.aggregate([\n  { $match: { category: \"java\" } },          // uses index\n  { $project: { category: 1, level: 1 } },\n  { $sort: { level: 1 } }\n]);\n\n// GOOD: $match + $sort early → index covers both\nawait col.createIndex({ category: 1, level: 1 });",
+      "highlight": [
+        3,
+        4,
+        9,
+        10,
+        11,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "$match FIRST → uses index → fewer docs processed",
+            "done": true
+          },
+          {
+            "label": "$project early → smaller docs in pipeline",
+            "done": true
+          },
+          {
+            "label": "$sort after $match → may use index",
+            "active": true
+          },
+          {
+            "label": "allowDiskUse: true for large sort operations"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Caching with Redis + MongoDB",
+      "description": "Cache frequently read, rarely changing MongoDB data in Redis. Use cache-aside pattern: check cache first, fallback to MongoDB, populate cache on miss.",
+      "code": "const redis = createClient();\n\nasync function getTopic(slug) {\n  // 1. Check cache\n  const cached = await redis.get(`topic:${slug}`);\n  if (cached) return JSON.parse(cached);\n\n  // 2. Cache miss — query MongoDB\n  const topic = await col.findOne({ slug });\n  if (!topic) return null;\n\n  // 3. Populate cache (TTL 5 minutes)\n  await redis.setEx(`topic:${slug}`, 300, JSON.stringify(topic));\n\n  return topic;\n}\n\n// Invalidate on update\nasync function updateTopic(slug, data) {\n  await col.updateOne({ slug }, { $set: data });\n  await redis.del(`topic:${slug}`);  // invalidate cache\n}",
+      "highlight": [
+        5,
+        6,
+        9,
+        12,
+        19,
+        20
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Check Redis cache first",
+            "done": true
+          },
+          {
+            "label": "Cache HIT → return immediately (< 1ms)",
+            "done": true
+          },
+          {
+            "label": "Cache MISS → query MongoDB → cache result",
+            "active": true
+          },
+          {
+            "label": "On update: del from cache (invalidate)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Bulk operations for throughput",
+      "description": "Individual inserts have per-operation overhead. Bulk operations (insertMany, bulkWrite with ordered:false) dramatically increase throughput.",
+      "code": "// Slow: individual inserts\nfor (const item of 10000items) {\n  await col.insertOne(item);  // 10,000 round trips!\n}\n\n// Fast: bulk insert\nawait col.insertMany(items, { ordered: false });\n// One network round trip for all 10,000 docs\n\n// Mixed bulk operations\nawait col.bulkWrite([\n  ...inserts.map(doc => ({ insertOne: { document: doc } })),\n  ...updates.map(({ id, data }) => ({\n    updateOne: { filter: { _id: id }, update: { $set: data } }\n  }))\n], { ordered: false }); // continue on individual error",
+      "highlight": [
+        7,
+        11,
+        12,
+        13,
+        14,
+        16
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Bulk operation benefits",
+        "items": [
+          {
+            "label": "insertMany",
+            "color": "#10b981",
+            "value": "One round trip for N documents",
+            "highlight": true
+          },
+          {
+            "label": "ordered: false",
+            "color": "#818cf8",
+            "value": "Continue on error, max parallelism"
+          },
+          {
+            "label": "bulkWrite",
+            "color": "#f59e0b",
+            "value": "Mix insert/update/delete in one call"
+          },
+          {
+            "label": "Throughput",
+            "color": "#60a5fa",
+            "value": "10,000 ops vs 1 op per call"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

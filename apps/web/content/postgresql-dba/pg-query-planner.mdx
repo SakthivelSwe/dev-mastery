@@ -19,7 +19,289 @@ If the Table Statistics are out of date, the Planner will make terrible decision
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-explain" }
+{
+  "language": "sql",
+  "fileName": "planner.sql",
+  "steps": [
+    {
+      "title": "How the planner picks a plan",
+      "description": "Cost-based optimizer. Enumerates plans, estimates cost (I/O + CPU), picks cheapest. EXPLAIN shows the plan; ANALYZE runs and shows actual costs.",
+      "code": "-- Basic EXPLAIN\nEXPLAIN SELECT * FROM users WHERE email = 'x@y.com';\n\n-- Cost format: startup..total, rows, width\n Index Scan using idx_users_email (cost=0.29..8.31 rows=1 width=64)\n   Index Cond: (email = 'x@y.com'::text)\n\n-- Cost model constants:\nseq_page_cost = 1.0            -- sequential page read\nrandom_page_cost = 4.0         -- default (SET to 1.1 for SSD!)\ncpu_tuple_cost = 0.01\ncpu_index_tuple_cost = 0.005\ncpu_operator_cost = 0.0025\n\n-- EXPLAIN ANALYZE — actually runs and shows real times\nEXPLAIN (ANALYZE, BUFFERS, VERBOSE)\nSELECT u.name, count(o.id)\nFROM users u LEFT JOIN orders o ON o.user_id = u.id\nGROUP BY u.name;\n\n-- Look for:\n-- Estimated rows vs Actual rows (big mismatch → stale stats)\n-- Buffers: shared hit=X read=Y  (I/O breakdown)\n-- Time in each node\n\n-- Format options\nEXPLAIN (FORMAT JSON) ...;    -- for tools\nEXPLAIN (FORMAT YAML) ...;\nEXPLAIN (SETTINGS) ...;        -- shows relevant settings",
+      "highlight": [
+        2,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        19,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Planner enumerates possible plans",
+            "done": true
+          },
+          {
+            "label": "Estimates cost of each (I/O + CPU)",
+            "done": true
+          },
+          {
+            "label": "Picks lowest total cost",
+            "active": true
+          },
+          {
+            "label": "EXPLAIN ANALYZE: run + show actual"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Reading EXPLAIN output",
+      "description": "Read bottom-up. Each node feeds into its parent. Key node types: Seq Scan, Index Scan, Bitmap Heap Scan, Hash Join, Nested Loop, Sort, Aggregate.",
+      "code": "EXPLAIN ANALYZE\nSELECT u.name, count(o.id) AS orders\nFROM users u\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.created_at > '2025-01-01'\nGROUP BY u.name\nORDER BY orders DESC LIMIT 10;\n\n-- Read bottom-up:\n Limit  (actual time=150ms rows=10)                          -- top: final result\n   ->  Sort  (actual time=145ms rows=10 loops=1)\n         Sort Key: (count(o.id)) DESC\n         Sort Method: top-N heapsort  Memory: 26kB\n         ->  HashAggregate  (actual time=140ms rows=1234)     -- group by\n               Group Key: u.name\n               ->  Hash Right Join  (actual time=100ms rows=5678)   -- join\n                     Hash Cond: (o.user_id = u.id)\n                     ->  Seq Scan on orders o  (actual rows=10000)   -- scan orders\n                     ->  Hash  (actual time=30ms rows=1234)\n                           ->  Index Scan on idx_users_created (actual rows=1234)   -- filter users\n                                 Index Cond: (created_at > '2025-01-01')\n\n-- Node types cheat sheet:\n-- Seq Scan       — full table scan (bad for large tables)\n-- Index Scan     — use index + fetch heap rows\n-- Index Only Scan— use index only (no heap fetch!)\n-- Bitmap Heap Scan — combine multiple indexes\n-- Nested Loop    — for each row in A, look up in B (good for small A)\n-- Hash Join      — build hash table, probe\n-- Merge Join     — both sides sorted, merge (good for range joins)\n-- Sort           — explicit sort\n-- HashAggregate  — GROUP BY via hash table\n-- Gather         — parallel workers converge here",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Read plan bottom-up",
+        "items": [
+          {
+            "label": "Leaves = data sources",
+            "color": "#10b981",
+            "value": "Seq Scan, Index Scan",
+            "highlight": true
+          },
+          {
+            "label": "Middle = joins/aggregates",
+            "color": "#818cf8",
+            "value": "Hash Join, HashAggregate"
+          },
+          {
+            "label": "Top = final ops",
+            "color": "#f59e0b",
+            "value": "Sort, Limit"
+          },
+          {
+            "label": "Estimated vs actual",
+            "color": "#ef4444",
+            "value": "Big mismatch → run ANALYZE"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Statistics and ANALYZE",
+      "description": "Planner uses statistics (pg_statistic). Stale stats → bad plans. ANALYZE updates stats. Extended statistics for column correlations.",
+      "code": "-- Update statistics for a table\nANALYZE users;\n\n-- Update everything\nANALYZE;\n\n-- Check stats freshness\nSELECT schemaname, relname, last_analyze, last_autoanalyze, n_mod_since_analyze\nFROM pg_stat_user_tables\nORDER BY n_mod_since_analyze DESC;\n\n-- Auto-analyze happens when 10% of rows changed (default)\n-- autovacuum_analyze_scale_factor = 0.1\n\n-- Statistics stored per column\nSELECT * FROM pg_stats WHERE tablename = 'users' AND attname = 'email';\n-- n_distinct: -1 (all unique)\n-- null_frac: 0\n-- avg_width: 25\n-- most_common_vals: NULL\n-- histogram_bounds: {a@..., z@...}\n\n-- Increase statistics for skewed columns\nALTER TABLE events ALTER COLUMN user_id SET STATISTICS 1000;   -- default 100\nANALYZE events;\n\n-- Extended statistics (correlated columns, PG 10+)\nCREATE STATISTICS stat_users_role_country (dependencies, ndistinct)\nON role, country FROM users;\nANALYZE users;\n\n-- Now planner knows role and country are correlated\n-- Example: 90% of admins are in US\n-- Without extended stats: planner assumes independence → wrong row estimates",
+      "highlight": [
+        2,
+        5,
+        8,
+        9,
+        10,
+        13,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        24,
+        25,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Autovacuum ANALYZE at 10% changes",
+            "done": true
+          },
+          {
+            "label": "Manual ANALYZE after bulk load",
+            "done": true
+          },
+          {
+            "label": "SET STATISTICS 1000 for skewed columns",
+            "active": true
+          },
+          {
+            "label": "CREATE STATISTICS for correlated columns"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Forcing plans and hints",
+      "description": "PostgreSQL rejects hints philosophically. Options: adjust cost settings, disable specific plan types (SET enable_seqscan=off), rewrite query, use pg_hint_plan.",
+      "code": "-- No native query hints in PG\n-- Instead, use session-level \"toggle\" flags:\n\nSET enable_seqscan = off;\nSET enable_indexscan = off;\nSET enable_bitmapscan = off;\nSET enable_hashjoin = off;\nSET enable_mergejoin = off;\nSET enable_nestloop = off;\n\n-- Use these ONLY to check if planner's choice is optimal\nEXPLAIN ANALYZE SELECT ... ;                     -- with all plans allowed\nSET enable_seqscan = off;\nEXPLAIN ANALYZE SELECT ... ;                      -- forcing index scan\nRESET enable_seqscan;\n\n-- Tune cost settings for your hardware\nALTER SYSTEM SET random_page_cost = 1.1;         -- SSD\nALTER SYSTEM SET effective_cache_size = '12GB';   -- ~75% RAM\nALTER SYSTEM SET cpu_tuple_cost = 0.01;\n\n-- pg_hint_plan extension (PostgreSQL comment hints)\nCREATE EXTENSION pg_hint_plan;\n\nSELECT /*+ IndexScan(users idx_users_email) */\n  * FROM users WHERE email = 'x@y.com';\n\nSELECT /*+ HashJoin(u o) */\n  u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id;\n\n-- Query rewrite is usually better than hints\n-- - Split complex query into CTEs\n-- - Add missing indexes\n-- - Update statistics",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Influencing the planner",
+        "items": [
+          {
+            "label": "Cost tuning",
+            "color": "#10b981",
+            "value": "random_page_cost, effective_cache_size",
+            "highlight": true
+          },
+          {
+            "label": "SET enable_x = off",
+            "color": "#818cf8",
+            "value": "Session-level plan exploration"
+          },
+          {
+            "label": "pg_hint_plan",
+            "color": "#f59e0b",
+            "value": "Extension: comment-based hints"
+          },
+          {
+            "label": "Rewrite query",
+            "color": "#60a5fa",
+            "value": "Usually better than hints"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Common planner problems",
+      "description": "Symptoms: slow query, seq scan on big table, high row estimate mismatch. Fix: ANALYZE, add index, extended stats, or rewrite.",
+      "code": "-- Problem 1: Stale statistics\nEXPLAIN ANALYZE SELECT * FROM events WHERE type = 'view';\n-- Seq Scan  (cost=0..1000 rows=10)  (actual rows=500000)\n-- 5-order-of-magnitude mismatch!\n-- Fix: ANALYZE events;\n\n-- Problem 2: Missing index\n-- Seq Scan on 10M row table\n-- Fix: CREATE INDEX ...;\n\n-- Problem 3: Correlated columns\n-- role='admin' AND country='US' → estimate wrong\n-- Fix: CREATE STATISTICS ... (dependencies) ON role, country;\n\n-- Problem 4: Bad plan due to over-optimistic estimates\nSELECT * FROM users WHERE email = current_setting('app.email');\n-- Planner can't see the value → uses estimate\n-- Fix: prepare + explicit type\nPREPARE q(text) AS SELECT * FROM users WHERE email = $1;\nEXECUTE q('x@y.com');\n\n-- Problem 5: Function call not marked STABLE/IMMUTABLE\nCREATE FUNCTION getid() RETURNS int AS $$ SELECT 42 $$ LANGUAGE sql;\nSELECT * FROM users WHERE id = getid();\n-- Planner calls fn per-row!\n-- Fix: mark IMMUTABLE if truly deterministic\nCREATE OR REPLACE FUNCTION getid() RETURNS int AS $$ SELECT 42 $$ LANGUAGE sql IMMUTABLE;\n\n-- Problem 6: OR conditions\nSELECT * FROM t WHERE a = 1 OR b = 2;\n-- Often becomes seq scan\n-- Fix: UNION\nSELECT * FROM t WHERE a = 1 UNION SELECT * FROM t WHERE b = 2;\n\n-- Problem 7: LIKE with leading wildcard\nSELECT * FROM users WHERE email LIKE '%@gmail.com';   -- no btree can help\n-- Fix: reverse column + index, or GIN with pg_trgm",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Planner troubleshooting",
+        "items": [
+          {
+            "label": "ANALYZE",
+            "color": "#10b981",
+            "value": "First step for slow queries",
+            "highlight": true
+          },
+          {
+            "label": "Extended stats",
+            "color": "#818cf8",
+            "value": "Correlated column combinations"
+          },
+          {
+            "label": "STABLE/IMMUTABLE fns",
+            "color": "#f59e0b",
+            "value": "Enable planner to reuse results"
+          },
+          {
+            "label": "Rewrite OR → UNION",
+            "color": "#60a5fa",
+            "value": "Common speedup pattern"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

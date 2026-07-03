@@ -18,7 +18,282 @@ There are dozens of settings in `postgresql.conf`, but three of them dictate 80%
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "postgres-config" }
+{
+  "language": "sql",
+  "fileName": "config.sql",
+  "steps": [
+    {
+      "title": "Where PostgreSQL reads config",
+      "description": "postgresql.conf: main config. postgresql.auto.conf: ALTER SYSTEM writes here. pg_hba.conf: authentication. Reload vs restart.",
+      "code": "-- Show current config source and value\nSELECT name, setting, source, sourcefile\nFROM pg_settings\nWHERE name IN ('shared_buffers', 'max_connections', 'work_mem');\n\n     name         | setting  | source        | sourcefile\n------------------+----------+---------------+---------------------------\n shared_buffers   | 524288   | configuration | /etc/postgresql/postgresql.conf\n max_connections  | 100      | configuration | /etc/postgresql/postgresql.conf\n work_mem         | 4096     | user          |\n\n-- Config precedence (last wins):\n-- 1. postgresql.conf\n-- 2. postgresql.auto.conf (ALTER SYSTEM)\n-- 3. Command-line flags\n-- 4. ALTER DATABASE / ROLE settings\n-- 5. Session-level SET\n\n-- ALTER SYSTEM writes to postgresql.auto.conf\nALTER SYSTEM SET shared_buffers = '4GB';\nSELECT pg_reload_conf();     -- reload without restart\n\n-- Restart required for:\n-- shared_buffers, max_connections, max_wal_size\n\n-- Session override (temporary)\nSET work_mem = '64MB';\nSHOW work_mem;\nRESET work_mem;\n\n-- View reload state\nSELECT name, setting, pending_restart FROM pg_settings\nWHERE pending_restart IS TRUE;",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "postgresql.conf: base config",
+            "done": true
+          },
+          {
+            "label": "postgresql.auto.conf: ALTER SYSTEM writes here",
+            "done": true
+          },
+          {
+            "label": "pg_reload_conf() for hot reload",
+            "active": true
+          },
+          {
+            "label": "Restart needed for memory settings"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Baseline tuning for OLTP",
+      "description": "Sensible defaults for a mid-size OLTP database. Use pgtune (https://pgtune.leopard.in.ua) or PGConfigurator as starting point.",
+      "code": "-- Baseline for 16GB RAM, 4-core, SSD, OLTP\n\n-- MEMORY\nshared_buffers = 4GB              -- 25% RAM\neffective_cache_size = 12GB        -- 75% RAM (planner hint)\nwork_mem = 16MB                    -- careful with concurrency\nmaintenance_work_mem = 1GB\n\n-- WAL / CHECKPOINT\nwal_buffers = 16MB\nmin_wal_size = 1GB\nmax_wal_size = 4GB                 -- more = fewer checkpoints\ncheckpoint_completion_target = 0.9  -- spread checkpoint I/O\n\n-- PARALLELISM\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n\n-- I/O\nrandom_page_cost = 1.1             -- SSD: 1.1 (HDD: 4.0)\neffective_io_concurrency = 200      -- SSD (HDD: 2)\n\n-- CONNECTIONS\nmax_connections = 100               -- use PgBouncer if need more\n\n-- LOGGING\nlog_min_duration_statement = 500ms\nlog_checkpoints = on\nlog_connections = on\nlog_lock_waits = on\n\n-- Apply\nALTER SYSTEM SET shared_buffers = '4GB';\n-- ... etc\nSELECT pg_reload_conf();",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        25,
+        26,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Tuning priorities",
+        "items": [
+          {
+            "label": "Memory: shared_buffers 25%",
+            "color": "#10b981",
+            "value": "Most impact for most workloads",
+            "highlight": true
+          },
+          {
+            "label": "WAL: max_wal_size",
+            "color": "#818cf8",
+            "value": "Fewer checkpoints = faster writes"
+          },
+          {
+            "label": "random_page_cost 1.1 (SSD)",
+            "color": "#f59e0b",
+            "value": "Tells planner SSDs are fast"
+          },
+          {
+            "label": "Logging: slow queries",
+            "color": "#60a5fa",
+            "value": "log_min_duration_statement"
+          }
+        ]
+      }
+    },
+    {
+      "title": "pg_hba.conf — authentication rules",
+      "description": "pg_hba.conf controls who can connect from where and how. Rules matched top-down. TYPE, DATABASE, USER, ADDRESS, METHOD.",
+      "code": "-- pg_hba.conf (host-based authentication)\n-- Format: TYPE  DATABASE  USER  ADDRESS  METHOD [options]\n\n# Local Unix socket — trust (dev only!)\nlocal   all             postgres                                trust\nlocal   all             all                                     peer\n\n# IPv4 — password required\nhost    all             all             127.0.0.1/32            scram-sha-256\nhost    all             all             10.0.0.0/16             scram-sha-256\n\n# App user for one database only\nhost    devmastery      appuser         10.0.1.0/24             scram-sha-256\n\n# Replication user (streaming replica)\nhost    replication     replicator      10.0.5.10/32            scram-sha-256\n\n# LDAP\nhost    all             all             10.0.0.0/16             ldap ldapserver=\"ldap.co\" ldapbasedn=\"ou=users,dc=co\"\n\n# SSL required\nhostssl all             all             0.0.0.0/0               scram-sha-256\n\n-- Methods:\n-- trust       : no auth (never use in prod!)\n-- peer        : match Unix user (local only)\n-- scram-sha-256: password (modern, secure)\n-- md5         : password (legacy)\n-- cert        : client certificate\n-- ldap / gss / pam : external\n\n-- Reload after edit\nSELECT pg_reload_conf();",
+      "highlight": [
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "pg_hba priority",
+        "items": [
+          {
+            "label": "Rules matched top-down",
+            "color": "#10b981",
+            "value": "First match wins — order matters!",
+            "highlight": true
+          },
+          {
+            "label": "scram-sha-256",
+            "color": "#818cf8",
+            "value": "Modern password hashing"
+          },
+          {
+            "label": "trust = insecure",
+            "color": "#ef4444",
+            "value": "No password check — dev only"
+          },
+          {
+            "label": "hostssl = force SSL",
+            "color": "#f59e0b",
+            "value": "Production: always require SSL"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Per-database and per-role settings",
+      "description": "Override defaults per database or per role. ALTER DATABASE, ALTER ROLE for policy without touching global config.",
+      "code": "-- Set per-database\nALTER DATABASE devmastery SET work_mem = '32MB';\nALTER DATABASE analytics SET work_mem = '256MB';\nALTER DATABASE analytics SET statement_timeout = '0';  -- long queries OK\n\n-- Set per-role\nALTER ROLE readonly SET statement_timeout = '30s';\nALTER ROLE analytics_user SET work_mem = '512MB';\nALTER ROLE api_user SET application_name = 'api';\n\n-- Combine (role in DB)\nALTER ROLE readonly IN DATABASE devmastery SET default_transaction_read_only = on;\n\n-- View overrides\nSELECT rolname, rolconfig FROM pg_roles WHERE rolconfig IS NOT NULL;\nSELECT datname, datconfig FROM pg_database WHERE datconfig IS NOT NULL;\n\n-- Session-level override (temporary)\nSET statement_timeout = '60s';\nSET work_mem = '256MB';\n-- Reset\nRESET statement_timeout;\nRESET ALL;\n\n-- Transaction-only (rolled back)\nBEGIN;\nSET LOCAL statement_timeout = '10s';\n-- ... queries ...\nCOMMIT;",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        12,
+        15,
+        16,
+        19,
+        20,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "ALTER SYSTEM: global defaults",
+            "done": true
+          },
+          {
+            "label": "ALTER DATABASE: per-db overrides",
+            "done": true
+          },
+          {
+            "label": "ALTER ROLE: per-user overrides",
+            "active": true
+          },
+          {
+            "label": "SET / SET LOCAL: session / transaction"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Autovacuum tuning",
+      "description": "Autovacuum reclaims dead tuples and updates statistics. Tune per-table for high-churn tables. Never disable autovacuum in production.",
+      "code": "-- Global autovacuum settings\nautovacuum = on                            -- NEVER disable\nautovacuum_max_workers = 3                  -- default 3\nautovacuum_naptime = 30s                    -- how often to check\nautovacuum_vacuum_scale_factor = 0.1        -- vacuum when 10% dead\nautovacuum_vacuum_threshold = 50            -- min dead tuples\nautovacuum_analyze_scale_factor = 0.05\n\n-- Per-table overrides (for high-churn tables)\nALTER TABLE sessions SET (\n  autovacuum_vacuum_scale_factor = 0.02,    -- vacuum every 2% dead\n  autovacuum_vacuum_cost_delay = 10,\n  autovacuum_analyze_scale_factor = 0.02\n);\n\n-- Monitor autovacuum\nSELECT schemaname, relname, last_vacuum, last_autovacuum,\n       n_dead_tup, autovacuum_count\nFROM pg_stat_user_tables\nORDER BY n_dead_tup DESC LIMIT 20;\n\n-- Running vacuums (in progress)\nSELECT pid, datname, relid::regclass, phase, heap_blks_scanned, heap_blks_total\nFROM pg_stat_progress_vacuum;\n\n-- Force vacuum\nVACUUM (VERBOSE, ANALYZE) sessions;\nVACUUM FULL sessions;              -- ⚠️ locks table exclusive\n\n-- Aggressive settings for OLTP\nautovacuum_vacuum_cost_delay = 2ms          -- faster (default 20ms)\nautovacuum_vacuum_cost_limit = 1000",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        26,
+        27,
+        28,
+        31,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Autovacuum tuning",
+        "items": [
+          {
+            "label": "scale_factor 0.1",
+            "color": "#10b981",
+            "value": "Vacuum when 10% dead tuples",
+            "highlight": true
+          },
+          {
+            "label": "Per-table override",
+            "color": "#818cf8",
+            "value": "Aggressive for hot tables"
+          },
+          {
+            "label": "Never disable",
+            "color": "#ef4444",
+            "value": "Bloat + txid wraparound risk"
+          },
+          {
+            "label": "Monitor pg_stat_user_tables",
+            "color": "#f59e0b",
+            "value": "Watch n_dead_tup grow"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

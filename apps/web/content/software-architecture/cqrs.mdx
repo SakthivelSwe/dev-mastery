@@ -21,7 +21,207 @@ These can use completely different databases, optimized for their specific acces
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "cqrs-pattern" }
+{
+  "language": "java",
+  "fileName": "CQRS.java",
+  "steps": [
+    {
+      "title": "Command Query Responsibility Segregation",
+      "description": "CQRS separates reads (queries) from writes (commands). The write model is optimised for consistency; the read model is optimised for query performance.",
+      "code": "// Command side: write model\npublic class CreateTopicCommand {\n    private final String title;\n    private final int level;\n}\n\n@Service\npublic class TopicCommandService {\n    public TopicId handle(CreateTopicCommand cmd) {\n        Topic topic = Topic.create(cmd.title(), cmd.level());\n        repo.save(topic);\n        events.publish(new TopicCreated(topic.id()));\n        return topic.id();\n    }\n}\n\n// Query side: read model (optimised projection)\npublic record TopicSummaryView(Long id, String title, int level, long views) {}\n\n@Service\npublic class TopicQueryService {\n    public List<TopicSummaryView> findByCategory(String cat) {\n        return topicViewRepo.findByCategory(cat);  // dedicated read DB/cache\n    }\n}",
+      "highlight": [
+        2,
+        9,
+        17,
+        21,
+        22
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "CQRS sides",
+        "items": [
+          {
+            "label": "Command side",
+            "color": "#10b981",
+            "value": "Write: consistency, validation, events",
+            "highlight": true
+          },
+          {
+            "label": "Query side",
+            "color": "#818cf8",
+            "value": "Read: speed, denormalised, projections"
+          },
+          {
+            "label": "Separate models",
+            "color": "#f59e0b",
+            "value": "Write model ≠ read model"
+          },
+          {
+            "label": "Separate DBs (optional)",
+            "color": "#60a5fa",
+            "value": "Write: normalised SQL | Read: Elasticsearch"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Command bus pattern",
+      "description": "A Command Bus dispatches commands to handlers. This decouples the caller from the handler and enables middleware (logging, validation, transactions).",
+      "code": "// Command Bus with Axon Framework (or MediatR-style)\npublic interface CommandBus {\n    <R> R dispatch(Command<R> command);\n}\n\n// Handler registered per command type\n@CommandHandler\npublic TopicId handle(CreateTopicCommand cmd) {\n    Topic topic = Topic.create(cmd.title(), cmd.level());\n    repo.save(topic);\n    return topic.id();\n}\n\n// Caller just dispatches — no coupling to handler\nTopicId id = commandBus.dispatch(new CreateTopicCommand(\"Java\", 1));\n\n// Middleware chain: validation → auth → transaction → handler",
+      "highlight": [
+        2,
+        7,
+        8,
+        9,
+        10,
+        14,
+        16
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "CommandBus.dispatch(command)",
+            "done": true
+          },
+          {
+            "label": "Middleware: validate + auth + tx begin",
+            "done": true
+          },
+          {
+            "label": "Handler executes business logic",
+            "active": true
+          },
+          {
+            "label": "Middleware: tx commit + event publish"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Read model projections",
+      "description": "Projections listen to domain events and build denormalised read models optimised for specific queries. Each view can have its own schema and storage.",
+      "code": "// Projection: builds read model from events\n@Service\npublic class TopicViewProjection {\n\n    @EventHandler\n    public void on(TopicCreated event) {\n        // Build read model from event\n        TopicView view = new TopicView(\n            event.topicId(), event.title(), event.level(), 0\n        );\n        topicViewRepo.save(view);\n    }\n\n    @EventHandler\n    public void on(TopicViewed event) {\n        topicViewRepo.incrementViews(event.topicId());\n        // Fast: denormalised counter, no JOIN needed\n    }\n}",
+      "highlight": [
+        5,
+        6,
+        8,
+        9,
+        10,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Command",
+          "Write DB",
+          "EventBus",
+          "Projection",
+          "Read DB"
+        ],
+        "messages": [
+          {
+            "from": "Command",
+            "to": "Write DB",
+            "label": "save topic"
+          },
+          {
+            "from": "Write DB",
+            "to": "EventBus",
+            "label": "TopicCreated event"
+          },
+          {
+            "from": "EventBus",
+            "to": "Projection",
+            "label": "on(TopicCreated)"
+          },
+          {
+            "from": "Projection",
+            "to": "Read DB",
+            "label": "save TopicView"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Eventual consistency in CQRS",
+      "description": "In CQRS with event-driven projections, the read model is eventually consistent. After a command, there's a small lag before the query model reflects the change.",
+      "code": "// After command, read model might be stale\nTopicId id = commandBus.dispatch(new CreateTopicCommand(\"Java\", 1));\n\n// Immediately querying might return empty!\nList<Topic> topics = queryService.findByCategory(\"java\");// may be empty!\n\n// Options:\n// 1. Accept eventual consistency — most UI patterns handle it\n// 2. Return command result directly (id, status)\n// 3. Query write model for immediate response\n// 4. Optimistic UI: show new item instantly, confirm async\n\n// Consistency window: usually milliseconds in practice\n// but design for seconds in distributed systems",
+      "highlight": [
+        2,
+        5,
+        9,
+        10,
+        11
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Command executed → write model updated",
+            "done": true
+          },
+          {
+            "label": "Event published asynchronously",
+            "done": true
+          },
+          {
+            "label": "Projection processes event → read model updated",
+            "active": true
+          },
+          {
+            "label": "Query now returns updated data (eventual)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "CQRS in Spring Boot with Axon",
+      "description": "Axon Framework provides CQRS + Event Sourcing infrastructure for Spring Boot. @CommandHandler, @EventHandler, @QueryHandler annotations wire everything.",
+      "code": "@Aggregate\npublic class TopicAggregate {\n    @AggregateIdentifier\n    private TopicId id;\n\n    @CommandHandler\n    public TopicAggregate(CreateTopicCommand cmd) {\n        apply(new TopicCreatedEvent(cmd.id(), cmd.title()));\n    }\n\n    @EventSourcingHandler\n    public void on(TopicCreatedEvent event) {\n        this.id = event.id();\n    }\n}\n\n// Query handling\n@QueryHandler\npublic List<TopicView> handle(FindTopicsByCategory query) {\n    return topicViewRepo.findByCategory(query.category());\n}",
+      "highlight": [
+        6,
+        7,
+        8,
+        12,
+        13,
+        17,
+        18,
+        19,
+        20
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Axon annotations",
+        "items": [
+          {
+            "label": "@CommandHandler",
+            "color": "#10b981",
+            "value": "Handles a command type",
+            "highlight": true
+          },
+          {
+            "label": "@EventSourcingHandler",
+            "color": "#818cf8",
+            "value": "Rebuilds state from events"
+          },
+          {
+            "label": "@EventHandler",
+            "color": "#f59e0b",
+            "value": "Updates read model projections"
+          },
+          {
+            "label": "@QueryHandler",
+            "color": "#60a5fa",
+            "value": "Answers a query"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

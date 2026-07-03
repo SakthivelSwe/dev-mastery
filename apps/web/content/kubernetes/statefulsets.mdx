@@ -18,7 +18,342 @@ A PostgreSQL primary node has a different role than a replica. A Kafka broker ha
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "statefulsets" }
+{
+  "language": "yaml",
+  "fileName": "statefulset.yaml",
+  "steps": [
+    {
+      "title": "What is a StatefulSet",
+      "description": "StatefulSet manages stateful pods with stable identities. Ordered start/stop. Stable network name. Persistent per-pod storage. For databases, queues, distributed systems.",
+      "code": "# Stateful workload pattern\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: postgres\nspec:\n  serviceName: postgres-headless    # required: headless Service\n  replicas: 3\n  selector:\n    matchLabels: { app: postgres }\n  template:\n    metadata:\n      labels: { app: postgres }\n    spec:\n      containers:\n        - name: postgres\n          image: postgres:15\n          ports:\n            - containerPort: 5432\n          volumeMounts:\n            - name: data\n              mountPath: /var/lib/postgresql/data\n  volumeClaimTemplates:\n    - metadata: { name: data }\n      spec:\n        accessModes: [ReadWriteOnce]\n        resources: { requests: { storage: 100Gi } }\n        storageClassName: fast-ssd\n\n# What you get:\n# ✅ Stable pod names: postgres-0, postgres-1, postgres-2\n# ✅ Stable DNS: postgres-0.postgres-headless.default.svc.cluster.local\n# ✅ Each pod gets its own PVC (data-postgres-0, data-postgres-1...)\n# ✅ Ordered creation (0 → 1 → 2) and deletion (2 → 1 → 0)\n# ✅ PVCs survive pod deletion\n\n$ kubectl get pods -l app=postgres\nNAME          READY   STATUS    AGE\npostgres-0    1/1     Running   5m\npostgres-1    1/1     Running   4m\npostgres-2    1/1     Running   3m\n\n$ kubectl get pvc\nNAME               STATUS   VOLUME       CAPACITY\ndata-postgres-0    Bound    pvc-abc      100Gi\ndata-postgres-1    Bound    pvc-def      100Gi\ndata-postgres-2    Bound    pvc-ghi      100Gi",
+      "highlight": [
+        6,
+        7,
+        8,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        44,
+        45,
+        46,
+        47
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "StatefulSet guarantees",
+        "items": [
+          {
+            "label": "Stable names",
+            "color": "#10b981",
+            "value": "postgres-0, -1, -2 forever",
+            "highlight": true
+          },
+          {
+            "label": "Stable DNS",
+            "color": "#818cf8",
+            "value": "Per-pod DNS via headless Service"
+          },
+          {
+            "label": "Per-pod PVC",
+            "color": "#f59e0b",
+            "value": "Storage bound to pod ordinal"
+          },
+          {
+            "label": "Ordered lifecycle",
+            "color": "#60a5fa",
+            "value": "Start 0→1→2, stop reverse"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Headless Service for StatefulSets",
+      "description": "StatefulSet requires a headless Service (clusterIP: None) to give each pod a stable DNS name.",
+      "code": "# Headless Service — no cluster IP\napiVersion: v1\nkind: Service\nmetadata:\n  name: postgres-headless\nspec:\n  clusterIP: None                # ← this makes it headless\n  selector:\n    app: postgres\n  ports:\n    - port: 5432\n\n# DNS resolves to individual pod IPs:\n$ kubectl run tmp --rm -it --image=busybox -- nslookup postgres-headless\nAddress: 10.244.1.5   (postgres-0)\nAddress: 10.244.2.7   (postgres-1)\nAddress: 10.244.3.2   (postgres-2)\n\n# Per-pod DNS names:\n# postgres-0.postgres-headless.default.svc.cluster.local\n# postgres-1.postgres-headless.default.svc.cluster.local\n# postgres-2.postgres-headless.default.svc.cluster.local\n\n# Use case: clients that need to talk to a specific replica\n# e.g., Kafka client discovers all brokers\n# e.g., Postgres replica knows how to reach primary\n\n# You often also need a regular ClusterIP Service for clients\n# that just need any-of-N (read replicas, etc.)\napiVersion: v1\nkind: Service\nmetadata:\n  name: postgres         # regular ClusterIP\nspec:\n  selector: { app: postgres }\n  ports: [{ port: 5432 }]",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        25,
+        26,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Headless Service (clusterIP: None)",
+            "done": true
+          },
+          {
+            "label": "DNS returns all pod IPs",
+            "done": true
+          },
+          {
+            "label": "Per-pod DNS: pod-N.svc.ns...",
+            "active": true
+          },
+          {
+            "label": "Add ClusterIP Service for load-balanced reads"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Ordered deployment and scaling",
+      "description": "StatefulSet starts pods 0 → N-1. Each pod must be Ready before next starts. Scale-down reverses order.",
+      "code": "# Scale up: 1 → 3\n# postgres-0 starts, waits until Ready\n# postgres-1 starts, waits until Ready\n# postgres-2 starts, waits until Ready\n\n# Scale down: 3 → 1\n# postgres-2 stops first\n# postgres-1 stops\n# postgres-0 remains\n\n$ kubectl scale sts postgres --replicas=5\n\n# Watch ordered creation\n$ kubectl get pods -l app=postgres -w\nNAME          READY   STATUS              AGE\npostgres-0    1/1     Running             5m\npostgres-1    1/1     Running             4m\npostgres-2    1/1     Running             3m\npostgres-3    0/1     ContainerCreating   1s      # waiting to Ready\npostgres-3    1/1     Running             8s\npostgres-4    0/1     ContainerCreating   0s      # only now starts\n\n# Override with podManagementPolicy: Parallel\nspec:\n  podManagementPolicy: Parallel      # start/stop all in parallel\n  # Default: OrderedReady (safest)\n\n# Parallel is useful for:\n# - Stateless replicas that just need stable identity\n# - Migrations from Deployments\n\n# Rolling update (in-place, same ordering)\n$ kubectl set image sts/postgres postgres=postgres:16\n# Pod postgres-2 restarts first, then -1, then -0 (reverse order)\n\n# Partitioned update: only update pods with ordinal >= N\nspec:\n  updateStrategy:\n    type: RollingUpdate\n    rollingUpdate:\n      partition: 2         # only pods 2 and above get updated\n\n# Use case: canary a single replica first\n#   partition=2 → only postgres-2 updates\n#   verify → set partition=0 to update rest",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        11,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "STS",
+          "pod-0",
+          "pod-1",
+          "pod-2"
+        ],
+        "messages": [
+          {
+            "from": "STS",
+            "to": "pod-0",
+            "label": "create → wait Ready"
+          },
+          {
+            "from": "pod-0",
+            "to": "STS",
+            "label": "Ready ✓"
+          },
+          {
+            "from": "STS",
+            "to": "pod-1",
+            "label": "create → wait Ready"
+          },
+          {
+            "from": "pod-1",
+            "to": "STS",
+            "label": "Ready ✓"
+          },
+          {
+            "from": "STS",
+            "to": "pod-2",
+            "label": "create"
+          },
+          {
+            "from": "STS",
+            "to": "pod-2",
+            "label": "scale down: stop first"
+          },
+          {
+            "from": "STS",
+            "to": "pod-1",
+            "label": "stop after -2 gone"
+          }
+        ]
+      }
+    },
+    {
+      "title": "PersistentVolumeClaim templates",
+      "description": "volumeClaimTemplates auto-create a PVC per pod. Storage sticks with the ordinal — pod-0 gets same disk on restart.",
+      "code": "spec:\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      spec:\n        accessModes: [ReadWriteOnce]\n        storageClassName: fast-ssd\n        resources:\n          requests: { storage: 100Gi }\n\n# For each pod, K8s creates a PVC:\n#   data-postgres-0\n#   data-postgres-1\n#   data-postgres-2\n\n# When postgres-1 dies and is recreated:\n# → new pod is scheduled\n# → mounts data-postgres-1 (SAME volume)\n# → data persists\n\n# When you delete the StatefulSet:\n$ kubectl delete sts postgres\n# ⚠️ PVCs are NOT deleted (protection)\n\n# Delete PVCs manually if needed:\n$ kubectl delete pvc -l app=postgres\n\n# Or with persistentVolumeClaimRetentionPolicy (K8s 1.27+)\nspec:\n  persistentVolumeClaimRetentionPolicy:\n    whenDeleted: Delete          # or Retain (default)\n    whenScaled:  Retain          # or Delete\n\n# Common combos:\n# whenDeleted: Retain, whenScaled: Retain — safest (default)\n# whenDeleted: Delete, whenScaled: Delete — CI/CD test clusters\n# whenDeleted: Retain, whenScaled: Delete — keep on delete, drop on scale-down\n\n# View PVCs owned by STS\n$ kubectl get pvc -l app=postgres",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        25,
+        26,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        37,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "PVC per pod",
+        "items": [
+          {
+            "label": "Auto-created per replica",
+            "color": "#10b981",
+            "value": "data-postgres-0, -1, -2",
+            "highlight": true
+          },
+          {
+            "label": "Stable storage",
+            "color": "#818cf8",
+            "value": "Same disk on pod restart"
+          },
+          {
+            "label": "PVCs survive STS delete",
+            "color": "#ef4444",
+            "value": "Protection — delete manually"
+          },
+          {
+            "label": "PVCRetentionPolicy (1.27+)",
+            "color": "#f59e0b",
+            "value": "Automate cleanup"
+          }
+        ]
+      }
+    },
+    {
+      "title": "StatefulSet vs Deployment",
+      "description": "Use StatefulSet when identity + storage matter. Deployment for stateless. Common StatefulSet users: databases, Kafka, Elasticsearch, Zookeeper.",
+      "code": "# StatefulSet when you need:\n# ✅ Stable, unique pod names\n# ✅ Stable DNS per pod\n# ✅ Persistent per-pod storage that survives restart\n# ✅ Ordered rollout/scale\n\n# Deployment when:\n# ✅ Stateless replicas (any pod handles any request)\n# ✅ No identity required\n# ✅ Shared or no persistent storage\n\n# Real-world StatefulSet examples:\n# - PostgreSQL primary + replicas (per-pod storage)\n# - Kafka brokers (broker ID = ordinal)\n# - Elasticsearch nodes (master/data)\n# - Zookeeper ensemble (server IDs)\n# - Redis cluster nodes\n# - Cassandra ring\n\n# For most databases in K8s, use an OPERATOR (not raw StatefulSet):\n# - CloudNativePG for PostgreSQL\n# - Strimzi for Kafka\n# - ECK for Elasticsearch\n# - Redis Operator\n#\n# Operators handle: replication, backups, upgrades, failover\n\n# Anti-patterns:\n# ❌ StatefulSet for stateless work — use Deployment\n# ❌ Raw StatefulSet for prod DB — use an operator\n# ❌ Sharing a PVC across STS pods — use RWX (rare) or design differently\n\n# For migration: managed cloud DBs (RDS, Cloud SQL) are often better\n# → save the ops complexity for what really benefits from K8s\n\n# Simplified decision tree:\n# Stateless HTTP API?      → Deployment\n# Batch job?               → Job / CronJob\n# One-per-node agent?      → DaemonSet\n# Database / stateful?     → Operator (preferred) or StatefulSet",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        31,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Which workload type?",
+        "items": [
+          {
+            "label": "Stateless HTTP",
+            "color": "#10b981",
+            "value": "Deployment",
+            "highlight": true
+          },
+          {
+            "label": "Batch job",
+            "color": "#818cf8",
+            "value": "Job / CronJob"
+          },
+          {
+            "label": "One per node",
+            "color": "#f59e0b",
+            "value": "DaemonSet"
+          },
+          {
+            "label": "Stateful DB",
+            "color": "#60a5fa",
+            "value": "Operator > raw StatefulSet"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

@@ -54,15 +54,169 @@ ZGC is a scalable, low-latency garbage collector designed to handle heaps up to 
 ## VISUALIZATION_CONFIG
 ```json
 {
-  "diagramType": "sequence",
-  "timeline": [
-    {"event": "Mutator Allocates Object in Eden", "thread": "Application"},
-    {"event": "Eden Fills Up", "thread": "JVM"},
-    {"event": "Stop-The-World (STW) Pause Initiated", "thread": "GC Thread"},
-    {"event": "Marking GC Roots", "thread": "GC Thread"},
-    {"event": "Evacuating Live Objects to Survivor (S0)", "thread": "GC Thread"},
-    {"event": "Updating References via Card Table", "thread": "GC Thread"},
-    {"event": "STW Resumed / Application Continues", "thread": "Application"}
+  "language": "java",
+  "fileName": "GCMechanics.java",
+  "steps": [
+    {
+      "title": "GC roots and reachability",
+      "description": "Objects reachable from GC roots (stack variables, static fields, JNI refs) are LIVE. All others are eligible for collection.",
+      "code": "// GC Roots:\n// - local variables on thread stacks\n// - static fields of loaded classes\n// - JNI references from native code\n// Object is collected when no GC root can reach it\n// Circular references between unreachable objects: collected (unlike ref-counting)",
+      "diagram": {
+        "kind": "memory",
+        "stack": [
+          {
+            "label": "Stack (Thread 1)",
+            "value": "ref ? Object A",
+            "type": "GC root",
+            "highlight": true
+          },
+          {
+            "label": "Static field",
+            "value": "ref ? Object B",
+            "type": "GC root"
+          }
+        ],
+        "heap": [
+          {
+            "label": "Object A",
+            "fields": [
+              [
+                "ref",
+                "? Object C"
+              ]
+            ]
+          },
+          {
+            "label": "Object C",
+            "fields": [
+              [
+                "ref",
+                "? Object D"
+              ]
+            ]
+          },
+          {
+            "label": "Object D (unreachable)",
+            "fields": [
+              [
+                "ref",
+                "? Object D (cycle)"
+              ]
+            ],
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "Generational hypothesis",
+      "description": "Most objects die young. JVM divides heap into: Young Generation (Eden + S0 + S1) and Old Generation. Short-lived objects are collected cheaply in Young GC.",
+      "code": "// Young Generation (small, collected frequently)\n// - Eden: newly allocated objects\n// - Survivor S0/S1: objects surviving Minor GC\n// Old Generation (large, collected infrequently)\n// - Objects surviving multiple Minor GCs are promoted\n// Minor GC (Young): fast, < 50ms\n// Major/Full GC (Old): slow, can cause STW pause > 1s",
+      "diagram": {
+        "kind": "boxes",
+        "title": "Heap generations",
+        "items": [
+          {
+            "label": "Eden: new allocations",
+            "color": "#10b981"
+          },
+          {
+            "label": "Survivor S0/S1: survived 1+ minor GC",
+            "color": "#818cf8"
+          },
+          {
+            "label": "Old Gen: long-lived objects",
+            "color": "#818cf8",
+            "highlight": true
+          },
+          {
+            "label": "Meta: class metadata (not heap)",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Minor GC � copying collection",
+      "description": "Minor GC uses mark-and-copy. Identify live objects in Eden, copy to Survivor space, increment age. Young GC is usually < 50ms.",
+      "code": "// Minor GC process:\n// 1. Mark live objects in Eden + active Survivor\n// 2. Copy live objects to empty Survivor space\n//    ? increment age\n//    ? if age >= threshold: promote to Old\n// 3. Clear Eden + active Survivor\n// Benefit: no fragmentation (compact by design)",
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "mark live objects in Eden + active S0",
+            "done": true
+          },
+          {
+            "label": "copy live to S1 (increment age)",
+            "done": true
+          },
+          {
+            "label": "age >= threshold (15) ? promote to Old Gen",
+            "active": true
+          },
+          {
+            "label": "clear Eden + S0, swap S0/S1 roles"
+          }
+        ]
+      }
+    },
+    {
+      "title": "G1GC � Garbage First (Java 9+ default)",
+      "description": "G1 divides heap into equal-size regions. Collect regions with most garbage first (hence \"Garbage First\"). Predictable pause time target.",
+      "code": "// G1 key settings:\n// -XX:MaxGCPauseMillis=200    (pause time target)\n// -XX:G1HeapRegionSize=4m     (region size 1-32MB)\n// G1 phases:\n// Young GC: evacuate Eden/Survivor regions ? pause < 200ms\n// Concurrent marking: trace live objects concurrently\n// Mixed GC: collect Young + some Old regions",
+      "diagram": {
+        "kind": "boxes",
+        "title": "G1GC phases",
+        "items": [
+          {
+            "label": "Young GC: stop-the-world, fast",
+            "color": "#818cf8"
+          },
+          {
+            "label": "Concurrent marking: parallel with app",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "Mixed GC: young + old regions",
+            "color": "#818cf8"
+          },
+          {
+            "label": "pause target: MaxGCPauseMillis",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "ZGC / Shenandoah � sub-ms pauses",
+      "description": "ZGC (Java 15+) and Shenandoah perform concurrent compaction. Stop-the-world pauses < 1ms regardless of heap size.",
+      "code": "// ZGC: concurrent relocation + load barriers\n// -XX:+UseZGC -Xmx32g\n// Pauses: < 1ms for heaps up to terabytes\n// Cost: ~15% throughput overhead vs G1\n// Use when: latency SLA < 5ms, large heap\n// Shenandoah: similar, different algorithm",
+      "diagram": {
+        "kind": "boxes",
+        "title": "GC comparison",
+        "items": [
+          {
+            "label": "G1: < 200ms pause (default)",
+            "color": "#818cf8"
+          },
+          {
+            "label": "ZGC: < 1ms pause, 15% overhead",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "Shenandoah: < 1ms, different impl",
+            "color": "#818cf8"
+          },
+          {
+            "label": "Serial/Parallel: throughput-optimized",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    }
   ]
 }
 ```

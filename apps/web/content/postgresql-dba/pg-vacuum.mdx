@@ -19,7 +19,273 @@ In the early days of Postgres, DBAs had to set up cron jobs to run `VACUUM` ever
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "postgres-vacuum" }
+{
+  "language": "sql",
+  "fileName": "vacuum.sql",
+  "steps": [
+    {
+      "title": "What VACUUM does",
+      "description": "VACUUM reclaims dead tuples (from UPDATE/DELETE). It also updates statistics and prevents transaction ID wraparound. Runs automatically via autovacuum.",
+      "code": "-- Every UPDATE creates a dead row (MVCC)\nUPDATE users SET last_login = NOW() WHERE id = 42;\n-- Old row: xmax = current_txid → dead\n-- New row: xmin = current_txid\n\n-- Dead tuples pile up → bloat\nSELECT relname, n_live_tup, n_dead_tup,\n       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct\nFROM pg_stat_user_tables\nORDER BY n_dead_tup DESC LIMIT 10;\n\n-- VACUUM reclaims dead tuples (space reusable, but file not shrunk)\nVACUUM users;\n\n-- VACUUM FULL rewrites the table (locks exclusive!)\nVACUUM FULL users;   -- reclaims disk space too\n\n-- Analyze — updates statistics for the planner\nANALYZE users;\n\n-- Combined\nVACUUM (VERBOSE, ANALYZE) users;\n\n-- What VACUUM does:\n-- 1. Scan pages, mark dead tuples reusable\n-- 2. Update visibility map (which pages have no dead tuples)\n-- 3. Update free space map (where to insert new rows)\n-- 4. Freeze old tuples (prevent txid wraparound)\n-- 5. Optional: ANALYZE stats",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        13,
+        16,
+        19,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "UPDATE/DELETE creates dead tuples",
+            "done": true
+          },
+          {
+            "label": "VACUUM marks space as reusable",
+            "done": true
+          },
+          {
+            "label": "VACUUM FULL rewrites — reclaims disk",
+            "active": true
+          },
+          {
+            "label": "Freeze prevents txid wraparound"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Autovacuum operation",
+      "description": "Autovacuum wakes up periodically, checks each table, and vacuums those with enough dead tuples. Tune per-table for hot tables.",
+      "code": "-- Autovacuum settings\nautovacuum = on                              -- keep on!\nautovacuum_naptime = 30s                      -- check every 30s\nautovacuum_max_workers = 3                    -- parallel workers\nautovacuum_vacuum_threshold = 50              -- min dead tuples\nautovacuum_vacuum_scale_factor = 0.2          -- 20% + threshold\nautovacuum_analyze_threshold = 50\nautovacuum_analyze_scale_factor = 0.1\n\n-- Formula: vacuum when dead_tuples > threshold + scale_factor × live_tuples\n-- For 1M row table: vacuum when > 50 + 0.2 × 1M = 200,050 dead tuples\n\n-- Per-table tuning (aggressive for hot tables)\nALTER TABLE sessions SET (\n  autovacuum_vacuum_scale_factor = 0.02,      -- vacuum every 2%\n  autovacuum_analyze_scale_factor = 0.02,\n  autovacuum_vacuum_cost_delay = 5\n);\n\n-- Monitor autovacuum runs\nSELECT relname, last_autovacuum, autovacuum_count, n_dead_tup\nFROM pg_stat_user_tables\nORDER BY last_autovacuum DESC;\n\n-- In-progress autovacuum\nSELECT pid, datname, relid::regclass, phase, heap_blks_scanned, heap_blks_total\nFROM pg_stat_progress_vacuum;\n\n-- Disable for maintenance (temporarily)\nALTER TABLE sessions SET (autovacuum_enabled = false);\n-- ... bulk load ...\nVACUUM ANALYZE sessions;\nALTER TABLE sessions RESET (autovacuum_enabled);",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        14,
+        15,
+        16,
+        17,
+        18,
+        21,
+        22,
+        23,
+        26,
+        27,
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Autovacuum triggers",
+        "items": [
+          {
+            "label": "scale_factor default 0.2",
+            "color": "#10b981",
+            "value": "Vacuum when 20% dead",
+            "highlight": true
+          },
+          {
+            "label": "Per-table override",
+            "color": "#818cf8",
+            "value": "Hot tables → 2%"
+          },
+          {
+            "label": "max_workers 3",
+            "color": "#f59e0b",
+            "value": "Concurrent vacuum limit"
+          },
+          {
+            "label": "cost_delay",
+            "color": "#60a5fa",
+            "value": "Throttle to reduce impact"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Bloat detection and remediation",
+      "description": "Table/index bloat = wasted space from dead tuples. Detect with pgstattuple. Fix with pg_repack or VACUUM FULL.",
+      "code": "-- Extension for accurate bloat measurement\nCREATE EXTENSION pgstattuple;\n\n-- Table bloat\nSELECT * FROM pgstattuple('users');\n table_len     | 100M\n dead_tuple_len| 25M            -- 25% bloat!\n dead_tuple_percent | 25\n free_space    | 3M\n\n-- Index bloat\nSELECT * FROM pgstatindex('users_email_idx');\n leaf_fragmentation | 45\n\n-- Approximate bloat (fast, cheaper)\nSELECT schemaname, tablename,\n  pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS size,\n  n_dead_tup\nFROM pg_stat_user_tables\nWHERE n_dead_tup > 10000\nORDER BY n_dead_tup DESC;\n\n-- Fix bloat:\n\n-- Option 1: VACUUM FULL (locks exclusive!)\nVACUUM FULL users;                -- ⚠️ downtime\n\n-- Option 2: pg_repack (online — no exclusive lock)\nCREATE EXTENSION pg_repack;\n$ pg_repack -t users -o email devmastery\n\n-- Option 3: pg_squeeze extension (background auto-repack)\nCREATE EXTENSION pg_squeeze;\n\n-- Prevent: tune autovacuum, use fillfactor for hot updates\nALTER TABLE sessions SET (fillfactor = 80);",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        13,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        26,
+        29,
+        30,
+        32,
+        33,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Bloat > 20-30% impacts performance",
+            "done": true
+          },
+          {
+            "label": "pgstattuple gives exact %",
+            "done": true
+          },
+          {
+            "label": "pg_repack fixes online",
+            "active": true
+          },
+          {
+            "label": "Prevent: autovacuum tuning + fillfactor"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transaction ID wraparound",
+      "description": "PostgreSQL txid is 32-bit. Approaches 2 billion → wraparound → data corruption. VACUUM prevents this by freezing old tuples.",
+      "code": "-- Check age of tables (largest = oldest txids)\nSELECT c.relname, greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS age\nFROM pg_class c\nLEFT JOIN pg_class t ON c.reltoastrelid = t.oid\nWHERE c.relkind = 'r'\nORDER BY 2 DESC LIMIT 20;\n\n-- Warning threshold\n-- autovacuum_freeze_max_age = 200 million (default)\n-- Beyond: aggressive autovacuum forced\n\n-- Emergency vacuum (approaching wraparound)\nvacuum_freeze_min_age = 50000000\nvacuum_freeze_table_age = 150000000\n\n-- Manually freeze aggressively\nVACUUM (FREEZE, VERBOSE) users;\n\n-- Symptoms of approaching wraparound:\n-- WARNING: oldest xmin is far in the past\n-- ERROR: database is not accepting commands to avoid wraparound data loss\n-- HINT: Stop the postmaster and vacuum that database in single-user mode.\n\n-- Prevention:\n-- 1. Keep autovacuum on!\n-- 2. Monitor txid age via pg_stat_activity\n-- 3. Tune autovacuum for large tables\nALTER TABLE huge_table SET (\n  autovacuum_freeze_max_age = 100000000    -- more aggressive\n);\n\n-- PostgreSQL 12+: 64-bit txids for logical replication (bigger safety margin)",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        10,
+        11,
+        13,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        33
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Wraparound protection",
+        "items": [
+          {
+            "label": "txid = 32-bit",
+            "color": "#ef4444",
+            "value": "2 billion max — wraparound risk",
+            "highlight": true
+          },
+          {
+            "label": "VACUUM FREEZE",
+            "color": "#10b981",
+            "value": "Marks old rows immune from wraparound"
+          },
+          {
+            "label": "freeze_max_age 200M",
+            "color": "#818cf8",
+            "value": "Aggressive vacuum triggered"
+          },
+          {
+            "label": "Emergency at 2 billion",
+            "color": "#f59e0b",
+            "value": "DB refuses writes to prevent corruption"
+          }
+        ]
+      }
+    },
+    {
+      "title": "VACUUM performance impact",
+      "description": "VACUUM does I/O — throttled with cost limits. Balance freshness vs load. Priority for large hot tables.",
+      "code": "-- Cost-based delay (throttle VACUUM I/O)\nautovacuum_vacuum_cost_delay = 20ms       -- pause between chunks\nautovacuum_vacuum_cost_limit = 2000\n\n-- Cost model:\n-- vacuum_cost_page_hit = 1        -- in shared buffers\n-- vacuum_cost_page_miss = 10      -- read from disk\n-- vacuum_cost_page_dirty = 20     -- write dirty page\n\n-- Each chunk accumulates cost → sleep when limit hit\n\n-- Faster vacuum (accept more load):\nALTER SYSTEM SET autovacuum_vacuum_cost_delay = 2ms;\nALTER SYSTEM SET autovacuum_vacuum_cost_limit = 5000;\n\n-- Parallel vacuum (PG 13+, for indexes)\nVACUUM (PARALLEL 4) users;    -- 4 parallel index vacuum workers\n\n-- Track vacuum activity in real time\nSELECT pid, datname, relid::regclass, phase,\n       heap_blks_total, heap_blks_scanned, heap_blks_vacuumed,\n       index_vacuum_count\nFROM pg_stat_progress_vacuum;\n\n phase                        \n-------------------------------\n scanning heap\n vacuuming indexes\n vacuuming heap\n cleaning up indexes\n truncating heap\n\n-- I/O impact\nSELECT * FROM pg_stat_io WHERE backend_type = 'autovacuum worker';",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "VACUUM tuning",
+        "items": [
+          {
+            "label": "cost_delay throttles I/O",
+            "color": "#10b981",
+            "value": "Lower = faster vacuum, more load",
+            "highlight": true
+          },
+          {
+            "label": "PARALLEL for indexes",
+            "color": "#818cf8",
+            "value": "PG 13+ speeds up large tables"
+          },
+          {
+            "label": "pg_stat_progress_vacuum",
+            "color": "#f59e0b",
+            "value": "Watch phases in real time"
+          },
+          {
+            "label": "Balance",
+            "color": "#60a5fa",
+            "value": "Aggressive vacuum vs app response time"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

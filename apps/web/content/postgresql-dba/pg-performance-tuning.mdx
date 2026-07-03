@@ -17,7 +17,302 @@ PostgreSQL manages memory in two completely distinct ways:
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-tuning" }
+{
+  "language": "sql",
+  "fileName": "perf-tuning.sql",
+  "steps": [
+    {
+      "title": "Performance tuning workflow",
+      "description": "1. Measure with pg_stat_statements. 2. Find slow queries. 3. EXPLAIN ANALYZE. 4. Fix (index, rewrite, config). 5. Verify improvement.",
+      "code": "-- Step 1: Enable pg_stat_statements\nCREATE EXTENSION pg_stat_statements;\n\n-- Step 2: Wait, collect a day of production traffic\n\n-- Step 3: Find worst queries\nSELECT queryid, calls, mean_exec_time, total_exec_time,\n       LEFT(query, 100)\nFROM pg_stat_statements\nORDER BY total_exec_time DESC LIMIT 20;\n\n-- Step 4: EXPLAIN ANALYZE each\nEXPLAIN (ANALYZE, BUFFERS, VERBOSE)\nSELECT ... ;   -- suspect query\n\n-- Step 5: Fix (in order of preference):\n-- 1. Add missing index\n-- 2. Update stats (ANALYZE)\n-- 3. Rewrite query (UNION, CTE, avoid OR)\n-- 4. Extended statistics for correlated columns\n-- 5. Tune shared_buffers, work_mem\n-- 6. Application changes (batching, caching)\n\n-- Step 6: Verify\nSELECT pg_stat_statements_reset();\n-- Wait a day\n-- Compare metrics\n\n-- Golden principles:\n-- - Measure, don't guess\n-- - Change one thing at a time\n-- - Verify improvement with data\n-- - Keep a tuning log",
+      "highlight": [
+        2,
+        6,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Measure — pg_stat_statements",
+            "done": true
+          },
+          {
+            "label": "Focus on top queries by total_time",
+            "done": true
+          },
+          {
+            "label": "EXPLAIN + fix root cause",
+            "active": true
+          },
+          {
+            "label": "Verify with fresh measurement"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Memory tuning",
+      "description": "shared_buffers (25% RAM), work_mem (per query sort), effective_cache_size (planner hint), maintenance_work_mem (for VACUUM/CREATE INDEX).",
+      "code": "-- Global memory (per RAM tier)\n-- 8 GB RAM:\nshared_buffers = 2GB              -- 25%\neffective_cache_size = 6GB         -- 75%\nwork_mem = 8MB                     -- conservative\nmaintenance_work_mem = 512MB\n\n-- 32 GB RAM:\nshared_buffers = 8GB\neffective_cache_size = 24GB\nwork_mem = 32MB\nmaintenance_work_mem = 2GB\n\n-- 128 GB RAM:\nshared_buffers = 32GB\neffective_cache_size = 96GB\nwork_mem = 128MB\nmaintenance_work_mem = 4GB\n\n-- work_mem trap:\n-- Actual memory = work_mem × connections × sort operations per query\n-- 100 conn × 32MB × 2 = 6.4 GB!\n\n-- Solutions:\n-- 1. Lower work_mem, raise per query when needed:\nSET work_mem = '256MB';\nEXPLAIN ANALYZE SELECT ...;\n\n-- 2. Per-role\nALTER ROLE analytics_user SET work_mem = '512MB';\n\n-- 3. Per-query\nBEGIN;\nSET LOCAL work_mem = '1GB';\n-- ... heavy query ...\nCOMMIT;\n\n-- Check spilling to disk (indicates work_mem too low)\nEXPLAIN ANALYZE SELECT ... ORDER BY ...;\n-- Look for: Sort Method: external merge  Disk: 15000kB\n-- vs desired: Sort Method: quicksort  Memory: 25kB\n\n-- Buffer cache hit ratio\nSELECT sum(blks_hit) * 100.0 / sum(blks_hit + blks_read) AS cache_hit_ratio\nFROM pg_stat_database;\n-- Aim > 99% for OLTP",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        25,
+        26,
+        29,
+        32,
+        33,
+        34,
+        35,
+        38,
+        39,
+        40,
+        43,
+        44,
+        45
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Memory settings",
+        "items": [
+          {
+            "label": "shared_buffers 25%",
+            "color": "#10b981",
+            "value": "Biggest single knob",
+            "highlight": true
+          },
+          {
+            "label": "work_mem × connections",
+            "color": "#818cf8",
+            "value": "Beware total consumption"
+          },
+          {
+            "label": "effective_cache_size 75%",
+            "color": "#f59e0b",
+            "value": "Planner hint — includes OS cache"
+          },
+          {
+            "label": "maintenance_work_mem",
+            "color": "#60a5fa",
+            "value": "For VACUUM, CREATE INDEX"
+          }
+        ]
+      }
+    },
+    {
+      "title": "I/O and checkpoint tuning",
+      "description": "Reduce write amplification, spread checkpoint I/O, tune WAL, use SSD-aware settings.",
+      "code": "-- SSD-aware planner cost\nrandom_page_cost = 1.1              -- default 4.0 for HDD\neffective_io_concurrency = 200       -- HDD: 2; SSD: 100-300\nmaintenance_io_concurrency = 100\n\n-- WAL/checkpoint tuning\nmin_wal_size = 2GB\nmax_wal_size = 8GB                    -- more = fewer checkpoints\ncheckpoint_timeout = 15min             -- default 5 min\ncheckpoint_completion_target = 0.9    -- spread I/O\ncheckpoint_flush_after = 256kB         -- write chunks\n\n-- Background writer\nbgwriter_delay = 200ms\nbgwriter_lru_maxpages = 100\nbgwriter_lru_multiplier = 2.0\n\n-- Async commits (some data loss risk on crash — for high-throughput inserts only)\nsynchronous_commit = off              -- ⚠️ up to wal_writer_delay of data loss\nwal_writer_delay = 200ms\n\n-- Check if checkpoints are keeping up\nSELECT * FROM pg_stat_bgwriter;\n-- checkpoints_timed high vs checkpoints_req: healthy\n-- checkpoints_req high: max_wal_size too small\n\n-- Cache hit ratio per table\nSELECT relname,\n       heap_blks_hit + heap_blks_read AS reads,\n       round(100.0 * heap_blks_hit / NULLIF(heap_blks_hit + heap_blks_read, 0), 1) AS hit_pct\nFROM pg_statio_user_tables\nORDER BY reads DESC LIMIT 10;\n\n-- I/O timing (enable for detailed metrics)\ntrack_io_timing = on\n\nSELECT * FROM pg_stat_io WHERE object = 'relation';",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        15,
+        16,
+        19,
+        20,
+        23,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        36
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "I/O tuning",
+        "items": [
+          {
+            "label": "random_page_cost 1.1",
+            "color": "#10b981",
+            "value": "Tell planner SSDs are fast",
+            "highlight": true
+          },
+          {
+            "label": "max_wal_size 8GB",
+            "color": "#818cf8",
+            "value": "Fewer, bigger checkpoints"
+          },
+          {
+            "label": "checkpoint_completion 0.9",
+            "color": "#f59e0b",
+            "value": "Spread I/O over interval"
+          },
+          {
+            "label": "track_io_timing",
+            "color": "#60a5fa",
+            "value": "Detailed I/O visibility"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Query rewrites for performance",
+      "description": "Common speedup patterns: OR → UNION, EXISTS instead of IN, LATERAL joins, CTEs, avoid SELECT *.",
+      "code": "-- Anti-pattern 1: OR clauses often become seq scan\n-- Slow\nSELECT * FROM users WHERE email = 'x@y.com' OR username = 'xyz';\n-- Fast\nSELECT * FROM users WHERE email = 'x@y.com'\nUNION\nSELECT * FROM users WHERE username = 'xyz';\n\n-- Anti-pattern 2: IN with subquery\n-- Slow\nSELECT * FROM orders WHERE user_id IN (SELECT id FROM users WHERE role = 'admin');\n-- Fast\nSELECT o.* FROM orders o WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.user_id AND u.role = 'admin');\n-- Faster still (index-friendly)\nSELECT o.* FROM orders o JOIN users u ON u.id = o.user_id WHERE u.role = 'admin';\n\n-- Anti-pattern 3: SELECT * (wide reads)\n-- Slow (fetches all columns including TOAST)\nSELECT * FROM articles WHERE id = 42;\n-- Fast\nSELECT id, title, published_at FROM articles WHERE id = 42;\n\n-- Anti-pattern 4: OFFSET on deep pages\n-- Slow: OFFSET 100000 scans 100k rows first!\nSELECT * FROM orders ORDER BY created_at DESC LIMIT 20 OFFSET 100000;\n-- Fast: cursor pagination\nSELECT * FROM orders WHERE created_at < $last_created ORDER BY created_at DESC LIMIT 20;\n\n-- Anti-pattern 5: N+1 queries in app code\n-- Slow: N+1 pattern (200 queries)\n-- users.forEach(u => db.query(\"SELECT * FROM orders WHERE user_id=?\", u.id))\n-- Fast: single JOIN\nSELECT u.id, u.name, o.id, o.total\nFROM users u LEFT JOIN orders o ON o.user_id = u.id;\n\n-- Anti-pattern 6: LIKE with leading wildcard\n-- Cannot use btree index\nSELECT * FROM users WHERE email LIKE '%@gmail.com';\n-- Fix: GIN index with pg_trgm\nCREATE EXTENSION pg_trgm;\nCREATE INDEX idx_email_trgm ON users USING gin (email gin_trgm_ops);",
+      "highlight": [
+        3,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Query rewrites",
+        "items": [
+          {
+            "label": "OR → UNION",
+            "color": "#10b981",
+            "value": "Enables index use per branch",
+            "highlight": true
+          },
+          {
+            "label": "IN subquery → EXISTS/JOIN",
+            "color": "#818cf8",
+            "value": "Better plan choice"
+          },
+          {
+            "label": "OFFSET → cursor",
+            "color": "#f59e0b",
+            "value": "Deep pages linear cost"
+          },
+          {
+            "label": "GIN + pg_trgm",
+            "color": "#60a5fa",
+            "value": "LIKE with leading %"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Application-level optimizations",
+      "description": "Batch inserts, prepared statements, JSONB carefully, connection pooling, read replicas, application caching.",
+      "code": "-- 1. Batch inserts (100x faster than individual)\nINSERT INTO events (user_id, type, data) VALUES\n  ($1, $2, $3),\n  ($4, $5, $6),\n  ($7, $8, $9);\n-- Or use COPY for very large loads\nCOPY events (user_id, type, data) FROM STDIN;\n\n-- 2. Prepared statements (skip parse + plan)\nPREPARE get_user(bigint) AS\nSELECT * FROM users WHERE id = $1;\n\nEXECUTE get_user(42);\nEXECUTE get_user(43);\n\n-- 3. UPSERT for insert-or-update\nINSERT INTO users (id, name, updated_at)\nVALUES (42, 'Alice', NOW())\nON CONFLICT (id) DO UPDATE\nSET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at;\n\n-- 4. RETURNING to skip second query\nINSERT INTO orders (user_id, total) VALUES ($1, $2) RETURNING id;\n-- vs\n-- INSERT ... ;\n-- SELECT lastval();\n\n-- 5. CTE for readability (usually inlined in PG 12+)\nWITH recent AS (\n  SELECT * FROM orders WHERE created_at > NOW() - INTERVAL '1 day'\n)\nSELECT user_id, count(*) FROM recent GROUP BY user_id;\n\n-- 6. Materialized views for expensive aggregations\nCREATE MATERIALIZED VIEW mv_daily_orders AS\nSELECT DATE(created_at) AS day, count(*), sum(total)\nFROM orders GROUP BY 1;\n\nCREATE UNIQUE INDEX ON mv_daily_orders (day);\nREFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_orders;\n\n-- 7. Application cache (Redis) for hot reads",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        43
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Batch inserts (100x)",
+            "done": true
+          },
+          {
+            "label": "Prepared statements + UPSERT + RETURNING",
+            "done": true
+          },
+          {
+            "label": "Materialized views for aggregates",
+            "active": true
+          },
+          {
+            "label": "App cache + read replicas for scale"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

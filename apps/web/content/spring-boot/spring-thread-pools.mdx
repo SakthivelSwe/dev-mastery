@@ -1,0 +1,495 @@
+---
+slug: "spring-thread-pools"
+title: "Spring Thread Pools — ThreadPoolTaskExecutor Deep Dive"
+level: 3
+---
+
+## WHY
+
+Spring wraps `java.util.concurrent.ThreadPoolExecutor` with `ThreadPoolTaskExecutor` — same 7-parameter constructor semantics, but with lifecycle integration (starts after Spring context is ready, shuts down on `SIGTERM`), MDC/context propagation via `TaskDecorator`, Micrometer-observability, and clean YAML configuration. Every serious Spring Boot app has multiple pools — one for `@Async` email dispatch, one for outbound HTTP calls, one for CPU-heavy PDF generation, one for the Tomcat request handler itself. Sizing them wrong is how services silently degrade under load.
+
+This topic maps the whole Spring pool ecosystem: Tomcat's request pool, `ThreadPoolTaskExecutor` for `@Async`, `ThreadPoolTaskScheduler` for `@Scheduled`, `WebClient`'s reactor threads, and how to expose them all to Micrometer/Prometheus.
+
+## THEORY
+
+### The four pool types you meet in a Spring Boot app
+
+| Pool | What it powers | Backing class |
+|------|----------------|---------------|
+| **Tomcat worker pool** | HTTP request threads (`@RestController`) | Tomcat's `Executor` — configured via `server.tomcat.threads.*` |
+| **`ThreadPoolTaskExecutor`** | `@Async` methods, general task execution | Wraps `ThreadPoolExecutor` |
+| **`ThreadPoolTaskScheduler`** | `@Scheduled` methods | Wraps `ScheduledThreadPoolExecutor` |
+| **Reactor `Schedulers`** | WebFlux, `Flux.publishOn(...)` | Rings of event-loop threads |
+
+### `ThreadPoolTaskExecutor` — the 6 knobs you actually touch
+
+```java
+ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+e.setCorePoolSize(10);              // always-alive workers
+e.setMaxPoolSize(30);                // upper bound during bursts
+e.setQueueCapacity(200);             // BOUNDED queue between core and max
+e.setKeepAliveSeconds(60);           // idle time before above-core workers die
+e.setThreadNamePrefix("outbound-");  // log & thread-dump readability
+e.setAllowCoreThreadTimeOut(true);   // shrink to 0 when idle
+e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+e.initialize();
+```
+
+### The execution flow (same as ThreadPoolExecutor)
+
+```
+                     ┌── #workers < core?  ─── create worker → run task
+task submitted ────► │
+                     └── else ── queue not full? ── enqueue
+                                                  │
+                                                  └── else ── #workers < max? ── create worker
+                                                                              │
+                                                                              └── else ── rejection handler
+```
+**Bounded queue** is essential — the default in Spring (`Integer.MAX_VALUE` for `queueCapacity`) is a leak. Always cap it.
+
+### Tomcat request pool — the pool you inherit
+
+```yaml
+server:
+  tomcat:
+    threads:
+      max: 200         # maximumPoolSize for HTTP workers
+      min-spare: 10    # corePoolSize
+    max-connections: 8192      # max accepted sockets
+    accept-count: 100          # OS-level accept backlog
+    connection-timeout: 20000  # ms
+```
+
+Sizing: use Goetz's I/O-bound formula.
+```
+Nthreads = Ncpu * Ucpu * (1 + W/C)
+```
+For a 4-vCPU box handling requests that spend 50 ms in DB and 5 ms in Java: `4 * 0.8 * 11 ≈ 35`. The 200 default is generous but well within safety.
+
+### Task decoration — the "must-have" plumbing
+
+By default, MDC (log context) and SecurityContext are NOT copied to worker threads. Solve with `TaskDecorator`:
+
+```java
+class ContextDecorator implements TaskDecorator {
+    @Override
+    public Runnable decorate(Runnable task) {
+        var mdc = MDC.getCopyOfContextMap();
+        var sec = SecurityContextHolder.getContext();
+        return () -> {
+            try {
+                if (mdc != null) MDC.setContextMap(mdc);
+                SecurityContextHolder.setContext(sec);
+                task.run();
+            } finally {
+                MDC.clear();
+                SecurityContextHolder.clearContext();
+            }
+        };
+    }
+}
+```
+Attach: `e.setTaskDecorator(new ContextDecorator())`.
+
+### Observability — expose pool state to metrics
+
+Spring Boot Actuator auto-registers Micrometer metrics for every `ThreadPoolTaskExecutor` when Micrometer is on the classpath:
+
+```
+executor.pool.core        executor.pool.size       executor.pool.max
+executor.active           executor.queued          executor.queue.remaining
+executor.completed
+```
+
+Dashboards you actually want:
+- `executor.queued` — sustained > 0 means the pool is undersized.
+- `executor.active / executor.pool.max` — sustained ~1 means saturation.
+- Rejected task counter — non-zero means the queue is dropping work.
+
+### Shutdown behavior
+
+`ThreadPoolTaskExecutor` implements `DisposableBean` — on `SIGTERM` it calls `shutdown()` and waits for in-flight tasks. Tune:
+
+```java
+e.setWaitForTasksToCompleteOnShutdown(true);   // drain queue
+e.setAwaitTerminationSeconds(30);              // max wait
+```
+Without these, Spring interrupts running tasks on shutdown — half-committed transactions, dropped messages.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "PoolsConfig.java",
+  "steps": [
+    {
+      "title": "Tomcat request pool",
+      "description": "Every HTTP request runs on a Tomcat worker thread. Configure size in application.yml. Formula: Ncpu × Ucpu × (1 + W/C).",
+      "code": "server:\n  tomcat:\n    threads:\n      max: 200\n      min-spare: 10\n    max-connections: 8192\n    accept-count: 100",
+      "language": "yaml",
+      "highlight": [
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 100,
+        "workers": [
+          {
+            "name": "http-nio-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-nio-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-nio-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-nio-4",
+            "state": "WAITING",
+            "note": "idle"
+          }
+        ],
+        "queue": [
+          {
+            "label": "req5"
+          },
+          {
+            "label": "req6"
+          },
+          {
+            "label": "req7"
+          },
+          {
+            "label": "req8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "ThreadPoolTaskExecutor — for @Async",
+      "description": "Spring's wrapper around ThreadPoolExecutor. Adds lifecycle hooks, TaskDecorator, and Micrometer metrics. Always bounded, always CallerRunsPolicy.",
+      "code": "@Bean(\"outbound\")\nThreadPoolTaskExecutor outboundExecutor() {\n    ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();\n    e.setCorePoolSize(20);\n    e.setMaxPoolSize(40);\n    e.setQueueCapacity(200);\n    e.setThreadNamePrefix(\"outbound-\");\n    e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());\n    e.setWaitForTasksToCompleteOnShutdown(true);\n    e.setAwaitTerminationSeconds(30);\n    e.initialize();\n    return e;\n}",
+      "highlight": [
+        4,
+        5,
+        6,
+        8,
+        9,
+        10
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 10,
+        "workers": [
+          {
+            "name": "outbound-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "outbound-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "outbound-3",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T4"
+          },
+          {
+            "label": "T5"
+          }
+        ]
+      }
+    },
+    {
+      "title": "ThreadPoolTaskScheduler — for @Scheduled",
+      "description": "Separate pool for @Scheduled methods. Sizing = the number of scheduled methods that might overlap.",
+      "code": "@Bean\nThreadPoolTaskScheduler taskScheduler() {\n    ThreadPoolTaskScheduler s = new ThreadPoolTaskScheduler();\n    s.setPoolSize(10);\n    s.setThreadNamePrefix(\"sched-\");\n    s.setRemoveOnCancelPolicy(true);\n    return s;\n}",
+      "highlight": [
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 0,
+        "workers": [
+          {
+            "name": "sched-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "sched-2",
+            "state": "WAITING"
+          },
+          {
+            "name": "sched-3",
+            "state": "WAITING"
+          }
+        ],
+        "queue": []
+      }
+    },
+    {
+      "title": "Bulkhead — one pool per failure domain",
+      "description": "Never share a single executor across fast/slow work. Split into dbPool, partnerPool, cpuPool — a stuck partner API cannot starve the DB path.",
+      "code": "@Bean(\"dbPool\")      TPTaskExec dbPool()      { ... 20/40/500 CallerRuns ... }\n@Bean(\"partnerPool\") TPTaskExec partnerPool() { ... 10/10/50 CallerRuns ... }\n@Bean(\"cpuPool\")     TPTaskExec cpuPool()     { ... N/N/100 Abort ... }",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Bulkheads",
+        "items": [
+          {
+            "label": "dbPool",
+            "color": "#10b981"
+          },
+          {
+            "label": "partnerPool",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "cpuPool",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Micrometer observability",
+      "description": "With Micrometer, every ThreadPoolTaskExecutor auto-exposes queue depth, active count, and completed count. Dashboards alert BEFORE the pool saturates.",
+      "code": "ExecutorServiceMetrics.monitor(registry, e.getThreadPoolExecutor(), \"outbound\");\n// exposes:\n// executor_pool_size{name=\"outbound\"}\n// executor_active_threads{name=\"outbound\"}\n// executor_queued_tasks{name=\"outbound\"}",
+      "highlight": [
+        1,
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Metrics per pool",
+        "items": [
+          {
+            "label": "active",
+            "color": "#10b981"
+          },
+          {
+            "label": "queued",
+            "color": "#f59e0b",
+            "highlight": true
+          },
+          {
+            "label": "poolSize",
+            "color": "#818cf8"
+          },
+          {
+            "label": "completed",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — YAML-configured pool via Spring Boot
+```yaml
+spring:
+  task:
+    execution:
+      pool:
+        core-size: 8
+        max-size: 32
+        queue-capacity: 500
+        keep-alive: 60s
+      thread-name-prefix: task-
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s
+```
+```java
+@Service
+class Worker {
+    @Async
+    public CompletableFuture<String> doStuff() {
+        System.out.println(Thread.currentThread().getName());  // task-1, task-2, ...
+        return CompletableFuture.completedFuture("done");
+    }
+}
+```
+
+### Level 2 — Multiple pools, one per failure domain
+```java
+@Configuration
+@EnableAsync
+class ExecutorsConfig {
+
+    @Bean("outboundHttpExecutor")
+    public ThreadPoolTaskExecutor outbound() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(20);
+        e.setMaxPoolSize(50);
+        e.setQueueCapacity(1000);
+        e.setThreadNamePrefix("outbound-http-");
+        e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        e.setTaskDecorator(new ContextDecorator());
+        e.initialize();
+        return e;
+    }
+
+    @Bean("cpuExecutor")
+    public ThreadPoolTaskExecutor cpu() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(cores);
+        e.setMaxPoolSize(cores);
+        e.setQueueCapacity(100);
+        e.setThreadNamePrefix("cpu-");
+        e.initialize();
+        return e;
+    }
+
+    @Bean("emailExecutor")
+    public ThreadPoolTaskExecutor email() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(4);
+        e.setMaxPoolSize(4);
+        e.setQueueCapacity(10_000);   // emails can queue for hours safely
+        e.setThreadNamePrefix("email-");
+        e.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardOldestPolicy());
+        e.initialize();
+        return e;
+    }
+}
+```
+`@Async("outboundHttpExecutor")` on each service method dispatches to the right pool.
+
+### Level 3 — `TaskDecorator` for MDC + tracing
+```java
+public class MdcTaskDecorator implements TaskDecorator {
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        Map<String, String> mdc = MDC.getCopyOfContextMap();
+        return () -> {
+            Map<String, String> previous = MDC.getCopyOfContextMap();
+            try {
+                if (mdc != null) MDC.setContextMap(mdc); else MDC.clear();
+                runnable.run();
+            } finally {
+                if (previous != null) MDC.setContextMap(previous); else MDC.clear();
+            }
+        };
+    }
+}
+```
+Every log line inside the async task now carries the caller's `traceId`, `userId`, etc.
+
+### Level 4 — Custom pool + Micrometer instrumentation
+```java
+@Configuration
+class ObservablePool {
+
+    @Bean
+    public ThreadPoolTaskExecutor reportExecutor(MeterRegistry registry) {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(4);
+        e.setMaxPoolSize(4);
+        e.setQueueCapacity(50);
+        e.setThreadNamePrefix("report-");
+        e.setTaskDecorator(new MdcTaskDecorator());
+        e.initialize();
+        ExecutorServiceMetrics.monitor(registry, e.getThreadPoolExecutor(), "report");
+        return e;
+    }
+}
+```
+Now `/actuator/prometheus` exposes:
+```
+executor_pool_size{name="report"}
+executor_active_threads{name="report"}
+executor_queued_tasks{name="report"}
+executor_completed_tasks_total{name="report"}
+```
+
+### Level 5 — Graceful shutdown handling
+```java
+@Bean
+public ThreadPoolTaskExecutor gracefulExecutor() {
+    ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+    e.setCorePoolSize(10);
+    e.setMaxPoolSize(20);
+    e.setQueueCapacity(200);
+    e.setThreadNamePrefix("gr-");
+
+    // KEY: on SIGTERM, wait up to 30s for in-flight tasks
+    e.setWaitForTasksToCompleteOnShutdown(true);
+    e.setAwaitTerminationSeconds(30);
+
+    e.initialize();
+    return e;
+}
+```
+In Kubernetes with `terminationGracePeriodSeconds: 60`, this ensures no in-flight background work is killed mid-way.
+
+## REAL_WORLD
+
+**Notification service under a load spike.** During a marketing push, the service receives 40 000 email requests/min. The `emailExecutor` (5 workers, 500 queue) fills up in seconds — `CallerRunsPolicy` kicks in, making the HTTP request thread run the task itself. Response latency creeps up, but nothing is dropped. `executor.queued{name="email"}` on the Grafana dashboard shows the exact moment the marketing push started, and `executor.pool.max` shows the pool auto-expanding to `maxPoolSize`. When the push ends, the queue drains within 90 seconds and `allowCoreThreadTimeOut` shrinks the pool back to `corePoolSize`. Zero pages, zero data loss, zero code changes.
+
+Compare with an earlier version of the same service that used `Executors.newFixedThreadPool(5)` in a `@Bean` — under the same load, GC pauses climbed from 20 ms to 4 s within 10 minutes as the unbounded queue accumulated tens of thousands of Runnables in the old-gen heap.
+
+## INTERVIEW
+
+**Q: What's the difference between `ThreadPoolTaskExecutor` and `ThreadPoolExecutor`?**
+A: `ThreadPoolTaskExecutor` is Spring's wrapper — same 7-param semantics but integrated with Spring lifecycle (starts after context ready, shuts down cleanly), supports `TaskDecorator` for MDC/security propagation, and gets Micrometer metrics for free.
+
+**Q: How do you size the Tomcat thread pool?**
+A: Goetz formula: `Ncores * Ucpu * (1 + W/C)`. W = avg wait per request (I/O, DB, external calls). C = CPU compute per request. Set `Ucpu = 0.7-0.9` as safety margin. Measure W and C with real traffic before setting.
+
+**Q: What's the default `queueCapacity` for `ThreadPoolTaskExecutor`, and why is it dangerous?**
+A: `Integer.MAX_VALUE` — effectively unbounded. That means the pool will queue tasks in memory indefinitely under load, and `maximumPoolSize` is dead code (extra threads are only spawned when the queue is full). Always set an explicit small capacity.
+
+**Q: How do you propagate MDC / SecurityContext to `@Async` methods?**
+A: Set a `TaskDecorator` on the executor. The decorator captures the caller thread's MDC and SecurityContext, restores them inside the task, and clears them in a `finally` block. Spring Security ships `DelegatingSecurityContextAsyncTaskExecutor` for the security part only.
+
+**Q: What's the difference between `spring.task.execution` and `spring.task.scheduling` in `application.yml`?**
+A: `spring.task.execution` configures the default `ThreadPoolTaskExecutor` used by `@Async`. `spring.task.scheduling` configures the default `ThreadPoolTaskScheduler` used by `@Scheduled`. Two different pools, two different YAML sections.
+
+**Q: What's `CallerRunsPolicy` and when is it the right default?**
+A: When the queue is full and max threads are busy, the SUBMITTING thread runs the task synchronously. This creates natural back-pressure — the caller slows down until the pool catches up. Excellent default for HTTP endpoints: rather than fail traffic, the request thread does the work itself, cascading the slowdown to the upstream client instead of losing it.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Spring runs a bunch of "helper crews" behind the scenes. One crew answers the phone (Tomcat), one crew sends emails (`@Async` executor), one crew does the weekly cleanup (`@Scheduled` scheduler). Each crew has a size — too small and requests wait in a long line; too big and the crews get in each other's way. Because these crews live inside your app, Spring lets you set their size in one config file — and if you ask nicely, it tells you every second how many helpers are busy and how long the line is.
+
+## BUILD
+
+Build a **bulkhead executor gateway**:
+1. Define three pools via `application.yml`: `db`, `outboundHttp`, `pdfRender` — each with distinct core/max/queue.
+2. Register Micrometer metrics on all three via `ExecutorServiceMetrics.monitor(...)`.
+3. Attach a `MdcTaskDecorator` to each.
+4. Endpoint `GET /health/pools` returns each pool's `poolSize`, `activeCount`, `queueSize`, `completedTaskCount`.
+5. Simulate a stress test: 5 000 concurrent tasks split across the three pools — verify the pools scale independently and one pool's saturation doesn't affect others.
+6. **Bonus**: add a `/admin/pools/{name}/resize?core=X&max=Y` endpoint that dynamically resizes the given pool at runtime.
+
+## SPACED REVIEW
+
+**Day 1**: Write the YAML block that configures `@Async`'s default executor to core=10, max=30, queue=500.
+**Day 3**: Explain why the default `queueCapacity = MAX_VALUE` is a production hazard.
+**Day 7**: Sketch a `TaskDecorator` that propagates MDC. Where do you clear the map afterwards, and why?
+**Day 14**: List the three canonical pool categories in a Spring app (Tomcat, TaskExecutor, TaskScheduler) and one metric to alert on for each.
+

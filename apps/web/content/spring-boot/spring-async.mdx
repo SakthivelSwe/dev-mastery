@@ -1,0 +1,538 @@
+---
+slug: "spring-async"
+title: "Spring @Async — Fire-and-Forget & Non-Blocking Methods"
+level: 3
+---
+
+## WHY
+
+An HTTP endpoint that calls out to three internal services in serial holds the Tomcat worker thread for the sum of all three round-trips. If each takes 200 ms, that's 600 ms per request while doing almost no CPU work — a 200-thread pool is saturated at just 333 req/s. `@Async` lets ANY Spring bean method return a `CompletableFuture` and execute on a dedicated thread pool. The controller returns to the request thread immediately; the actual work runs in the background; results are composed via CompletableFuture pipelines. Combined with Java 21 virtual threads, one machine can serve tens of thousands of concurrent slow requests without breaking a sweat.
+
+`@Async` also solves the "fire-and-forget" case: user requests a password reset → the API returns 202 immediately → the actual email send happens on a background thread → user isn't waiting for SMTP.
+
+## THEORY
+
+### The two ingredients
+
+1. `@EnableAsync` on a `@Configuration` class (or on `@SpringBootApplication`).
+2. `@Async` on any public method of a Spring-managed bean.
+
+Spring's proxy layer intercepts calls to `@Async` methods and reroutes them onto a `TaskExecutor`. The method itself may look like ordinary blocking code.
+
+### Return types you can use
+
+| Return type | Behavior |
+|-------------|----------|
+| `void` | Fire-and-forget. **Exceptions are lost unless you register an `AsyncUncaughtExceptionHandler`.** |
+| `Future<T>` | Legacy; less composable than CompletableFuture |
+| `CompletableFuture<T>` | Recommended — composable, timeout-friendly, chainable |
+| `ListenableFuture<T>` | Deprecated in Spring 6 |
+
+### The proxy trap — the #1 `@Async` bug
+
+`@Async` works through Spring AOP proxies. Calling an `@Async` method on `this` inside the SAME bean bypasses the proxy — the call runs synchronously on the caller's thread.
+
+```java
+@Service
+class UserService {
+    @Async
+    public CompletableFuture<Void> sendEmail(User u) { /* ... */ }
+
+    public void register(User u) {
+        userRepo.save(u);
+        sendEmail(u);            // BUG: runs synchronously — same thread as register()
+    }
+}
+```
+Fix options:
+- Inject a self-reference (`ApplicationContext.getBean(UserService.class).sendEmail(u)`).
+- Split into two beans so the call crosses a bean boundary.
+- Call `AopContext.currentProxy()` (requires `@EnableAspectJAutoProxy(exposeProxy = true)`).
+
+### Configuring the executor
+
+By default, Spring uses a `SimpleAsyncTaskExecutor` — **it creates a new thread per invocation, unbounded**. That is a production landmine. Always define a bounded executor:
+
+```java
+@Configuration
+@EnableAsync
+class AsyncConfig {
+    @Bean("emailExecutor")
+    public Executor emailExecutor() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(5);
+        e.setMaxPoolSize(10);
+        e.setQueueCapacity(500);
+        e.setThreadNamePrefix("email-");
+        e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        e.initialize();
+        return e;
+    }
+}
+```
+Then reference it: `@Async("emailExecutor")`.
+
+### Exception handling
+
+Uncaught exceptions in a `@Async` method:
+- On `CompletableFuture<T>` return type: captured in the future. Callers must observe.
+- On `void` return type: dispatched to the `AsyncUncaughtExceptionHandler`. Default is a noisy stderr log. Provide your own:
+
+```java
+@Configuration
+@EnableAsync
+class AsyncConfig implements AsyncConfigurer {
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> log.error(
+                "async {} failed: {}", method.getName(), ex.getMessage(), ex);
+    }
+}
+```
+
+### Context propagation — the sneaky trap
+
+Anything stored on the request thread is INVISIBLE on the async thread by default:
+- `SecurityContextHolder` — `getContext().getAuthentication()` returns null.
+- `RequestContextHolder` — `LocaleContext`, request attributes.
+- MDC (SLF4J logging context) — trace IDs, user IDs vanish from logs.
+
+Fixes:
+- `DelegatingSecurityContextAsyncTaskExecutor` wraps your executor and propagates security.
+- `TaskDecorator` on `ThreadPoolTaskExecutor` — a lambda that captures the caller's context and restores it inside the task.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "AsyncFlow.java",
+  "steps": [
+    {
+      "title": "Controller returns immediately",
+      "description": "The @RestController receives a request. It calls an @Async method, which the Spring AOP proxy reroutes onto a background TaskExecutor. The request thread is free.",
+      "code": "@PostMapping(\"/register\")\npublic ResponseEntity<Void> register(@RequestBody User u) {\n    userRepo.save(u);\n    emailService.sendWelcomeAsync(u);   // fires and forgets\n    return ResponseEntity.accepted().build();\n}",
+      "highlight": [
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "client",
+          "controller",
+          "emailExecutor"
+        ],
+        "messages": [
+          {
+            "from": "client",
+            "to": "controller",
+            "label": "POST /register"
+          },
+          {
+            "from": "controller",
+            "to": "emailExecutor",
+            "label": "submit sendWelcome"
+          },
+          {
+            "from": "controller",
+            "to": "client",
+            "label": "202 Accepted (fast)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "@Async on the method",
+      "description": "The service is a normal Spring bean. @Async tells Spring to intercept calls through a proxy and dispatch to a TaskExecutor. Return type CompletableFuture<T> gives the caller a handle to the result.",
+      "code": "@Service\nclass EmailService {\n    @Async(\"emailExecutor\")\n    public CompletableFuture<Boolean> sendWelcomeAsync(User u) {\n        smtp.send(u.email(), template.render(u));\n        return CompletableFuture.completedFuture(true);\n    }\n}",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "What @Async does",
+        "items": [
+          {
+            "label": "AOP proxy",
+            "color": "#818cf8"
+          },
+          {
+            "label": "submit → TaskExecutor",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "CompletableFuture",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Bounded executor — never SimpleAsyncTaskExecutor",
+      "description": "The default @Async executor is SimpleAsyncTaskExecutor — it spawns unbounded threads. Always define your own bounded ThreadPoolTaskExecutor with CallerRunsPolicy.",
+      "code": "@Bean(\"emailExecutor\")\npublic Executor emailExecutor() {\n    ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();\n    e.setCorePoolSize(5);\n    e.setMaxPoolSize(10);\n    e.setQueueCapacity(500);\n    e.setThreadNamePrefix(\"email-\");\n    e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());\n    e.initialize();\n    return e;\n}",
+      "highlight": [
+        4,
+        5,
+        6,
+        8
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 10,
+        "workers": [
+          {
+            "name": "email-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "email-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "email-3",
+            "state": "WAITING",
+            "note": "idle"
+          },
+          {
+            "name": "email-4",
+            "state": "WAITING",
+            "note": "idle"
+          },
+          {
+            "name": "email-5",
+            "state": "WAITING",
+            "note": "idle"
+          }
+        ],
+        "queue": [
+          {
+            "label": "msg6"
+          },
+          {
+            "label": "msg7"
+          }
+        ]
+      }
+    },
+    {
+      "title": "The self-invocation trap",
+      "description": "Calling an @Async method on `this` from within the SAME bean bypasses the proxy — the call runs SYNCHRONOUSLY. Split into two beans, or fetch the proxy via ApplicationContext.",
+      "code": "@Service\nclass Bad {\n    @Async public CompletableFuture<Void> heavy() { ... }\n\n    public void go() {\n        heavy();   // BUG: bypasses proxy, runs synchronously\n    }\n}",
+      "highlight": [
+        5,
+        6,
+        7
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "this.heavy() ≠ proxy.heavy()",
+        "items": [
+          {
+            "label": "this.heavy()",
+            "color": "#ef4444",
+            "value": "sync (bug)"
+          },
+          {
+            "label": "other.heavy()",
+            "color": "#10b981",
+            "value": "async (via proxy)",
+            "highlight": true
+          },
+          {
+            "label": "ctx.getBean(Bad).heavy()",
+            "color": "#10b981",
+            "value": "async (fetch proxy)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "MDC / SecurityContext propagation",
+      "description": "By default the request thread's MDC (log context) and SecurityContext are NOT visible to the async thread. Fix with a TaskDecorator that copies both before running the task.",
+      "code": "class ContextDecorator implements TaskDecorator {\n    public Runnable decorate(Runnable r) {\n        var mdc = MDC.getCopyOfContextMap();\n        var sec = SecurityContextHolder.getContext();\n        return () -> {\n            try {\n                if (mdc != null) MDC.setContextMap(mdc);\n                SecurityContextHolder.setContext(sec);\n                r.run();\n            } finally { MDC.clear(); SecurityContextHolder.clearContext(); }\n        };\n    }\n}",
+      "highlight": [
+        3,
+        4,
+        6,
+        7,
+        8
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "request-thread",
+          "decorator",
+          "async-thread"
+        ],
+        "messages": [
+          {
+            "from": "request-thread",
+            "to": "decorator",
+            "label": "capture MDC + Security"
+          },
+          {
+            "from": "decorator",
+            "to": "async-thread",
+            "label": "restore + run task"
+          },
+          {
+            "from": "async-thread",
+            "to": "decorator",
+            "label": "finally: clear"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Enable and use `@Async`
+```java
+@SpringBootApplication
+@EnableAsync
+public class Application { public static void main(String[] a) { SpringApplication.run(Application.class, a); } }
+
+@Service
+class NotificationService {
+
+    @Async
+    public CompletableFuture<Boolean> sendEmail(String to, String subject) {
+        try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        System.out.printf("[%s] emailed %s%n", Thread.currentThread().getName(), to);
+        return CompletableFuture.completedFuture(true);
+    }
+}
+
+@RestController
+class Ctrl {
+    private final NotificationService svc;
+    Ctrl(NotificationService svc) { this.svc = svc; }
+
+    @PostMapping("/notify")
+    public ResponseEntity<Void> notify(@RequestBody Req req) {
+        svc.sendEmail(req.to(), req.subject());        // returns immediately
+        return ResponseEntity.accepted().build();
+    }
+    record Req(String to, String subject) {}
+}
+```
+
+### Level 2 — Bounded custom executor
+```java
+@Configuration
+@EnableAsync
+class AsyncConfig implements AsyncConfigurer {
+
+    @Bean("emailExecutor")
+    public Executor emailExecutor() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(5);
+        e.setMaxPoolSize(10);
+        e.setQueueCapacity(500);
+        e.setThreadNamePrefix("email-");
+        e.setKeepAliveSeconds(60);
+        e.setAllowCoreThreadTimeOut(true);
+        e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        e.initialize();
+        return e;
+    }
+
+    @Bean("reportExecutor")
+    public Executor reportExecutor() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(2);
+        e.setMaxPoolSize(4);
+        e.setQueueCapacity(50);
+        e.setThreadNamePrefix("report-");
+        e.initialize();
+        return e;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) ->
+            LoggerFactory.getLogger("async").error("uncaught in {}", method, ex);
+    }
+}
+
+@Service
+class Services {
+    @Async("emailExecutor")
+    public CompletableFuture<Void> sendEmail(String to) { /* ... */ return CompletableFuture.completedFuture(null); }
+
+    @Async("reportExecutor")
+    public CompletableFuture<byte[]> generatePdfReport(Long orderId) { /* ... */ return CompletableFuture.completedFuture(new byte[0]); }
+}
+```
+
+### Level 3 — Parallel fan-out inside a controller
+```java
+@RestController
+class HomeController {
+    private final UserService     users;
+    private final OrderService    orders;
+    private final WishlistService wishlists;
+
+    HomeController(UserService u, OrderService o, WishlistService w) {
+        this.users = u; this.orders = o; this.wishlists = w;
+    }
+
+    @GetMapping("/api/home/{userId}")
+    public HomeView home(@PathVariable Long userId) throws Exception {
+        CompletableFuture<User>    uCF = users.findAsync(userId);        // @Async in each service
+        CompletableFuture<List<Order>>    oCF = orders.recentAsync(userId);
+        CompletableFuture<List<Product>>  wCF = wishlists.forAsync(userId)
+                .completeOnTimeout(List.of(), 500, TimeUnit.MILLISECONDS);
+
+        CompletableFuture.allOf(uCF, oCF, wCF).get(2, TimeUnit.SECONDS);
+        return new HomeView(uCF.get(), oCF.get(), wCF.get());
+    }
+}
+```
+
+### Level 4 — MDC / security propagation via `TaskDecorator`
+```java
+@Configuration
+class AsyncContextConfig {
+    @Bean("contextExecutor")
+    public Executor contextExecutor() {
+        ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+        e.setCorePoolSize(4);
+        e.setMaxPoolSize(8);
+        e.setQueueCapacity(200);
+        e.setThreadNamePrefix("ctx-");
+        e.setTaskDecorator(new MdcAndSecurityTaskDecorator());
+        e.initialize();
+        return e;
+    }
+}
+
+class MdcAndSecurityTaskDecorator implements TaskDecorator {
+    @Override
+    public Runnable decorate(Runnable task) {
+        Map<String, String>  mdc  = MDC.getCopyOfContextMap();       // caller thread
+        SecurityContext      sec  = SecurityContextHolder.getContext();
+        return () -> {
+            SecurityContext prev = SecurityContextHolder.getContext();
+            Map<String, String> prevMdc = MDC.getCopyOfContextMap();
+            try {
+                if (mdc != null) MDC.setContextMap(mdc);
+                SecurityContextHolder.setContext(sec);
+                task.run();
+            } finally {
+                if (prevMdc != null) MDC.setContextMap(prevMdc); else MDC.clear();
+                SecurityContextHolder.setContext(prev);
+            }
+        };
+    }
+}
+```
+
+### Level 5 — The self-invocation trap and its fix
+```java
+@Service
+class BadUsage {
+    @Async public CompletableFuture<Void> heavyWork() { return null; }
+
+    public void broken() { heavyWork(); }         // BUG: runs synchronously
+}
+
+@Service
+class GoodUsage {
+    private final ApplicationContext ctx;
+    GoodUsage(ApplicationContext ctx) { this.ctx = ctx; }
+
+    @Async public CompletableFuture<Void> heavyWork() { return null; }
+
+    public void works() {
+        // Route the call through Spring's proxy — @Async is honoured
+        ctx.getBean(GoodUsage.class).heavyWork();
+    }
+}
+
+// Best practice: split into TWO beans so the call always crosses a bean boundary
+@Service class HeavyWorker { @Async public CompletableFuture<Void> heavyWork() { return null; } }
+@Service class Caller { private final HeavyWorker w; Caller(HeavyWorker w) { this.w = w; } public void ok() { w.heavyWork(); } }
+```
+
+## REAL_WORLD
+
+**A commerce checkout endpoint** dispatches four independent side-effects the customer doesn't need to wait for: metrics event, audit log, warehouse pre-reservation, marketing engine notification. Doing them all `@Async` cuts the endpoint's P95 from 250 ms → 80 ms with no user-visible change.
+
+```java
+@RestController
+class CheckoutController {
+    private final CheckoutService svc;
+    private final MetricsService  metrics;
+    private final AuditService    audit;
+    private final WarehouseService warehouse;
+    private final MarketingService marketing;
+
+    @PostMapping("/checkout")
+    public CheckoutResponse checkout(@RequestBody CheckoutRequest req) {
+        var order = svc.placeOrder(req);              // SYNC — critical path
+
+        // FIRE AND FORGET — none of these block the response
+        metrics.recordCheckoutAsync(order);
+        audit.logCheckoutAsync(order);
+        warehouse.preReserveAsync(order);
+        marketing.notifyPurchaseAsync(order);
+
+        return new CheckoutResponse(order.id(), order.total());
+    }
+}
+```
+Each `*Async(...)` method is annotated `@Async("...Executor")` on its own bounded pool — even if the marketing engine goes down, only the marketing executor's queue fills, other flows unaffected.
+
+## INTERVIEW
+
+**Q: What does `@Async` do and what are the prerequisites?**
+A: It routes calls to the annotated method onto a background thread pool via a Spring AOP proxy. Requires `@EnableAsync` somewhere in configuration. Method must be public. Calls made from OUTSIDE the bean (via another Spring-managed bean) go through the proxy; self-invocations do not.
+
+**Q: What happens if I call an `@Async` method from another method in the same class?**
+A: The call bypasses the proxy — it runs synchronously on the caller's thread. Fixes: split into two beans, inject a self-reference via `ApplicationContext`, or use AspectJ compile-time weaving.
+
+**Q: What's the default executor for `@Async`? Why is it dangerous?**
+A: `SimpleAsyncTaskExecutor` — spawns a new thread per invocation, unbounded. Under load it will fork thousands of threads and OOM. Always define a bounded `ThreadPoolTaskExecutor` and reference it by name in `@Async("myExecutor")`.
+
+**Q: What return types are valid for an `@Async` method?**
+A: `void`, `Future<T>`, `CompletableFuture<T>`, and (deprecated in Spring 6) `ListenableFuture<T>`. `CompletableFuture<T>` is preferred — composable, timeout-friendly, and exceptions surface to the caller.
+
+**Q: How do you handle exceptions from a `void @Async` method?**
+A: Implement `AsyncConfigurer.getAsyncUncaughtExceptionHandler()`. For `CompletableFuture` return types, exceptions are captured in the future — callers must observe them via `get()`, `exceptionally()`, or `handle()`.
+
+**Q: How do you propagate MDC / SecurityContext to an async thread?**
+A: Set a `TaskDecorator` on `ThreadPoolTaskExecutor`. The decorator captures `MDC.getCopyOfContextMap()` and `SecurityContextHolder.getContext()` on the caller thread, restores them inside the task, and restores previous values in `finally`. For security only, use `DelegatingSecurityContextAsyncTaskExecutor`.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> `@Async` is a sticker you put on a method that says "when someone asks me to do this, I'll say 'okay, running along now' and hand the paper to my team of helpers in the back room." Instead of the customer standing at the counter waiting, they get their receipt right away. Meanwhile the back-room team does the actual work in parallel. If the back-room team is full (queue capacity reached), the front counter helps with the work itself (`CallerRunsPolicy`) — nobody drops the paper.
+
+## BUILD
+
+Build a **notification dispatcher**:
+1. Three services — `EmailService`, `SmsService`, `PushService` — each with a bounded `ThreadPoolTaskExecutor`.
+2. Each service exposes an `@Async CompletableFuture<Boolean> send(...)` method.
+3. A `NotificationOrchestrator` bean has `dispatch(userId, message, channels)` — for each channel it calls the corresponding service's async send.
+4. Return an aggregated `Map<Channel, Boolean>` using `CompletableFuture.allOf` + `.get(2, SECONDS)`.
+5. Register an `AsyncUncaughtExceptionHandler` that records failures to a Micrometer counter.
+6. **Bonus**: add a `TaskDecorator` that copies MDC so log lines from inside the async send methods still have the request's trace ID.
+
+## SPACED REVIEW
+
+**Day 1**: Write the minimal `@Async` example — including `@EnableAsync` and a custom executor bean.
+**Day 3**: Explain the self-invocation trap with a code example.
+**Day 7**: List the valid return types of `@Async` methods.
+**Day 14**: Given a request that must run 3 downstream calls in parallel with a 500 ms hard budget, sketch the controller code.
+

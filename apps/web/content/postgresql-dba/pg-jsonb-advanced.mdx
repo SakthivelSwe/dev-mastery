@@ -17,7 +17,294 @@ Postgres has two types: `json` and `jsonb`.
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-jsonb" }
+{
+  "language": "sql",
+  "fileName": "jsonb.sql",
+  "steps": [
+    {
+      "title": "JSONB vs JSON",
+      "description": "JSONB is binary, indexed, faster to query. JSON preserves whitespace/duplicates. Use JSONB unless you need exact input preservation.",
+      "code": "-- JSONB (recommended)\nCREATE TABLE events (\n  id BIGSERIAL PRIMARY KEY,\n  data JSONB NOT NULL\n);\n\nINSERT INTO events (data) VALUES\n  ('{\"user_id\": 42, \"action\": \"login\", \"tags\": [\"a\", \"b\"], \"meta\": {\"ip\": \"1.2.3.4\"}}');\n\n-- Access operators\nSELECT data->'user_id' FROM events;          -- returns JSONB: 42\nSELECT data->>'user_id' FROM events;         -- returns text: \"42\"\nSELECT data#>'{meta,ip}' FROM events;        -- path: JSONB\nSELECT data#>>'{meta,ip}' FROM events;       -- path: text\n\n-- Existence + containment\nSELECT * FROM events WHERE data ? 'user_id';           -- key exists\nSELECT * FROM events WHERE data ?| ARRAY['a', 'b'];     -- any key\nSELECT * FROM events WHERE data ?& ARRAY['a', 'b'];     -- all keys\nSELECT * FROM events WHERE data @> '{\"action\": \"login\"}'::jsonb;   -- contains\nSELECT * FROM events WHERE data <@ '{\"user_id\": 42, \"extra\": null}'::jsonb;  -- contained in\n\n-- Modification (creates new JSONB)\nSELECT jsonb_set(data, '{status}', '\"active\"') FROM events;\nSELECT data || '{\"new_key\": \"value\"}'::jsonb FROM events;\nSELECT data - 'user_id' FROM events;                    -- remove key\nSELECT data #- '{meta,ip}' FROM events;                 -- remove path",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "JSONB operators",
+        "items": [
+          {
+            "label": "->  vs  ->>",
+            "color": "#10b981",
+            "value": "JSONB result vs text result",
+            "highlight": true
+          },
+          {
+            "label": "@> containment",
+            "color": "#818cf8",
+            "value": "Perfect for filters + GIN index"
+          },
+          {
+            "label": "? existence",
+            "color": "#f59e0b",
+            "value": "Key exists check"
+          },
+          {
+            "label": "|| concat / - key",
+            "color": "#60a5fa",
+            "value": "Merge and remove"
+          }
+        ]
+      }
+    },
+    {
+      "title": "GIN indexes on JSONB",
+      "description": "GIN index makes JSONB queries fast. Two operator classes: default (all operators, larger index) or jsonb_path_ops (containment only, smaller/faster).",
+      "code": "-- Default GIN — supports all operators\nCREATE INDEX idx_events_data ON events USING gin (data);\n\n-- Now these are fast:\nSELECT * FROM events WHERE data @> '{\"action\": \"login\"}';\nSELECT * FROM events WHERE data ? 'user_id';\nSELECT * FROM events WHERE data ?& ARRAY['a', 'b'];\n\n-- jsonb_path_ops — smaller, supports only @>\nCREATE INDEX idx_events_data_path ON events USING gin (data jsonb_path_ops);\n-- Only @> works, but index is 30% smaller and faster\n\nSELECT * FROM events WHERE data @> '{\"user_id\": 42}';\n\n-- Path-specific index (small + fast for specific queries)\nCREATE INDEX idx_events_user_id ON events ((data->>'user_id'));\nSELECT * FROM events WHERE data->>'user_id' = '42';\n\nCREATE INDEX idx_events_user_id_int ON events (((data->>'user_id')::int));\nSELECT * FROM events WHERE (data->>'user_id')::int = 42;\n\n-- Partial + expression index\nCREATE INDEX idx_events_logins ON events ((data->>'user_id'))\nWHERE data->>'action' = 'login';\n\n-- Compare sizes\nSELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass))\nFROM pg_indexes WHERE tablename = 'events';",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        10,
+        13,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "JSONB indexing",
+        "items": [
+          {
+            "label": "Default GIN",
+            "color": "#10b981",
+            "value": "All operators — biggest",
+            "highlight": true
+          },
+          {
+            "label": "jsonb_path_ops",
+            "color": "#818cf8",
+            "value": "Only @> — 30% smaller"
+          },
+          {
+            "label": "Expression index",
+            "color": "#f59e0b",
+            "value": "Specific path — smallest"
+          },
+          {
+            "label": "Partial index",
+            "color": "#60a5fa",
+            "value": "Filter subset of rows"
+          }
+        ]
+      }
+    },
+    {
+      "title": "JSONB aggregates and transformations",
+      "description": "jsonb_agg, jsonb_object_agg build JSON from rows. jsonb_each, jsonb_array_elements expand JSON to rows.",
+      "code": "-- Aggregate: rows → JSONB\nSELECT jsonb_agg(row_to_jsonb(u)) FROM users u;\n-- [{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]\n\nSELECT jsonb_object_agg(id::text, name) FROM users;\n-- {\"1\":\"Alice\",\"2\":\"Bob\"}\n\n-- Expand: JSONB → rows\nSELECT id, jsonb_array_elements(data->'tags') AS tag\nFROM events\nWHERE data ? 'tags';\n\nSELECT id, key, value\nFROM events, jsonb_each(data);\n\nSELECT id, elem->>'name' AS name, (elem->>'age')::int AS age\nFROM users, jsonb_array_elements(data->'friends') AS elem;\n\n-- Building complex JSON in queries\nSELECT jsonb_build_object(\n  'id', u.id,\n  'name', u.name,\n  'orders', (\n    SELECT jsonb_agg(jsonb_build_object('id', o.id, 'total', o.total))\n    FROM orders o WHERE o.user_id = u.id\n  )\n) FROM users u;\n\n-- Path queries (PG 12+)\nSELECT data #> '{friends,0,name}' FROM users;              -- deep access\nSELECT jsonb_path_query(data, '$.friends[*] ? (@.age > 25)') FROM users;\n\n-- Update in place\nUPDATE events\nSET data = jsonb_set(data, '{status}', '\"active\"', true)   -- true = create if missing\nWHERE id = 42;\n\n-- Remove a key\nUPDATE events SET data = data - 'temp_field' WHERE id = 42;",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        9,
+        10,
+        11,
+        13,
+        14,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        32,
+        33,
+        34,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "jsonb_agg: rows → array",
+            "done": true
+          },
+          {
+            "label": "jsonb_array_elements: array → rows",
+            "done": true
+          },
+          {
+            "label": "jsonb_build_object: assemble nested JSON",
+            "active": true
+          },
+          {
+            "label": "jsonb_path_query: JSONPath queries"
+          }
+        ]
+      }
+    },
+    {
+      "title": "JSONB vs relational — when to use",
+      "description": "JSONB: variable schemas, event payloads, config, arrays of objects. Relational: joins, aggregates, hot filters. Often both — hybrid schema.",
+      "code": "-- ✅ Great fit for JSONB:\n-- - Variable schema (per-tenant custom fields)\n-- - Event payloads (audit logs)\n-- - Feature flag config\n-- - API request/response snapshots\n-- - Arrays of related items when embedded\n\n-- Example: hybrid schema\nCREATE TABLE users (\n  id BIGSERIAL PRIMARY KEY,\n  email TEXT UNIQUE NOT NULL,         -- relational: filter/join\n  name TEXT NOT NULL,\n  role TEXT NOT NULL,                 -- relational: filter\n  preferences JSONB,                  -- JSONB: variable + rarely queried\n  metadata JSONB                       -- JSONB: audit trail\n);\n\n-- Query fast on relational columns\nSELECT * FROM users WHERE role = 'admin';\n\n-- Access preferences when needed\nSELECT preferences->>'theme' FROM users WHERE id = 42;\n\n-- ❌ Anti-patterns:\n-- - Everything in one JSONB column (no schema, no constraints)\n-- - Frequently joined data inside JSONB (slow)\n-- - Aggregates over JSONB arrays (slow — better as separate table)\n\n-- Migration: JSONB → column\nALTER TABLE users ADD COLUMN theme TEXT;\nUPDATE users SET theme = preferences->>'theme';\nALTER TABLE users ALTER COLUMN theme SET NOT NULL;\nUPDATE users SET preferences = preferences - 'theme';\n\n-- Storage cost\n-- JSONB with common keys → space overhead vs regular columns\n-- Compression (TOAST) helps",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        22,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "JSONB fit checklist",
+        "items": [
+          {
+            "label": "✅ Variable schema",
+            "color": "#10b981",
+            "value": "Custom fields per tenant/user",
+            "highlight": true
+          },
+          {
+            "label": "✅ Rare filter/join",
+            "color": "#818cf8",
+            "value": "Access by primary key mostly"
+          },
+          {
+            "label": "❌ Hot query fields",
+            "color": "#ef4444",
+            "value": "Extract to relational columns"
+          },
+          {
+            "label": "❌ Aggregation targets",
+            "color": "#f59e0b",
+            "value": "Split into related table"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Performance patterns for JSONB",
+      "description": "Extract hot fields to generated columns. Use partial indexes. Prefer @> over key traversal. Watch out for full row rewrite on UPDATE.",
+      "code": "-- Generated column: virtual column from JSONB\nALTER TABLE events\nADD COLUMN user_id BIGINT GENERATED ALWAYS AS ((data->>'user_id')::bigint) STORED;\n\nCREATE INDEX idx_events_user_id ON events (user_id);\n\n-- Now the query is a direct column lookup (fast!)\nSELECT * FROM events WHERE user_id = 42;\n\n-- Statistics for JSONB (limited)\n-- Postgres stats DON'T track individual JSON paths well\n-- Solution: extract to columns/generated for common paths\n\n-- @> is faster than key-by-key checks\n-- ✅ Fast (uses GIN)\nSELECT * FROM events WHERE data @> '{\"action\": \"login\", \"success\": true}';\n\n-- ❌ Slower (multiple text ops)\nSELECT * FROM events WHERE data->>'action' = 'login' AND (data->>'success')::bool = true;\n\n-- UPDATE rewrites the whole JSONB (large columns = slow)\nUPDATE events SET data = jsonb_set(data, '{seen}', 'true')\nWHERE id = 42;\n-- Even small change = rewrite entire row (MVCC)\n\n-- For high-frequency updates: separate the volatile field\nCREATE TABLE events (\n  id BIGSERIAL PRIMARY KEY,\n  data JSONB,\n  last_seen TIMESTAMPTZ    -- hot: update frequently\n) WITH (fillfactor = 80);\n\n-- Compression: use LZ4 for JSONB (PG 14+)\nALTER TABLE events ALTER COLUMN data SET COMPRESSION lz4;\n\n-- Monitor JSONB storage\nSELECT pg_size_pretty(pg_relation_size('events')) AS main,\n       pg_size_pretty(pg_total_relation_size('events') - pg_relation_size('events')) AS toast_and_indexes;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        12,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "JSONB optimization",
+        "items": [
+          {
+            "label": "Generated columns",
+            "color": "#10b981",
+            "value": "Extract hot fields for indexing",
+            "highlight": true
+          },
+          {
+            "label": "@> with GIN",
+            "color": "#818cf8",
+            "value": "Fastest containment queries"
+          },
+          {
+            "label": "LZ4 compression",
+            "color": "#f59e0b",
+            "value": "PG 14+ — smaller TOAST"
+          },
+          {
+            "label": "Separate hot fields",
+            "color": "#60a5fa",
+            "value": "Volatile → own column"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

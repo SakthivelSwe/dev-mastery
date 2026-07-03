@@ -19,7 +19,260 @@ An index is fundamentally a separate data structure stored on the hard drive. It
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-btree" }
+{
+  "language": "sql",
+  "fileName": "indexing.sql",
+  "steps": [
+    {
+      "title": "Index types in PostgreSQL",
+      "description": "B-tree (default), Hash, GIN (arrays/JSON/full-text), GiST (geometric/full-text), BRIN (huge sequential data), SP-GiST. Choose based on query pattern.",
+      "code": "-- B-tree: default, best for equality + range\nCREATE INDEX idx_users_email ON users (email);\nCREATE INDEX idx_orders_created ON orders (created_at);\n\n-- Hash: equality only, faster than btree for = queries\nCREATE INDEX idx_sessions_token ON sessions USING hash (token);\n\n-- GIN: multi-valued (arrays, jsonb, tsvector)\nCREATE INDEX idx_articles_tags ON articles USING gin (tags);\nCREATE INDEX idx_articles_body_fts ON articles USING gin (to_tsvector('english', body));\nCREATE INDEX idx_events_data ON events USING gin (data jsonb_path_ops);\n\n-- GiST: geometric, full-text, custom\nCREATE INDEX idx_places_location ON places USING gist (location);\nCREATE INDEX idx_ranges ON events USING gist (during);   -- tsrange\n\n-- BRIN: block-range, for very large tables with correlation\nCREATE INDEX idx_events_ts_brin ON events USING brin (created_at) WITH (pages_per_range=32);\n-- 1000x smaller than btree for time-series!\n\n-- SP-GiST: partitioned data (IPs, phone trees)\nCREATE INDEX idx_ips ON logs USING spgist (client_ip);\n\n-- Index size comparison\nSELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass))\nFROM pg_indexes WHERE tablename = 'events';",
+      "highlight": [
+        2,
+        3,
+        6,
+        9,
+        10,
+        11,
+        14,
+        15,
+        18,
+        19,
+        22,
+        25,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Index type by use case",
+        "items": [
+          {
+            "label": "B-tree",
+            "color": "#10b981",
+            "value": "Default — equality + range + sort",
+            "highlight": true
+          },
+          {
+            "label": "GIN",
+            "color": "#818cf8",
+            "value": "JSONB, arrays, full-text"
+          },
+          {
+            "label": "BRIN",
+            "color": "#f59e0b",
+            "value": "Time-series, sequential — tiny!"
+          },
+          {
+            "label": "GiST",
+            "color": "#60a5fa",
+            "value": "Geo, ranges, exclusion"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partial and expression indexes",
+      "description": "Partial indexes cover only rows matching WHERE. Expression indexes index a function result. Both dramatically reduce index size.",
+      "code": "-- Partial index: only active users\nCREATE INDEX idx_users_active_email ON users (email) WHERE active = true;\n-- Much smaller if most users are inactive/deleted\n\n-- Query must use same predicate to hit it\nSELECT * FROM users WHERE email = 'x@y.com' AND active = true;  -- uses index\nSELECT * FROM users WHERE email = 'x@y.com';                     -- may NOT use it\n\n-- Only unfinished tasks\nCREATE INDEX idx_tasks_pending ON tasks (assignee_id) WHERE status != 'done';\n\n-- Case-insensitive email lookup\nCREATE INDEX idx_users_email_lower ON users (LOWER(email));\nSELECT * FROM users WHERE LOWER(email) = LOWER('X@Y.COM');\n\n-- JSONB path indexing (extract + index)\nCREATE INDEX idx_events_user_id ON events ((data->>'user_id'));\nSELECT * FROM events WHERE data->>'user_id' = '42';\n\n-- Combined: partial + expression\nCREATE INDEX idx_active_lower_email ON users (LOWER(email)) WHERE active = true;\n\n-- Size comparison\nSELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass))\nFROM pg_indexes WHERE tablename = 'users';\n-- idx_users_email        (all rows):    450 MB\n-- idx_users_active_email (active only):  45 MB   ← 10x smaller!",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        10,
+        13,
+        14,
+        17,
+        18,
+        21,
+        24,
+        25,
+        26,
+        27,
+        28
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Selective indexes",
+        "items": [
+          {
+            "label": "Partial (WHERE)",
+            "color": "#10b981",
+            "value": "Only rows matching predicate",
+            "highlight": true
+          },
+          {
+            "label": "Expression",
+            "color": "#818cf8",
+            "value": "LOWER(email), (json->>x)"
+          },
+          {
+            "label": "Query must match",
+            "color": "#f59e0b",
+            "value": "Same WHERE / expression to use it"
+          },
+          {
+            "label": "Massive size savings",
+            "color": "#60a5fa",
+            "value": "5-100x smaller for sparse data"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Multi-column and covering indexes",
+      "description": "Multi-column: order matters. Leftmost prefix rule. Covering indexes (INCLUDE) add columns for index-only scans without adding to the sort key.",
+      "code": "-- Multi-column index\nCREATE INDEX idx_orders_user_date ON orders (user_id, created_at);\n\n-- Query patterns it covers:\nSELECT * FROM orders WHERE user_id = 42;                                    -- ✅ uses index\nSELECT * FROM orders WHERE user_id = 42 AND created_at > '2025-01-01';       -- ✅ uses index\nSELECT * FROM orders WHERE created_at > '2025-01-01';                        -- ❌ NOT used (skipped leftmost)\n\n-- Column order rule: put equality first, then ranges\nCREATE INDEX idx_orders_status_date ON orders (status, created_at);\nSELECT * FROM orders WHERE status = 'pending' AND created_at > NOW() - INTERVAL '1 day';\n\n-- Covering index (PG 11+): INCLUDE columns for index-only scan\nCREATE INDEX idx_users_email_covering ON users (email) INCLUDE (name, created_at);\n\n-- Query gets everything from index — no table lookup!\nSELECT email, name, created_at FROM users WHERE email = 'x@y.com';\n-- Plan: Index Only Scan (no Heap access!)\n\n-- Check if index-only scan happened\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT email, name FROM users WHERE email = 'x@y.com';\n-- Index Only Scan using idx_users_email_covering\n--   Heap Fetches: 0     ← perfect!\n\n-- If Heap Fetches > 0: VACUUM to update visibility map",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        10,
+        11,
+        14,
+        17,
+        18,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Multi-column: leftmost prefix rule",
+            "done": true
+          },
+          {
+            "label": "Put equality columns first, ranges last",
+            "done": true
+          },
+          {
+            "label": "INCLUDE for index-only scans (no heap)",
+            "active": true
+          },
+          {
+            "label": "VACUUM to keep visibility map fresh"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Index usage analysis",
+      "description": "Track which indexes are used and which are wasting space. Unused indexes slow writes without helping reads.",
+      "code": "-- Index usage stats\nSELECT schemaname, relname AS table_name, indexrelname AS index_name,\n       idx_scan, idx_tup_read, idx_tup_fetch,\n       pg_size_pretty(pg_relation_size(indexrelid)) AS size\nFROM pg_stat_user_indexes\nORDER BY idx_scan;\n\n-- Unused indexes (0 scans)\nSELECT schemaname||'.'||relname AS table,\n       indexrelname AS index,\n       pg_size_pretty(pg_relation_size(indexrelid)) AS size\nFROM pg_stat_user_indexes\nWHERE idx_scan = 0\n  AND indexrelname NOT LIKE '%_pkey'      -- keep primary keys\n  AND indexrelname NOT LIKE '%_key'        -- keep unique\nORDER BY pg_relation_size(indexrelid) DESC;\n\n-- Duplicate indexes\nSELECT array_agg(indexname) AS duplicates,\n       array_agg(indexdef)\nFROM pg_indexes\nGROUP BY tablename, indexdef\nHAVING count(*) > 1;\n\n-- Bloat check\nSELECT schemaname, tablename, indexname,\n       pg_size_pretty(pg_relation_size(indexname::regclass)) AS size,\n       idx_scan\nFROM pg_stat_user_indexes\nJOIN pg_indexes USING (schemaname, tablename, indexname)\nORDER BY pg_relation_size(indexname::regclass) DESC LIMIT 20;\n\n-- Drop unused index\nDROP INDEX CONCURRENTLY idx_never_used;\n\n-- Rebuild bloated index (online, no lock)\nREINDEX INDEX CONCURRENTLY idx_users_email;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        33,
+        36,
+        37
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Index hygiene",
+        "items": [
+          {
+            "label": "pg_stat_user_indexes",
+            "color": "#10b981",
+            "value": "idx_scan = 0 → unused",
+            "highlight": true
+          },
+          {
+            "label": "DROP unused",
+            "color": "#818cf8",
+            "value": "Speeds writes, saves space"
+          },
+          {
+            "label": "REINDEX CONCURRENTLY",
+            "color": "#f59e0b",
+            "value": "Rebuild bloated indexes online"
+          },
+          {
+            "label": "Duplicate detection",
+            "color": "#60a5fa",
+            "value": "Same indexdef → redundant"
+          }
+        ]
+      }
+    },
+    {
+      "title": "CREATE INDEX CONCURRENTLY",
+      "description": "CREATE INDEX locks the table. CONCURRENTLY builds without blocking writes. Slower but zero downtime — essential for production.",
+      "code": "-- ❌ Blocks writes for entire build\nCREATE INDEX idx_users_email ON users (email);\n\n-- ✅ No exclusive lock — writes continue\nCREATE INDEX CONCURRENTLY idx_users_email ON users (email);\n\n-- Downsides of CONCURRENTLY:\n-- - Takes longer (~2x)\n-- - Cannot run inside transaction\n-- - Can leave INVALID index if it fails\n\n-- Check for invalid indexes (after failed CONCURRENTLY)\nSELECT indexrelid::regclass, indisvalid\nFROM pg_index\nWHERE NOT indisvalid;\n\n-- Rebuild an invalid index\nDROP INDEX CONCURRENTLY idx_users_email;\nCREATE INDEX CONCURRENTLY idx_users_email ON users (email);\n\n-- Monitor progress (PG 12+)\nSELECT pid, datname, relid::regclass, phase,\n       blocks_total, blocks_done,\n       tuples_total, tuples_done\nFROM pg_stat_progress_create_index;\n\n-- Migration pattern: safe schema changes\n-- 1. Add column NULLable\nALTER TABLE users ADD COLUMN new_field TEXT;\n\n-- 2. Backfill in batches (no table lock)\nUPDATE users SET new_field = LOWER(email) WHERE id BETWEEN 1 AND 10000;\n\n-- 3. Add index concurrently\nCREATE INDEX CONCURRENTLY idx_users_new_field ON users (new_field);\n\n-- 4. Add NOT NULL constraint (if needed) via NOT VALID + VALIDATE\nALTER TABLE users ADD CONSTRAINT users_new_field_nn CHECK (new_field IS NOT NULL) NOT VALID;\nALTER TABLE users VALIDATE CONSTRAINT users_new_field_nn;",
+      "highlight": [
+        2,
+        5,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        15,
+        18,
+        19,
+        22,
+        23,
+        24,
+        25,
+        29,
+        32,
+        35,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "CREATE INDEX CONCURRENTLY: no exclusive lock",
+            "done": true
+          },
+          {
+            "label": "Writes continue during build",
+            "done": true
+          },
+          {
+            "label": "Two passes over table — slower",
+            "active": true
+          },
+          {
+            "label": "Check pg_index.indisvalid after build"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

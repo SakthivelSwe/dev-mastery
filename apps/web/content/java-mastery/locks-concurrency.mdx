@@ -1,0 +1,459 @@
+---
+slug: "locks-concurrency"
+title: "Explicit Locks — ReentrantLock, ReadWriteLock, StampedLock"
+level: 3
+---
+
+## WHY
+
+`synchronized` is fine when you don't care about (a) fairness, (b) timeout, (c) interruptibility, or (d) multiple waiting rooms. The moment you need any of those — and any medium-complexity system needs at least one — you outgrow `synchronized` and reach for `java.util.concurrent.locks`. A payment API that must **give up after 200 ms** rather than hold up the request thread indefinitely, a cache that lets **many readers pass simultaneously**, a queue that must wake exactly the right waiter — these are impossible with `synchronized` alone.
+
+`ReentrantLock` gives you tryLock+timeout+interrupt. `ReadWriteLock` unblocks concurrent readers. `StampedLock` adds optimistic reads for hot metadata. Together they turn concurrency from "hope the coarse lock is fast enough" into an engineered design.
+
+## THEORY
+
+### `Lock` interface — the modern replacement for `synchronized`
+
+```java
+Lock lock = new ReentrantLock();
+
+lock.lock();                                    // like entering `synchronized`
+try {
+    // critical section
+} finally {
+    lock.unlock();                              // MUST be in finally — no automatic release
+}
+```
+
+| Feature | `synchronized` | `ReentrantLock` |
+|---------|---------------|-----------------|
+| Reentrant | Yes | Yes |
+| Try without blocking | No | `tryLock()` |
+| Try with timeout | No | `tryLock(200, MILLISECONDS)` |
+| Interruptible while waiting | No | `lockInterruptibly()` |
+| Fairness | No (unfair) | Optional (`new ReentrantLock(true)`) |
+| Multiple conditions | 1 (via `wait/notify`) | Any number (`newCondition()`) |
+| Requires manual unlock? | No — automatic on block exit | **Yes** — `try/finally` mandatory |
+
+### `Condition` — replacement for `wait/notify`
+
+```java
+Lock lock = new ReentrantLock();
+Condition notFull  = lock.newCondition();       // producers wait here
+Condition notEmpty = lock.newCondition();       // consumers wait here
+```
+Advantage: one lock, two waiting rooms. `notEmpty.signal()` wakes only consumers; producers stay asleep — vs `notifyAll()` on a single monitor which wakes everyone and forces them to re-check.
+
+### `ReadWriteLock` — many readers, one writer
+
+| Access pattern | Traditional lock | ReadWriteLock |
+|----------------|------------------|---------------|
+| Read-heavy (99% reads) | 1 thread at a time | N readers concurrent, writer waits |
+| Write-heavy | Same | Slightly slower than plain lock |
+| Balanced | Same | Modest gain |
+
+Rule: use `ReadWriteLock` only when READS clearly dominate WRITES (≥ 5:1). Otherwise the extra bookkeeping costs more than the parallelism gains.
+
+### `StampedLock` (Java 8+) — optimistic reads
+
+Three modes:
+- **Write** (exclusive) — like `writeLock().lock()`.
+- **Pessimistic read** — like `readLock().lock()`.
+- **Optimistic read** — grab a "stamp" without ANY blocking; do your read; then validate the stamp. If a writer sneaked in between, retry.
+
+Optimistic reads are essentially free (no cache-coherence traffic) → ideal for hot metadata like coordinate updates, sequence counters. Trade-off: **not reentrant**; harder to use correctly.
+
+### Fairness — the double-edged sword
+
+`new ReentrantLock(true)` gives you **fair** ordering (FIFO). Every waiting thread gets the lock in arrival order — no starvation. Cost: 5-10x lower throughput than the default unfair lock, because you lose "barging" (a thread already running on-core can jump ahead of a parked waiter, saving a context switch). Use fairness only if you can PROVE starvation, or if latency variance matters more than throughput (rare).
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "Locks.java",
+  "steps": [
+    {
+      "title": "ReentrantLock — synchronized on steroids",
+      "description": "Same semantics as synchronized (mutual exclusion + reentrancy) but adds tryLock, timeouts, interruptible acquire, fairness, and multiple conditions.",
+      "code": "Lock lock = new ReentrantLock();\nlock.lock();\ntry {\n    // critical section\n} finally {\n    lock.unlock();   // MUST be in finally\n}",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "T1",
+            "state": "RUNNABLE",
+            "note": "holds ReentrantLock"
+          },
+          {
+            "name": "T2",
+            "state": "WAITING",
+            "note": "lock.lock() parks here"
+          }
+        ]
+      }
+    },
+    {
+      "title": "tryLock(200ms) — give up instead of hang",
+      "description": "The request thread should never block indefinitely. tryLock with timeout returns false if it can't grab the lock — the caller responds with a 503 or degrades gracefully.",
+      "code": "if (lock.tryLock(200, MILLISECONDS)) {\n    try { transfer(); } finally { lock.unlock(); }\n} else {\n    metrics.increment(\"lock.timeout\");\n    return Response.serviceUnavailable();\n}",
+      "highlight": [
+        1,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "tryLock(200ms)",
+            "done": true
+          },
+          {
+            "label": "acquired?",
+            "active": true,
+            "note": "branch on outcome"
+          },
+          {
+            "label": "YES → do work → unlock",
+            "done": true
+          },
+          {
+            "label": "NO → return 503"
+          }
+        ]
+      }
+    },
+    {
+      "title": "ReadWriteLock — many readers, one writer",
+      "description": "Read-heavy config caches use ReadWriteLock. Any number of readers pass concurrently; a writer temporarily blocks NEW readers until it finishes.",
+      "code": "ReadWriteLock rw = new ReentrantReadWriteLock();\nLock r = rw.readLock();\nLock w = rw.writeLock();\n\n// hot path\nr.lock(); try { return config.get(key); } finally { r.unlock(); }\n\n// rare reload\nw.lock(); try { config.putAll(fresh); } finally { w.unlock(); }",
+      "highlight": [
+        5,
+        8
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "reader-1",
+            "state": "RUNNABLE",
+            "note": "holds read lock"
+          },
+          {
+            "name": "reader-2",
+            "state": "RUNNABLE",
+            "note": "holds read lock"
+          },
+          {
+            "name": "reader-3",
+            "state": "RUNNABLE",
+            "note": "holds read lock"
+          },
+          {
+            "name": "writer",
+            "state": "WAITING",
+            "note": "waits for readers to drain"
+          }
+        ]
+      }
+    },
+    {
+      "title": "StampedLock — optimistic read",
+      "description": "For hyper-hot getters. Grab a stamp WITHOUT locking, read the fields, then validate. If a writer sneaked in, retry with pessimistic read.",
+      "code": "long stamp = sl.tryOptimisticRead();\ndouble cx = x, cy = y;\nif (!sl.validate(stamp)) {\n    stamp = sl.readLock();\n    try { cx = x; cy = y; } finally { sl.unlockRead(stamp); }\n}",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "tryOptimisticRead() — no lock",
+            "done": true
+          },
+          {
+            "label": "read fields",
+            "done": true
+          },
+          {
+            "label": "validate(stamp) — did a writer sneak in?",
+            "active": true
+          },
+          {
+            "label": "YES → retry with readLock()"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Condition — replaces wait/notify",
+      "description": "One ReentrantLock can host multiple Conditions. producers wait on notFull, consumers on notEmpty — no more \"wake everyone and re-check\".",
+      "code": "Lock lock = new ReentrantLock();\nCondition notFull  = lock.newCondition();\nCondition notEmpty = lock.newCondition();\n\n// consumer\nlock.lock();\ntry { while (q.isEmpty()) notEmpty.await(); q.remove(); notFull.signal(); }\nfinally { lock.unlock(); }",
+      "highlight": [
+        2,
+        3,
+        7
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Two waiting rooms · one lock",
+        "items": [
+          {
+            "label": "notFull",
+            "value": "producers wait",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "notEmpty",
+            "value": "consumers wait",
+            "color": "#10b981"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — `ReentrantLock` basics with tryLock
+```java
+import java.util.concurrent.locks.*;
+import java.util.concurrent.TimeUnit;
+
+public class TryLockDemo {
+    private final Lock lock = new ReentrantLock();
+    private int balance = 100;
+
+    public boolean transferOrGiveUp(int amount) throws InterruptedException {
+        if (!lock.tryLock(200, TimeUnit.MILLISECONDS)) {
+            System.out.println("could not get lock in 200ms — giving up");
+            return false;
+        }
+        try {
+            if (balance < amount) return false;
+            balance -= amount;
+            return true;
+        } finally {
+            lock.unlock();                       // ALWAYS in finally
+        }
+    }
+}
+```
+
+### Level 2 — `Condition` for a bounded blocking queue
+```java
+import java.util.*;
+import java.util.concurrent.locks.*;
+
+public class ConditionQueue<T> {
+    private final Queue<T> q = new ArrayDeque<>();
+    private final int capacity;
+
+    private final Lock lock = new ReentrantLock();
+    private final Condition notFull  = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    public ConditionQueue(int capacity) { this.capacity = capacity; }
+
+    public void put(T item) throws InterruptedException {
+        lock.lock();
+        try {
+            while (q.size() == capacity) notFull.await();   // producers wait here
+            q.add(item);
+            notEmpty.signal();                              // wake ONE consumer
+        } finally { lock.unlock(); }
+    }
+
+    public T take() throws InterruptedException {
+        lock.lock();
+        try {
+            while (q.isEmpty()) notEmpty.await();           // consumers wait here
+            T item = q.remove();
+            notFull.signal();                               // wake ONE producer
+            return item;
+        } finally { lock.unlock(); }
+    }
+}
+```
+Difference from the wait/notify version: **producers only wake producers, consumers only wake consumers** — no spurious wakeup thrash.
+
+### Level 3 — `ReadWriteLock` — hot config cache
+```java
+import java.util.*;
+import java.util.concurrent.locks.*;
+
+public class ConfigCache {
+    private final Map<String, String> config = new HashMap<>();
+    private final ReadWriteLock rw = new ReentrantReadWriteLock();
+    private final Lock r = rw.readLock();
+    private final Lock w = rw.writeLock();
+
+    public String get(String key) {
+        r.lock();
+        try { return config.get(key); }
+        finally { r.unlock(); }
+    }
+
+    public void put(String key, String value) {
+        w.lock();
+        try { config.put(key, value); }
+        finally { w.unlock(); }
+    }
+
+    public void reloadFromDisk(Map<String, String> fresh) {
+        w.lock();                                // upgrade to writer — blocks NEW readers
+        try {
+            config.clear();
+            config.putAll(fresh);
+        } finally { w.unlock(); }
+    }
+    // 99% of the time N threads call get() concurrently — no blocking between them.
+}
+```
+
+### Level 4 — `StampedLock` optimistic read
+```java
+import java.util.concurrent.locks.StampedLock;
+
+public class Point {
+    private double x, y;
+    private final StampedLock sl = new StampedLock();
+
+    public void move(double dx, double dy) {
+        long stamp = sl.writeLock();
+        try { x += dx; y += dy; }
+        finally { sl.unlockWrite(stamp); }
+    }
+
+    public double distanceFromOrigin() {
+        long stamp = sl.tryOptimisticRead();     // no blocking, no CAS
+        double cx = x, cy = y;                   // read fields
+        if (!sl.validate(stamp)) {               // did a writer sneak in?
+            stamp = sl.readLock();               // fall back to pessimistic
+            try { cx = x; cy = y; }
+            finally { sl.unlockRead(stamp); }
+        }
+        return Math.hypot(cx, cy);
+    }
+}
+```
+On the fast path (no writer contended) `distanceFromOrigin()` is roughly as fast as an uncontended `volatile` read — orders of magnitude faster than a `ReentrantLock`.
+
+### Level 5 — Fair vs unfair — measured
+```java
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class FairnessBench {
+    public static void main(String[] args) throws Exception {
+        bench("UNFAIR", new ReentrantLock(false));
+        bench("FAIR  ", new ReentrantLock(true));
+    }
+
+    static void bench(String label, ReentrantLock lock) throws Exception {
+        AtomicLong ops = new AtomicLong();
+        int threads = 8;
+        long endAt = System.currentTimeMillis() + 500;
+        Thread[] ts = new Thread[threads];
+        for (int i = 0; i < threads; i++) {
+            ts[i] = new Thread(() -> {
+                while (System.currentTimeMillis() < endAt) {
+                    lock.lock();
+                    try { ops.incrementAndGet(); }
+                    finally { lock.unlock(); }
+                }
+            });
+            ts[i].start();
+        }
+        for (Thread t : ts) t.join();
+        System.out.printf("%s ops = %,d%n", label, ops.get());
+    }
+    // Typical output: UNFAIR: 8-15M   FAIR: 500K-2M  (fair is 5-15x slower)
+}
+```
+
+## REAL_WORLD
+
+**A production timeout-based cache update in a Spring service** — the request thread must NEVER be held for more than 100 ms waiting for a stale-cache refresh, even under contention:
+
+```java
+@Component
+public class HotItemCache {
+    private final ReentrantLock refreshLock = new ReentrantLock();
+    private volatile Snapshot snapshot = new Snapshot(Map.of(), 0);
+
+    public Item lookup(String id) {
+        Snapshot s = snapshot;                  // volatile read — always latest ref
+        if (System.currentTimeMillis() - s.at > 30_000) {
+            tryRefreshAsync();
+        }
+        return s.data.get(id);
+    }
+
+    private void tryRefreshAsync() {
+        // Only ONE refresh at a time — everyone else keeps serving stale (that's fine)
+        if (!refreshLock.tryLock()) return;
+        try {
+            Map<String, Item> fresh = repo.loadAll();
+            snapshot = new Snapshot(fresh, System.currentTimeMillis());
+        } finally { refreshLock.unlock(); }
+    }
+    record Snapshot(Map<String, Item> data, long at) {}
+    // ... injected fields omitted
+}
+```
+`tryLock()` (no timeout) → the caller never blocks. Under a stampede, the FIRST call refreshes while the next N calls short-circuit and serve stale data for a few ms. This one pattern is worth memorizing.
+
+## INTERVIEW
+
+**Q: When would you prefer `ReentrantLock` over `synchronized`?**
+A: When you need any of: (1) `tryLock` with timeout, (2) interruptible acquisition (`lockInterruptibly`), (3) fairness ordering, (4) multiple `Condition` waiting sets on the same lock. If you don't need any of those, prefer `synchronized` — the JVM optimizes it aggressively (biased locking, lock elision, adaptive spinning) and there's no risk of forgetting to `unlock()`.
+
+**Q: What must you ALWAYS do after `lock.lock()`?**
+A: Wrap the critical section in `try { ... } finally { lock.unlock(); }`. Unlike `synchronized`, the JVM does not release the lock automatically when the scope exits — a thrown exception without `finally` leaks the lock forever and deadlocks the next caller.
+
+**Q: When is `ReadWriteLock` worth using?**
+A: When reads dominate writes by at least 5:1 AND the critical section is large enough that overlapping reads matters (i.e., not just a single field load — for that, `volatile` or an `AtomicReference` is cheaper). It's WORSE than a plain lock for balanced workloads because the bookkeeping is more expensive.
+
+**Q: What is optimistic locking, and how does `StampedLock` implement it?**
+A: Optimistic locking says "assume no writer will interfere; read; then verify". `StampedLock.tryOptimisticRead()` returns a stamp without any locking. You read the fields, then call `sl.validate(stamp)`. If a writer has acquired the write lock since you took the stamp, validate returns false and you fall back to a pessimistic read. On a read-heavy path with rare writes, this is nearly free.
+
+**Q: Is `StampedLock` reentrant?**
+A: **No.** If a thread holding a write stamp calls another method that tries to acquire the write lock again, it deadlocks against itself. This is one reason `StampedLock` is more error-prone than `ReentrantLock` and should be reserved for tight, well-scoped hot paths.
+
+**Q: What's the price of fairness?**
+A: Roughly 5-15x lower throughput vs an unfair lock. Fairness forbids "barging" (a thread already on-core acquiring the lock ahead of a parked waiter), which forces a context switch every time the lock is handed off. Only use fairness when you can measure starvation and can afford the throughput cost.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> `synchronized` is a bathroom with one key and one door — you either wait, forever, or get in. `ReentrantLock` is the same bathroom but with a timer on the door — you can knock and say "I'll wait 30 seconds, then I'm leaving." `ReadWriteLock` is a museum reading room — any number of readers can flip through the books at the same time, but if someone wants to WRITE in a book, everyone else has to leave first. `StampedLock` is that reading room with a twist: readers just glance at the page in a hurry, then check "did anyone edit while I was looking?" — if not, done in a millisecond; if yes, come back and take a proper seat.
+
+## BUILD
+
+Build a **request-coalescing loader**:
+1. Class `Loader<K, V>` with method `V load(K key)`. Internally uses a `ConcurrentHashMap<K, Future<V>>`.
+2. If a key is being loaded, subsequent callers wait on the SAME `Future`, not each launching a fresh load.
+3. Use a `ReentrantLock` per bucket (or `ConcurrentHashMap.computeIfAbsent`) to guarantee only one worker starts per key.
+4. Add a `tryLock(200 ms)` fallback so callers give up rather than block forever on a stuck loader.
+5. Stress-test with 1000 threads asking for 10 distinct keys — you should see exactly 10 underlying load calls, not 10 000.
+
+## SPACED REVIEW
+
+**Day 1**: Write the canonical `try/finally` template for `ReentrantLock` from memory.
+**Day 3**: Explain when `ReadWriteLock` is worse than a plain lock. Give the read/write ratio rule of thumb.
+**Day 7**: Draw the two-condition producer-consumer with `ReentrantLock` — mark which `signal()` wakes which side.
+**Day 14**: Explain why `StampedLock` is NOT reentrant and one concrete deadlock pattern that arises from that.
+

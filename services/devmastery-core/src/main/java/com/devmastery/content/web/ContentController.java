@@ -28,6 +28,19 @@ public class ContentController {
         return content.listTopics(pathSlug, level, page, size);
     }
 
+    /**
+     * Free-text search over published topic titles. Called by the command
+     * palette (Ctrl-K) on the web app; returns a lightweight {@link ContentService.TopicSummary}
+     * list. Declared BEFORE {@code /topics/{slug}} so Spring's path matcher
+     * treats "search" as a fixed literal instead of a slug value.
+     */
+    @GetMapping("/topics/search")
+    public List<ContentService.TopicSummary> searchTopics(
+            @RequestParam("q") String q,
+            @RequestParam(defaultValue = "20") int limit) {
+        return content.searchTopics(q, limit);
+    }
+
     @GetMapping("/topics/{slug}")
     public ContentService.TopicDetail topic(@PathVariable String slug) {
         return content.getTopicBySlug(slug);

@@ -22,7 +22,388 @@ Kubernetes has a flat networking model — every Pod can communicate with every 
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "k8s-networking-deep" }
+{
+  "language": "yaml",
+  "fileName": "networking.yaml",
+  "steps": [
+    {
+      "title": "The K8s networking model",
+      "description": "Every pod gets its own IP. Pods can reach each other without NAT. Services get virtual IPs. CNI plugin implements the network.",
+      "code": "# 4 fundamental K8s network requirements:\n# 1. Pods can talk to any other pod (no NAT)\n# 2. Nodes can talk to any pod (no NAT)\n# 3. Pods see own IP as others see it\n# 4. Services expose stable virtual IPs\n\n# Network topology (simplified):\n# ┌── Node 1 ─────────────────────┐  ┌── Node 2 ─────────────┐\n# │  Pod A (10.244.1.5)            │  │  Pod C (10.244.2.7)   │\n# │  Pod B (10.244.1.6)            │  │  Pod D (10.244.2.8)   │\n# │  CNI bridge: 10.244.1.0/24     │  │  10.244.2.0/24        │\n# └───────────────────────────────┘  └───────────────────────┘\n#           │                                 │\n#           └────── overlay/routing ──────────┘\n#\n# Pod CIDR: 10.244.0.0/16       (each node gets subnet)\n# Service CIDR: 10.96.0.0/12    (virtual IPs, no interface)\n\n# CNI plugins implement this:\n# Calico:   BGP or IPIP tunneling — very popular\n# Cilium:   eBPF-based, high performance + observability\n# Flannel:  simple overlay (VXLAN)\n# Weave:    encrypted overlay\n# AWS VPC CNI: pods get real VPC IPs\n# GKE Dataplane V2 (Cilium): default on GKE\n\n# Inspect networking\n$ kubectl get nodes -o custom-columns=NAME:.metadata.name,POD-CIDR:.spec.podCIDR\nNAME     POD-CIDR\nnode1    10.244.1.0/24\nnode2    10.244.2.0/24\nnode3    10.244.3.0/24\n\n# Pod-to-pod (same node): via CNI bridge (fast)\n# Pod-to-pod (cross-node): via overlay/BGP\n# Pod-to-Service (ClusterIP): kube-proxy translates via iptables/IPVS/eBPF\n\n# Test connectivity\n$ kubectl run -it --rm netshoot --image=nicolaka/netshoot -- bash\n# netshoot has: dig, curl, tcpdump, iperf, mtr, ping, netcat",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "K8s network truths",
+        "items": [
+          {
+            "label": "Flat pod network",
+            "color": "#10b981",
+            "value": "No NAT between pods",
+            "highlight": true
+          },
+          {
+            "label": "Per-node subnet",
+            "color": "#818cf8",
+            "value": "Node gets slice of pod CIDR"
+          },
+          {
+            "label": "CNI plugin",
+            "color": "#f59e0b",
+            "value": "Implements the fabric"
+          },
+          {
+            "label": "Service IPs virtual",
+            "color": "#60a5fa",
+            "value": "No interface — iptables trick"
+          }
+        ]
+      }
+    },
+    {
+      "title": "How Services actually work",
+      "description": "kube-proxy watches Services + Endpoints. Programs iptables (or IPVS or eBPF). Traffic to Service IP → DNAT to a random backend pod.",
+      "code": "# kube-proxy modes:\n# 1. iptables (default) — DNAT rules per Service\n# 2. IPVS — kernel LB, better perf at scale\n# 3. eBPF (Cilium) — programmable, most efficient\n\n# Example: Service \"api\" at 10.96.100.50:80 → 3 backend pods\n\n# iptables mode\n# Client → connects to 10.96.100.50:80\n# ↓\n# iptables PREROUTING: DNAT to random pod\n#   → 10.244.1.5:3000  (probability 33%)\n#   → 10.244.2.7:3000  (probability 33%)\n#   → 10.244.3.2:3000  (probability 33%)\n# ↓\n# Packet forwarded to actual pod\n\n# See the rules\n$ iptables -t nat -L KUBE-SERVICES\n$ iptables -t nat -L KUBE-SVC-XXXX\n\n# IPVS mode\n$ ipvsadm -Ln\nTCP  10.96.100.50:80 rr\n  -> 10.244.1.5:3000     Masq   1  0  0\n  -> 10.244.2.7:3000     Masq   1  0  0\n  -> 10.244.3.2:3000     Masq   1  0  0\n\n# Load balancing algorithms (IPVS):\n# rr: round-robin (default)\n# lc: least connections\n# sh: source hashing\n# dh: destination hashing\n\n# Endpoints (or EndpointSlices)\n$ kubectl get endpoints api\nNAME    ENDPOINTS                                       AGE\napi     10.244.1.5:3000,10.244.2.7:3000,10.244.3.2:3000   5m\n\n# When a pod becomes Ready → added to endpoints\n# When a pod fails readiness → removed\n\n# EndpointSlices (K8s 1.21+) scale better than Endpoints\n$ kubectl get endpointslices\n\n# Session affinity — sticky\nspec:\n  sessionAffinity: ClientIP\n  sessionAffinityConfig:\n    clientIP: { timeoutSeconds: 3600 }",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        40,
+        41,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Client",
+          "iptables",
+          "Pod-1",
+          "Pod-2",
+          "Pod-3"
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "iptables",
+            "label": "connect 10.96.100.50:80"
+          },
+          {
+            "from": "iptables",
+            "to": "iptables",
+            "label": "DNAT (random pod)"
+          },
+          {
+            "from": "iptables",
+            "to": "Pod-2",
+            "label": "forward to 10.244.2.7:3000"
+          },
+          {
+            "from": "Pod-2",
+            "to": "Client",
+            "label": "response"
+          }
+        ]
+      }
+    },
+    {
+      "title": "NetworkPolicy for isolation",
+      "description": "By default: all pods can reach all pods. NetworkPolicy = firewall rules. Applied by CNI plugin (Calico, Cilium, etc.).",
+      "code": "# Default: open (any pod → any pod)\n# NetworkPolicy adds allow-lists (whitelist model)\n\n# Deny-all baseline\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: default-deny\n  namespace: api-prod\nspec:\n  podSelector: {}                # all pods in NS\n  policyTypes: [Ingress, Egress]\n\n# Allow specific ingress\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: allow-web-to-api\n  namespace: api-prod\nspec:\n  podSelector:\n    matchLabels: { app: api }\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - namespaceSelector:\n            matchLabels: { env: prod }\n          podSelector:\n            matchLabels: { app: web }\n      ports:\n        - protocol: TCP\n          port: 3000\n\n# Allow egress to DB namespace + DNS\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: { name: api-egress, namespace: api-prod }\nspec:\n  podSelector:\n    matchLabels: { app: api }\n  policyTypes: [Egress]\n  egress:\n    - to:\n        - namespaceSelector: { matchLabels: { name: db-prod } }\n          podSelector: { matchLabels: { app: postgres } }\n      ports:\n        - { protocol: TCP, port: 5432 }\n    # Allow DNS\n    - to:\n        - namespaceSelector: {}\n          podSelector: { matchLabels: { k8s-app: kube-dns } }\n      ports:\n        - { protocol: UDP, port: 53 }\n    # Allow external HTTPS (whitelist)\n    - to:\n        - ipBlock:\n            cidr: 0.0.0.0/0\n            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]\n      ports: [{ protocol: TCP, port: 443 }]\n\n# ⚠️ NetworkPolicy requires a CNI that supports it:\n# ✅ Calico, Cilium, Weave, Antrea\n# ❌ Flannel (needs Canal or supplement)",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Default: all pods reach all pods",
+            "done": true
+          },
+          {
+            "label": "default-deny baseline first",
+            "done": true
+          },
+          {
+            "label": "Allow specific flows (whitelist)",
+            "active": true
+          },
+          {
+            "label": "CNI must support NetworkPolicy"
+          }
+        ]
+      }
+    },
+    {
+      "title": "DNS deep dive",
+      "description": "CoreDNS resolves service + pod names. Pod DNS config controls search domains. Custom domains + external resolvers possible.",
+      "code": "# CoreDNS runs in kube-system\n$ kubectl -n kube-system get pods -l k8s-app=kube-dns\n$ kubectl -n kube-system get cm coredns -o yaml\n\n# Corefile:\n.:53 {\n    errors\n    health\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n      pods insecure\n      fallthrough in-addr.arpa ip6.arpa\n    }\n    prometheus :9153\n    forward . /etc/resolv.conf              # external DNS fallback\n    cache 30\n    loop\n    reload\n}\n\n# Pod DNS config (auto-populated)\n$ kubectl exec myapp-xyz -- cat /etc/resolv.conf\nnameserver 10.96.0.10\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n\n# Names that resolve:\n# api                                   (short — with search domains)\n# api.default\n# api.default.svc\n# api.default.svc.cluster.local          (fully qualified)\n\n# Custom DNS config per pod\nspec:\n  dnsPolicy: None                        # or ClusterFirst (default)\n  dnsConfig:\n    nameservers: [8.8.8.8, 1.1.1.1]\n    searches: [example.com, corp.internal]\n    options:\n      - name: ndots\n        value: \"2\"\n\n# Common issue: ndots:5 causes slow DNS\n# Every dotted name < 5 dots tries search domains first!\n# Fix: use fully qualified names OR ndots:2\n\n# Debug DNS from a pod\n$ kubectl run -it --rm dnstest --image=nicolaka/netshoot -- bash\n$ dig api.default.svc.cluster.local +short\n$ nslookup api\n$ dig +trace google.com\n\n# CoreDNS metrics (Prometheus scrape)\n$ curl coredns:9153/metrics\n# coredns_dns_requests_total, cache_hits, ...",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49,
+        50,
+        52,
+        53,
+        54
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "DNS in K8s",
+        "items": [
+          {
+            "label": "CoreDNS",
+            "color": "#10b981",
+            "value": "Cluster DNS (in kube-system)",
+            "highlight": true
+          },
+          {
+            "label": "search domains",
+            "color": "#818cf8",
+            "value": "short names resolve"
+          },
+          {
+            "label": "ndots:5 pitfall",
+            "color": "#ef4444",
+            "value": "Many failed lookups first"
+          },
+          {
+            "label": "dnsPolicy: None",
+            "color": "#f59e0b",
+            "value": "Custom resolvers per pod"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Debugging network issues",
+      "description": "netshoot + curl + tcpdump + ss. Test connectivity from a pod. Check DNS, endpoints, NetworkPolicies, kube-proxy.",
+      "code": "# Debug toolkit — launch a netshoot pod\n$ kubectl run -it --rm netshoot --image=nicolaka/netshoot -- bash\n\n# Test service DNS\n# curl -v api.api-prod.svc.cluster.local:80\n\n# Ping a pod IP\n# ping 10.244.2.7                       # ICMP (may be blocked)\n\n# Check listening ports on a pod\n# nc -zv api-pod 3000\n# ss -tulpn\n\n# Trace network path\n# mtr --report --report-cycles 30 <ip>\n\n# tcpdump inside pod\n# tcpdump -i any -nn port 5432 -w /tmp/db.pcap\n\n# Common issues:\n\n# 1. Service returns \"connection refused\"\n# → App not listening on right port? Check containerPort vs targetPort\n$ kubectl describe svc api\n$ kubectl exec api-xyz -- ss -tlnp\n\n# 2. Service returns nothing (hangs)\n# → No pods matching selector (empty endpoints)\n$ kubectl get endpoints api\n# ENDPOINTS = <none>  → selector wrong or pods not Ready\n\n# 3. Cross-namespace fails\n# → NetworkPolicy blocking? Use fully-qualified name?\n$ kubectl get netpol -n api-prod\n\n# 4. DNS lookup fails\n$ kubectl exec myapp -- nslookup kubernetes.default\n# If fails: CoreDNS down, or pod's DNS config wrong\n\n# 5. External connectivity fails\n$ kubectl exec myapp -- curl -v https://example.com\n# → Egress NetworkPolicy? NAT gateway? DNS?\n\n# 6. Intermittent failures\n# → check kube-proxy is running on every node\n$ kubectl -n kube-system get pods -l k8s-app=kube-proxy -o wide\n# → check iptables/IPVS rules on the node\n\n# 7. Slow connections\n# → check network MTU (esp. cross-node)\n# → check ndots DNS pitfall\n\n# eBPF observability with Cilium/Hubble\n$ hubble observe --follow --pod api-prod/api-xyz",
+      "highlight": [
+        2,
+        5,
+        8,
+        11,
+        12,
+        15,
+        18,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "netshoot pod: full toolkit",
+            "done": true
+          },
+          {
+            "label": "endpoints, selectors, ports",
+            "done": true
+          },
+          {
+            "label": "NetworkPolicy checks",
+            "active": true
+          },
+          {
+            "label": "Hubble/Cilium for eBPF observability"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

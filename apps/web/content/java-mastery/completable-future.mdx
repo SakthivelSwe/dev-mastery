@@ -1,0 +1,447 @@
+---
+slug: "completable-future"
+title: "CompletableFuture — Async Pipelines"
+level: 4
+---
+
+## WHY
+
+`Future.get()` blocks the calling thread — it's a nice contract but a terrible tool for composition. If a checkout request must call the inventory service, THEN the pricing service, THEN the payment service, doing that with three `Future.get()` calls back-to-back means the request thread spends 300 ms holding a Tomcat worker slot doing nothing but waiting.
+
+`CompletableFuture` solves this by letting you describe the whole pipeline as a graph — `thenApply`, `thenCompose`, `thenCombine`, `exceptionally`. The pipeline executes on background pools; the request thread hands off after step 1 and moves on. Twenty concurrent requests, twenty pipelines, one thread runs the compose steps as each stage completes. This is how modern Java services (BFF gateways, orchestrators) achieve high throughput without going fully reactive.
+
+## THEORY
+
+### The core operators
+
+| Operator | Signature | What it does |
+|----------|----------|--------------|
+| `supplyAsync(f)` | `Supplier<T> → CF<T>` | Start a task on ForkJoinPool.commonPool (or a given executor) |
+| `runAsync(r)` | `Runnable → CF<Void>` | Start a fire-and-forget async task |
+| `thenApply(f)` | `Function<T,U>` | Transform the result (same thread as producer) |
+| `thenApplyAsync(f, exec)` | | Transform on `exec`, off the producer's thread |
+| `thenAccept(c)` | `Consumer<T>` | Side-effect on the value, chain ends with CF<Void> |
+| `thenRun(r)` | `Runnable` | Ignore value, just run something |
+| `thenCompose(f)` | `Function<T, CF<U>>` | Flat-map — chain a dependent async step |
+| `thenCombine(other, biFn)` | | Wait for TWO CFs, combine their results |
+| `allOf(cf1, cf2, ...)` | | Wait for all — returns CF<Void>; use `.join()` on originals for values |
+| `anyOf(cf1, cf2, ...)` | | Wait for first to complete |
+| `exceptionally(fn)` | `Fn<Throwable, T>` | Recovery handler |
+| `handle(biFn)` | `BiFn<T, Throwable, U>` | Handle both success and failure in one shot |
+| `whenComplete(biCon)` | `BiConsumer<T, Throwable>` | Side-effect on either outcome, doesn't change value |
+| `orTimeout(t, unit)` (9+) | | Fail with TimeoutException if not done |
+| `completeOnTimeout(v, t, unit)` (9+) | | Complete with fallback value |
+
+### `thenApply` vs `thenApplyAsync` — the executor question
+
+- `thenApply(f)` runs `f` on **whichever thread completed the previous stage**. If that thread is a callback thread inside a client library (e.g., Netty event loop), your code hijacks it.
+- `thenApplyAsync(f)` runs on `ForkJoinPool.commonPool`.
+- `thenApplyAsync(f, exec)` runs on the explicit executor `exec`.
+
+Rule of thumb: whenever a stage does non-trivial work (any DB call, any lock), use `thenApplyAsync(fn, myExecutor)` — don't hijack the framework's callback thread.
+
+### `thenCompose` vs `thenCombine`
+
+```java
+// thenCompose — sequential dependent async
+CompletableFuture<User>       user   = userService.findAsync(id);
+CompletableFuture<List<Order>> orders = user.thenCompose(u -> orderService.byUserAsync(u.id));
+// Note: result type is CF<List<Order>>, NOT CF<CF<List<Order>>>
+
+// thenCombine — parallel independent async
+CompletableFuture<User>    userCF    = userService.findAsync(id);
+CompletableFuture<Address> addressCF = addressService.forAsync(id);
+CompletableFuture<Profile> profile   = userCF.thenCombine(addressCF, Profile::new);
+// user and address are fetched concurrently; combined when both are done.
+```
+
+### Error handling
+
+`exceptionally(t -> fallback)` catches ANY exception from the upstream chain and returns a fallback. But it can only produce the SAME type `T` — no exception transformation. `handle((v, t) -> ...)` runs whether success or failure, letting you convert exceptions or produce a different type.
+
+**Gotcha**: `exceptionally` returns a NEW `CompletableFuture`. Chaining `.thenApply(x -> ...)` AFTER `.exceptionally(...)` operates on the recovered value. Chaining BEFORE it operates on the raw stream.
+
+### The default executor is a footgun
+
+`supplyAsync(fn)` uses `ForkJoinPool.commonPool()` by default. That pool has `Nprocessors - 1` threads and is **shared with parallel streams, other CompletableFutures, and the JIT**. Blocking work on `commonPool` starves everything else. In production, ALWAYS pass an explicit executor:
+
+```java
+CompletableFuture.supplyAsync(this::loadFromDb, dbExecutor)
+```
+
+### Timeouts
+
+`orTimeout(3, TimeUnit.SECONDS)` completes the future exceptionally with a `TimeoutException` if not done in 3 s. **But the underlying task keeps running** — you don't stop it, you just stop waiting. Combine with `Future.cancel(true)` on the original if you need real cancellation.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "CFPipeline.java",
+  "steps": [
+    {
+      "title": "supplyAsync — start on a background pool",
+      "description": "A CompletableFuture starts on your Executor (or ForkJoinPool.commonPool if omitted). The caller thread is free immediately.",
+      "code": "CompletableFuture<String> cf = CompletableFuture\n    .supplyAsync(() -> loadUser(id), userExecutor);",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "caller",
+          "userExecutor"
+        ],
+        "messages": [
+          {
+            "from": "caller",
+            "to": "userExecutor",
+            "label": "supplyAsync"
+          },
+          {
+            "from": "userExecutor",
+            "to": "caller",
+            "label": "return CF (not yet complete)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "thenApply — transform the value",
+      "description": "thenApply runs its function ON the thread that completed the previous stage. Use thenApplyAsync(fn, exec) to hop back to your own pool.",
+      "code": "cf.thenApply(user -> user.name().toUpperCase())\n  .thenAccept(name -> log.info(\"hello {}\", name));",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "supplyAsync — loadUser(id)",
+            "done": true
+          },
+          {
+            "label": "thenApply — .name().toUpperCase()",
+            "active": true
+          },
+          {
+            "label": "thenAccept — log"
+          }
+        ]
+      }
+    },
+    {
+      "title": "thenCombine — merge two parallel calls",
+      "description": "Fire user AND address CFs in parallel; combine when both complete. Combiner runs on whichever thread completed last.",
+      "code": "var userCF    = supplyAsync(() -> loadUser(id),    pool);\nvar addressCF = supplyAsync(() -> loadAddress(id), pool);\nvar profile   = userCF.thenCombine(addressCF, Profile::new);",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "caller",
+          "userService",
+          "addressService"
+        ],
+        "messages": [
+          {
+            "from": "caller",
+            "to": "userService",
+            "label": "loadUser"
+          },
+          {
+            "from": "caller",
+            "to": "addressService",
+            "label": "loadAddress"
+          },
+          {
+            "from": "userService",
+            "to": "caller",
+            "label": "↩"
+          },
+          {
+            "from": "addressService",
+            "to": "caller",
+            "label": "↩"
+          }
+        ]
+      }
+    },
+    {
+      "title": "exceptionally — fallback",
+      "description": "Any exception in the upstream chain flows into exceptionally. Return a fallback value of the same type. Or use `handle` for finer control.",
+      "code": "cf.thenApply(User::name)\n  .exceptionally(t -> \"guest\")   // any upstream failure → \"guest\"\n  .thenAccept(System.out::println);",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "supplyAsync — loadUser(id)",
+            "done": true,
+            "note": "throws NotFound"
+          },
+          {
+            "label": "thenApply — User::name",
+            "done": true
+          },
+          {
+            "label": "exceptionally — \"guest\"",
+            "active": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "Timeouts — orTimeout / completeOnTimeout",
+      "description": "Every call needs a budget. orTimeout completes exceptionally with TimeoutException; completeOnTimeout falls back to a value. Underlying task is NOT cancelled — you must do that yourself if you need to.",
+      "code": "recCF.completeOnTimeout(List.of(), 500, MILLISECONDS)   // best-effort\n     .exceptionally(t -> List.of());",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Timeouts",
+        "items": [
+          {
+            "label": "orTimeout",
+            "value": "fail after N ms",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "completeOnTimeout",
+            "value": "fallback after N ms",
+            "color": "#10b981"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — supplyAsync, thenApply, thenAccept
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class BasicPipeline {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture
+                .supplyAsync(() -> "hello")                       // stage 1
+                .thenApply(s -> s + " world")                     // stage 2
+                .thenApply(String::toUpperCase)                   // stage 3
+                .thenAccept(System.out::println)                  // side-effect
+                .get();                                           // block main
+        // Output: HELLO WORLD
+    }
+}
+```
+
+### Level 2 — Parallel fan-out with `allOf`
+```java
+import java.util.concurrent.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class ParallelFanOut {
+    static int slowSquare(int n) {
+        try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+        return n * n;
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        long start = System.currentTimeMillis();
+
+        List<CompletableFuture<Integer>> futures = List.of(1,2,3,4,5,6,7,8).stream()
+                .map(i -> CompletableFuture.supplyAsync(() -> slowSquare(i), pool))
+                .toList();
+
+        int sum = CompletableFuture
+                .allOf(futures.toArray(new CompletableFuture[0]))     // wait for all
+                .thenApply(v -> futures.stream().mapToInt(CompletableFuture::join).sum())
+                .get();
+
+        long ms = System.currentTimeMillis() - start;
+        System.out.println("sum=" + sum + " in " + ms + " ms");
+        // ~600 ms with 4 workers (8 tasks / 4 threads * 300ms), not 8*300ms=2400ms.
+        pool.shutdown();
+    }
+}
+```
+
+### Level 3 — Sequential dependent calls with `thenCompose`
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class CheckoutFlow {
+    // Simulated async service calls
+    static CompletableFuture<String>  fetchUser(int id) {
+        return CompletableFuture.supplyAsync(() -> "user-" + id);
+    }
+    static CompletableFuture<Integer> fetchCart(String user) {
+        return CompletableFuture.supplyAsync(() -> user.length() * 10);
+    }
+    static CompletableFuture<Boolean> charge(int amount) {
+        return CompletableFuture.supplyAsync(() -> amount < 100);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Boolean ok = fetchUser(42)
+                .thenCompose(CheckoutFlow::fetchCart)     // depends on user
+                .thenCompose(CheckoutFlow::charge)         // depends on cart total
+                .get();
+        System.out.println("charged=" + ok);
+    }
+}
+```
+
+### Level 4 — Error recovery: `exceptionally` and `handle`
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ErrorHandling {
+    public static void main(String[] args) throws Exception {
+        // exceptionally — replace error with fallback value
+        String v1 = CompletableFuture.<String>supplyAsync(() -> {
+                    throw new RuntimeException("boom");
+                })
+                .exceptionally(t -> "FALLBACK: " + t.getMessage())
+                .get();
+        System.out.println(v1); // FALLBACK: java.lang.RuntimeException: boom
+
+        // handle — see both value and error, produce something new
+        String v2 = CompletableFuture.<String>supplyAsync(() -> {
+                    if (Math.random() < 0.5) throw new RuntimeException("half fail");
+                    return "OK";
+                })
+                .handle((result, error) -> error == null ? "SUCCESS " + result
+                                                          : "ERROR " + error.getMessage())
+                .get();
+        System.out.println(v2);
+    }
+}
+```
+
+### Level 5 — Realistic BFF endpoint: user + orders + recommendations in parallel
+```java
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.*;
+
+public class ProfileBFF {
+    record User(int id, String name)               {}
+    record Order(int id, int userId, double total) {}
+    record Rec(String sku, double score)           {}
+    record Profile(User user, List<Order> orders, List<Rec> recs) {}
+
+    private final ExecutorService pool = Executors.newFixedThreadPool(20);
+
+    public Profile fetchProfile(int userId) throws Exception {
+        CompletableFuture<User>        userCF  = CompletableFuture.supplyAsync(
+                () -> callUserService(userId), pool)
+                .orTimeout(1, TimeUnit.SECONDS);
+
+        CompletableFuture<List<Order>> ordersCF = CompletableFuture.supplyAsync(
+                () -> callOrderService(userId), pool)
+                .orTimeout(2, TimeUnit.SECONDS)
+                .exceptionally(t -> List.of());                        // best-effort
+
+        CompletableFuture<List<Rec>>   recsCF   = CompletableFuture.supplyAsync(
+                () -> callRecService(userId), pool)
+                .completeOnTimeout(List.of(), 500, TimeUnit.MILLISECONDS); // best-effort
+
+        // Wait for all three (or fail fast on user)
+        return CompletableFuture.allOf(userCF, ordersCF, recsCF)
+                .thenApply(v -> new Profile(userCF.join(), ordersCF.join(), recsCF.join()))
+                .get(3, TimeUnit.SECONDS);
+    }
+
+    // stubbed remote calls
+    User        callUserService(int id) { return new User(id, "Alice"); }
+    List<Order> callOrderService(int id){ return List.of(new Order(1, id, 42.0)); }
+    List<Rec>   callRecService(int id)  { return List.of(new Rec("SKU-9", 0.87)); }
+}
+```
+Three network calls, ALL running concurrently. User call is hard-timeout (must succeed within 1 s). Orders and recs are best-effort — they fail-open with empty lists so the profile still renders.
+
+## REAL_WORLD
+
+**API composition in a Backend-For-Frontend (BFF).** Mobile app calls `GET /home` — the BFF has to gather data from six microservices (user, cart, wishlist, recommendations, notifications, promotions). Naive sequential calls: 6 × 100 ms = 600 ms tail latency. With `CompletableFuture`, they fan out in parallel: 100 ms tail latency (bounded by the slowest call). The pattern is textbook:
+
+```java
+@GetMapping("/home")
+public HomeResponse home(@AuthUser String userId) {
+    var user      = supplyAsync(() -> userService.get(userId),         apiExec);
+    var cart      = supplyAsync(() -> cartService.get(userId),         apiExec);
+    var wishlist  = supplyAsync(() -> wishlistService.get(userId),     apiExec)
+                    .completeOnTimeout(List.of(), 200, MILLISECONDS);
+    var recs      = supplyAsync(() -> recsService.for(userId),         apiExec)
+                    .completeOnTimeout(List.of(), 200, MILLISECONDS);
+    var notif     = supplyAsync(() -> notifService.count(userId),      apiExec)
+                    .exceptionally(t -> 0);
+    var promo     = supplyAsync(() -> promoService.active(userId),     apiExec)
+                    .completeOnTimeout(List.of(), 100, MILLISECONDS);
+
+    return allOf(user, cart, wishlist, recs, notif, promo)
+            .thenApply(v -> new HomeResponse(user.join(), cart.join(),
+                    wishlist.join(), recs.join(), notif.join(), promo.join()))
+            .join();
+}
+```
+Fast, resilient, and each downstream has its own timeout / fallback policy.
+
+## INTERVIEW
+
+**Q: What's the difference between `thenApply` and `thenApplyAsync`?**
+A: `thenApply(fn)` runs `fn` on the thread that completed the previous stage — which could be a caller thread, a framework callback thread, or the executor. `thenApplyAsync(fn)` schedules `fn` on `ForkJoinPool.commonPool`. `thenApplyAsync(fn, exec)` schedules on `exec`. In production, prefer the explicit-executor form so you never hijack a wrong thread.
+
+**Q: What's the difference between `thenCompose` and `thenCombine`?**
+A: `thenCompose` chains a DEPENDENT async step (sequential): the second `CompletableFuture` is created from the first's result. `thenCombine` combines TWO INDEPENDENT `CompletableFuture`s: they run in parallel and the combiner runs when both complete.
+
+**Q: Why is `ForkJoinPool.commonPool()` a footgun for `CompletableFuture`?**
+A: It's shared with parallel streams, other CFs, and the JVM's own tasks. Its size is `Nprocessors - 1`. Blocking work on `commonPool` starves everything else. Always pass an explicit `Executor` for I/O-heavy work.
+
+**Q: `.orTimeout(3, SECONDS)` — does it cancel the underlying task?**
+A: No. It completes the returned CF exceptionally with a `TimeoutException`, but the task keeps running on the executor. If cancellation matters, you must also cancel the source (e.g., `future.cancel(true)`) — and the task must respect `Thread.currentThread().isInterrupted()`.
+
+**Q: When would you choose `handle` over `exceptionally`?**
+A: `exceptionally(fn)` receives only the throwable — you can't inspect the successful value. `handle(biFn)` receives both `(value, error)` and can inspect either — good for logging, metrics, or transforming success values as well as errors.
+
+**Q: How do you enforce a hard latency budget on a compound call?**
+A: Give each stage its own `orTimeout` or `completeOnTimeout(fallback, ...)`, then wrap the outer `allOf(...).get(budget, TimeUnit.MILLISECONDS)` — so if any stage exceeds its budget, the whole endpoint fails fast rather than tail-latency creeping up.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> `CompletableFuture` is like ordering food for a group. Instead of calling the pizza place, waiting for the pizza to arrive, THEN calling the burger place, THEN the drinks place (all in a row while your friends starve) — you call all three at once, and each one calls you back when their delivery is done. `thenCombine` is you saying "when the pizza AND the drinks arrive, put them together on the table." `exceptionally` is your backup plan: "if the burger place doesn't deliver, order tacos instead."
+
+## BUILD
+
+Build an **image-thumbnail service**:
+1. Given a `List<URL> images`, download each in parallel using an `ExecutorService` (say 10 threads).
+2. Wrap each download in `CompletableFuture.supplyAsync(this::download, ioPool)`.
+3. Chain `.thenApplyAsync(this::resize, cpuPool)` — resize on a CPU-bound pool.
+4. Chain `.thenApplyAsync(this::uploadToS3, ioPool)`.
+5. Attach `.orTimeout(5, SECONDS)` and `.exceptionally(t -> null)` so one bad image doesn't fail the batch.
+6. `allOf(...)` and return a `Map<URL, S3Url>` of successful uploads.
+7. **Bonus**: expose progress via a `Consumer<Progress>` callback that fires from `whenComplete` on each stage.
+
+## SPACED REVIEW
+
+**Day 1**: Write, from memory, a two-stage pipeline: fetch user async → return greeting.
+**Day 3**: Give one case where `thenApply` is wrong and `thenApplyAsync` is right.
+**Day 7**: Sketch a fan-out of 3 parallel calls with `allOf` and a 500 ms budget.
+**Day 14**: Explain the difference between `exceptionally`, `handle`, and `whenComplete`.
+

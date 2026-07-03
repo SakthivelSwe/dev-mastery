@@ -41,9 +41,163 @@ flowchart TD
 Most developers believe Transactional Outbox Pattern is straightforward to implement, but the devil is in the edge cases — failure handling, ordering guarantees, and eventual consistency require careful design.
 
 ## VISUALIZATION_CONFIG
-
 ```json
-{ "component": "FlowChart", "state": "microservices-ms-outbox-pattern" }
+{
+  "language": "java",
+  "fileName": "Outbox.java",
+  "steps": [
+    {
+      "title": "The dual-write problem",
+      "description": "Saving to DB and publishing to Kafka in the same operation can fail partially — DB saved but Kafka not published (or vice versa). The outbox pattern solves this.",
+      "code": "// BROKEN: dual-write\norderRepo.save(order);             // can succeed\nkafkaTemplate.send(\"events\", event); // can fail → event lost!\n\n// OR: Kafka succeeds, DB fails → event without order in DB!",
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "save order to DB ✓",
+            "done": true
+          },
+          {
+            "label": "publish to Kafka ✗ (network down)",
+            "done": true
+          },
+          {
+            "label": "order saved but event LOST",
+            "active": true
+          },
+          {
+            "label": "downstream services never notified → inconsistency"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Outbox table",
+      "description": "Write the event to an outbox table IN THE SAME TRANSACTION as the business data. Atomicity guaranteed by the DB transaction.",
+      "code": "// Same @Transactional:\ntransactionTemplate.execute(status -> {\n    orderRepo.save(order);\n    outboxRepo.save(new OutboxEvent(\n        \"order-events\",\n        objectMapper.writeValueAsString(new OrderPlacedEvent(order))\n    ));\n    return null;  // BOTH committed or BOTH rolled back\n});",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Outbox atomicity",
+        "items": [
+          {
+            "label": "save order",
+            "color": "#818cf8"
+          },
+          {
+            "label": "save outbox record",
+            "color": "#818cf8"
+          },
+          {
+            "label": "BOTH in one transaction → atomic",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "Kafka publish is async/separate",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Relay process",
+      "description": "A relay (poller or CDC listener) reads the outbox table and publishes to Kafka. Marks records as published after success.",
+      "code": "// Polling relay (simple)\n@Scheduled(fixedDelay = 1000)\nvoid relay() {\n    List<OutboxEvent> pending = outboxRepo.findByPublished(false);\n    for (OutboxEvent e : pending) {\n        kafkaTemplate.send(e.getTopic(), e.getPayload()).get();\n        outboxRepo.markPublished(e.getId());\n    }\n}",
+      "highlight": [
+        3,
+        5,
+        6,
+        7
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "relay",
+          "outbox table",
+          "Kafka"
+        ],
+        "messages": [
+          {
+            "from": "relay",
+            "to": "outbox table",
+            "label": "SELECT WHERE published=false"
+          },
+          {
+            "from": "relay",
+            "to": "Kafka",
+            "label": "send event payload"
+          },
+          {
+            "from": "relay",
+            "to": "outbox table",
+            "label": "UPDATE published=true"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transactional outbox vs Debezium CDC",
+      "description": "Simple poller has at-least-once delivery. Debezium reads Postgres WAL (change data capture) — zero-latency, no polling, exact delivery.",
+      "code": "# Debezium connector config:\ndebezium.source.connector.class=PostgresConnector\ndebezium.source.database.hostname=postgres\ndebezium.source.table.include.list=public.outbox_events\n# Debezium reads WAL → publishes to Kafka\n# Much lower latency than polling",
+      "diagram": {
+        "kind": "boxes",
+        "title": "Relay approaches",
+        "items": [
+          {
+            "label": "polling relay: simple, ~1s delay",
+            "color": "#818cf8"
+          },
+          {
+            "label": "Debezium CDC: real-time, reads WAL",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "both guarantee at-least-once delivery",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Idempotent consumers",
+      "description": "The outbox guarantees at-least-once. Consumers MUST be idempotent — processing the same event twice has no additional effect.",
+      "code": "@KafkaListener(topics=\"order-events\")\nvoid onOrderPlaced(OrderPlacedEvent e) {\n    // idempotency check: was this already processed?\n    if (processedEventRepo.exists(e.getEventId())) return;\n    fulfillOrder(e.getOrderId());\n    processedEventRepo.mark(e.getEventId());\n}",
+      "highlight": [
+        4,
+        6
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "event arrives",
+            "done": true
+          },
+          {
+            "label": "already processed? → skip",
+            "active": true
+          },
+          {
+            "label": "process + mark processed"
+          },
+          {
+            "label": "duplicate delivery has no effect"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

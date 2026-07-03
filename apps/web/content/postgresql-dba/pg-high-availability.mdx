@@ -23,7 +23,350 @@ To prevent Split-Brain, HA systems require **Quorum (Consensus)**. You cannot ha
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-ha" }
+{
+  "language": "sql",
+  "fileName": "ha.sql",
+  "steps": [
+    {
+      "title": "HA architecture components",
+      "description": "Primary + hot standby(s) + failover automation + connection routing. Popular stacks: Patroni, repmgr, pg_auto_failover, cloud-managed (RDS).",
+      "code": "-- Classic HA stack\n\n-- Primary (rw) ──┐\n--                ├──▶ HAProxy / Pgbouncer / Pgpool ──▶ Apps\n-- Standby 1 (ro) ┘\n-- Standby 2 (ro) ┘\n--\n-- Consensus (Patroni + etcd/Consul) manages leadership\n\n-- Patroni (industry standard for self-managed HA)\n-- - Uses Raft consensus (via etcd/Consul/K8s)\n-- - Automatic failover on primary failure\n-- - Prevents split-brain\n-- - REST API for orchestration\n\n-- patroni.yml example\nscope: postgres-cluster\nname: node1\n\nrestapi:\n  listen: 0.0.0.0:8008\n  connect_address: 10.0.1.10:8008\n\netcd:\n  hosts: etcd1:2379,etcd2:2379,etcd3:2379\n\nbootstrap:\n  dcs:\n    ttl: 30\n    loop_wait: 10\n    postgresql:\n      parameters:\n        wal_level: replica\n        max_connections: 200\n\npostgresql:\n  listen: 0.0.0.0:5432\n  data_dir: /var/lib/postgresql/data\n  authentication:\n    replication: {username: replicator, password: ...}\n\n-- Cloud managed:\n-- - AWS RDS Multi-AZ    (automated failover)\n-- - Google Cloud SQL     (HA option)\n-- - Azure DB for PG      (Flexible Server HA)\n-- - Supabase             (built-in HA)",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        42,
+        43,
+        44,
+        45,
+        46
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "HA components",
+        "items": [
+          {
+            "label": "Primary + standbys",
+            "color": "#10b981",
+            "value": "Streaming replication",
+            "highlight": true
+          },
+          {
+            "label": "Consensus (etcd/Consul)",
+            "color": "#818cf8",
+            "value": "Elects leader — prevents split-brain"
+          },
+          {
+            "label": "Patroni/repmgr",
+            "color": "#f59e0b",
+            "value": "Failover automation"
+          },
+          {
+            "label": "HAProxy/Pgpool",
+            "color": "#60a5fa",
+            "value": "Client routing"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Failover mechanics",
+      "description": "When primary fails: promote standby, redirect clients, fence old primary. Manual or automatic via Patroni/repmgr/RDS.",
+      "code": "-- Manual failover steps:\n-- 1. Confirm primary is down (not just network)\n-- 2. Choose best standby (least lag)\n-- 3. Promote standby to primary\nSELECT pg_promote(true, 60);          -- wait up to 60s\n-- Or: pg_ctl promote -D $PGDATA\n\n-- 4. Point other standbys to new primary\nALTER SYSTEM SET primary_conninfo = 'host=newprimary ...';\nSELECT pg_reload_conf();\n\n-- 5. Reconfigure old primary as standby (when it comes back)\n$ pg_rewind --target-pgdata=$PGDATA --source-server=\"host=newprimary user=...\"\n-- Or: pg_basebackup fresh\n\n-- Patroni automation:\n-- Detects primary failure via etcd lock timeout\n-- Promotes least-lagged replica\n-- Updates etcd → HAProxy routes to new primary\n-- Fences old primary → prevents split-brain\n\n$ patronictl failover --candidate node2\n$ patronictl switchover --leader node1 --candidate node2\n\n-- Split-brain prevention:\n-- - Only one node has the leader lock in consensus store\n-- - Other nodes see lock exists → refuse to promote\n-- - Fencing: STONITH (shoot the other node in the head)\n\n-- Failover timing:\n-- Detection:  10-30 sec (loop_wait × N)\n-- Promotion:  1-5 sec (pg_promote)\n-- Client redirect: 1-30 sec (depends on connection pool)\n-- Total RTO: 30-60 sec typical",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Client",
+          "HAProxy",
+          "Patroni",
+          "Primary",
+          "Standby"
+        ],
+        "messages": [
+          {
+            "from": "Primary",
+            "to": "Primary",
+            "label": "CRASH"
+          },
+          {
+            "from": "Patroni",
+            "to": "Patroni",
+            "label": "detect (lock timeout)"
+          },
+          {
+            "from": "Patroni",
+            "to": "Standby",
+            "label": "pg_promote"
+          },
+          {
+            "from": "Patroni",
+            "to": "HAProxy",
+            "label": "update backend"
+          },
+          {
+            "from": "Client",
+            "to": "HAProxy",
+            "label": "new connection"
+          },
+          {
+            "from": "HAProxy",
+            "to": "Standby",
+            "label": "route to new primary"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Client connection routing",
+      "description": "Clients must find the current primary. Options: HAProxy + health checks, DNS updates, service discovery, connection strings with multiple hosts.",
+      "code": "-- Option 1: HAProxy with health checks\nfrontend postgres-write\n  bind *:5432\n  default_backend pg-primary\n\nbackend pg-primary\n  option httpchk GET /primary\n  http-check expect status 200\n  server pg1 pg1:5432 check port 8008 inter 2s\n  server pg2 pg2:5432 check port 8008 inter 2s\n  server pg3 pg3:5432 check port 8008 inter 2s\n\n-- Patroni REST API on port 8008:\n-- /primary  → 200 if this node is primary, else 503\n-- /replica  → 200 if this node is replica, else 503\n-- HAProxy learns which is primary automatically\n\n-- Option 2: Client-side multi-host (libpq)\npostgres://user:pass@pg1,pg2,pg3:5432/devmastery?target_session_attrs=read-write\n\n-- Node.js pg-native:\nconst pool = new Pool({\n  host: 'pg1,pg2,pg3',\n  target_session_attrs: 'read-write'\n});\n\n-- Client tries hosts in order → picks first that reports read-write\n\n-- Option 3: DNS with short TTL + updated on failover\n-- CNAME db.internal → currently-primary.internal (TTL 30s)\n-- Failover: DNS update + wait for TTL\n\n-- Option 4: Service discovery (Consul, etcd, K8s Service)\n-- Update service endpoint on failover\n-- Clients discover via DNS SRV records\n\n-- Best practice: pool connections in app + short idle timeout\n-- On failover, dead connections evicted quickly",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Routing strategies",
+        "items": [
+          {
+            "label": "HAProxy + Patroni",
+            "color": "#10b981",
+            "value": "Health check discovers primary",
+            "highlight": true
+          },
+          {
+            "label": "Multi-host libpq",
+            "color": "#818cf8",
+            "value": "target_session_attrs=read-write"
+          },
+          {
+            "label": "DNS updates",
+            "color": "#f59e0b",
+            "value": "Simple but slow (TTL)"
+          },
+          {
+            "label": "K8s Service",
+            "color": "#60a5fa",
+            "value": "kubectl selector switches"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Split-brain prevention",
+      "description": "Split-brain = two \"primaries\" accepting writes. Prevent via consensus (Raft), fencing, and network partition detection.",
+      "code": "-- Split-brain scenario:\n-- Primary loses network to standbys\n-- Standbys promote a new primary\n-- Original primary still accepting writes on isolated network segment\n-- → Data divergence!\n\n-- Prevention mechanisms:\n\n-- 1. Consensus store (etcd/Consul with Raft)\n-- Only one node can hold the \"leader\" lock at a time\n-- Requires quorum (majority) to establish lock\n-- If original primary loses etcd quorum → gives up leader role → stops writing\n\n-- 2. Fencing (STONITH)\n-- Automated: cut power / network to old primary before promoting new\n-- Cloud: use API to detach/stop old instance\n\n-- 3. Witness node\n-- Odd number of nodes (3, 5)\n-- Prevents ties in leader election\n\n-- 4. Synchronous replication\nsynchronous_commit = on\nsynchronous_standby_names = 'ANY 1 (standby1, standby2)'\n-- Primary refuses writes if no standby available\n-- Trade-off: unavailability instead of split-brain\n\n-- Odd cluster sizes (avoid 2 nodes!)\n-- 1 node:  no HA\n-- 2 nodes: split-brain risk (no majority possible)\n-- 3 nodes: 1 failure OK (2 form majority)\n-- 5 nodes: 2 failures OK\n\n-- Multi-region considerations:\n-- Latency between regions affects sync replication\n-- Common pattern:\n-- - 3 nodes in primary region (sync)\n-- - Async replicas in DR region\n-- - Manual failover for regional disaster (RTO measured in minutes)",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Split-brain protection",
+        "items": [
+          {
+            "label": "Raft consensus",
+            "color": "#10b981",
+            "value": "Majority elects leader",
+            "highlight": true
+          },
+          {
+            "label": "Odd node count",
+            "color": "#818cf8",
+            "value": "3, 5 — prevent ties"
+          },
+          {
+            "label": "Fencing",
+            "color": "#ef4444",
+            "value": "Kill old primary before promoting"
+          },
+          {
+            "label": "Sync replication",
+            "color": "#f59e0b",
+            "value": "No writes without quorum"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cloud-managed HA",
+      "description": "AWS RDS, Google Cloud SQL, Azure Database. Multi-AZ automatic failover. Read replicas across regions. Trade control for operational ease.",
+      "code": "-- AWS RDS Multi-AZ\n-- - Synchronous replication to standby in another AZ\n-- - Automatic failover (60-120 sec)\n-- - Automated backups + point-in-time recovery\n-- - Encryption at rest + in transit\n\n$ aws rds create-db-instance \\\n    --db-instance-identifier devmastery-prod \\\n    --engine postgres --engine-version 15.4 \\\n    --db-instance-class db.r6g.xlarge \\\n    --multi-az \\\n    --storage-type gp3 --allocated-storage 100 \\\n    --backup-retention-period 30 \\\n    --preferred-backup-window \"02:00-04:00\"\n\n-- Add read replica (in-region or cross-region)\n$ aws rds create-db-instance-read-replica \\\n    --db-instance-identifier devmastery-replica-us-west \\\n    --source-db-instance-identifier devmastery-prod \\\n    --db-instance-class db.r6g.large\n\n-- Google Cloud SQL: similar\n$ gcloud sql instances create devmastery \\\n    --database-version=POSTGRES_15 \\\n    --tier=db-custom-4-16384 \\\n    --availability-type=REGIONAL \\        # Multi-zone HA\n    --enable-bin-log \\\n    --backup-start-time=02:00\n\n-- Azure Database for PostgreSQL Flexible Server\naz postgres flexible-server create \\\n    --name devmastery \\\n    --high-availability ZoneRedundant \\\n    --storage-size 100 --sku-name Standard_D4ds_v4\n\n-- Supabase\n-- HA + read replicas built-in\n-- Point-in-time recovery + automated backups\n-- Zero-config for most cases\n\n-- Trade-offs:\n-- + Ops handled: backups, patching, failover\n-- + SLA: usually 99.95%+\n-- - Vendor lock-in\n-- - Cost premium (~2-3x vs self-managed)\n-- - Less control (specific tunables blocked)",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        31,
+        32,
+        33,
+        34,
+        37,
+        38,
+        39,
+        42,
+        43,
+        44,
+        45,
+        46
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Managed PG choice",
+        "items": [
+          {
+            "label": "AWS RDS",
+            "color": "#10b981",
+            "value": "Mature, Multi-AZ, replicas",
+            "highlight": true
+          },
+          {
+            "label": "Google Cloud SQL",
+            "color": "#818cf8",
+            "value": "Simpler, good defaults"
+          },
+          {
+            "label": "Azure Flexible",
+            "color": "#f59e0b",
+            "value": "Zone-redundant HA"
+          },
+          {
+            "label": "Supabase",
+            "color": "#60a5fa",
+            "value": "Full BaaS on top of PG"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

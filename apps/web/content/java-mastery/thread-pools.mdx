@@ -1,0 +1,557 @@
+---
+slug: "thread-pools"
+title: "Thread Pools — Types, Sizing & Tuning"
+level: 3
+---
+
+## WHY
+
+Most Java performance problems in production are misconfigured thread pools. The two extremes cause different disasters:
+
+- **Pool too small** → requests queue → latency spikes → timeouts cascade → error rate climbs → the load balancer removes the instance → the remaining instances get MORE load → outage.
+- **Pool too big** → context switches dominate → CPU cache thrashes → GC pauses lengthen → memory pressure → OOM.
+
+The right size depends on whether the work is **CPU-bound** or **I/O-bound**, on target CPU utilization, and on how long tasks block. There's a formula. Learn it, apply it, stop guessing.
+
+## THEORY
+
+### The five ready-made pool factories
+
+| Factory | Corp / Max | Queue | When it fits |
+|---------|-----------|-------|--------------|
+| `newFixedThreadPool(n)` | `n` / `n` | Unbounded `LinkedBlockingQueue` | Steady load; **replace with explicit bounded queue in prod** |
+| `newCachedThreadPool` | `0` / `MAX_VALUE` | `SynchronousQueue` (0-capacity) | Short bursts of quick tasks — **dangerous under sustained load** |
+| `newSingleThreadExecutor` | `1` / `1` | Unbounded | Sequentially ordered work (event handlers, log writers) |
+| `newScheduledThreadPool(n)` | `n` fixed | `DelayedWorkQueue` | Timers, cron |
+| `newWorkStealingPool()` | `parallelism` = cores | Per-thread deques | CPU-bound recursive work (`ForkJoin`) |
+| `newVirtualThreadPerTaskExecutor()` | ∞ virtual threads | none | Java 21+ I/O-heavy fan-out |
+
+### Sizing formula for I/O-bound work (Brian Goetz)
+
+```
+Nthreads = Ncpu * Ucpu * (1 + W/C)
+
+Ncpu = number of cores
+Ucpu = target CPU utilization (0..1)  usually 0.7-0.9
+W    = average wait time per task (blocking I/O)
+C    = average compute time per task
+```
+
+For a REST endpoint on an 8-core box calling a database that takes 40 ms round-trip while your own code takes 5 ms of CPU: `W/C = 8`. At `Ucpu = 0.8`: `Nthreads = 8 * 0.8 * 9 ≈ 58`. So a pool of ~60 handles this well; 200 (Tomcat default) is generous, but 500 would thrash.
+
+### Sizing for CPU-bound work
+
+```
+Nthreads = Ncpu + 1
+```
+One extra thread absorbs occasional page faults. Anything more than `Ncpu + 1` just adds context-switching overhead. This is the default for `ForkJoinPool.commonPool()`.
+
+### The choice of BlockingQueue matters
+
+| Queue type | Behavior | When to use |
+|-----------|---------|-------------|
+| `LinkedBlockingQueue(capacity)` | FIFO, capped | Default choice for most pools |
+| `ArrayBlockingQueue(capacity)` | FIFO, capped, single lock | Predictable memory, slightly slower |
+| `SynchronousQueue` | 0 capacity — hand-off | Cached pool, direct producer→consumer |
+| `PriorityBlockingQueue` | Priority-ordered | Rare — task priorities |
+| `DelayQueue` | Tasks with delays | ScheduledThreadPoolExecutor |
+| `LinkedTransferQueue` | Optimized hand-off | High-throughput producer/consumer |
+
+### The "queue full → error" surprise
+
+Bounded queue + `AbortPolicy` + tight budget → under a load spike your callers see `RejectedExecutionException`. Two production-worthy alternatives:
+
+1. **`CallerRunsPolicy`** — the submitter runs the task. Slows the intake naturally. Best for HTTP endpoints.
+2. **Custom `RejectedExecutionHandler`** that logs and delegates to a slow-lane pool. Best for critical-vs-degradable workload segregation.
+
+### `allowCoreThreadTimeOut(true)` — trim quiet pools
+
+By default, core threads live forever. On a service that idles for hours at night, they still hold ~1 MB of stack each. `pool.allowCoreThreadTimeOut(true)` lets even core threads exit after `keepAliveTime` — the pool shrinks to zero threads when idle, back to `corePoolSize` when work arrives.
+
+### Common thread-pool misconfigurations
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Requests time out during traffic spike | Pool too small, queue too big — tasks sit in queue past their SLA |
+| GC pauses growing over hours | Unbounded queue accumulating Runnable objects |
+| Sudden `RejectedExecutionException` under normal load | Bounded queue too small; consider increasing or switching policy |
+| High CPU but low throughput | Pool >> cores → context switching thrash |
+| Threads named `pool-3-thread-27` in logs | Missing `ThreadFactory` — impossible to correlate |
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "PoolSizing.java",
+  "steps": [
+    {
+      "title": "The sizing formula",
+      "description": "Goetz's formula for I/O-bound work: Nthreads = Ncores × Ucpu × (1 + W/C). W = avg wait per task. C = avg CPU per task. Ucpu = target 0.7–0.9.",
+      "code": "// 4-core box, task = 40ms DB call + 5ms Java compute\nint cores = 4;\ndouble W = 40, C = 5, U = 0.8;\nint nThreads = (int)(cores * U * (1 + W / C));   // ≈ 29",
+      "highlight": [
+        3,
+        4
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Formula inputs",
+        "items": [
+          {
+            "label": "Ncpu",
+            "value": "4",
+            "color": "#818cf8"
+          },
+          {
+            "label": "Ucpu",
+            "value": "0.8",
+            "color": "#818cf8"
+          },
+          {
+            "label": "W (ms)",
+            "value": "40",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "C (ms)",
+            "value": "5",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "N",
+            "value": "≈ 29",
+            "color": "#10b981",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "FIXED pool — bounded threads, unbounded queue (danger)",
+      "description": "Executors.newFixedThreadPool(N) uses an unbounded LinkedBlockingQueue. Under a burst, tasks pile up in memory → OOM before anyone gets rejected.",
+      "code": "ExecutorService pool = Executors.newFixedThreadPool(10);\n// queue = LinkedBlockingQueue<>()  ← Integer.MAX_VALUE capacity!",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 20,
+        "workers": [
+          {
+            "name": "w-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-4",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T5",
+            "highlight": false
+          },
+          {
+            "label": "T6",
+            "highlight": false
+          },
+          {
+            "label": "T7",
+            "highlight": false
+          },
+          {
+            "label": "T8",
+            "highlight": false
+          },
+          {
+            "label": "T9",
+            "highlight": false
+          },
+          {
+            "label": "T10",
+            "highlight": false
+          },
+          {
+            "label": "T11",
+            "highlight": false
+          },
+          {
+            "label": "T12",
+            "highlight": false
+          },
+          {
+            "label": "T13",
+            "highlight": false
+          },
+          {
+            "label": "T14",
+            "highlight": false
+          },
+          {
+            "label": "T15",
+            "highlight": false
+          },
+          {
+            "label": "T16",
+            "highlight": true
+          },
+          {
+            "label": "T17",
+            "highlight": true
+          },
+          {
+            "label": "T18",
+            "highlight": true
+          },
+          {
+            "label": "T19",
+            "highlight": true
+          },
+          {
+            "label": "T20",
+            "highlight": true
+          },
+          {
+            "label": "T21",
+            "highlight": true
+          },
+          {
+            "label": "T22",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "CACHED pool — unbounded threads (danger²)",
+      "description": "Executors.newCachedThreadPool: max = Integer.MAX_VALUE, SynchronousQueue. On a burst of 10 000 blocking tasks it spawns 10 000 OS threads and OOMs.",
+      "code": "ExecutorService pool = Executors.newCachedThreadPool();\n// max=MAX_VALUE, SynchronousQueue(hand-off)",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 0,
+        "workers": [
+          {
+            "name": "w-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-4",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-500",
+            "state": "RUNNABLE",
+            "note": "…thousands"
+          }
+        ],
+        "queue": []
+      }
+    },
+    {
+      "title": "Production pattern — bounded queue + CallerRuns",
+      "description": "Explicit ThreadPoolExecutor with bounded queue AND back-pressure. When the queue is full and max is reached, the submitter runs the task itself — throughput self-limits gracefully.",
+      "code": "new ThreadPoolExecutor(\n    20, 40, 60, TimeUnit.SECONDS,\n    new LinkedBlockingQueue<>(200),\n    namedFactory(\"outbound\"),\n    new ThreadPoolExecutor.CallerRunsPolicy());",
+      "highlight": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 12,
+        "workers": [
+          {
+            "name": "w-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "w-4",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "T5",
+            "highlight": true
+          },
+          {
+            "label": "T6"
+          },
+          {
+            "label": "T7"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Bulkhead — pool per failure domain",
+      "description": "Never share ONE pool across fast/slow work. Separate pools for DB, external partner, and CPU-heavy tasks so a stuck partner API doesn't starve DB reads.",
+      "code": "@Bean(\"dbPool\")      ThreadPoolTaskExecutor dbPool()       { ... 20/40/500 ... }\n@Bean(\"partnerPool\") ThreadPoolTaskExecutor partnerPool()  { ... 10/10/50  ... }\n@Bean(\"cpuPool\")     ThreadPoolTaskExecutor cpuPool()      { ... cores/cores/100 ... }",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Bulkheads",
+        "items": [
+          {
+            "label": "dbPool",
+            "value": "20/40/500",
+            "color": "#10b981"
+          },
+          {
+            "label": "partnerPool",
+            "value": "10/10/50",
+            "color": "#f59e0b"
+          },
+          {
+            "label": "cpuPool",
+            "value": "N+1/N+1/100",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Compare the four canonical pool types
+```java
+import java.util.concurrent.*;
+
+public class PoolTypesDemo {
+    public static void main(String[] args) throws Exception {
+        run("FIXED(2)  ", Executors.newFixedThreadPool(2));
+        run("CACHED    ", Executors.newCachedThreadPool());
+        run("SINGLE    ", Executors.newSingleThreadExecutor());
+        run("WORK_STEAL", Executors.newWorkStealingPool());
+    }
+
+    static void run(String label, ExecutorService pool) throws Exception {
+        System.out.println("\n=== " + label + " ===");
+        for (int i = 0; i < 5; i++) {
+            final int id = i;
+            pool.execute(() -> {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                System.out.printf("  [%s] task %d%n",
+                        Thread.currentThread().getName(), id);
+            });
+        }
+        pool.shutdown();
+        pool.awaitTermination(3, TimeUnit.SECONDS);
+    }
+}
+```
+`FIXED(2)` shows 2 threads reused for 5 tasks. `CACHED` spawns 5 threads. `SINGLE` runs 5 sequentially. `WORK_STEAL` uses cores threads.
+
+### Level 2 — Compute the I/O-bound sizing formula from measurements
+```java
+public class PoolSizer {
+    /** Goetz formula: Nthreads = Ncpu * Ucpu * (1 + W/C) */
+    public static int recommendedSize(double avgWaitMs, double avgComputeMs,
+                                      double targetUtilisation) {
+        int cores = Runtime.getRuntime().availableProcessors();
+        double waitPerCompute = avgWaitMs / avgComputeMs;
+        return (int) Math.round(cores * targetUtilisation * (1 + waitPerCompute));
+    }
+
+    public static void main(String[] args) {
+        // Typical REST endpoint: 40 ms DB call, 5 ms of Java processing, 80% target CPU
+        int n = recommendedSize(40, 5, 0.8);
+        System.out.println("Recommended thread count: " + n);
+    }
+}
+```
+
+### Level 3 — Production-grade builder
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ProdPools {
+    public static ExecutorService bounded(String name,
+                                          int core, int max, int queue,
+                                          RejectedExecutionHandler rejection) {
+        AtomicInteger n = new AtomicInteger();
+        ThreadFactory tf = r -> {
+            Thread t = new Thread(r);
+            t.setName(name + "-" + n.incrementAndGet());
+            t.setDaemon(false);
+            t.setUncaughtExceptionHandler((th, ex) ->
+                    System.err.println("[" + th.getName() + "] " + ex));
+            return t;
+        };
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                core, max,
+                60, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queue),
+                tf,
+                rejection);
+        pool.allowCoreThreadTimeOut(true);            // shrink to 0 when idle
+        return pool;
+    }
+
+    public static void main(String[] args) {
+        ExecutorService http = bounded("http-out",
+                20, 40, 200,
+                new ThreadPoolExecutor.CallerRunsPolicy());
+        // ... submit tasks ...
+    }
+}
+```
+
+### Level 4 — Instrument the pool for monitoring
+```java
+import java.util.concurrent.*;
+
+public class InstrumentedPool extends ThreadPoolExecutor {
+    public InstrumentedPool(int core, int max, int queue) {
+        super(core, max, 60, TimeUnit.SECONDS,
+              new LinkedBlockingQueue<>(queue));
+    }
+
+    public void printStats() {
+        System.out.printf("active=%d pool=%d largest=%d completed=%d queued=%d%n",
+                getActiveCount(), getPoolSize(), getLargestPoolSize(),
+                getCompletedTaskCount(), getQueue().size());
+    }
+
+    public static void main(String[] args) throws Exception {
+        InstrumentedPool pool = new InstrumentedPool(2, 4, 10);
+        for (int i = 0; i < 20; i++) {
+            pool.submit(() -> { Thread.sleep(200); return null; });
+        }
+        for (int i = 0; i < 5; i++) {
+            Thread.sleep(200);
+            pool.printStats();
+        }
+        pool.shutdown();
+    }
+}
+```
+`getPoolSize()` and `getActiveCount()` are exactly what a `/metrics` endpoint should expose. Micrometer's `ExecutorServiceMetrics` uses these under the hood.
+
+### Level 5 — Segregated pools (bulkhead pattern)
+```java
+import java.util.concurrent.*;
+
+public class Bulkhead {
+    // Fast-path work — DB reads
+    private final ExecutorService dbPool =
+            new ThreadPoolExecutor(20, 40, 60, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(500));
+
+    // Slow external calls — isolated
+    private final ExecutorService partnerPool =
+            new ThreadPoolExecutor(10, 10, 0, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(50),
+                    new ThreadPoolExecutor.CallerRunsPolicy());
+
+    // CPU-bound compression / crypto
+    private final ExecutorService cpuPool =
+            new ThreadPoolExecutor(
+                    Runtime.getRuntime().availableProcessors() + 1,
+                    Runtime.getRuntime().availableProcessors() + 1,
+                    0, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(100));
+
+    public <T> Future<T> queryDb(Callable<T> t)      { return dbPool.submit(t); }
+    public <T> Future<T> callPartner(Callable<T> t)  { return partnerPool.submit(t); }
+    public <T> Future<T> encrypt(Callable<T> t)      { return cpuPool.submit(t); }
+    // If the partner API hangs, dbPool and cpuPool are unaffected.
+}
+```
+
+## REAL_WORLD
+
+**Spring Boot's Tomcat thread pool** is a classic sizing decision. In `application.yml`:
+
+```yaml
+server:
+  tomcat:
+    threads:
+      max: 200                   # maximumPoolSize
+      min-spare: 10              # corePoolSize
+    max-connections: 8192        # accept queue
+    accept-count: 100            # OS-level backlog
+    connection-timeout: 20000    # ms
+```
+
+For a service that mostly makes 50-ms DB queries with 5 ms of compute (W/C = 10), on 4 cores at 80% target CPU: `Nthreads = 4 * 0.8 * 11 ≈ 35`. The default 200 has plenty of headroom for burst load. If your service instead makes 10 upstream calls per request averaging 200 ms each, W/C is much higher, and you need `spring.threads.virtual.enabled=true` (Java 21) or a reactive stack — a plain 200-thread pool will not survive.
+
+## INTERVIEW
+
+**Q: How do you size a thread pool for I/O-bound work?**
+A: Goetz's formula: `Nthreads = Ncores * Ucpu * (1 + W/C)`, where W is average blocking wait per task, C is average CPU compute per task, Ucpu is target CPU utilization (0.7–0.9). Measure W and C with real production tracing.
+
+**Q: How do you size a thread pool for CPU-bound work?**
+A: `Ncores + 1`. Any more than that and threads just compete for cores, thrashing caches without producing more work.
+
+**Q: What's the difference between `newFixedThreadPool` and `newCachedThreadPool`?**
+A: `Fixed(n)` has exactly `n` threads and an **unbounded** queue — pending tasks pile up in memory. `Cached` has 0 core, `Integer.MAX_VALUE` max, and a 0-capacity `SynchronousQueue` — every incoming task either lands on an idle thread or spawns a new one. Cached can spawn thousands of threads under burst load and OOM the JVM.
+
+**Q: When should you use `SynchronousQueue`?**
+A: When you want direct hand-off — no buffering between submitter and worker. Only makes sense with a large `maximumPoolSize` (e.g., `newCachedThreadPool`), since if there is no idle worker, the submitter blocks unless a new thread is created.
+
+**Q: Why bother with a bounded queue instead of unbounded?**
+A: An unbounded queue makes `maximumPoolSize` dead code (no thread beyond `corePoolSize` is ever created), and lets memory grow indefinitely under load. A bounded queue turns backlog into rejections, which you handle with a policy — you regain control.
+
+**Q: What is `allowCoreThreadTimeOut(true)` and when do you use it?**
+A: It lets even core threads die after `keepAliveTime` idle. Use it on services that go quiet for long stretches (nightly jobs, low-traffic APIs) to release ~1 MB of stack per idle thread. Cost: the next spike pays thread-creation latency.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> A thread pool is like a restaurant kitchen. `corePoolSize` is your regular chefs — always on shift. `queue` is the ticket rail where orders wait. `maximumPoolSize` is extra chefs you can page in when the rail overflows. `keepAliveTime` is how long an extra chef stays after tickets slow down. Rejection policies are what happens when the rail is full AND all chefs are busy — turn diners away (`AbortPolicy`), make the waiter cook the order themselves (`CallerRunsPolicy`), or throw out the oldest ticket (`DiscardOldestPolicy`).
+
+## BUILD
+
+Build a **self-tuning pool monitor**:
+1. Wrap a `ThreadPoolExecutor` with a scheduled task (every 10 s) that reads `getActiveCount()`, `getQueue().size()`, `getCompletedTaskCount()`.
+2. If queue is > 80% full for 3 samples in a row, increase `corePoolSize` (up to a hard max).
+3. If queue is empty and `activeCount < corePoolSize / 2` for 6 samples, decrease `corePoolSize` (down to a hard min).
+4. Log every resize with the current utilization.
+5. **Bonus**: expose the metrics as a JSON `/metrics` endpoint with a small `HttpServer`.
+
+## SPACED REVIEW
+
+**Day 1**: Write the I/O-bound sizing formula. Plug in W=100 ms, C=10 ms, 8 cores, 80% utilization.
+**Day 3**: Explain why `newCachedThreadPool` is unsafe under sustained blocking load.
+**Day 7**: List the 4 built-in rejection policies and one use case for each.
+**Day 14**: What does `allowCoreThreadTimeOut(true)` change? When is it worth enabling?
+

@@ -20,7 +20,288 @@ Appending data to the end of a single file is incredibly fast (Sequential I/O). 
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "postgres-wal" }
+{
+  "language": "sql",
+  "fileName": "wal.sql",
+  "steps": [
+    {
+      "title": "What is WAL and why it exists",
+      "description": "Write-Ahead Log = every change written to WAL before data files. On crash: replay WAL. Enables durability, replication, and point-in-time recovery.",
+      "code": "-- WAL flow\n-- 1. Transaction begins\n-- 2. Modifies data in shared_buffers (not on disk yet)\n-- 3. Writes change record to WAL buffer\n-- 4. On COMMIT: flush WAL to disk (wal_fsync)\n-- 5. Data files written later by bgwriter/checkpointer\n\n-- After crash:\n-- 1. Start with last checkpoint\n-- 2. Replay WAL records forward\n-- 3. Database consistent again\n\n-- View WAL files\nSELECT pg_walfile_name(pg_current_wal_lsn());\n-- 000000010000000A000000B3\n\n-- Location on disk\n$ ls -la $PGDATA/pg_wal/\n-rw-------  16M  000000010000000A000000B3   -- current\n-rw-------  16M  000000010000000A000000B2   -- prior\n\n-- Each WAL segment is 16MB (default)\nSHOW wal_segment_size;\n\n-- WAL settings\nSHOW wal_level;              -- minimal | replica (default) | logical\nSHOW max_wal_size;            -- 1GB by default; increase for fewer checkpoints\nSHOW min_wal_size;\nSHOW wal_buffers;             -- 16MB\nSHOW wal_writer_delay;        -- 200ms",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Change modifies buffer + writes WAL record",
+            "done": true
+          },
+          {
+            "label": "COMMIT: fsync WAL to disk",
+            "done": true
+          },
+          {
+            "label": "Data files updated later (bgwriter)",
+            "active": true
+          },
+          {
+            "label": "Crash: replay WAL from last checkpoint"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Checkpoints",
+      "description": "Checkpoint = flush all dirty buffers to disk, sync WAL. Establishes point where replay can start. Trigger: max_wal_size or timeout.",
+      "code": "-- Checkpoint triggers:\n-- 1. Time: checkpoint_timeout (default 5 min)\n-- 2. Volume: max_wal_size (default 1GB)\n-- 3. Manual: CHECKPOINT command\n\nCHECKPOINT;    -- force one\n\n-- Settings\ncheckpoint_timeout = 15min                    -- longer = fewer, bigger I/O bursts\nmax_wal_size = 4GB                            -- more WAL = fewer checkpoints\nmin_wal_size = 1GB\ncheckpoint_completion_target = 0.9            -- spread I/O over 90% of interval\ncheckpoint_flush_after = 256kB                -- flush chunks\n\n-- Monitor checkpoint activity\nSELECT * FROM pg_stat_bgwriter;\n\n checkpoints_timed | checkpoints_req | buffers_checkpoint | buffers_backend\n-------------------+-----------------+--------------------+-----------------\n                42 |               3 |           1,234,567 |         89,012\n\n-- Ratio: timed vs req\n-- Mostly timed (>90%): healthy\n-- Many req: max_wal_size too small (need larger)\n\n-- Checkpoint frequency\nlog_checkpoints = on    -- log each checkpoint\n\n-- After enabling, logs show:\n-- LOG:  checkpoint starting: time\n-- LOG:  checkpoint complete: wrote 1234 buffers (0.5%); ...",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        16,
+        18,
+        19,
+        20,
+        23,
+        24,
+        27,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Checkpoint tuning",
+        "items": [
+          {
+            "label": "checkpoint_timeout 15min",
+            "color": "#10b981",
+            "value": "Less frequent = fewer I/O spikes",
+            "highlight": true
+          },
+          {
+            "label": "max_wal_size 4GB",
+            "color": "#818cf8",
+            "value": "Bigger = fewer but larger checkpoints"
+          },
+          {
+            "label": "completion_target 0.9",
+            "color": "#f59e0b",
+            "value": "Spread I/O over 90% of interval"
+          },
+          {
+            "label": "Mostly timed (not req)",
+            "color": "#60a5fa",
+            "value": "Healthy — max_wal_size adequate"
+          }
+        ]
+      }
+    },
+    {
+      "title": "WAL levels and replication",
+      "description": "wal_level = minimal (crash recovery only), replica (streaming replication), logical (logical decoding). Higher levels = more WAL data.",
+      "code": "-- wal_level options\nSHOW wal_level;\n\n-- minimal: only what's needed for crash recovery\n-- replica: enough for physical replication + PITR (default)\n-- logical: full row-level changes for logical replication\n\n-- Change wal_level (restart required!)\nALTER SYSTEM SET wal_level = 'logical';\n-- systemctl restart postgresql\n\n-- For streaming replication:\nmax_wal_senders = 10               -- concurrent replica connections\nmax_replication_slots = 10          -- persistent replication positions\nwal_keep_size = 1GB                 -- WAL retention for lagging replicas\nhot_standby = on                    -- on replica: allow read queries\n\n-- Replication slot (prevents WAL cleanup)\nSELECT pg_create_physical_replication_slot('replica1');\nSELECT pg_create_logical_replication_slot('my_slot', 'pgoutput');\n\n-- Slot status (careful — full slots block WAL cleanup!)\nSELECT slot_name, active, restart_lsn,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag\nFROM pg_replication_slots;\n\n-- Archive mode (for PITR)\narchive_mode = on\narchive_command = 'test ! -f /archive/%f && cp %p /archive/%f'\n-- Or ship to S3:\n-- archive_command = 'aws s3 cp %p s3://backups/wal/%f'",
+      "highlight": [
+        2,
+        4,
+        5,
+        6,
+        9,
+        10,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        23,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "wal_level choices",
+        "items": [
+          {
+            "label": "minimal",
+            "color": "#818cf8",
+            "value": "Crash recovery only — smallest WAL"
+          },
+          {
+            "label": "replica (default)",
+            "color": "#10b981",
+            "value": "Streaming replication + PITR",
+            "highlight": true
+          },
+          {
+            "label": "logical",
+            "color": "#f59e0b",
+            "value": "Row-level for logical replication"
+          },
+          {
+            "label": "Higher = bigger WAL",
+            "color": "#60a5fa",
+            "value": "~2x for logical over minimal"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Point-in-Time Recovery (PITR)",
+      "description": "Base backup + continuous WAL archive → restore to any point in time. Essential for disaster recovery.",
+      "code": "-- Setup PITR\n-- 1. Enable archiving\narchive_mode = on\narchive_command = 'aws s3 cp %p s3://backups/wal/%f --quiet'\nwal_level = replica\n\n-- 2. Take base backup\n$ pg_basebackup -D /backup/base_$(date +%F) -Ft -z -P\n\n-- 3. Archive keeps ticking as WAL segments fill\n$ ls /archive/wal/\n000000010000000A000000B0.gz\n000000010000000A000000B1.gz\n...\n\n-- RESTORE: recover to point in time\n-- 1. Stop postgres\n-- 2. Remove PGDATA\n-- 3. Restore base backup\n$ tar xzf /backup/base_2026-07-01/base.tar.gz -C $PGDATA\n\n-- 4. Configure recovery in postgresql.auto.conf\nrestore_command = 'aws s3 cp s3://backups/wal/%f %p'\nrecovery_target_time = '2026-07-02 14:30:00'\n-- Or: recovery_target_lsn, recovery_target_xid, recovery_target_name\n\n-- 5. Create signal file\n$ touch $PGDATA/recovery.signal\n\n-- 6. Start postgres — replays WAL up to target\n$ systemctl start postgresql\n\n-- Monitor recovery\nSELECT pg_is_in_recovery();\nSELECT pg_last_wal_replay_lsn();\n\n-- When done: promote (exit recovery)\nSELECT pg_promote();\n\n-- Modern tools: pgBackRest, WAL-G, Barman\n-- Handle base backup + WAL archive + point-in-time restore",
+      "highlight": [
+        3,
+        4,
+        5,
+        8,
+        11,
+        12,
+        13,
+        14,
+        20,
+        23,
+        24,
+        25,
+        28,
+        31,
+        34,
+        35,
+        37,
+        38,
+        40,
+        41,
+        42
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Backup",
+          "Archive",
+          "WAL",
+          "Recovery"
+        ],
+        "messages": [
+          {
+            "from": "Backup",
+            "to": "Archive",
+            "label": "nightly pg_basebackup"
+          },
+          {
+            "from": "WAL",
+            "to": "Archive",
+            "label": "continuous WAL shipping"
+          },
+          {
+            "from": "Recovery",
+            "to": "Archive",
+            "label": "restore base backup"
+          },
+          {
+            "from": "Recovery",
+            "to": "Archive",
+            "label": "restore_command fetches WAL"
+          },
+          {
+            "from": "Recovery",
+            "to": "Recovery",
+            "label": "replay to recovery_target_time"
+          }
+        ]
+      }
+    },
+    {
+      "title": "WAL monitoring and troubleshooting",
+      "description": "Watch WAL volume, replication lag, and slot status. Full slots or archive failures can fill disk and stop writes.",
+      "code": "-- Current WAL position\nSELECT pg_current_wal_lsn();\n-- 0/1A5F3D0\n\n-- WAL generation rate\nSELECT\n  now() - stats_reset AS interval,\n  pg_size_pretty(wal_bytes / EXTRACT(EPOCH FROM now() - stats_reset) * 60) AS bytes_per_min\nFROM pg_stat_wal;\n\n-- Replication lag (bytes)\nSELECT application_name, client_addr,\n  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))   AS sent_lag,\n  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS replay_lag\nFROM pg_stat_replication;\n\n-- Replication slot bloat (danger!)\nSELECT slot_name, active, restart_lsn,\n  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots;\n\n-- Archive success\nSELECT archived_count, last_archived_wal, last_archived_time,\n       failed_count, last_failed_wal, last_failed_time\nFROM pg_stat_archiver;\n\n-- Common problems:\n\n-- Problem 1: archive_command failing → pg_wal fills up\n-- Solution: fix archive destination, check pg_stat_archiver\n\n-- Problem 2: inactive replication slot → pg_wal fills up\n-- Solution: drop unused slots\nSELECT pg_drop_replication_slot('unused_slot');\n\n-- Problem 3: max_wal_size too small → frequent checkpoints\n-- Solution: increase max_wal_size",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        22,
+        23,
+        24,
+        27,
+        28,
+        29,
+        32,
+        33,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "WAL troubleshooting",
+        "items": [
+          {
+            "label": "pg_stat_replication",
+            "color": "#10b981",
+            "value": "Replica lag in bytes",
+            "highlight": true
+          },
+          {
+            "label": "pg_stat_archiver",
+            "color": "#818cf8",
+            "value": "Archive success/failure"
+          },
+          {
+            "label": "Inactive slots = danger",
+            "color": "#ef4444",
+            "value": "Retained WAL fills disk"
+          },
+          {
+            "label": "pg_wal disk full",
+            "color": "#f59e0b",
+            "value": "DB stops accepting writes"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

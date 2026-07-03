@@ -1,0 +1,390 @@
+---
+slug: "threads-fundamentals"
+title: "Threads — Fundamentals & JVM Internals"
+level: 2
+---
+
+## WHY
+
+Modern CPUs have 8, 16, even 128 cores. If your Java program runs on a single thread, it uses **one core** — the other 15 sit idle. A batch job that processes 10 million records serially might take 2 hours; the same job across 16 threads finishes in 8 minutes.
+
+But threads are not just about speed. They're about **not blocking the user**. When a Spring Boot controller handles a request, that request runs on a Tomcat worker thread. If it blocks for 2 seconds fetching a database row, that worker is unavailable to serve OTHER users. Tomcat's default pool has ~200 threads. On a busy service, if every request blocks for 2 seconds, you can serve at most 100 req/sec before users start seeing HTTP 503. Master threads → master throughput, latency, and scaling.
+
+## THEORY
+
+### What Is a Thread?
+A thread is the **smallest unit of execution** the OS can schedule onto a CPU core. A JVM process starts with one thread (`main`) but can spawn thousands. Each thread has its own:
+
+| Per-thread resource | Shared with all threads in the JVM |
+|--------------------|------------------------------------|
+| Program Counter (PC) — current instruction | Heap (objects) |
+| Stack (local variables, method frames) | Method Area / Metaspace (class metadata) |
+| Register set (managed by OS) | Static fields |
+| Thread-local storage (`ThreadLocal`) | Loaded classes, string pool |
+
+That is why passing an object between threads is "free" (both see the same Heap address) but **local variables inside a method are private to each thread**.
+
+### The JVM Thread → OS Thread Mapping
+Since JDK 1.3 (HotSpot), Java uses a **1:1 mapping**: every `java.lang.Thread` maps to one native OS thread (`pthread` on Linux, `Windows fiber`/kernel thread on Windows). This is why threads are expensive — creating one takes ~1 ms and consumes ~1 MB of stack. Java 21's **Virtual Threads** break this 1:1 assumption (see `virtual-threads` topic).
+
+```
+     JVM (single process)                          OS Kernel
++-------------------------------+           +---------------------+
+| main       Thread-1  Thread-2 |    1:1    |  Task1  Task2  Task3|
+|   |          |         |      | <-------> |    |     |     |    |
+|   +----- Heap (shared) ----+  |           |  CPU0  CPU1  CPU2  ...
+| Stack1   Stack2      Stack3   |           +---------------------+
++-------------------------------+
+```
+
+### The Thread Scheduler
+Java does **not** decide which thread runs next — the OS scheduler does. Java only supplies **hints**:
+- `Thread.setPriority(1..10)` — hint, most JVMs on Linux ignore it.
+- `Thread.yield()` — hint that "I don't mind giving up my time-slice".
+- `Thread.sleep(ms)` — this ACTUALLY yields (blocks) the thread for the OS.
+
+The scheduler is **preemptive** — it can pause your thread at any bytecode boundary and hand the core to another thread. This is why concurrent bugs are non-deterministic: **you can never predict interleaving**.
+
+### User Threads vs Daemon Threads
+| Kind | JVM waits for it to finish? | Typical use |
+|------|-----------------------------|-------------|
+| User thread (default) | Yes | Business tasks, HTTP request handling |
+| Daemon thread | No — JVM exits when only daemons remain | GC, JIT compiler, log flushers, timers |
+
+Set with `t.setDaemon(true)` **before** `t.start()`.
+
+### The Java Memory Model (JMM) — The 30-Second Version
+Each thread has a per-core CPU cache. Writing `counter = 5` on Core-0 may sit in Core-0's L1 cache and never reach main memory until the OS forces a flush. Core-1, reading `counter`, may see the old value indefinitely. `volatile`, `synchronized`, and the `java.util.concurrent` primitives all establish **happens-before** relationships that force the JVM to publish writes and invalidate stale caches.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "ThreadsIntro.java",
+  "steps": [
+    {
+      "title": "main thread starts",
+      "description": "Every JVM process begins with a single \"main\" thread. It runs your public static void main and lives until that method returns.",
+      "code": "public class ThreadsIntro {\n    public static void main(String[] args) throws Exception {\n        System.out.println(\"[main] hello\");\n        Thread worker = new Thread(() -> {\n            for (int i = 0; i < 3; i++)\n                System.out.println(\"  [worker] tick \" + i);\n        }, \"worker\");\n        worker.start();\n        worker.join();\n        System.out.println(\"[main] done\");\n    }\n}",
+      "highlight": [
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "main",
+            "state": "RUNNABLE",
+            "note": "running main()"
+          }
+        ]
+      }
+    },
+    {
+      "title": "new Thread(...) — NEW state",
+      "description": "The Thread object is created but the OS has not scheduled it yet. Its state is NEW. Only main is currently running.",
+      "code": "Thread worker = new Thread(() -> {\n    for (int i = 0; i < 3; i++)\n        System.out.println(\"  [worker] tick \" + i);\n}, \"worker\");",
+      "highlight": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "main",
+            "state": "RUNNABLE",
+            "note": "creating worker"
+          },
+          {
+            "name": "worker",
+            "state": "NEW",
+            "note": "not started yet"
+          }
+        ]
+      }
+    },
+    {
+      "title": "worker.start() — RUNNABLE",
+      "description": "start() asks the JVM to spawn a native OS thread. The worker becomes RUNNABLE — eligible to run on a CPU core. main continues in parallel.",
+      "code": "worker.start();   // NEW → RUNNABLE  (a new OS thread is created)",
+      "highlight": [
+        8
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "main",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "worker",
+            "state": "RUNNABLE",
+            "note": "now running"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Per-thread stack, shared heap",
+      "description": "Each thread has its OWN stack (local variables, method frames). Both threads share the SAME heap (objects, static fields). Passing an object between threads is free — both see the same address.",
+      "code": "// worker's call stack             // main's call stack\n//   run()                             main()\n//     i = 0 (local)                     worker (local)\n//                                       args   (local)\n//               \\           /\n//                 Shared Heap\n//                 [ System.out, \"worker\" String, Thread object, … ]",
+      "diagram": {
+        "kind": "memory",
+        "stack": [
+          {
+            "label": "i",
+            "value": "0",
+            "type": "main:—"
+          },
+          {
+            "label": "worker",
+            "value": "ref → 0x1f42",
+            "type": "main:Thread"
+          },
+          {
+            "label": "i",
+            "value": "2",
+            "type": "worker:int",
+            "highlight": true
+          }
+        ],
+        "heap": [
+          {
+            "label": "Thread@0x1f42",
+            "fields": [
+              [
+                "name",
+                "\"worker\""
+              ],
+              [
+                "state",
+                "RUNNABLE"
+              ]
+            ],
+            "highlight": true
+          },
+          {
+            "label": "String@0x2c11",
+            "fields": [
+              [
+                "value",
+                "\"worker\""
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "title": "worker.join() — main waits",
+      "description": "main calls join(), which blocks until worker terminates. main moves to WAITING. When the lambda finishes, worker is TERMINATED and main resumes.",
+      "code": "worker.join();   // main waits until worker terminates",
+      "highlight": [
+        9
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "main",
+            "state": "WAITING",
+            "note": "blocked in join()"
+          },
+          {
+            "name": "worker",
+            "state": "RUNNABLE",
+            "note": "still ticking"
+          }
+        ]
+      }
+    },
+    {
+      "title": "TERMINATED — both threads exit",
+      "description": "worker's lambda returns → worker becomes TERMINATED → the JVM wakes main from join() → main prints \"done\" and also terminates. The JVM exits once no user threads remain.",
+      "code": "System.out.println(\"[main] done\");   // both threads terminated cleanly",
+      "highlight": [
+        10
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "main",
+            "state": "TERMINATED",
+            "active": false
+          },
+          {
+            "name": "worker",
+            "state": "TERMINATED",
+            "active": false
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Beginner: Prove main is a Thread
+```java
+public class MainIsAThread {
+    public static void main(String[] args) {
+        Thread current = Thread.currentThread();
+        System.out.println("Name:     " + current.getName());        // "main"
+        System.out.println("ID:       " + current.getId());
+        System.out.println("Priority: " + current.getPriority());    // 5 (NORM_PRIORITY)
+        System.out.println("Daemon?   " + current.isDaemon());       // false
+        System.out.println("Group:    " + current.getThreadGroup().getName()); // "main"
+        System.out.println("Alive?    " + current.isAlive());        // true
+    }
+}
+```
+
+### Level 2 — Spawning Your First Worker
+```java
+public class FirstWorker {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("[main] starting worker...");
+
+        Thread worker = new Thread(() -> {
+            for (int i = 1; i <= 3; i++) {
+                System.out.println("  [worker] tick " + i);
+                try { Thread.sleep(200); } catch (InterruptedException e) { return; }
+            }
+        }, "download-worker");
+
+        worker.start();                           // NEW -> RUNNABLE (starts running)
+        System.out.println("[main] worker started, doing my own work");
+
+        // WITHOUT join(), main might exit before worker finishes
+        worker.join();                            // main blocks until worker is TERMINATED
+        System.out.println("[main] worker finished, exiting");
+    }
+}
+```
+Output interleaves — the exact order changes every run because the scheduler is nondeterministic.
+
+### Level 3 — Per-thread Stack, Shared Heap (proven)
+```java
+public class StackVsHeap {
+    static int sharedCounter = 0;                 // Heap (static field)
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> work("A"), "T-A");
+        Thread t2 = new Thread(() -> work("B"), "T-B");
+        t1.start(); t2.start();
+        t1.join();  t2.join();
+        System.out.println("Final sharedCounter (WRONG on purpose): " + sharedCounter);
+    }
+
+    static void work(String tag) {
+        int localCounter = 0;                     // Stack — private to this thread
+        for (int i = 0; i < 100_000; i++) {
+            localCounter++;                       // no contention — private
+            sharedCounter++;                      // race! two threads write the same Heap slot
+        }
+        System.out.println(tag + " localCounter = " + localCounter);
+    }
+}
+```
+`localCounter` always prints 100000 (private stack). `sharedCounter` is almost never 200000 — proof that shared Heap needs synchronization.
+
+### Level 4 — Daemon vs User Thread Behavior
+```java
+public class DaemonDemo {
+    public static void main(String[] args) {
+        Thread housekeeping = new Thread(() -> {
+            while (true) {
+                System.out.println("  [daemon] cleaning up...");
+                try { Thread.sleep(300); } catch (InterruptedException e) { return; }
+            }
+        }, "housekeeping");
+        housekeeping.setDaemon(true);             // MUST be set before start()
+        housekeeping.start();
+
+        // Do main's work
+        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        System.out.println("[main] finished — JVM will exit even though daemon is running");
+        // Because housekeeping is a daemon, the JVM exits here — no need for interrupt().
+    }
+}
+```
+
+### Level 5 — Inspecting All Threads at Runtime
+```java
+public class ThreadInspector {
+    public static void main(String[] args) throws InterruptedException {
+        // Spawn a couple of workers so the dump has more to show
+        for (int i = 0; i < 3; i++) {
+            new Thread(() -> {
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            }, "worker-" + i).start();
+        }
+
+        Thread.sleep(200); // let workers reach RUNNABLE
+
+        // Snapshot every live thread in the JVM
+        Thread.getAllStackTraces().forEach((t, stack) -> {
+            System.out.printf("%-25s id=%-4d state=%-13s daemon=%b priority=%d%n",
+                    t.getName(), t.getId(), t.getState(), t.isDaemon(), t.getPriority());
+        });
+        // You will see main, workers, plus JVM internals: GC threads, JIT, Finalizer, Reference Handler...
+    }
+}
+```
+
+## REAL_WORLD
+
+**Tomcat request handling** (behind every Spring Boot app):
+Tomcat starts an *acceptor* thread that listens on the socket. When a TCP connection arrives, the acceptor hands the socket to a thread from a **worker pool** (`server.tomcat.threads.max` — default 200). That worker executes your `@RestController` method top-to-bottom. If your method blocks on a slow SQL query for 3 seconds, that specific worker is unavailable for 3 seconds. All 200 workers busy → new requests queue on `server.tomcat.accept-count` (default 100) → beyond that, TCP resets.
+
+**Rule of thumb**: on a JVM-hosted HTTP service, blocking I/O on request-handling threads is your #1 scalability enemy. Options: (a) offload blocking work to a dedicated `ExecutorService`, (b) switch to reactive (`WebFlux`), (c) switch to Java 21 virtual threads (`spring.threads.virtual.enabled=true`).
+
+## INTERVIEW
+
+**Q: What's the difference between a process and a thread?**
+A: A process has its own address space (heap, code, data segments). Threads live INSIDE a process and share its address space. Two threads see the same Heap; two processes do not (unless they set up shared memory explicitly). Consequence: switching between threads is ~10x cheaper than switching between processes.
+
+**Q: Is `main` a thread?**
+A: Yes. Every JVM starts with the `main` thread (user thread, priority 5, in thread group `main`). When `main()` returns, the main thread terminates — but the JVM keeps running as long as any **non-daemon** thread is still alive.
+
+**Q: Why is creating a thread expensive?**
+A: In the classic 1:1 model, `new Thread().start()` invokes a system call (`clone` on Linux, `CreateThread` on Windows) that allocates a native kernel thread, a ~1 MB stack, and updates the OS scheduler's run queue. Cost is roughly 1–2 ms. That's why you use **thread pools** to reuse threads, or **virtual threads** which are ~1000x cheaper.
+
+**Q: What happens if I call `run()` instead of `start()`?**
+A: `run()` executes synchronously on the calling thread — no new thread is created. `start()` is the JNI entry that asks the JVM to spawn a new OS thread and have IT call `run()`. Calling `run()` directly is one of the classic beginner bugs.
+
+**Q: What's a daemon thread?**
+A: A thread that does NOT prevent the JVM from exiting. The JVM only waits for user threads. GC, JIT, and Finalizer threads are daemons. Set via `t.setDaemon(true)` BEFORE `t.start()`.
+
+**Q: How does the JVM decide which thread runs on which core?**
+A: It doesn't. Java delegates to the OS scheduler. Java only sets a priority hint (`Thread.setPriority`), which most modern OS schedulers on Linux ignore. Assume that at any instruction boundary the scheduler may pause your thread — this is the mental model needed to reason about concurrency bugs.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Imagine a kitchen. The kitchen is your JVM. The chefs are threads — each chef can work on a different recipe at the same time. All chefs share the same pantry (the Heap — where ingredients / objects live), but each chef has their own cutting board (their Stack — where they lay out just what they're chopping right now). A single chef can only cook one thing at once; if you want three dishes ready at 7 PM, you hire three chefs. But now they'll all reach for the same salt shaker at the same time — that's a race condition, and the rest of this section is about how to stop them fighting.
+
+## BUILD
+
+Build a small **"progress dashboard" utility**:
+1. Spawn 4 worker threads, each simulating a download (sleep 100–500 ms, then increment a shared `AtomicInteger downloadedFiles`).
+2. From `main`, every 200 ms, print `[progress] <count>/<total> files`.
+3. Use `join()` so `main` waits for all workers.
+4. Make the progress printer thread a **daemon** so the JVM exits cleanly when work is done.
+5. **Bonus**: measure and print the total wall-clock time. Then rerun with 1 thread — observe the speed-up.
+
+## SPACED REVIEW
+
+**Day 1**: Draw the JVM memory diagram showing 3 threads with their stacks and one shared Heap. Which pieces are per-thread?
+**Day 3**: Write a program that spawns two threads and demonstrates that calling `run()` instead of `start()` is a bug.
+**Day 7**: Explain to a colleague why `Thread.getAllStackTraces()` shows GC and Finalizer threads even in a "Hello World" program.
+**Day 14**: In Tomcat with `threads.max=200`, how many concurrent slow endpoints (each blocking 5 s) can you handle before requests start timing out? Do the math.
+

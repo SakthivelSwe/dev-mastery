@@ -1,0 +1,434 @@
+---
+slug: "volatile-atomic"
+title: "volatile, Atomic Classes & the Java Memory Model"
+level: 3
+---
+
+## WHY
+
+You wrote `while (!running) { ... }` to poll a shared flag from another thread. In dev on your laptop, it works. In production it never sees the flag flip. Why? The JIT compiler, seeing that `running` is not written inside the loop, hoists the read OUT of the loop — your thread reads the value ONCE at start and then spins forever. `volatile` is the four-letter fix that tells the compiler and CPU: "someone else may change this — re-read it every time and publish my writes immediately."
+
+For counters, references, and flags where a full lock is overkill, `AtomicInteger`, `AtomicLong`, and `AtomicReference` deliver **lock-free** thread-safety at roughly the cost of a single CPU instruction (`lock cmpxchg`). Understand these three concepts — the Java Memory Model, `volatile`, and CAS — and 90% of "why is my concurrent code weird" evaporates.
+
+## THEORY
+
+### The Java Memory Model (JMM) — one paragraph
+Each CPU core has its own L1/L2 cache. A write on core-0 may sit in that cache and be invisible to core-1 for milliseconds. The JMM defines **happens-before** rules that tell the JIT and the CPU when they MUST publish/flush a write. Without a happens-before edge, other threads may see stale values indefinitely. `volatile`, `synchronized`, `Lock`, and `AtomicXxx` all create happens-before edges.
+
+### `volatile` — three guarantees
+
+1. **Visibility**: writes are made visible to other threads (no CPU-cache caching).
+2. **Atomicity for read/write of the field itself** (including 64-bit `long`/`double`, which without `volatile` may be torn on 32-bit JVMs).
+3. **Happens-before ordering**: writes BEFORE the volatile write in program order are also visible after the volatile read on another thread.
+
+What `volatile` does **NOT** give you:
+- Compound operations like `counter++` are still NOT atomic — that's read + add + write.
+- Multiple field updates are not published together.
+
+### The CAS (compare-and-swap) primitive
+Modern CPUs expose an instruction (`lock cmpxchg` on x86, `ldxr/stxr` on ARM) that atomically: "check if memory[addr] == expected → if so, write newValue → return whether it succeeded". `AtomicInteger.compareAndSet(expected, new)` maps directly to this. The `incrementAndGet` loop is:
+```
+do {
+    int old = get();
+    int next = old + 1;
+} while (!compareAndSet(old, next));
+```
+No lock, no context switch. Just a retry loop that almost always succeeds on the first attempt.
+
+### The `AtomicXxx` family (`java.util.concurrent.atomic`)
+
+| Class | Purpose | Key methods |
+|-------|---------|-------------|
+| `AtomicInteger` / `AtomicLong` | Lock-free counters | `incrementAndGet`, `addAndGet`, `compareAndSet` |
+| `AtomicBoolean` | Lock-free flag | `compareAndSet`, `getAndSet` |
+| `AtomicReference<V>` | Lock-free object ref swap | `compareAndSet`, `updateAndGet`, `accumulateAndGet` |
+| `AtomicIntegerArray` | Element-wise atomic array | `getAndSet(i, v)`, `compareAndSet(i, e, n)` |
+| `AtomicStampedReference` | Reference + version counter | Solves the "ABA problem" |
+| `LongAdder` / `LongAccumulator` | Contended counters | `increment`, `add`, `sum` — faster than AtomicLong under high contention |
+
+### `LongAdder` vs `AtomicLong` — the striping trick
+Under high contention on 32 cores, `AtomicLong.incrementAndGet()` becomes a bottleneck — every core fights for the same cache line, each `cmpxchg` retries dozens of times. `LongAdder` maintains an **array of counters** and each thread writes to its own cell (based on thread hash). Total = `sum()` at read time. Result: 10-100x higher throughput under heavy contention — but slower reads because `sum()` walks the array. Rule: contended writes, rare reads → `LongAdder`. Otherwise → `AtomicLong`.
+
+### The ABA problem
+Thread A reads reference `R` → its value is `X`.
+Thread B swaps `R` to `Y`, then back to `X`.
+Thread A's CAS(`X` → `Z`) succeeds — but the intermediate state was missed. In lock-free linked lists this causes nodes to be reused and freed twice. `AtomicStampedReference` adds a version counter so the CAS also checks the stamp.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "VolatileAtomic.java",
+  "steps": [
+    {
+      "title": "The visibility bug",
+      "description": "Without volatile, the JIT may hoist the read of `running` out of the loop — reader never sees the flip. The worker spins forever.",
+      "code": "static boolean running = true;\n\nThread worker = new Thread(() -> {\n    while (running) { /* ... */ }   // JIT may optimise to while(true)!\n});",
+      "highlight": [
+        1,
+        4
+      ],
+      "diagram": {
+        "kind": "memory",
+        "stack": [
+          {
+            "label": "running (cached)",
+            "value": "true",
+            "type": "CPU-cache",
+            "highlight": true
+          }
+        ],
+        "heap": [
+          {
+            "label": "static running",
+            "fields": [
+              [
+                "value",
+                "false — updated by main"
+              ]
+            ],
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "volatile — publish + republish",
+      "description": "Adding volatile forces every write to be published to main memory and every read to fetch it. Establishes a happens-before edge between the writer and the reader.",
+      "code": "static volatile boolean running = true;\n\n// main\nrunning = false;   // publish · visible immediately to all threads",
+      "highlight": [
+        1,
+        4
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "main",
+          "main-memory",
+          "worker"
+        ],
+        "messages": [
+          {
+            "from": "main",
+            "to": "main-memory",
+            "label": "volatile write: running=false"
+          },
+          {
+            "from": "main-memory",
+            "to": "worker",
+            "label": "volatile read: running=false"
+          }
+        ]
+      }
+    },
+    {
+      "title": "volatile is NOT enough for counter++",
+      "description": "volatile makes each individual read and write visible. But `counter++` is three ops: read, add, write. Two threads can still both read the same value and lose an increment.",
+      "code": "static volatile int counter = 0;\n// Thread 1               // Thread 2\ncounter++;                counter++;\n// read 0, add 1, write 1 // read 0, add 1, write 1  → LOST INCREMENT",
+      "highlight": [
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Not enough",
+        "items": [
+          {
+            "label": "visibility",
+            "color": "#10b981",
+            "value": "✓ volatile"
+          },
+          {
+            "label": "atomic++",
+            "color": "#ef4444",
+            "value": "✗ still racy"
+          }
+        ]
+      }
+    },
+    {
+      "title": "AtomicInteger.incrementAndGet — CAS",
+      "description": "AtomicInteger uses a hardware compare-and-swap. The increment is atomic. No lock, no context switch — just a retry loop that almost always succeeds on the first attempt.",
+      "code": "AtomicInteger counter = new AtomicInteger();\ncounter.incrementAndGet();   // atomic ++\n\n// Under the hood:\n// do {\n//   int old = get();\n//   int next = old + 1;\n// } while (!compareAndSet(old, next));",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "read current value (old)",
+            "done": true
+          },
+          {
+            "label": "compute new value (old+1)",
+            "done": true
+          },
+          {
+            "label": "CAS(old → new)",
+            "active": true
+          },
+          {
+            "label": "success? → done · else → retry"
+          }
+        ]
+      }
+    },
+    {
+      "title": "LongAdder — striped counter for hot writes",
+      "description": "On 16+ cores, AtomicLong becomes a cache-line hotspot. LongAdder shards writes across an array of cells (per-thread). Reads are slower (walks all cells) but writes are ~10× faster under contention.",
+      "code": "LongAdder adder = new LongAdder();\nadder.increment();      // per-thread cell → tiny contention\nadder.increment();\nlong total = adder.sum();   // sums cells",
+      "highlight": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "LongAdder cells",
+        "items": [
+          {
+            "label": "cell[0]",
+            "value": "2317",
+            "color": "#818cf8"
+          },
+          {
+            "label": "cell[1]",
+            "value": "2201",
+            "color": "#818cf8"
+          },
+          {
+            "label": "cell[2]",
+            "value": "2119",
+            "color": "#818cf8"
+          },
+          {
+            "label": "cell[3]",
+            "value": "2408",
+            "color": "#818cf8"
+          },
+          {
+            "label": "sum()",
+            "value": "9045",
+            "color": "#10b981",
+            "highlight": true
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — The `volatile` visibility bug and fix
+```java
+public class VolatileFlag {
+    // Without `volatile` the reader thread may loop forever
+    private static volatile boolean running = true;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            long ticks = 0;
+            while (running) { ticks++; }         // hot loop
+            System.out.println("stopped after " + ticks + " ticks");
+        });
+        worker.start();
+        Thread.sleep(1_000);
+        running = false;                          // publish the flip
+        worker.join();
+        // Without volatile: hangs forever. With volatile: stops in ~1 s.
+    }
+}
+```
+
+### Level 2 — Why `volatile` is NOT enough for `counter++`
+```java
+public class VolatileCantDoIncrement {
+    private static volatile int counter = 0;
+
+    public static void main(String[] args) throws Exception {
+        Runnable r = () -> { for (int i = 0; i < 100_000; i++) counter++; };
+        Thread a = new Thread(r), b = new Thread(r);
+        a.start(); b.start(); a.join(); b.join();
+        System.out.println("counter=" + counter); // NOT 200000 — volatile ≠ atomic increment
+    }
+}
+```
+
+### Level 3 — `AtomicInteger`, `AtomicReference`, and `compareAndSet`
+```java
+import java.util.concurrent.atomic.*;
+
+public class AtomicBasics {
+    public static void main(String[] args) throws Exception {
+        // Lock-free counter — correct AND fast
+        AtomicInteger counter = new AtomicInteger();
+        Runnable r = () -> { for (int i = 0; i < 100_000; i++) counter.incrementAndGet(); };
+        Thread a = new Thread(r), b = new Thread(r);
+        a.start(); b.start(); a.join(); b.join();
+        System.out.println("counter=" + counter.get());   // exactly 200000
+
+        // AtomicReference — atomically swap an object
+        AtomicReference<String> ref = new AtomicReference<>("initial");
+        boolean swapped = ref.compareAndSet("initial", "updated");
+        System.out.println("swapped=" + swapped + " value=" + ref.get()); // true, updated
+
+        // updateAndGet — apply a function atomically
+        AtomicInteger total = new AtomicInteger(10);
+        int result = total.updateAndGet(x -> x * 2 + 5);
+        System.out.println("result=" + result);           // 25
+    }
+}
+```
+
+### Level 4 — `LongAdder` vs `AtomicLong` under contention
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class AdderVsAtomic {
+    public static void main(String[] args) throws Exception {
+        int threads = 16, iters = 1_000_000;
+        bench("AtomicLong ", threads, iters, new AtomicLong()::incrementAndGet);
+
+        LongAdder adder = new LongAdder();
+        bench("LongAdder  ", threads, iters, () -> { adder.increment(); return 0L; });
+        System.out.println("LongAdder final sum = " + adder.sum());
+    }
+
+    static void bench(String label, int threads, int iters,
+                      java.util.function.Supplier<?> op) throws Exception {
+        ExecutorService exec = Executors.newFixedThreadPool(threads);
+        long start = System.nanoTime();
+        CountDownLatch done = new CountDownLatch(threads);
+        for (int t = 0; t < threads; t++) {
+            exec.submit(() -> {
+                for (int i = 0; i < iters; i++) op.get();
+                done.countDown();
+            });
+        }
+        done.await();
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        exec.shutdown();
+        System.out.printf("%s: %d ms%n", label, ms);
+    }
+    // Expect LongAdder ~3-5x faster than AtomicLong on 16 threads.
+}
+```
+
+### Level 5 — Lock-free stack (illustrating CAS retry loop)
+```java
+import java.util.concurrent.atomic.AtomicReference;
+
+public class LockFreeStack<T> {
+    private static class Node<T> {
+        final T item; final Node<T> next;
+        Node(T item, Node<T> next) { this.item = item; this.next = next; }
+    }
+    private final AtomicReference<Node<T>> head = new AtomicReference<>();
+
+    public void push(T item) {
+        Node<T> newHead;
+        Node<T> oldHead;
+        do {
+            oldHead = head.get();
+            newHead = new Node<>(item, oldHead);
+        } while (!head.compareAndSet(oldHead, newHead));   // retry until CAS wins
+    }
+
+    public T pop() {
+        Node<T> oldHead;
+        Node<T> newHead;
+        do {
+            oldHead = head.get();
+            if (oldHead == null) return null;
+            newHead = oldHead.next;
+        } while (!head.compareAndSet(oldHead, newHead));
+        return oldHead.item;
+    }
+    // Note: susceptible to the ABA problem — production code uses AtomicStampedReference
+    // or Michael-Scott algorithms with hazard pointers.
+}
+```
+
+## REAL_WORLD
+
+**Metrics counters in a high-QPS service.** A gateway sitting in front of a fleet handles 100 000 req/s across 32 cores. You want per-endpoint request counters, latency histograms, error counts — updated on the hot path with the lowest possible overhead.
+
+```java
+public class Metrics {
+    // Cheap counter — thousands of writes/sec, but low contention per endpoint
+    private final ConcurrentHashMap<String, LongAdder> requests = new ConcurrentHashMap<>();
+
+    // Highly contended global counter (every request bumps it)
+    private final LongAdder totalRequests = new LongAdder();
+
+    // Reference swap — only reassigned when the config changes (rare)
+    private final AtomicReference<Config> config = new AtomicReference<>(new Config());
+
+    // Simple flag — enable/disable feature at runtime
+    private volatile boolean tracingEnabled = false;
+
+    public void onRequest(String endpoint) {
+        totalRequests.increment();
+        requests.computeIfAbsent(endpoint, k -> new LongAdder()).increment();
+        if (tracingEnabled) trace(endpoint);
+    }
+
+    public Config current()          { return config.get(); }
+    public void updateConfig(Config c) { config.set(c); }        // publish new config
+    public void setTracing(boolean b) { tracingEnabled = b; }    // toggle at runtime
+    private void trace(String endpoint) { /* ... */ }
+    static class Config { }
+}
+```
+Each concurrency primitive earns its keep: `LongAdder` for contended counters, `AtomicReference` for reference swaps, `volatile` for booleans, `ConcurrentHashMap` for per-key aggregation. No `synchronized` on the hot path.
+
+## INTERVIEW
+
+**Q: What does `volatile` do?**
+A: Three things: (1) writes are published to other threads immediately (no CPU-cache staleness); (2) reads always fetch from main memory / cache-coherent state; (3) it establishes a happens-before edge so writes BEFORE the volatile write are visible after the volatile read on another thread. It does NOT make compound operations like `x++` atomic.
+
+**Q: Is `volatile int counter; counter++` thread-safe?**
+A: No. `counter++` is read-modify-write. `volatile` guarantees each individual read and each individual write is visible, but two threads can still both read the same value, both increment, and both write — one increment is lost. Use `AtomicInteger` instead.
+
+**Q: What is CAS?**
+A: Compare-and-Swap — a single hardware instruction that atomically compares a memory location to an expected value and, if equal, writes a new value. It's the primitive that enables lock-free algorithms. All `AtomicXxx` classes are built on `Unsafe.compareAndSwap*` under the hood.
+
+**Q: When should I prefer `LongAdder` over `AtomicLong`?**
+A: When many threads write frequently AND reads are relatively rare. `LongAdder` stripes writes across an internal cell array, avoiding cache-line contention. But `sum()` walks the array, so if you read the counter more often than you write it, `AtomicLong` (single field) is faster.
+
+**Q: What is the ABA problem?**
+A: Between two reads of the same reference, its value went `X → Y → X`. A CAS from `X` to `Z` will succeed, but you missed the intermediate mutation. In lock-free linked lists this causes nodes to be reused wrongly. Solution: `AtomicStampedReference` — the CAS also verifies a version counter.
+
+**Q: Give a case where you should use `synchronized` INSTEAD of `AtomicReference`.**
+A: When you need to update MULTIPLE fields atomically as a group. `AtomicReference` protects one field. If you must update `balance` AND `lastTxnId` together such that no reader ever sees a mixed state, wrap them in an immutable record and store that in a single `AtomicReference<Snapshot>` — OR use `synchronized` / `ReentrantLock`.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Imagine two kids passing notes across the classroom. Without `volatile`, one kid writes "let's meet at 3 PM" on the note but keeps it in his desk — the other kid never sees it. `volatile` is a rule that says "whenever you change the note, walk it over and put it on the other kid's desk immediately, and always look at the newest note before reading."
+>
+> But `volatile` doesn't help with COUNTING. If both kids look at the whiteboard tally, both add one, both write "3" — the tally is now 3 instead of 4. To count safely without a teacher (a lock), you use `AtomicInteger` — a magic scoreboard where "click the button" is guaranteed to bump the number by exactly one, no matter how many kids press it at once.
+
+## BUILD
+
+Build a **lock-free unique-ID generator** (like Twitter's Snowflake, simplified):
+1. Class `SnowflakeId` produces 64-bit IDs: `[41-bit timestamp | 10-bit machine ID | 12-bit sequence]`.
+2. Sequence resets to 0 each new millisecond.
+3. Use a single `AtomicLong` state that packs `timestampMillis << 22 | sequence` — mutate with `updateAndGet` (a CAS loop) to guarantee monotonic non-repeating IDs even under contention.
+4. Stress-test with 8 threads generating 1M IDs each — verify NO duplicates and that IDs are strictly monotonically increasing.
+5. **Bonus**: profile it against a `synchronized` counterpart at 1M IDs / thread / 16 threads.
+
+## SPACED REVIEW
+
+**Day 1**: List the three guarantees of `volatile`.
+**Day 3**: Explain why `volatile int x; x++;` is a bug.
+**Day 7**: Sketch the CAS retry loop for `AtomicInteger.incrementAndGet`.
+**Day 14**: When would you replace `AtomicLong` with `LongAdder`? Give the read/write ratio rule.
+

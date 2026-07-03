@@ -16,7 +16,303 @@ This module covers advanced techniques to squeeze maximum performance and minima
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeVisualizer", "state": "container-optimization" }
+{
+  "language": "dockerfile",
+  "fileName": "Dockerfile.optimized",
+  "steps": [
+    {
+      "title": "Size optimization checklist",
+      "description": "Small images = fast pulls + fast deploys + smaller attack surface. Multi-stage, alpine/distroless, single RUN, no cache files.",
+      "code": "# Optimization checklist:\n# ✅ Multi-stage build\n# ✅ Small base (alpine, slim, distroless)\n# ✅ Combine RUN commands + cleanup\n# ✅ .dockerignore\n# ✅ Production-only dependencies\n# ✅ Delete build tools after use\n# ✅ Squash layers when useful (--squash)\n\n# Example: 1.2 GB → 45 MB\nFROM node:18-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN --mount=type=cache,target=/root/.npm npm ci\nCOPY . .\nRUN npm run build && \\\n    npm prune --production\n\n# Distroless final\nFROM gcr.io/distroless/nodejs18-debian12:nonroot\nWORKDIR /app\nCOPY --from=builder --chown=nonroot:nonroot /app/node_modules ./node_modules\nCOPY --from=builder --chown=nonroot:nonroot /app/dist ./dist\nCOPY --from=builder --chown=nonroot:nonroot /app/package.json ./\nUSER nonroot\nCMD [\"dist/server.js\"]\n\n# Check size\n$ docker images myapp\nmyapp   optimized   45MB     # was 1.2GB!\n\n# Dive tool — analyze layers\n$ dive myapp:optimized",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        32,
+        33
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Multi-stage + small base",
+            "done": true
+          },
+          {
+            "label": "Cache mounts speed rebuilds",
+            "done": true
+          },
+          {
+            "label": "Distroless for final = tiny + secure",
+            "active": true
+          },
+          {
+            "label": "Use `dive` to audit layer sizes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Startup time optimization",
+      "description": "Fast startup enables rapid scaling. Layer ordering, warm caches, and native compilation matter.",
+      "code": "# Fast startup techniques:\n\n# 1. Preload dependencies at build time\nRUN --mount=type=cache,target=/root/.npm npm ci\n# Not at runtime!\n\n# 2. Trim large dependencies\n# Analyze bundle:\nRUN npm install --production && \\\n    npm dedupe && \\\n    rm -rf node_modules/*/test node_modules/*/docs\n\n# 3. Warm up caches / connections in ENTRYPOINT\n#!/bin/sh\n# entrypoint.sh\nnode -e \"require('./cache-warmup.js')\"\nexec \"$@\"\n\n# 4. Native compile for Node (via bytenode)\n# Reduces cold start\n\n# 5. GraalVM Native Image for Java (Spring Native)\n# Java startup: 5-10 sec → 100 ms\nFROM ghcr.io/graalvm/native-image:22 AS builder\nRUN native-image -jar app.jar\n\nFROM alpine\nCOPY --from=builder /app/app /app\nCMD [\"/app\"]\n# Now starts in 30-100 ms\n\n# 6. Kubernetes: startup probes for slow apps\n# livenessProbe:\n#   httpGet: {path: /health, port: 8080}\n#   initialDelaySeconds: 30    # give app time to warm up",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Startup optimization",
+        "items": [
+          {
+            "label": "Deps at build time",
+            "color": "#10b981",
+            "value": "Not runtime — huge win",
+            "highlight": true
+          },
+          {
+            "label": "GraalVM Native (Java)",
+            "color": "#818cf8",
+            "value": "5s → 100ms cold start"
+          },
+          {
+            "label": "Bytecode compilation",
+            "color": "#f59e0b",
+            "value": "Skip parse step"
+          },
+          {
+            "label": "Startup probe grace",
+            "color": "#60a5fa",
+            "value": "K8s waits before health check"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Runtime resource optimization",
+      "description": "Tune memory limits, JVM flags, GC strategy, and worker counts for your specific workload.",
+      "code": "# Node.js — set memory limits\nCMD [\"node\", \"--max-old-space-size=384\", \"server.js\"]\n# Docker limit: 512M → tell V8 to use max 384M (leaves room for GC, C++ heap)\n\n# Java — modern JDK auto-detects container limits\nCMD [\"java\", \"-XX:MaxRAMPercentage=75.0\", \"-XX:+UseZGC\", \"-jar\", \"app.jar\"]\n# Uses 75% of container memory limit as heap\n# ZGC = low-latency garbage collector\n\n# Python — worker count\nCMD [\"gunicorn\", \"--workers\", \"4\", \"--threads\", \"2\", \"app:app\"]\n# 4 workers × 2 threads = 8 concurrent requests\n\n# Go — GOMAXPROCS auto-detects\n# But explicit is better:\nENV GOMAXPROCS=2\n\n# Postgres — memory tuning\nCMD [\"postgres\",\n     \"-c\", \"shared_buffers=256MB\",\n     \"-c\", \"effective_cache_size=768MB\",\n     \"-c\", \"max_connections=100\"]\n\n# Redis — memory limit + eviction\nCMD [\"redis-server\",\n     \"--maxmemory\", \"512mb\",\n     \"--maxmemory-policy\", \"allkeys-lru\"]\n\n# General rule: leave 20-30% headroom in memory limits",
+      "highlight": [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Runtime tuning",
+        "items": [
+          {
+            "label": "Node --max-old-space-size",
+            "color": "#10b981",
+            "value": "V8 heap size — less than container",
+            "highlight": true
+          },
+          {
+            "label": "Java MaxRAMPercentage",
+            "color": "#818cf8",
+            "value": "Auto-detects container limit"
+          },
+          {
+            "label": "Workers × threads",
+            "color": "#f59e0b",
+            "value": "Match to CPU limit + workload"
+          },
+          {
+            "label": "20-30% headroom",
+            "color": "#60a5fa",
+            "value": "Room for GC, OS, kernel"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Image scanning and slimming",
+      "description": "Tools: docker scout, trivy, snyk (security). slim (auto-remove unused files). Use in CI.",
+      "code": "# Docker Scout (built-in)\n$ docker scout cves myapp:latest\n$ docker scout quickview myapp:latest\n\n# Trivy (open source, fast)\n$ trivy image myapp:latest\nmyapp:latest (alpine 3.19.0)\n=======================\nTotal: 12 (HIGH: 2, CRITICAL: 1)\n\n# Grype (alternative)\n$ grype myapp:latest\n\n# Slim: auto-remove unused files (reduces size 20-30x!)\n$ slim build myapp:latest\nBuild result: myapp:latest.slim (32MB, was 145MB)\n\n# Docker slim analyzes runtime behavior:\n# - Runs container\n# - Traces file access\n# - Removes everything not accessed\n\n# In CI/CD (GitHub Actions)\nname: Security\nsteps:\n  - name: Build\n    run: docker build -t myapp:${{ github.sha }} .\n\n  - name: Scan with Trivy\n    uses: aquasecurity/trivy-action@master\n    with:\n      image-ref: myapp:${{ github.sha }}\n      severity: HIGH,CRITICAL\n      exit-code: 1    # fail build on findings\n\n# SBOM (Software Bill of Materials)\n$ docker buildx build --sbom=true -t myapp:v1 --push .\n$ docker sbom myapp:v1",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        15,
+        16,
+        17,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        37,
+        38,
+        39
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Security tooling",
+        "items": [
+          {
+            "label": "Trivy",
+            "color": "#10b981",
+            "value": "Free, fast — CI standard",
+            "highlight": true
+          },
+          {
+            "label": "Docker Scout",
+            "color": "#818cf8",
+            "value": "Built-in, Docker Desktop UI"
+          },
+          {
+            "label": "Snyk",
+            "color": "#f59e0b",
+            "value": "Commercial with policies"
+          },
+          {
+            "label": "Slim tool",
+            "color": "#60a5fa",
+            "value": "Auto-remove unused files"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Layer analysis with dive",
+      "description": "dive is a TUI tool that shows what's in each layer. Find fat layers, wasted space, and duplicate files.",
+      "code": "# Install\n$ brew install dive\n# or download from github.com/wagoodman/dive\n\n# Analyze image\n$ dive myapp:latest\n\n# UI:\n# ┌──────────────────────────────────────┐\n# │ Layers                    │ Contents │\n# │ FROM node:18-alpine       │  /       │\n# │ WORKDIR /app              │   /app   │\n# │ COPY package*.json        │    /pkg  │\n# │ RUN npm ci                │    /node │\n# │ COPY . .                  │  ...     │\n# └──────────────────────────┴──────────┘\n\n# Metrics dive shows:\n# - Image efficiency (wasted space)\n# - Files added / removed per layer\n# - Total size vs efficient size\n\n# Common problems:\n# - Copying then deleting (files still in layer!)\n# - Running apt-get update in separate layer\n# - Large package caches\n\n# CI integration\n$ dive --ci myapp:latest\n# Exit 0 if efficient, non-zero otherwise\n# Configure thresholds in .dive-ci\n\nrules:\n  lowestEfficiency: 0.95    # 95% efficient minimum\n  highestUserWastedPercent: 0.10",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "dive shows each layer's content",
+            "done": true
+          },
+          {
+            "label": "Highlights wasted space + duplicates",
+            "done": true
+          },
+          {
+            "label": "CI mode fails on inefficiency",
+            "active": true
+          },
+          {
+            "label": "Iterate: fix Dockerfile, re-measure"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

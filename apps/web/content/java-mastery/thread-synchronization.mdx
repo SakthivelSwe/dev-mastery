@@ -1,0 +1,467 @@
+---
+slug: "thread-synchronization"
+title: "Thread Synchronization — synchronized, Monitors, wait/notify"
+level: 3
+---
+
+## WHY
+
+`counter++` is not one instruction. It is three: **read** counter, **add 1**, **write** counter. If two threads execute those three steps interleaved, they can both read the same starting value, both compute the same result, and both write it — one increment is silently lost. Run this 100k times and your counter is off by 30–40%. Money, inventory, seat bookings — all corrupted, silently, in production.
+
+`synchronized` is Java's original built-in solution: turn a critical section into an atomic block by forcing threads to line up through a **monitor**. It is the foundation on which every other lock in the JVM is built, and it is still the right tool for 80% of thread-safety problems.
+
+## THEORY
+
+### The Race Condition — 30-second proof
+```
+Thread A                Thread B                Effect on counter (starts=0)
+--------                --------                --------------------
+read counter (0)        read counter (0)
+add 1 → 1               add 1 → 1
+write 1                                         counter = 1
+                        write 1                 counter = 1  (should be 2!)
+```
+One increment is lost. Non-deterministic; depends on scheduler timing.
+
+### The Monitor — every Java object has one
+Every `Object` in Java has a built-in **monitor** (an intrinsic lock). Only one thread can "own" a monitor at a time. `synchronized(x) { ... }` means: acquire `x`'s monitor, run the block, release the monitor.
+
+```java
+synchronized (lock) {
+    counter++;          // now atomic w.r.t. other threads that also synchronize on `lock`
+}
+```
+
+### Two syntactic forms
+```java
+class Bank {
+    private int balance;
+
+    // Form 1: synchronized method — locks THIS instance's monitor
+    public synchronized void deposit(int amount) { balance += amount; }
+
+    // Form 2: synchronized static method — locks the CLASS object's monitor
+    public static synchronized void resetStats() { /* ... */ }
+
+    // Form 3: synchronized block — locks the specified object's monitor
+    private final Object balanceLock = new Object();
+    public void withdraw(int amount) {
+        synchronized (balanceLock) { balance -= amount; }
+    }
+}
+```
+**Form 3 is preferred** — a *dedicated* private lock object that no outside code can inadvertently synchronize on. Never synchronize on `this` (any caller can also synchronize on your object and deadlock you), on `String` literals (interned globally), or on boxed primitives (also interned).
+
+### Reentrancy
+Java monitors are **reentrant**: the same thread can acquire the same monitor multiple times without deadlocking itself. This is essential — otherwise a synchronized method calling ANOTHER synchronized method on the same object would self-deadlock.
+
+### wait / notify / notifyAll — coordination via the monitor
+`synchronized` alone lets one thread run at a time; it doesn't let a thread PAUSE and wait for a condition. That's `wait/notify`:
+
+| Call | Precondition | Effect |
+|------|--------------|--------|
+| `obj.wait()` | Must own `obj`'s monitor | Release the monitor, enter WAITING state |
+| `obj.wait(ms)` | Must own `obj`'s monitor | Release monitor, WAITING up to ms |
+| `obj.notify()` | Must own `obj`'s monitor | Wake up ONE waiting thread |
+| `obj.notifyAll()` | Must own `obj`'s monitor | Wake up ALL waiting threads |
+
+**Always call `wait()` in a while-loop**, never an `if`:
+```java
+synchronized (queue) {
+    while (queue.isEmpty()) {         // WHILE, not IF — spurious wakeups exist
+        queue.wait();
+    }
+    take();
+}
+```
+Reason: (a) spurious wakeups are permitted by the JVM spec; (b) `notifyAll()` may wake N threads for M < N items — losers must re-check the condition.
+
+### The classic pitfalls
+1. **Synchronizing too much** — coarse locks serialize everything. Lock the minimum region.
+2. **Synchronizing on the wrong object** — two threads must lock on the **same** object to be exclusive; if each locks its own `new Object()`, there is no protection.
+3. **Holding the lock during blocking I/O** — you serialize all callers on the slow thing.
+4. **Deadlock** — two threads each hold what the other wants (see `deadlock-livelock-starvation`).
+5. **synchronized on a boxed primitive** — `Integer.valueOf(1)` may return the SAME cached object across the JVM → accidental cross-application deadlock.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "SyncCounter.java",
+  "steps": [
+    {
+      "title": "Two threads, no sync → race",
+      "description": "counter++ is read + add + write. Both threads read the same value, add 1, write 1. One increment is lost.",
+      "code": "static int counter = 0;\n\nvoid bump() {\n    counter++;         // NOT atomic: read, add, write\n}",
+      "highlight": [
+        4
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "T1",
+          "counter",
+          "T2"
+        ],
+        "messages": [
+          {
+            "from": "T1",
+            "to": "counter",
+            "label": "read 0"
+          },
+          {
+            "from": "T2",
+            "to": "counter",
+            "label": "read 0"
+          },
+          {
+            "from": "T1",
+            "to": "counter",
+            "label": "write 1"
+          },
+          {
+            "from": "T2",
+            "to": "counter",
+            "label": "write 1 (lost)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "synchronized — the monitor turnstile",
+      "description": "Every object has an intrinsic monitor. Wrap the critical section in synchronized(lock) — only one thread at a time can hold the monitor.",
+      "code": "private final Object lock = new Object();\n\nvoid bump() {\n    synchronized (lock) {   // acquire monitor\n        counter++;\n    }                        // release monitor\n}",
+      "highlight": [
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "T1",
+            "state": "RUNNABLE",
+            "note": "owns monitor · bumps counter"
+          },
+          {
+            "name": "T2",
+            "state": "BLOCKED",
+            "note": "waiting for monitor"
+          }
+        ],
+        "monitor": {
+          "name": "lock",
+          "owner": "T1",
+          "waiters": [
+            "T2"
+          ]
+        }
+      }
+    },
+    {
+      "title": "wait() releases the monitor",
+      "description": "Inside a synchronized block, wait() atomically releases the monitor AND parks the thread. Another thread can enter and mutate state, then call notify().",
+      "code": "synchronized (queue) {\n    while (queue.isEmpty()) {\n        queue.wait();       // releases monitor, blocks\n    }\n    return queue.remove();\n}",
+      "highlight": [
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "consumer",
+            "state": "WAITING",
+            "note": "inside wait()"
+          },
+          {
+            "name": "producer",
+            "state": "RUNNABLE",
+            "note": "about to put + notify"
+          }
+        ],
+        "monitor": {
+          "name": "queue",
+          "owner": "(free)",
+          "waiters": [
+            "consumer"
+          ]
+        }
+      }
+    },
+    {
+      "title": "notify() → consumer wakes",
+      "description": "producer calls queue.notify() (or notifyAll()) inside its own synchronized block. The consumer wakes, re-acquires the monitor, re-checks the while, and proceeds.",
+      "code": "synchronized (queue) {\n    queue.add(item);\n    queue.notifyAll();      // wake all waiters\n}",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "consumer",
+            "state": "RUNNABLE",
+            "note": "woken, holds monitor"
+          },
+          {
+            "name": "producer",
+            "state": "RUNNABLE",
+            "note": "released monitor"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Use a dedicated final lock object",
+      "description": "Never synchronize on `this`, on `String` literals, or on boxed primitives — anyone can synchronize on those objects and deadlock you. Use a private final Object.",
+      "code": "class BankAccount {\n    private final Object balanceLock = new Object();   // safe\n    private long cents;\n\n    public void deposit(long c) {\n        synchronized (balanceLock) { cents += c; }\n    }\n}",
+      "highlight": [
+        2,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Lock target choice",
+        "items": [
+          {
+            "label": "private final Object",
+            "highlight": true,
+            "color": "#10b981"
+          },
+          {
+            "label": "this",
+            "color": "#ef4444"
+          },
+          {
+            "label": "\"literal\"",
+            "color": "#ef4444"
+          },
+          {
+            "label": "Integer.valueOf(1)",
+            "color": "#ef4444"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Prove the race, then fix it
+```java
+public class RaceProof {
+    static int counter = 0;
+
+    static void bumpUnsafely()  { counter++; }
+    static synchronized void bumpSafely() { counter++; }
+
+    public static void main(String[] args) throws InterruptedException {
+        counter = 0;
+        Thread a = new Thread(() -> { for (int i = 0; i < 100_000; i++) bumpUnsafely(); });
+        Thread b = new Thread(() -> { for (int i = 0; i < 100_000; i++) bumpUnsafely(); });
+        a.start(); b.start(); a.join(); b.join();
+        System.out.println("UNSAFE: " + counter); // almost never 200000
+
+        counter = 0;
+        Thread c = new Thread(() -> { for (int i = 0; i < 100_000; i++) bumpSafely(); });
+        Thread d = new Thread(() -> { for (int i = 0; i < 100_000; i++) bumpSafely(); });
+        c.start(); d.start(); c.join(); d.join();
+        System.out.println("SAFE:   " + counter); // always 200000
+    }
+}
+```
+
+### Level 2 — Dedicated lock object (preferred pattern)
+```java
+public class BankAccount {
+    private final Object balanceLock = new Object();   // private, final, dedicated
+    private long balanceCents;
+
+    public void deposit(long cents) {
+        if (cents <= 0) throw new IllegalArgumentException();
+        synchronized (balanceLock) {
+            balanceCents += cents;
+        }
+    }
+
+    public boolean withdraw(long cents) {
+        synchronized (balanceLock) {
+            if (balanceCents < cents) return false;
+            balanceCents -= cents;
+            return true;
+        }
+    }
+
+    public long getBalanceCents() {
+        synchronized (balanceLock) {           // MUST also sync reads for visibility
+            return balanceCents;
+        }
+    }
+}
+```
+
+### Level 3 — wait / notify producer-consumer skeleton
+```java
+import java.util.*;
+
+public class WaitNotifyQueue<T> {
+    private final Queue<T> buffer = new LinkedList<>();
+    private final int capacity;
+    private final Object monitor = new Object();
+
+    public WaitNotifyQueue(int capacity) { this.capacity = capacity; }
+
+    public void put(T item) throws InterruptedException {
+        synchronized (monitor) {
+            while (buffer.size() == capacity) {   // WHILE, not IF
+                monitor.wait();
+            }
+            buffer.add(item);
+            monitor.notifyAll();                  // wake potentially-blocked consumers
+        }
+    }
+
+    public T take() throws InterruptedException {
+        synchronized (monitor) {
+            while (buffer.isEmpty()) {            // WHILE, not IF
+                monitor.wait();
+            }
+            T item = buffer.remove();
+            monitor.notifyAll();                  // wake potentially-blocked producers
+            return item;
+        }
+    }
+}
+```
+
+### Level 4 — Broken example: synchronizing on the wrong object
+```java
+public class WrongLockObject {
+    private Long balance = 100L;                  // BOXED! shared cache, mutable ref
+
+    // BROKEN — every deposit boxes a NEW Long → each thread locks a different object
+    public void badDeposit(long amount) {
+        synchronized (balance) {                  // WRONG — 'balance' reassigned inside
+            balance = balance + amount;
+        }
+    }
+
+    // FIXED — dedicated final lock object
+    private final Object lock = new Object();
+    public void goodDeposit(long amount) {
+        synchronized (lock) {
+            balance = balance + amount;
+        }
+    }
+}
+```
+The `balance` variable is REASSIGNED to a new `Long` each iteration. `synchronized(balance)` locks the OLD object; the next thread comes in, sees a NEW `balance`, and locks THAT. Nothing is actually mutually exclusive.
+
+### Level 5 — Fine-grained locking beats coarse locking
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+// BAD: one lock for the entire cache — all readers serialize
+class CoarseCache {
+    private final Map<String, byte[]> data = new HashMap<>();
+    public synchronized byte[] get(String k)             { return data.get(k); }
+    public synchronized void   put(String k, byte[] v)   { data.put(k, v); }
+}
+
+// GOOD: stripe the lock so unrelated keys don't block each other
+class StripedCache {
+    private static final int STRIPES = 32;
+    private final Object[] locks = new Object[STRIPES];
+    private final Map<String, byte[]> data = new HashMap<>();
+
+    StripedCache() { for (int i = 0; i < STRIPES; i++) locks[i] = new Object(); }
+
+    private Object lockFor(String k) {
+        return locks[(k.hashCode() & 0x7fffffff) % STRIPES];
+    }
+    public byte[] get(String k) { synchronized (lockFor(k)) { return data.get(k); } }
+    public void put(String k, byte[] v) { synchronized (lockFor(k)) { data.put(k, v); } }
+    // NB: HashMap itself isn't thread-safe — in production use ConcurrentHashMap.
+    //     This example just illustrates lock striping.
+}
+```
+
+## REAL_WORLD
+
+**Singleton double-checked locking (canonical bugfix)** — the pre-JMM version of this pattern was famously broken, and its correct form is a rite of passage:
+
+```java
+public class ConfigLoader {
+    private static volatile ConfigLoader instance;   // volatile REQUIRED
+    private final Config config;
+
+    private ConfigLoader() { this.config = loadFromDisk(); }
+
+    public static ConfigLoader getInstance() {
+        ConfigLoader local = instance;                // read volatile once (fast path)
+        if (local == null) {
+            synchronized (ConfigLoader.class) {
+                local = instance;
+                if (local == null) {                  // check again inside the lock
+                    local = new ConfigLoader();
+                    instance = local;
+                }
+            }
+        }
+        return local;
+    }
+    private Config loadFromDisk() { /* ... */ return new Config(); }
+    static class Config {}
+}
+```
+Without `volatile`, another thread reading `instance` may see a non-null reference to a **partially-constructed** object (the write is not yet fully flushed). The `volatile` establishes the happens-before edge that makes the pattern safe.
+
+## INTERVIEW
+
+**Q: Why is `counter++` not atomic?**
+A: It compiles to three JVM operations: `getfield`, `iconst_1 + iadd`, `putfield`. Between any two of them the OS may preempt the thread, another thread reads the same stale value, and one increment is lost.
+
+**Q: What object should I synchronize on?**
+A: A `private final Object myLock = new Object()` field. Never on `this` (anyone can lock on your object), never on `getClass()` unless you mean it (locks the class globally, blocking every instance's static synchronized methods), never on a `String` literal or a boxed primitive (both are interned).
+
+**Q: What's the difference between `wait()` and `sleep()`?**
+A: `sleep()` is a static `Thread` method — the thread pauses for the duration and keeps holding any locks it owns. `wait()` is an `Object` method — the thread must already own the monitor of that object, and calling `wait()` **releases** that monitor and enters WAITING state. Different tools, different purposes.
+
+**Q: Why must `wait()` always be inside a `while` loop, not an `if`?**
+A: Two reasons. (1) `notifyAll()` may wake multiple threads for a single available item — losers must re-check. (2) The JVM spec explicitly permits **spurious wakeups** where a thread returns from `wait()` without any `notify()`. The while-loop re-checks the condition.
+
+**Q: What is reentrancy? Give a case where it matters.**
+A: A reentrant lock lets the SAME thread acquire it multiple times without deadlocking. Case: a `synchronized` method `deposit()` that internally calls `synchronized` method `updateStats()` on the same object. Without reentrancy, the second call would deadlock waiting for the first to release the monitor it already owns.
+
+**Q: My synchronized block still shows the wrong value under load. Why?**
+A: The most common cause is that some code path **writes** the shared field WITHOUT synchronizing. Synchronization is a contract — every reader AND every writer must go through the same lock, or `volatile`, or an atomic. One unsynchronized write is enough to break every synchronized read.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Imagine a single bathroom in a house with lots of siblings. Each object in Java is like a room, and each room has ONE key — the "monitor". Before you enter a `synchronized` room, you have to grab the key. If someone else has it, you wait outside — "BLOCKED". When you're done, you drop the key and the next kid can grab it. `wait()` is putting the key down and going to sleep on the floor of the room; another kid comes in with the key, sees you sleeping, and yells "wake up!" — that's `notify()`. Only then do you stand up, grab the key back, and continue.
+
+## BUILD
+
+Build a **thread-safe rate limiter** using only `synchronized` and `wait/notify`:
+1. Class `RateLimiter(int permitsPerSecond)` with a single method `void acquire() throws InterruptedException` that blocks until a permit is available.
+2. Internally: `long lastRefillMillis` and `int availablePermits`. Refill up to the max at 1 permit every `1000/rate` ms.
+3. If no permits available, `wait()` on the internal monitor. A background daemon thread refills and `notifyAll()`s.
+4. Write a test: spawn 20 threads each trying to `acquire()` 100 times, measure total elapsed time — should be roughly `20*100 / permitsPerSecond` seconds.
+5. **Bonus**: measure fairness — how far off is the actual per-thread throughput from `permitsPerSecond / 20`?
+
+## SPACED REVIEW
+
+**Day 1**: Show the 3-step decomposition of `counter++` and explain how two threads lose an increment.
+**Day 3**: Write the CORRECT pattern for using `wait()` inside a `while` loop.
+**Day 7**: List 4 objects you should NEVER `synchronize` on and explain why.
+**Day 14**: Explain the difference between `sleep()`, `wait()`, and `join()` — including which ones release monitors and which ones don't.
+

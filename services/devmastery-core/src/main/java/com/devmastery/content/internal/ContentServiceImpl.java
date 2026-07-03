@@ -58,6 +58,15 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     }
 
     @Override
+    public List<TopicSummary> searchTopics(String query, int limit) {
+        if (query == null || query.isBlank()) return List.of();
+        String trimmed = query.trim();
+        int cappedLimit = Math.max(1, Math.min(limit, 50));
+        return topics.searchByTitle(trimmed, PageRequest.of(0, cappedLimit))
+                .stream().map(this::toSummary).toList();
+    }
+
+    @Override
     @Cacheable(value = CacheNames.TOPIC_BY_SLUG, key = "#slug")
     public TopicDetail getTopicBySlug(String slug) {
         TopicEntity t = topics.findBySlugAndStatus(slug, "published")

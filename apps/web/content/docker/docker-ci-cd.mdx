@@ -25,7 +25,320 @@ Every major CI/CD platform (GitHub Actions, GitLab CI, Jenkins, CircleCI) has fi
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "docker-cicd-pipeline" }
+{
+  "language": "yaml",
+  "fileName": ".github/workflows/docker.yml",
+  "steps": [
+    {
+      "title": "Building images in CI",
+      "description": "CI builds image on every commit. Tag with git SHA, branch, or semver. Push to registry. Use BuildKit cache for speed.",
+      "code": "# .github/workflows/build.yml\nname: Build\non: [push]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n\n    steps:\n      - uses: actions/checkout@v4\n\n      - name: Set up Docker Buildx\n        uses: docker/setup-buildx-action@v3\n\n      - name: Login to GHCR\n        uses: docker/login-action@v3\n        with:\n          registry: ghcr.io\n          username: ${{ github.actor }}\n          password: ${{ secrets.GITHUB_TOKEN }}\n\n      - name: Build and push\n        uses: docker/build-push-action@v5\n        with:\n          context: .\n          push: true\n          tags: |\n            ghcr.io/${{ github.repository }}:${{ github.sha }}\n            ghcr.io/${{ github.repository }}:${{ github.ref_name }}\n            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}:latest', github.repository) || '' }}\n          cache-from: type=gha\n          cache-to: type=gha,mode=max\n          platforms: linux/amd64,linux/arm64",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        15,
+        16,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Every commit triggers CI",
+            "done": true
+          },
+          {
+            "label": "Build with GHA cache (fast)",
+            "done": true
+          },
+          {
+            "label": "Multi-arch: amd64 + arm64",
+            "active": true
+          },
+          {
+            "label": "Push to GHCR with git SHA tag"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Testing in Docker CI",
+      "description": "Run tests inside container for consistency. Use multi-stage Dockerfile with a test target. Or use compose to spin up dependencies.",
+      "code": "# Option 1: test stage in Dockerfile\nFROM node:18-alpine AS deps\nRUN npm ci\n\nFROM deps AS test\nCOPY . .\nRUN npm run lint && npm test\n\nFROM deps AS build\nCOPY . .\nRUN npm run build\n\nFROM node:18-alpine AS production\nCOPY --from=build /app/dist ./\nCMD [\"node\", \"server.js\"]\n\n# CI runs\n$ docker build --target=test .    # runs lint + tests, fails on error\n\n# Option 2: docker compose with real deps\n# docker-compose.ci.yml\nservices:\n  db:\n    image: postgres:15-alpine\n    environment: { POSTGRES_PASSWORD: test }\n\n  api:\n    build: .\n    depends_on: [db]\n    environment: { DATABASE_URL: postgres://postgres:test@db/postgres }\n\n  tests:\n    build:\n      context: .\n      target: test\n    depends_on: [api]\n    command: npm test\n\n# In CI\n- run: docker compose -f docker-compose.ci.yml run --rm tests\n- if: always()\n  run: docker compose -f docker-compose.ci.yml down -v\n\n# GitHub Actions services (alternative)\nservices:\n  postgres:\n    image: postgres:15\n    ports: [\"5432:5432\"]",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        43,
+        44,
+        45,
+        46,
+        47
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "CI test strategies",
+        "items": [
+          {
+            "label": "Multi-stage test target",
+            "color": "#10b981",
+            "value": "docker build --target=test",
+            "highlight": true
+          },
+          {
+            "label": "Compose CI env",
+            "color": "#818cf8",
+            "value": "Real DB, real cache"
+          },
+          {
+            "label": "GHA services",
+            "color": "#f59e0b",
+            "value": "Managed sidecars"
+          },
+          {
+            "label": "Testcontainers",
+            "color": "#60a5fa",
+            "value": "Spin up in test code"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Scanning in CI",
+      "description": "Scan images for vulnerabilities before publishing. Fail build on HIGH/CRITICAL. Generate SBOM for compliance.",
+      "code": "# GitHub Actions with Trivy\nname: Security scan\non: [push, pull_request]\n\njobs:\n  scan:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n\n      - name: Build image\n        run: docker build -t myapp:${{ github.sha }} .\n\n      - name: Scan with Trivy\n        uses: aquasecurity/trivy-action@master\n        with:\n          image-ref: myapp:${{ github.sha }}\n          format: sarif\n          output: trivy-results.sarif\n          severity: HIGH,CRITICAL\n          exit-code: 1    # fail build on findings\n\n      - name: Upload Trivy results to GitHub Security\n        if: always()\n        uses: github/codeql-action/upload-sarif@v3\n        with:\n          sarif_file: trivy-results.sarif\n\n      - name: Generate SBOM\n        uses: anchore/sbom-action@v0\n        with:\n          image: myapp:${{ github.sha }}\n          output-file: sbom.spdx.json\n\n      - name: Sign image with cosign\n        env:\n          COSIGN_EXPERIMENTAL: 1\n        run: cosign sign myapp:${{ github.sha }}",
+      "highlight": [
+        3,
+        4,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Build image in CI",
+            "done": true
+          },
+          {
+            "label": "Trivy scans, fails on HIGH/CRITICAL",
+            "done": true
+          },
+          {
+            "label": "Upload SARIF to GitHub Security tab",
+            "active": true
+          },
+          {
+            "label": "Generate SBOM + sign with cosign"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Deploy from CI",
+      "description": "After successful build + tests + scan, deploy. Options: SSH + docker compose, K8s kubectl apply, GitOps (ArgoCD/Flux).",
+      "code": "# Simple: SSH + docker compose\n- name: Deploy to staging\n  uses: appleboy/ssh-action@v1\n  with:\n    host: ${{ secrets.STAGING_HOST }}\n    username: deploy\n    key: ${{ secrets.SSH_KEY }}\n    script: |\n      cd /opt/myapp\n      docker compose pull\n      docker compose up -d\n      docker system prune -f\n\n# Better: K8s kubectl apply\n- name: Deploy to K8s\n  uses: azure/k8s-deploy@v4\n  with:\n    manifests: |\n      k8s/deployment.yaml\n      k8s/service.yaml\n    images: ghcr.io/${{ github.repository }}:${{ github.sha }}\n    namespace: production\n\n# Best: GitOps (ArgoCD/Flux)\n# CI: build image + update image tag in a Git repo\n- name: Update image tag in GitOps repo\n  run: |\n    git clone https://github.com/org/gitops-repo\n    cd gitops-repo\n    yq eval '.image.tag = \"${{ github.sha }}\"' -i apps/api/values.yaml\n    git commit -am \"Update api to ${{ github.sha }}\"\n    git push\n\n# ArgoCD watches the repo → deploys change to cluster\n# Rollback = git revert\n\n# Feature flag approach (safest)\n# Deploy new code with flag OFF\n# Enable per-user or gradually",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        38,
+        39,
+        40
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Deploy strategies",
+        "items": [
+          {
+            "label": "SSH + compose",
+            "color": "#10b981",
+            "value": "Simple — single host",
+            "highlight": true
+          },
+          {
+            "label": "kubectl apply",
+            "color": "#818cf8",
+            "value": "Direct K8s deploy from CI"
+          },
+          {
+            "label": "GitOps",
+            "color": "#f59e0b",
+            "value": "Git repo drives cluster state"
+          },
+          {
+            "label": "Feature flags",
+            "color": "#60a5fa",
+            "value": "Deploy safe, enable slow"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Full CI/CD pipeline",
+      "description": "Complete pipeline: build → test → scan → sign → deploy → smoke test → notify. Each stage gates the next.",
+      "code": "name: CI/CD\non:\n  push:\n    branches: [main]\n\njobs:\n  # Stage 1: Build + test\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: docker build --target=test .\n\n  # Stage 2: Build image\n  build:\n    needs: test\n    runs-on: ubuntu-latest\n    outputs:\n      tag: ${{ steps.meta.outputs.tag }}\n    steps:\n      - uses: actions/checkout@v4\n      - uses: docker/setup-buildx-action@v3\n      - uses: docker/login-action@v3\n        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }\n      - id: meta\n        run: echo \"tag=ghcr.io/${{ github.repository }}:${{ github.sha }}\" >> $GITHUB_OUTPUT\n      - uses: docker/build-push-action@v5\n        with:\n          push: true\n          tags: ${{ steps.meta.outputs.tag }}\n\n  # Stage 3: Scan\n  scan:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - uses: aquasecurity/trivy-action@master\n        with:\n          image-ref: ${{ needs.build.outputs.tag }}\n          severity: HIGH,CRITICAL\n          exit-code: 1\n\n  # Stage 4: Deploy staging\n  deploy-staging:\n    needs: [build, scan]\n    runs-on: ubuntu-latest\n    environment: staging\n    steps:\n      - run: kubectl set image deployment/api api=${{ needs.build.outputs.tag }} -n staging\n\n  # Stage 5: Smoke tests\n  smoke:\n    needs: deploy-staging\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl -f https://staging.devmastery.com/health\n      - run: npm run test:smoke\n\n  # Stage 6: Deploy production (manual approval)\n  deploy-prod:\n    needs: smoke\n    runs-on: ubuntu-latest\n    environment:\n      name: production\n      url: https://api.devmastery.com\n    steps:\n      - run: kubectl set image deployment/api api=${{ needs.build.outputs.tag }} -n production\n\n  # Notify\n  notify:\n    needs: deploy-prod\n    runs-on: ubuntu-latest\n    steps:\n      - uses: 8398a7/action-slack@v3\n        with: { status: ${{ job.status }}, webhook_url: ${{ secrets.SLACK_WEBHOOK }} }",
+      "highlight": [
+        6,
+        7,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        31,
+        32,
+        33,
+        41,
+        42,
+        43,
+        44,
+        45,
+        49,
+        50,
+        51,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "test → build → scan → staging",
+            "done": true
+          },
+          {
+            "label": "Smoke tests validate staging",
+            "done": true
+          },
+          {
+            "label": "Manual approval → deploy prod",
+            "active": true
+          },
+          {
+            "label": "Slack notification"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

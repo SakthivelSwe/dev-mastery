@@ -133,7 +133,7 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
       case 'theory':
         return <MarkdownView source={topic.layers.theory} />;
       case 'visualizer':
-        return <VisualizerShell topicSlug={topicSlug} />;
+        return <VisualizerShell topicSlug={topicSlug} visualLayer={topic.layers.visual} />;
       case 'code':
         return (
           <div className="h-full">

@@ -1,0 +1,511 @@
+---
+slug: "spring-virtual-threads"
+title: "Spring Boot & Virtual Threads (Loom)"
+level: 4
+---
+
+## WHY
+
+Before Java 21 + Spring Boot 3.2, a blocking Spring Boot service capped out around 200 concurrent requests — the Tomcat pool's default `max: 200`. Anything more meant either raising the pool (and burning ~200 MB per 100 extra threads for stack space, plus context-switch overhead) or migrating to `WebFlux` (a full reactive rewrite). Virtual threads change the trade-off: keep the same blocking, familiar `@RestController` + JPA + `RestTemplate` code, flip a single config flag, and now the same JVM can serve tens of thousands of concurrent slow requests. This is the biggest single-line performance boost the Spring ecosystem has ever shipped.
+
+## THEORY
+
+### The single line that enables it
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+What Spring Boot 3.2+ swaps under the hood when this is `true`:
+
+| Component | Before | After |
+|-----------|--------|-------|
+| Tomcat request executor | Platform-thread pool (default 200) | `Executors.newVirtualThreadPerTaskExecutor()` — unbounded |
+| `@Async` default executor | `ThreadPoolTaskExecutor` (platform threads) | Virtual-thread-per-task executor |
+| `@Scheduled` scheduler | `ThreadPoolTaskScheduler` (platform threads) | `SimpleAsyncTaskScheduler` + virtual threads |
+| RabbitMQ / Kafka listener threads | Platform | Virtual |
+| WebFlux `Schedulers.boundedElastic()` | Unaffected | Unaffected (already M:N) |
+
+### The scaling story
+
+An 8-vCPU box running a service that spends 100 ms per request in blocking DB/HTTP calls:
+
+| Model | Realistic concurrency | Memory per request |
+|-------|----------------------|--------------------|
+| Platform threads, `max: 200` | 200 | ~1 MB each |
+| Platform threads, `max: 2000` | 2000 (borderline) | ~1 MB each + higher GC |
+| WebFlux (reactive) | Tens of thousands | ~few KB per request |
+| Virtual threads | Tens of thousands | ~few KB per request (heap continuations) |
+
+Virtual threads deliver the WebFlux scaling profile with plain blocking code.
+
+### What virtual threads DON'T help with
+
+- **CPU-bound work.** No speedup — they still run on the same carrier platform threads. Compute-heavy work still needs `ForkJoinPool` / `parallelStream`.
+- **`synchronized` hot paths.** VTs pin their carrier while holding a monitor (Java 21 behavior; fixed in 24+). Replace with `ReentrantLock`.
+- **JNI or native code**. Same pinning issue.
+- **Existing thread-pool tuning.** Since VTs are cheap, pool tuning becomes irrelevant — but if you kept explicit executors around (e.g., for isolation), they still work.
+
+### Detecting pinning
+
+```yaml
+management:
+  metrics:
+    binders:
+      jvm-info:
+        enabled: true
+```
+Plus JVM flag: `-Djdk.tracePinnedThreads=full` — logs every pinning event with the offending stack. As of Spring Boot 3.2, they're logged as WARN.
+
+Common pinning culprits in real apps:
+- `synchronized` inside `RestTemplate` / older `HikariCP` versions (fixed in latest).
+- `synchronized` in your own singletons that do I/O — replace with `ReentrantLock`.
+- JNI-based libraries (native crypto, image processing).
+
+### `@Async` + virtual threads = fire-and-forget at scale
+
+With virtual threads enabled, `@Async` uses `AsyncTaskExecutor` backed by virtual threads. That means fire-and-forget email sends, audit logs, and metrics events cost essentially nothing. You can `@Async` far more aggressively than before.
+
+### Structured concurrency (JEP 453, preview)
+
+Not enabled by default in Spring Boot yet, but pairs beautifully with virtual threads. `StructuredTaskScope.ShutdownOnFailure` lets a controller fan out to N downstream services with automatic cancellation and error propagation — the modern replacement for hand-rolled `CompletableFuture.allOf` fan-outs.
+
+### When to STILL use WebFlux instead
+
+- Server-sent events / WebSocket streaming — a natural fit for reactive.
+- You already use reactive drivers (Reactor Kafka, R2DBC) and want end-to-end back-pressure.
+- Deep functional pipelines that read cleanly as `Flux` operators.
+
+For everything else — a plain REST service with blocking JPA / HttpClient / JDBC — virtual threads win on readability, debug-ability, and ecosystem support.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "Config.java",
+  "steps": [
+    {
+      "title": "Enable in one line",
+      "description": "Spring Boot 3.2+ on Java 21+: one YAML flag switches Tomcat, @Async default executor, and @Scheduled scheduler to virtual threads.",
+      "code": "spring:\n  threads:\n    virtual:\n      enabled: true",
+      "language": "yaml",
+      "highlight": [
+        4
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "One flag — three swaps",
+        "items": [
+          {
+            "label": "Tomcat executor",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "@Async default",
+            "color": "#10b981"
+          },
+          {
+            "label": "@Scheduled sched",
+            "color": "#10b981"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Before — 200 platform threads",
+      "description": "Default Tomcat pool is 200. A slow endpoint (2s per request) can serve at most ~100 req/s before requests start timing out.",
+      "code": "server:\n  tomcat:\n    threads: { max: 200 }\n# Under load: 200 threads busy, next requests queue and time out.",
+      "language": "yaml",
+      "highlight": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 20,
+        "workers": [
+          {
+            "name": "http-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "http-200",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "req0",
+            "highlight": false
+          },
+          {
+            "label": "req1",
+            "highlight": false
+          },
+          {
+            "label": "req2",
+            "highlight": false
+          },
+          {
+            "label": "req3",
+            "highlight": false
+          },
+          {
+            "label": "req4",
+            "highlight": false
+          },
+          {
+            "label": "req5",
+            "highlight": false
+          },
+          {
+            "label": "req6",
+            "highlight": false
+          },
+          {
+            "label": "req7",
+            "highlight": false
+          },
+          {
+            "label": "req8",
+            "highlight": false
+          },
+          {
+            "label": "req9",
+            "highlight": false
+          },
+          {
+            "label": "req10",
+            "highlight": false
+          },
+          {
+            "label": "req11",
+            "highlight": false
+          },
+          {
+            "label": "req12",
+            "highlight": false
+          },
+          {
+            "label": "req13",
+            "highlight": true
+          },
+          {
+            "label": "req14",
+            "highlight": true
+          },
+          {
+            "label": "req15",
+            "highlight": true
+          },
+          {
+            "label": "req16",
+            "highlight": true
+          },
+          {
+            "label": "req17",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "After — unbounded virtual threads",
+      "description": "Tomcat swaps its request executor for newVirtualThreadPerTaskExecutor. Each request runs on its own virtual thread. Blocking JPA / RestClient / JDBC all work unchanged.",
+      "code": "// (No code change on the endpoint!)\n@GetMapping(\"/slow\")\npublic String slow() {\n    String body = restClient.get()\n        .uri(\"https://httpbin.org/delay/2\").retrieve().body(String.class);\n    return \"ok \" + Thread.currentThread().isVirtual();   // → true\n}",
+      "highlight": [
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 10,
+        "workers": [
+          {
+            "name": "carrier-1",
+            "state": "RUNNABLE",
+            "note": "2 vts mounted"
+          },
+          {
+            "name": "carrier-2",
+            "state": "RUNNABLE",
+            "note": "1 vt mounted"
+          }
+        ],
+        "queue": [
+          {
+            "label": "vt-38"
+          },
+          {
+            "label": "vt-39"
+          },
+          {
+            "label": "vt-40"
+          },
+          {
+            "label": "vt-41"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Pinning — detect and fix",
+      "description": "A virtual thread cannot be unmounted while holding a `synchronized` monitor. That pins the carrier. Detect with -Djdk.tracePinnedThreads=full, then replace with ReentrantLock.",
+      "code": "// PIN — carrier is stuck for 2s\nsynchronized (cacheLock) {\n    return restClient.get()...body(String.class);\n}\n\n// FIX\nlock.lock();\ntry { return restClient.get()...body(String.class); }\nfinally { lock.unlock(); }",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Pinning triggers",
+        "items": [
+          {
+            "label": "synchronized + blocking I/O",
+            "color": "#ef4444",
+            "highlight": true
+          },
+          {
+            "label": "JNI + blocking I/O",
+            "color": "#ef4444"
+          },
+          {
+            "label": "ReentrantLock + blocking I/O",
+            "color": "#10b981"
+          }
+        ]
+      }
+    },
+    {
+      "title": "When virtual threads DON'T help",
+      "description": "CPU-bound work: no speedup — same carriers underneath. WebFlux: still preferable for SSE / WebSocket / end-to-end reactive back-pressure. Everything else — plain REST + JPA — virtual threads win.",
+      "code": "// STILL use ForkJoin for CPU\nparallelStream()... // don't force onto virtual threads\n\n// STILL WebFlux for streaming\n@GetMapping(produces = MediaType.TEXT_EVENT_STREAM_VALUE)\npublic Flux<Event> stream() { return sse; }",
+      "diagram": {
+        "kind": "boxes",
+        "title": "Choose your model",
+        "items": [
+          {
+            "label": "Blocking REST + JPA",
+            "color": "#10b981",
+            "value": "Virtual threads",
+            "highlight": true
+          },
+          {
+            "label": "CPU-bound compute",
+            "color": "#818cf8",
+            "value": "ForkJoinPool"
+          },
+          {
+            "label": "SSE / WebSocket / R2DBC",
+            "color": "#818cf8",
+            "value": "WebFlux"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Enable and observe
+```yaml
+# application.yml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+```java
+@RestController
+class DemoController {
+    @GetMapping("/thread")
+    public String currentThread() {
+        Thread t = Thread.currentThread();
+        return String.format("name=%s virtual=%s daemon=%s",
+                t.getName(), t.isVirtual(), t.isDaemon());
+    }
+}
+```
+Hit `/thread`. With the flag on: `virtual=true`, name like `VirtualThread[#39]/runnable@ForkJoinPool-1-worker-3`. With the flag off: `virtual=false`, name `http-nio-8080-exec-1`.
+
+### Level 2 — Compare throughput of a slow endpoint
+```java
+@RestController
+class SlowController {
+    private final RestClient http = RestClient.builder().build();
+
+    @GetMapping("/slow")
+    public Map<String, Object> slow() {
+        String body = http.get()
+                .uri("https://httpbin.org/delay/2")
+                .retrieve()
+                .body(String.class);
+        return Map.of("virtual", Thread.currentThread().isVirtual(),
+                      "len", body == null ? 0 : body.length());
+    }
+}
+```
+Load test with `wrk -t4 -c500 -d30s http://localhost:8080/slow`:
+- Without virtual threads (`max: 200`): ~100 req/s, 200 in-flight at once, others queue and time out.
+- With virtual threads: ~250 req/s (2-second endpoint → theoretical max is 500-750 depending on JVM), 500 concurrent handled cleanly.
+
+### Level 3 — Custom virtual-thread executor bean
+```java
+@Configuration
+class ExecConfig {
+    // Override the default @Async executor when you want fine control
+    @Bean("virtualExecutor")
+    public AsyncTaskExecutor virtualExecutor() {
+        return new TaskExecutorAdapter(Executors.newVirtualThreadPerTaskExecutor());
+    }
+}
+
+@Service
+class Notifier {
+    @Async("virtualExecutor")
+    public CompletableFuture<Boolean> sendEmail(String to) {
+        // Blocking SMTP call — cheap on a virtual thread
+        return CompletableFuture.completedFuture(true);
+    }
+}
+```
+
+### Level 4 — Detecting pinning under load
+```java
+// Start the JVM with:
+//   -Djdk.tracePinnedThreads=full
+//
+// Sample offending code:
+@RestController
+class BadController {
+    private static final Object cacheLock = new Object();
+    private final RestClient http = RestClient.builder().build();
+
+    @GetMapping("/pinning-bug")
+    public String buggy() {
+        synchronized (cacheLock) {                     // grabs a monitor
+            return http.get()                          // then does BLOCKING I/O
+                    .uri("https://httpbin.org/delay/1")
+                    .retrieve().body(String.class);
+        }
+    }
+}
+// JVM log during load: "Thread parked while holding monitor" + full stack trace.
+```
+Fix:
+```java
+private static final ReentrantLock cacheLock = new ReentrantLock();
+
+@GetMapping("/fixed")
+public String fixed() {
+    cacheLock.lock();
+    try { return http.get().uri(...).retrieve().body(String.class); }
+    finally { cacheLock.unlock(); }
+}
+```
+
+### Level 5 — Structured Concurrency for a BFF endpoint
+```java
+@RestController
+class ProfileController {
+
+    private final UserService     users;
+    private final OrderService    orders;
+    private final WishlistService wishlists;
+
+    ProfileController(UserService u, OrderService o, WishlistService w) {
+        this.users = u; this.orders = o; this.wishlists = w;
+    }
+
+    @GetMapping("/profile/{id}")
+    public ProfileView profile(@PathVariable long id) throws Exception {
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+            Supplier<User>        u = scope.fork(() -> users.load(id));
+            Supplier<List<Order>> o = scope.fork(() -> orders.recent(id));
+            Supplier<List<Product>> w = scope.fork(() -> wishlists.get(id));
+
+            scope.join()                                    // wait for all
+                 .throwIfFailed();                          // propagate first failure
+
+            return new ProfileView(u.get(), o.get(), w.get());
+        }
+    }
+}
+```
+Three concurrent downstream calls, automatic cancellation of siblings on any failure — zero leaked virtual threads. This replaces sprawling `CompletableFuture.allOf(...).thenApply(...)` chains.
+
+## REAL_WORLD
+
+**Enabling virtual threads in a production payment gateway (Q1 2024).** Before: 8-vCPU, 4 GB heap, `max: 200` Tomcat threads. Under peak Cyber Monday traffic — 4 000 req/s with average latency 380 ms — the pool saturated; P99 hit 3.2 s and 0.4% of requests returned 503.
+
+Single change: `spring.threads.virtual.enabled: true`. Result:
+- P50 latency dropped 220 ms → 180 ms (fewer context switches).
+- P99 latency dropped 3.2 s → 240 ms (no queue-wait).
+- 503 rate dropped to 0%.
+- Memory: modest increase (~50 MB) from virtual-thread heap continuations — trivial compared to the ~200 MB reduction from smaller platform-thread pools.
+
+The team then found one `synchronized`-inside-`HttpClient` warm-up path via `-Djdk.tracePinnedThreads`, converted it to `ReentrantLock`, and P99 dropped to 180 ms.
+
+## INTERVIEW
+
+**Q: What single Spring Boot property enables virtual threads?**
+A: `spring.threads.virtual.enabled=true` (available since Spring Boot 3.2 on Java 21+). It switches Tomcat's request handler, `@Async`'s default executor, and `@Scheduled`'s task scheduler to virtual-thread-based executors.
+
+**Q: What kinds of workloads benefit from virtual threads?**
+A: I/O-bound blocking workloads — endpoints that call databases, external HTTP services, message brokers. Virtual threads park cheaply during the wait. CPU-bound workloads see no benefit (they still need cores) and native/JNI code cannot use them.
+
+**Q: What is pinning and how do you fix it?**
+A: A virtual thread cannot be unmounted from its carrier while it holds a `synchronized` monitor or is inside JNI code. If it blocks in that state, the entire carrier is pinned — throughput collapses. Fix: replace `synchronized` with `ReentrantLock` on any code that might block. Detect with `-Djdk.tracePinnedThreads=full`.
+
+**Q: Should you still tune `server.tomcat.threads.max` when virtual threads are enabled?**
+A: No — Tomcat swaps to `newVirtualThreadPerTaskExecutor` which is unbounded. The setting is ignored. If you need to cap concurrency, do it explicitly with a `Semaphore` or via rate-limiting middleware.
+
+**Q: Do virtual threads replace WebFlux?**
+A: For plain REST + blocking client + JPA services — largely yes. Simpler code, same scaling profile. But WebFlux still wins for server-sent events, WebSocket streaming, end-to-end reactive back-pressure with reactive drivers (R2DBC, Reactor Kafka), or deep `Flux` operator pipelines.
+
+**Q: Does virtual-thread mode affect `@Async` methods?**
+A: Yes — the default `AsyncTaskExecutor` becomes a virtual-thread-per-task executor. Your existing bean-level `@Bean("myExecutor")` definitions are untouched; if you referenced them with `@Async("myExecutor")` they still use your custom pool. So you can mix: fire-and-forget on virtual threads, isolated bounded platform-thread pools for critical work with strict concurrency limits.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Before virtual threads, every phone call to your Spring app needed its own dedicated phone-agent, and the office only had 200 agents. If everyone called at once, callers 201+ heard "sorry, all agents busy — please hold." With virtual threads, one flip of a switch turns your office into a call-center with THOUSANDS of "virtual" agents (Spring's helpers), all sharing a small crew of real workers behind the scenes. When one virtual agent is listening on hold, they hand the phone back to the real crew, who serve other calls. Nobody hears "all agents busy" until you're at truly-huge scale.
+
+## BUILD
+
+Build a **fan-out benchmark**:
+1. `@RestController` endpoint `GET /fan-out/{n}` — makes N concurrent HTTP calls to an external delay endpoint (e.g., `httpbin.org/delay/2`).
+2. Version A: use `CompletableFuture.supplyAsync(...)` with a `ThreadPoolTaskExecutor(20 threads, queue 100)`.
+3. Version B: use `StructuredTaskScope.ShutdownOnFailure` with `newVirtualThreadPerTaskExecutor()`.
+4. Load test with `wrk -c50 -d30s http://localhost:8080/fan-out/50`.
+5. Compare P50/P99 latencies and throughput. Log CPU/RSS via `jcmd VM.native_memory`.
+6. **Bonus**: enable `-Djdk.tracePinnedThreads=full`, deliberately introduce a `synchronized` block in one of the downstream calls, observe the pinning log, then fix with `ReentrantLock`.
+
+## SPACED REVIEW
+
+**Day 1**: Write the YAML flag that enables virtual threads in Spring Boot 3.2+.
+**Day 3**: Explain why virtual threads don't speed up CPU-bound work.
+**Day 7**: Show the fix for a pinned virtual thread caused by `synchronized` around a blocking HTTP call.
+**Day 14**: Given a payment gateway currently on WebFlux, list two reasons TO migrate to virtual threads and two reasons NOT to.
+

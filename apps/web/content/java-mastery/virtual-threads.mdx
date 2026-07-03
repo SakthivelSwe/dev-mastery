@@ -150,11 +150,216 @@ try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
 ## VISUALIZATION_CONFIG
 ```json
 {
-  "type": "none"
+  "language": "java",
+  "fileName": "VirtualThreads.java",
+  "steps": [
+    {
+      "title": "Platform threads — 1:1 with OS",
+      "description": "Every Thread is a native OS thread. ~1 MB stack, ~1 ms creation. Practical limit: 10-20 thousand.",
+      "code": "Thread t = new Thread(() -> handle(req));\nt.start();\n// Native OS thread created. Costly.",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Old model (1:1)",
+        "items": [
+          {
+            "label": "Thread",
+            "value": "1 MB stack",
+            "color": "#ef4444"
+          },
+          {
+            "label": "OS thread",
+            "value": "kernel",
+            "color": "#ef4444"
+          },
+          {
+            "label": "CPU core"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Virtual threads — M:N",
+      "description": "A virtual thread is a lightweight Java object scheduled by the JVM on a small pool of platform CARRIER threads. Millions per JVM. Cost: ~1 KB heap, ~1 µs creation.",
+      "code": "Thread.ofVirtual().start(() -> handle(req));\n// JVM parks/mounts the virtual thread on any carrier",
+      "highlight": [
+        1,
+        2
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "New model (M:N)",
+        "items": [
+          {
+            "label": "vt1",
+            "color": "#818cf8"
+          },
+          {
+            "label": "vt2",
+            "color": "#818cf8"
+          },
+          {
+            "label": "vt3",
+            "color": "#818cf8"
+          },
+          {
+            "label": "vt4",
+            "color": "#818cf8"
+          },
+          {
+            "label": "↕ carrier",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "CPU core"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Blocking is cheap — the JVM unmounts",
+      "description": "When a virtual thread calls a blocking JDK API (Socket, HTTP, JDBC), the JVM unmounts the virtual thread — copies its stack to the heap — and frees the carrier for another virtual thread.",
+      "code": "Thread.ofVirtual().start(() -> {\n    HttpResponse<String> r = client.send(req, ofString());\n    process(r);\n});",
+      "highlight": [
+        2
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "vt",
+          "JVM",
+          "carrier",
+          "OS"
+        ],
+        "messages": [
+          {
+            "from": "vt",
+            "to": "OS",
+            "label": "socket.read()"
+          },
+          {
+            "from": "JVM",
+            "to": "carrier",
+            "label": "unmount vt"
+          },
+          {
+            "from": "carrier",
+            "to": "JVM",
+            "label": "ready for another vt"
+          },
+          {
+            "from": "OS",
+            "to": "JVM",
+            "label": "data ready"
+          },
+          {
+            "from": "JVM",
+            "to": "vt",
+            "label": "remount + resume"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Pinning — the one footgun",
+      "description": "A virtual thread canNOT be unmounted while holding a synchronized monitor or inside JNI. Blocking there PINS the carrier. Fix: use ReentrantLock instead of synchronized on hot paths.",
+      "code": "// PINNING\nsynchronized (lock) {\n    slowHttpCall();      // carrier is stuck!\n}\n\n// FIXED\nLock l = new ReentrantLock();\nl.lock(); try { slowHttpCall(); } finally { l.unlock(); }\n// Detect: -Djdk.tracePinnedThreads=full",
+      "highlight": [
+        2,
+        3,
+        4,
+        8,
+        9
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Pinning triggers",
+        "items": [
+          {
+            "label": "synchronized",
+            "color": "#ef4444",
+            "highlight": true
+          },
+          {
+            "label": "JNI",
+            "color": "#ef4444"
+          },
+          {
+            "label": "ReentrantLock",
+            "color": "#10b981"
+          },
+          {
+            "label": "BlockingQueue",
+            "color": "#10b981"
+          }
+        ]
+      }
+    },
+    {
+      "title": "newVirtualThreadPerTaskExecutor",
+      "description": "The recommended production API. Executes each task on a fresh virtual thread. Do NOT pool virtual threads — they are cheap and pooling defeats the point (and leaks ThreadLocal state).",
+      "code": "try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (URL url : urls) exec.submit(() -> fetch(url));\n}   // try-with-resources → clean shutdown",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "threadpool",
+        "capacity": 10,
+        "workers": [
+          {
+            "name": "carrier-1",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "carrier-2",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "carrier-3",
+            "state": "RUNNABLE"
+          },
+          {
+            "name": "carrier-4",
+            "state": "RUNNABLE"
+          }
+        ],
+        "queue": [
+          {
+            "label": "vt5"
+          },
+          {
+            "label": "vt6"
+          },
+          {
+            "label": "vt7"
+          },
+          {
+            "label": "vt8"
+          },
+          {
+            "label": "vt9"
+          },
+          {
+            "label": "vt10"
+          },
+          {
+            "label": "vt11"
+          },
+          {
+            "label": "vt12"
+          }
+        ]
+      }
+    }
+  ]
 }
 ```
-
----
 
 ## CODE
 

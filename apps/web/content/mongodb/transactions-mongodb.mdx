@@ -23,7 +23,236 @@ Modern MongoDB transactions are specifically referring to **Multi-Document** tra
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "mongo-transactions" }
+{
+  "language": "javascript",
+  "fileName": "transactions.js",
+  "steps": [
+    {
+      "title": "Multi-document transactions",
+      "description": "MongoDB 4.0+ supports ACID multi-document transactions across collections. Required for operations that must be atomic across multiple documents.",
+      "code": "const session = client.startSession();\n\ntry {\n  session.startTransaction({\n    readConcern: { level: \"snapshot\" },\n    writeConcern: { w: \"majority\" }\n  });\n\n  await accountsCol.updateOne(\n    { _id: fromId },\n    { $inc: { balance: -amount } },\n    { session }\n  );\n\n  await accountsCol.updateOne(\n    { _id: toId },\n    { $inc: { balance: +amount } },\n    { session }\n  );\n\n  await session.commitTransaction();\n} catch (err) {\n  await session.abortTransaction();\n  throw err;\n} finally {\n  await session.endSession();\n}",
+      "highlight": [
+        1,
+        4,
+        9,
+        15,
+        21,
+        23,
+        26
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "App",
+          "MongoDB Primary",
+          "Replica"
+        ],
+        "messages": [
+          {
+            "from": "App",
+            "to": "MongoDB Primary",
+            "label": "startTransaction"
+          },
+          {
+            "from": "App",
+            "to": "MongoDB Primary",
+            "label": "updateOne (debit)"
+          },
+          {
+            "from": "App",
+            "to": "MongoDB Primary",
+            "label": "updateOne (credit)"
+          },
+          {
+            "from": "App",
+            "to": "MongoDB Primary",
+            "label": "commitTransaction"
+          },
+          {
+            "from": "MongoDB Primary",
+            "to": "Replica",
+            "label": "replicate oplog"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transaction isolation and read concern",
+      "description": "snapshot read concern gives a consistent view of data as of the transaction start. No \"dirty reads\" — each transaction sees a stable snapshot.",
+      "code": "session.startTransaction({\n  readConcern: { level: \"snapshot\" },    // consistent view\n  writeConcern: { w: \"majority\", j: true } // durable commit\n});\n\n// Within transaction:\n// All reads see data as of transaction start time\n// Other concurrent transactions don't affect our reads\n// Our writes are invisible to others until commit\n\n// readConcern levels:\n// majority: committed by majority of replicas\n// snapshot: point-in-time view (transactions only)\n// linearizable: latest committed (single doc reads)",
+      "highlight": [
+        2,
+        3,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Read concern levels",
+        "items": [
+          {
+            "label": "snapshot",
+            "color": "#10b981",
+            "value": "Consistent point-in-time for transactions",
+            "highlight": true
+          },
+          {
+            "label": "majority",
+            "color": "#818cf8",
+            "value": "Data acknowledged by majority replicas"
+          },
+          {
+            "label": "local",
+            "color": "#f59e0b",
+            "value": "Data on local node (may be rolled back)"
+          },
+          {
+            "label": "linearizable",
+            "color": "#60a5fa",
+            "value": "Absolutely latest write (slow)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transactional patterns",
+      "description": "Use transactions for transfer operations, order placement, inventory reservations — any multi-collection writes that must be atomic.",
+      "code": "// Order + inventory transaction\nasync function placeOrder(userId, productId, qty) {\n  const session = client.startSession();\n  session.startTransaction();\n  try {\n    // 1. Check + decrement inventory\n    const inv = await inventory.findOneAndUpdate(\n      { productId, stock: { $gte: qty } },\n      { $inc: { stock: -qty } },\n      { session, returnDocument: 'after' }\n    );\n    if (!inv) throw new Error(\"Out of stock\");\n\n    // 2. Create order\n    await orders.insertOne({\n      userId, productId, qty,\n      status: \"confirmed\", createdAt: new Date()\n    }, { session });\n\n    await session.commitTransaction();\n    return inv;\n  } catch(e) {\n    await session.abortTransaction();\n    throw e;\n  } finally { await session.endSession(); }\n}",
+      "highlight": [
+        7,
+        8,
+        9,
+        11,
+        15,
+        16,
+        17,
+        20
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Start transaction + session",
+            "done": true
+          },
+          {
+            "label": "findOneAndUpdate inventory atomically",
+            "done": true
+          },
+          {
+            "label": "insertOne order document",
+            "active": true
+          },
+          {
+            "label": "commit or abort on error"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Transaction limitations",
+      "description": "MongoDB transactions have overhead. Best practices: keep transactions short (<1 second), avoid holding locks, use single-document atomic operations when possible.",
+      "code": "// PREFER single-document atomics (no transaction)\nawait col.findOneAndUpdate(\n  { _id: id, version: currentVersion },\n  { $set: { data: newData }, $inc: { version: 1 } },\n  { returnDocument: 'after' }\n);\n// Optimistic concurrency via version field\n\n// Transaction limits:\n// - 1000 documents max modified per transaction (MongoDB 4.4)\n// - 16MB oplog entry size limit\n// - Default 60s transaction lifetime\n// - WiredTiger: snapshot isolation per transaction\n\n// Retry logic for transient errors\nconst TRANSIENT_ERR = 112;  // WriteConflict\nif (err.code === TRANSIENT_ERR) retryTransaction();",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        10,
+        11,
+        12,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Transaction best practices",
+        "items": [
+          {
+            "label": "Keep short",
+            "color": "#10b981",
+            "value": "< 1 second ideally",
+            "highlight": true
+          },
+          {
+            "label": "Single-doc atomics first",
+            "color": "#818cf8",
+            "value": "No transaction overhead"
+          },
+          {
+            "label": "Retry on WriteConflict (112)",
+            "color": "#f59e0b",
+            "value": "Transient error — safe to retry"
+          },
+          {
+            "label": "Avoid cross-shard (expensive)",
+            "color": "#ef4444",
+            "value": "Distributed two-phase commit"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Distributed transactions across shards",
+      "description": "Cross-shard transactions use two-phase commit (2PC) internally — more expensive. Minimize by designing schemas so related data lives on the same shard.",
+      "code": "// Cross-shard transaction (2PC internally)\n// Expensive but supported since MongoDB 4.2\nsession.startTransaction();\n\nawait usersCol.updateOne(   // hits shard A\n  { _id: userId }, { $inc: { orderCount: 1 } },\n  { session }\n);\nawait ordersCol.insertOne(  // hits shard B\n  { userId, items, total },\n  { session }\n);\n\nawait session.commitTransaction();\n// 2PC: prepare on all shards → commit on all shards\n// If any shard fails → abort all shards",
+      "highlight": [
+        5,
+        6,
+        9,
+        10,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "App",
+          "Shard A",
+          "Shard B",
+          "Config"
+        ],
+        "messages": [
+          {
+            "from": "App",
+            "to": "Shard A",
+            "label": "prepare (lock)"
+          },
+          {
+            "from": "App",
+            "to": "Shard B",
+            "label": "prepare (lock)"
+          },
+          {
+            "from": "Shard A",
+            "to": "Config",
+            "label": "prepared OK"
+          },
+          {
+            "from": "Shard B",
+            "to": "Config",
+            "label": "prepared OK"
+          },
+          {
+            "from": "App",
+            "to": "Shard A",
+            "label": "commit"
+          },
+          {
+            "from": "App",
+            "to": "Shard B",
+            "label": "commit"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

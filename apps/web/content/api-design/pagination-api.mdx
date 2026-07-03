@@ -16,7 +16,274 @@ If your database has 10 million users, and a mobile app calls `GET /users`, what
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeRunner", "state": "pagination-api" }
+{
+  "language": "http",
+  "fileName": "pagination.http",
+  "steps": [
+    {
+      "title": "Offset-based pagination",
+      "description": "Simple: page + pageSize (or limit + offset). Easy to jump to any page. Downside: performance degrades on deep pages, unstable if data changes.",
+      "code": "# Offset pagination\nGET /topics?page=2&pageSize=20\n\n→ 200\n{\n  \"data\": [ ... 20 items ... ],\n  \"meta\": {\n    \"page\": 2,\n    \"pageSize\": 20,\n    \"total\": 1250,\n    \"totalPages\": 63\n  },\n  \"links\": {\n    \"self\":  \"/topics?page=2&pageSize=20\",\n    \"prev\":  \"/topics?page=1&pageSize=20\",\n    \"next\":  \"/topics?page=3&pageSize=20\",\n    \"first\": \"/topics?page=1&pageSize=20\",\n    \"last\":  \"/topics?page=63&pageSize=20\"\n  }\n}\n\n# SQL: LIMIT + OFFSET\nSELECT * FROM topics ORDER BY created_at DESC LIMIT 20 OFFSET 20;\n\n# Downsides:\n# - Deep pages slow: OFFSET 1000000 scans 1M rows!\n# - Inconsistent: item inserted between requests → skipped or duplicated",
+      "highlight": [
+        2,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        23,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Offset pagination",
+        "items": [
+          {
+            "label": "Simple to implement",
+            "color": "#10b981",
+            "value": "LIMIT/OFFSET everywhere",
+            "highlight": true
+          },
+          {
+            "label": "Jump to any page",
+            "color": "#818cf8",
+            "value": "Show total pages, page numbers"
+          },
+          {
+            "label": "Deep page problem",
+            "color": "#ef4444",
+            "value": "OFFSET 1M scans 1M rows"
+          },
+          {
+            "label": "Unstable on updates",
+            "color": "#f59e0b",
+            "value": "Duplicates/skips if data changes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cursor-based pagination",
+      "description": "Use a cursor (opaque token) that points to the next result. Fast at any depth, stable across inserts. But no \"jump to page N\".",
+      "code": "# First request — no cursor\nGET /topics?pageSize=20\n\n→ 200\n{\n  \"data\": [ ... 20 items ... ],\n  \"meta\": { \"pageSize\": 20, \"hasMore\": true },\n  \"links\": {\n    \"next\": \"/topics?pageSize=20&cursor=eyJpZCI6MTAwLCJ0cyI6MTcyMDAwMH0\"\n  }\n}\n\n# Client follows next link\nGET /topics?pageSize=20&cursor=eyJpZCI6MTAwLCJ0cyI6MTcyMDAwMH0\n# Cursor decoded: { \"id\": 100, \"ts\": 1720000 }\n\n# SQL: index-friendly WHERE clause\nSELECT * FROM topics\nWHERE (created_at, id) < ('2026-07-03', 100)  # after cursor\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n\n# Cursor = base64(JSON of last row's sort keys)\n# Uses index efficiently at any depth",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Client",
+          "API",
+          "DB"
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "API",
+            "label": "GET /topics?pageSize=20"
+          },
+          {
+            "from": "API",
+            "to": "DB",
+            "label": "SELECT ... ORDER BY ts, id LIMIT 20"
+          },
+          {
+            "from": "API",
+            "to": "Client",
+            "label": "data + next cursor (last row)"
+          },
+          {
+            "from": "Client",
+            "to": "API",
+            "label": "GET /topics?cursor=X"
+          },
+          {
+            "from": "API",
+            "to": "DB",
+            "label": "SELECT WHERE (ts,id) < cursor LIMIT 20"
+          },
+          {
+            "from": "API",
+            "to": "Client",
+            "label": "next 20 items"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Keyset (seek) pagination",
+      "description": "Cursor pagination with a sort key. WHERE last_key < cursor uses the index. Fastest for infinite scroll / feeds.",
+      "code": "# Keyset pagination\n# Sort by created_at DESC + id DESC (tie-breaker)\n\n# First page\nSELECT * FROM topics\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n\n# Response includes last row's (created_at, id) as cursor\n\n# Next page\nSELECT * FROM topics\nWHERE (created_at, id) < ('2026-07-03T09:00:00Z', 100)\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n\n# Index makes this instant:\nCREATE INDEX idx_topics_ts_id ON topics (created_at DESC, id DESC);\n\n# Perfect for:\n# - Twitter feeds\n# - Infinite scroll\n# - Real-time lists that grow\n\n# NOT good for:\n# - Random access (\"jump to page 100\")\n# - Total count required",
+      "highlight": [
+        5,
+        6,
+        7,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Keyset benefits",
+        "items": [
+          {
+            "label": "Fast at any depth",
+            "color": "#10b981",
+            "value": "Index seek — no scan",
+            "highlight": true
+          },
+          {
+            "label": "Stable across inserts",
+            "color": "#818cf8",
+            "value": "New items don't affect existing pages"
+          },
+          {
+            "label": "No random access",
+            "color": "#ef4444",
+            "value": "Must page forward from start"
+          },
+          {
+            "label": "No total count",
+            "color": "#f59e0b",
+            "value": "Hard to compute cheaply"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Choosing pagination style",
+      "description": "Use offset for admin UIs with jump-to-page. Use cursor for user feeds and infinite scroll. Sometimes provide both.",
+      "code": "# Decision tree:\n\n# Do users need to jump to specific page?\n# ├── Yes: offset pagination\n# │   └── Example: admin table with page numbers\n# └── No: cursor / keyset\n#     └── Example: Twitter feed, product list, notifications\n\n# Is dataset huge (>100k rows)?\n# ├── Yes: cursor / keyset (deep offset is slow)\n# └── No: either works\n\n# Do users insert data frequently?\n# ├── Yes: cursor (stable)\n# └── No: offset OK\n\n# Real-world example:\n# - /admin/users?page=5           (offset — admin)\n# - /feed?cursor=abc              (cursor — user feed)\n# - /search?page=1&pageSize=10    (offset — small result sets)\n# - /notifications?cursor=abc     (cursor — real-time)",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        21
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Admin/search UI: offset (jump to page)",
+            "done": true
+          },
+          {
+            "label": "Feed/scroll: cursor (fast + stable)",
+            "done": true
+          },
+          {
+            "label": "Provide both when different clients need both",
+            "active": true
+          },
+          {
+            "label": "Document the pattern in API docs"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Pagination best practices",
+      "description": "Set reasonable defaults and maximums. Return next/prev links, not just page numbers. Include hasMore flag.",
+      "code": "# Sensible defaults + limits\nconst DEFAULT_PAGE_SIZE = 20;\nconst MAX_PAGE_SIZE = 100;  # prevent abuse\n\nfunction paginate(req) {\n  const pageSize = Math.min(\n    parseInt(req.query.pageSize) || DEFAULT_PAGE_SIZE,\n    MAX_PAGE_SIZE\n  );\n  const page = Math.max(1, parseInt(req.query.page) || 1);\n  return { limit: pageSize, offset: (page - 1) * pageSize };\n}\n\n# Response includes:\n{\n  \"data\": [ ... ],\n  \"meta\": {\n    \"page\": 2,\n    \"pageSize\": 20,\n    \"total\": 1250,      # optional (skip for cursor)\n    \"hasMore\": true      # simpler than total\n  },\n  \"links\": {\n    \"next\": \"/topics?page=3\",\n    \"prev\": \"/topics?page=1\"\n  }\n}\n\n# Anti-patterns:\n# ❌ No pagination — returns all rows\n# ❌ No max — client requests pageSize=100000",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Pagination hygiene",
+        "items": [
+          {
+            "label": "Cap pageSize",
+            "color": "#10b981",
+            "value": "Max 100 — prevent huge responses",
+            "highlight": true
+          },
+          {
+            "label": "Sensible default",
+            "color": "#818cf8",
+            "value": "20-25 items per page"
+          },
+          {
+            "label": "hasMore flag",
+            "color": "#f59e0b",
+            "value": "Simpler than total for cursor"
+          },
+          {
+            "label": "Next/prev links",
+            "color": "#60a5fa",
+            "value": "HATEOAS — self-descriptive"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

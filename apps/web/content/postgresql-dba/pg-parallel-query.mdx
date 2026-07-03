@@ -19,7 +19,280 @@ Parallel execution is coordinated by a special Query Planner node called **Gathe
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-parallel" }
+{
+  "language": "sql",
+  "fileName": "parallel.sql",
+  "steps": [
+    {
+      "title": "Parallel query overview",
+      "description": "PostgreSQL parallelizes some queries automatically. Big scans, aggregates, and joins use worker processes for speedup on multi-core systems.",
+      "code": "-- Enable parallel query (usually on by default)\nSHOW max_parallel_workers_per_gather;    -- 2 (default)\nSHOW max_parallel_workers;                -- 8\nSHOW max_worker_processes;                -- 8\n\n-- Tune for parallel-friendly queries\nALTER SYSTEM SET max_parallel_workers = 8;\nALTER SYSTEM SET max_parallel_workers_per_gather = 4;\nALTER SYSTEM SET parallel_setup_cost = 100;\nALTER SYSTEM SET parallel_tuple_cost = 0.01;\n\n-- Force parallel (for testing)\nSET force_parallel_mode = on;\nSET min_parallel_table_scan_size = 0;\n\n-- Simple parallel scan\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT count(*) FROM events WHERE created_at > '2025-01-01';\n\n Gather  (cost=1234.5..1234.6 rows=1 width=8) (actual time=200ms rows=1)\n   Workers Planned: 2\n   Workers Launched: 2\n   ->  Partial Aggregate  (actual time=190ms rows=3)\n         ->  Parallel Seq Scan on events (actual rows=333,333)\n\n-- Speedup vs sequential\n-- Sequential: 600ms\n-- 2 workers:  250ms  (~2.5x)\n-- 4 workers:  180ms  (~3.5x, diminishing returns)",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        27,
+        28,
+        29
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Query planner chooses parallel plan",
+            "done": true
+          },
+          {
+            "label": "Leader spawns worker processes",
+            "done": true
+          },
+          {
+            "label": "Each worker scans a portion",
+            "active": true
+          },
+          {
+            "label": "Leader gathers + aggregates results"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Which operations parallelize",
+      "description": "Parallel: sequential scan, index scan (some), joins (hash, nested loop, merge), aggregate. NOT parallel: CTE, subquery in some forms, small tables.",
+      "code": "-- ✅ Parallel-capable:\n\n-- Sequential Scan\nEXPLAIN SELECT * FROM events WHERE type = 'view';\n-- Parallel Seq Scan\n\n-- Aggregate\nEXPLAIN SELECT count(*), sum(amount) FROM orders;\n-- Parallel Seq Scan → Partial Aggregate → Gather → Finalize Aggregate\n\n-- Hash Join\nEXPLAIN SELECT u.name, count(o.id)\nFROM users u JOIN orders o ON o.user_id = u.id\nGROUP BY u.name;\n-- Parallel Hash Join\n\n-- Bitmap Heap Scan (PG 10+)\nEXPLAIN SELECT * FROM orders WHERE status = 'pending' AND amount > 100;\n\n-- ❌ Not parallel:\n-- - Small tables (below min_parallel_table_scan_size = 8MB)\n-- - Cursor operations\n-- - CTE (WITH) that's referenced multiple times\n-- - LOCK TABLE\n-- - Volatile functions in query\n\n-- Force parallel-unsafe\nCREATE FUNCTION some_volatile_fn() RETURNS int AS $$\n  SELECT nextval('my_seq');\n$$ LANGUAGE sql VOLATILE PARALLEL UNSAFE;\n\n-- Mark function parallel safe when it is\nCREATE FUNCTION calc_tax(amt numeric) RETURNS numeric AS $$\n  SELECT amt * 0.15;\n$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Parallel operations",
+        "items": [
+          {
+            "label": "Seq Scan + Aggregate",
+            "color": "#10b981",
+            "value": "Perfect fit — big scans + counts",
+            "highlight": true
+          },
+          {
+            "label": "Hash Join",
+            "color": "#818cf8",
+            "value": "Parallel builds hash + probes"
+          },
+          {
+            "label": "Bitmap Heap Scan",
+            "color": "#f59e0b",
+            "value": "Parallel bitmap consumption"
+          },
+          {
+            "label": "Not parallel",
+            "color": "#ef4444",
+            "value": "Small tables, CTEs, volatile fns"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Parallel index and heap operations",
+      "description": "CREATE INDEX and VACUUM can run in parallel (PG 11-13+). Speeds up maintenance on huge tables.",
+      "code": "-- Parallel CREATE INDEX (PG 11+)\n-- Uses max_parallel_maintenance_workers\nSET max_parallel_maintenance_workers = 4;\n\nCREATE INDEX CONCURRENTLY idx_events_ts ON events (created_at);\n-- Uses parallel workers automatically\n\n-- CONCURRENTLY = no exclusive lock (essential for production!)\n\n-- Parallel VACUUM (PG 13+)\nVACUUM (PARALLEL 4) large_table;\n-- 4 workers process indexes in parallel\n\n-- Parallel ALTER TABLE (PG 11+)\n-- Some ALTER TABLE forms use parallel workers\n\n-- Settings\nmax_parallel_maintenance_workers = 4       -- for CREATE INDEX, VACUUM\nmaintenance_work_mem = 2GB                 -- more = faster maintenance\n\n-- Check parallel workers in use\nSELECT pid, application_name, backend_type, wait_event\nFROM pg_stat_activity\nWHERE backend_type = 'parallel worker';\n\n-- Real-world index build times\n-- 100M row table, single-threaded: 45 min\n-- 4 parallel workers:               13 min  (~3.5x speedup)",
+      "highlight": [
+        3,
+        5,
+        6,
+        8,
+        11,
+        12,
+        14,
+        15,
+        18,
+        19,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Parallel maintenance",
+        "items": [
+          {
+            "label": "CREATE INDEX",
+            "color": "#10b981",
+            "value": "Uses parallel_maintenance_workers",
+            "highlight": true
+          },
+          {
+            "label": "CONCURRENTLY",
+            "color": "#818cf8",
+            "value": "Non-blocking — always use in prod"
+          },
+          {
+            "label": "VACUUM PARALLEL",
+            "color": "#f59e0b",
+            "value": "PG 13+ — parallel index vacuum"
+          },
+          {
+            "label": "maintenance_work_mem",
+            "color": "#60a5fa",
+            "value": "Set high during builds — 2GB+"
+          }
+        ]
+      }
+    },
+    {
+      "title": "When parallel query hurts",
+      "description": "Parallel adds overhead. Small queries, high-concurrency workloads, or low-CPU systems may see slowdowns. Tune per workload.",
+      "code": "-- Parallel overhead sources:\n-- 1. Worker startup (~5-10 ms)\n-- 2. Inter-process communication\n-- 3. CPU cache thrashing on high concurrency\n\n-- Case where parallel hurts:\n\n-- Small table — parallel isn't worth it\nSET min_parallel_table_scan_size = 8MB;\n-- Tables smaller than 8MB stay sequential\n\n-- High-concurrency OLTP\n-- 100 concurrent queries × 4 workers each = 400 processes → contention\n\n-- Disable for specific workload\nSET max_parallel_workers_per_gather = 0;    -- session-level\n\n-- Per-role\nALTER ROLE app_user SET max_parallel_workers_per_gather = 0;\n\n-- Per-database\nALTER DATABASE devmastery SET max_parallel_workers_per_gather = 0;\n\n-- Tune costs (planner uses these)\nparallel_tuple_cost = 0.1                   -- transferring tuple to leader\nparallel_setup_cost = 1000                  -- worker startup\n-- Higher = less inclined to parallelize\n\n-- Compare plans\nSET max_parallel_workers_per_gather = 0;\nEXPLAIN ANALYZE SELECT count(*) FROM events;\n-- vs\nSET max_parallel_workers_per_gather = 4;\nEXPLAIN ANALYZE SELECT count(*) FROM events;",
+      "highlight": [
+        2,
+        3,
+        4,
+        8,
+        9,
+        10,
+        12,
+        13,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        25,
+        26,
+        27,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "When to avoid parallel",
+        "items": [
+          {
+            "label": "Small tables",
+            "color": "#ef4444",
+            "value": "Overhead > benefit",
+            "highlight": true
+          },
+          {
+            "label": "High OLTP concurrency",
+            "color": "#818cf8",
+            "value": "Too many processes"
+          },
+          {
+            "label": "Simple index lookups",
+            "color": "#f59e0b",
+            "value": "Point queries are sequential"
+          },
+          {
+            "label": "Per-role tuning",
+            "color": "#10b981",
+            "value": "Analytics user parallel, app user not"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Analyzing parallel plans",
+      "description": "EXPLAIN shows Gather and worker counts. ANALYZE shows actual worker distribution. Use to verify parallel is helping.",
+      "code": "-- EXPLAIN with details\nEXPLAIN (ANALYZE, BUFFERS, VERBOSE)\nSELECT date_trunc('day', created_at) AS day, count(*)\nFROM events\nWHERE type = 'view'\nGROUP BY 1\nORDER BY 1;\n\n-- Sample output:\n-- Finalize GroupAggregate  (actual time=1234ms rows=90)\n--   Group Key: (date_trunc('day', created_at))\n--   ->  Gather Merge  (actual rows=270 loops=1)\n--         Workers Planned: 2\n--         Workers Launched: 2                     <- verify workers launched\n--         ->  Sort  (actual time=1000ms rows=90 loops=3)\n--               ->  Partial HashAggregate\n--                     ->  Parallel Seq Scan on events\n--                           Filter: (type = 'view')\n--                           Rows Removed by Filter: 6,666,667\n--         Workers: 2                              <- distribution info\n--\n\n-- Verify workers were actually launched (not just planned)\n-- Planned 4, Launched 2 → shortage of max_parallel_workers slots\n\n-- Aggregate parallel workers over queries\nSELECT query, calls,\n       total_exec_time,\n       (planned_parallel_workers > 0) AS uses_parallel\nFROM pg_stat_statements\nWHERE planned_parallel_workers > 0\nORDER BY total_exec_time DESC;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "EXPLAIN ANALYZE shows Workers Planned/Launched",
+            "done": true
+          },
+          {
+            "label": "Planned > Launched → increase max_parallel_workers",
+            "done": true
+          },
+          {
+            "label": "Verify Partial→Finalize chain is working",
+            "active": true
+          },
+          {
+            "label": "Compare actual time vs sequential run"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

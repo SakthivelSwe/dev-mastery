@@ -9,6 +9,9 @@ public interface ContentService {
 
     List<TopicSummary> listTopics(String pathSlug, Integer level, int page, int size);
 
+    /** Case-insensitive search on topic title. Backs the {@code /v1/topics/search} endpoint. */
+    List<TopicSummary> searchTopics(String query, int limit);
+
     TopicDetail getTopicBySlug(String slug);
 
     List<PathSummary> listPaths();

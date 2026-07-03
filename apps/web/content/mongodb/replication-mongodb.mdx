@@ -22,7 +22,201 @@ When you update a document on the Primary, it writes a record of that operation 
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "mongo-replication" }
+{
+  "language": "javascript",
+  "fileName": "replication.js",
+  "steps": [
+    {
+      "title": "Replica set overview",
+      "description": "A replica set is a group of MongoDB servers that maintain the same data. One primary accepts writes; secondaries replicate. If primary fails, secondaries elect a new one.",
+      "code": "// Replica set connection string\nconst client = new MongoClient(\n  \"mongodb://mongo1:27017,mongo2:27017,mongo3:27017/mydb?replicaSet=rs0\"\n);\n\n// Check replica set status\nuse admin\nrs.status();\n// Shows: primary, secondaries, health, optime lag\n\n// Initiate replica set\nrs.initiate({\n  _id: \"rs0\",\n  members: [\n    { _id: 0, host: \"mongo1:27017\" },  // primary\n    { _id: 1, host: \"mongo2:27017\" },  // secondary\n    { _id: 2, host: \"mongo3:27017\", arbiterOnly: true }  // arbiter\n  ]\n});",
+      "highlight": [
+        3,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "threads",
+        "threads": [
+          {
+            "name": "Primary",
+            "state": "RUNNABLE",
+            "label": "Accepts reads + writes"
+          },
+          {
+            "name": "Secondary 1",
+            "state": "RUNNABLE",
+            "label": "Replicates oplog"
+          },
+          {
+            "name": "Secondary 2",
+            "state": "RUNNABLE",
+            "label": "Replicates oplog"
+          },
+          {
+            "name": "Arbiter",
+            "state": "WAITING",
+            "label": "Votes only — no data"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Write concern and read preference",
+      "description": "Write concern controls when MongoDB acknowledges a write. Read preference controls which replica handles read operations.",
+      "code": "// Write concern: w=majority means majority acked\nawait col.insertOne(\n  { name: \"Critical Data\" },\n  { writeConcern: { w: \"majority\", j: true, wtimeout: 5000 } }\n);\n// j:true = wait for journal flush (durable)\n\n// Read preference: read from secondary\nconst col2 = db.collection(\"topics\", {\n  readPreference: \"secondaryPreferred\",\n  readConcern: { level: \"majority\" }\n});\n// Use secondary for analytics/reporting\n// Never use secondary for reads requiring latest writes",
+      "highlight": [
+        3,
+        4,
+        9,
+        10,
+        11
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Read preference modes",
+        "items": [
+          {
+            "label": "primary (default)",
+            "color": "#10b981",
+            "value": "All reads from primary",
+            "highlight": true
+          },
+          {
+            "label": "primaryPreferred",
+            "color": "#818cf8",
+            "value": "Primary if available, else secondary"
+          },
+          {
+            "label": "secondaryPreferred",
+            "color": "#f59e0b",
+            "value": "Secondary if available (analytics)"
+          },
+          {
+            "label": "nearest",
+            "color": "#60a5fa",
+            "value": "Lowest network latency member"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Oplog — the replication log",
+      "description": "The oplog (operations log) is a capped collection in the local database that records every write operation. Secondaries tail the oplog to stay in sync.",
+      "code": "// View oplog\nuse local\ndb.oplog.rs.find().sort({ $natural: -1 }).limit(5)\n\n// Oplog entry structure\n{\n  ts: Timestamp(1688400000, 1),  // timestamp + increment\n  op: \"i\",   // i=insert, u=update, d=delete, c=command\n  ns: \"devmastery.topics\",\n  o: { _id: ObjectId(\"...\"), title: \"Java Intro\", ... },\n  o2: { _id: ObjectId(\"...\") }  // for updates: original query\n}\n\n// Oplog window: how far back replication can lag\n// Smaller oplog → smaller window → replicas must stay current",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Write hits primary",
+            "done": true
+          },
+          {
+            "label": "Oplog entry recorded (capped collection)",
+            "done": true
+          },
+          {
+            "label": "Secondaries tail oplog continuously",
+            "active": true
+          },
+          {
+            "label": "Secondary applies op → replication lag"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Failover and election",
+      "description": "When a primary becomes unavailable, secondaries start an election. The member with the most up-to-date oplog and highest priority wins. Election takes ~10-30 seconds.",
+      "code": "// Simulate failover\nrs.stepDown();  // primary steps down, election starts\n\n// Check who is primary\ndb.isMaster();\n// { ismaster: true/false, primary: \"mongo1:27017\", ... }\n\n// Priority: higher = more likely to be primary\nrs.reconfig({\n  ...rs.conf(),\n  members: [\n    { _id: 0, host: \"mongo1:27017\", priority: 2 },  // preferred\n    { _id: 1, host: \"mongo2:27017\", priority: 1 },\n    { _id: 2, host: \"mongo3:27017\", priority: 0 }   // never primary\n  ]\n});",
+      "highlight": [
+        2,
+        5,
+        8,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Primary",
+          "Secondary1",
+          "Secondary2"
+        ],
+        "messages": [
+          {
+            "from": "Primary",
+            "to": "Secondary1",
+            "label": "heartbeat timeout"
+          },
+          {
+            "from": "Secondary1",
+            "to": "Secondary2",
+            "label": "request vote"
+          },
+          {
+            "from": "Secondary2",
+            "to": "Secondary1",
+            "label": "grant vote (majority)"
+          },
+          {
+            "from": "Secondary1",
+            "to": "Secondary2",
+            "label": "I am new primary"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Change streams",
+      "description": "Change streams allow applications to subscribe to real-time notifications of MongoDB changes. They use the oplog under the hood and support filtering.",
+      "code": "// Watch a collection for changes\nconst changeStream = col.watch([\n  { $match: { \"operationType\": { $in: [\"insert\",\"update\"] } } }\n], { fullDocument: \"updateLookup\" });\n\nchangeStream.on(\"change\", (event) => {\n  console.log(event.operationType);  // insert | update | delete\n  console.log(event.fullDocument);   // full doc after change\n  console.log(event.updateDescription.updatedFields); // changed fields\n});\n\n// Resumable: save resumeToken to restart after disconnect\nconst token = event._id;\nconst stream2 = col.watch([], { resumeAfter: token });",
+      "highlight": [
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        13,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "collection.watch() opens change stream",
+            "done": true
+          },
+          {
+            "label": "MongoDB tails oplog internally",
+            "done": true
+          },
+          {
+            "label": "Matching change events pushed to cursor",
+            "active": true
+          },
+          {
+            "label": "resumeAfter token: reconnect without data loss"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

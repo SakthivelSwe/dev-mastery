@@ -1,0 +1,464 @@
+---
+slug: "fork-join-framework"
+title: "Fork/Join Framework & Work Stealing"
+level: 4
+---
+
+## WHY
+
+Some problems are naturally recursive and parallel: sorting a huge array, summing a matrix, walking a directory tree, computing a Fibonacci-style DP. Chopping the problem into halves, running each half on a separate thread, and combining results scales almost linearly with cores — but only if you don't waste half your effort on synchronization overhead.
+
+`ForkJoinPool` is Java's parallel-divide-and-conquer engine. Its trick is **work stealing**: every worker has its own deque of tasks; when one worker's deque is empty, it steals tasks from busy workers' deques. The result: near-optimal core utilization with almost no explicit coordination. `parallelStream`, `Arrays.parallelSort`, and `CompletableFuture.supplyAsync()` all run on the shared `ForkJoinPool.commonPool()`.
+
+## THEORY
+
+### The core types
+
+| Type | Return | Method to override |
+|------|--------|--------------------|
+| `RecursiveAction` | void | `compute()` |
+| `RecursiveTask<V>` | `V` | `V compute()` |
+| `CountedCompleter` | any | For dependency-graph style parallelism |
+
+### The `compute()` template
+
+```
+compute():
+    if problem is small enough (below THRESHOLD):
+        solve it sequentially and return
+    else:
+        split into subtasks
+        fork all but one subtask (schedule them to run in parallel)
+        compute the last subtask directly (avoid unnecessary hop)
+        join the forked subtasks and combine results
+```
+
+### fork vs invoke vs join — the three verbs
+
+| Method | Blocking? | Behavior |
+|--------|-----------|----------|
+| `task.fork()` | No | Schedule the task on the current worker's deque — returns immediately |
+| `task.invoke()` | Yes | Run and wait for the result — combines fork + join |
+| `task.join()` | Yes | Wait for a previously-forked task to finish; return its value |
+| `ForkJoinTask.invokeAll(tasks)` | Yes | Fork all but one, invoke the last, join the rest |
+
+**Rule**: fork N-1, invoke 1 directly. That way the current worker doesn't sit idle waiting for its own forked work.
+
+### Work-stealing internals
+
+```
+        Worker-A deque              Worker-B deque
+        (push/pop from top)         (push/pop from top)
+        ┌────┐                      ┌────┐
+        │ T5 │  ← A pushes here     │    │
+        ├────┤                      ├────┤
+        │ T4 │                      │    │
+        ├────┤                      ├────┤
+        │ T3 │  ← A pops here (LIFO)│    │
+        └────┘                      └────┘
+                                       ▲
+                                       │
+                          B is idle → steals from BOTTOM (T3)
+```
+- Workers push AND pop from the TOP of their own deque (LIFO, cache-friendly).
+- Idle workers steal from the BOTTOM of a random victim's deque (FIFO, oldest work first).
+- Only the victim can be stealing from the top, so the LIFO/FIFO split minimizes contention.
+
+### `parallelStream` uses `ForkJoinPool.commonPool`
+
+```java
+IntStream.rangeClosed(1, 10_000_000).parallel().sum();
+```
+Under the hood: split the range into chunks, wrap each in a `ForkJoinTask`, run on `commonPool`. Consequence: your parallel stream competes with any other CF or F/J work in the JVM. To isolate:
+
+```java
+ForkJoinPool custom = new ForkJoinPool(8);
+custom.submit(() -> IntStream.rangeClosed(1, 10_000_000).parallel().sum()).get();
+```
+
+### When Fork/Join is the WRONG tool
+
+- **Blocking I/O**: `ForkJoinPool` sizes to `Nprocessors - 1`. If tasks block, workers are stuck and cannot steal. Use a regular `ThreadPoolExecutor` instead.
+- **Small workloads**: below ~10 μs of work per task, the fork/join overhead dominates. Sequential is faster.
+- **Unbalanced trees**: work-stealing still works, but poorly balanced splits leave one worker doing most of the work.
+
+Java 8+ added `ManagedBlocker` so blocking tasks can *hint* the pool to spawn compensation threads — usable but rarely worth the complexity.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "java",
+  "fileName": "ParallelSum.java",
+  "steps": [
+    {
+      "title": "Divide the array",
+      "description": "compute() checks if the slice is small enough. If yes, sum it sequentially. If no, split into two halves.",
+      "code": "static final int THRESHOLD = 10_000;\n\nprotected Long compute() {\n    if (hi - lo <= THRESHOLD) return sequentialSum();\n    int mid = (lo + hi) >>> 1;\n    ...\n}",
+      "highlight": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Split",
+        "items": [
+          {
+            "label": "[0 .. 10M]",
+            "color": "#818cf8",
+            "value": "root"
+          },
+          {
+            "label": "[0 .. 5M]",
+            "color": "#818cf8"
+          },
+          {
+            "label": "[5M .. 10M]",
+            "color": "#818cf8"
+          }
+        ]
+      }
+    },
+    {
+      "title": "fork one · compute the other",
+      "description": "Idiomatic: fork() the left half onto the worker's deque; call compute() on the right half directly on THIS worker. Avoids the overhead of forking both.",
+      "code": "ParallelSum left  = new ParallelSum(arr, lo, mid);\nParallelSum right = new ParallelSum(arr, mid, hi);\nleft.fork();\nlong rightSum = right.compute();\nlong leftSum  = left.join();\nreturn leftSum + rightSum;",
+      "highlight": [
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "This worker's deque",
+        "items": [
+          {
+            "label": "left (forked)",
+            "color": "#f59e0b",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "Work stealing",
+      "description": "Idle workers steal from the BOTTOM of a busy worker's deque. Owner pushes/pops from the TOP (LIFO, cache-friendly). Steals rarely collide with the owner.",
+      "code": "// worker-A deque:   [T5, T4, T3]   push/pop from top\n//                            ↑\n//                         steal ←── worker-B (idle)\n//                         from bottom (FIFO)",
+      "diagram": {
+        "kind": "boxes",
+        "title": "A's deque · B steals from bottom",
+        "items": [
+          {
+            "label": "T5",
+            "color": "#818cf8",
+            "value": "top (owner)"
+          },
+          {
+            "label": "T4",
+            "color": "#818cf8"
+          },
+          {
+            "label": "T3",
+            "color": "#f59e0b",
+            "value": "stolen by B ↗",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "Combine",
+      "description": "Each level combines left + right on its way up. leftSum + rightSum at each recursion returns the total to its parent.",
+      "code": "return leftSum + rightSum;   // combine phase",
+      "highlight": [
+        1
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Combine tree",
+        "items": [
+          {
+            "label": "sum[0..5M]",
+            "value": "12500000"
+          },
+          {
+            "label": "sum[5M..10M]",
+            "value": "37500000"
+          },
+          {
+            "label": "root",
+            "value": "50000000",
+            "color": "#10b981",
+            "highlight": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "When Fork/Join is WRONG",
+      "description": "Blocking I/O: pool sizes to N-1 cores; a blocked worker cannot steal. Use ThreadPoolExecutor instead.\nSmall workloads: fork overhead dominates below ~10 μs / task.\nUnbalanced trees: one worker does most of the work.",
+      "code": "// If tasks BLOCK on I/O, use a plain ThreadPoolExecutor,\n// not ForkJoinPool.",
+      "diagram": {
+        "kind": "boxes",
+        "title": "Anti-patterns",
+        "items": [
+          {
+            "label": "Blocking I/O",
+            "color": "#ef4444"
+          },
+          {
+            "label": "Small workloads",
+            "color": "#ef4444"
+          },
+          {
+            "label": "Deeply unbalanced",
+            "color": "#ef4444"
+          },
+          {
+            "label": "Balanced compute",
+            "color": "#10b981",
+            "highlight": true
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — RecursiveTask: parallel sum
+```java
+import java.util.concurrent.*;
+
+public class ParallelSum extends RecursiveTask<Long> {
+    private static final int THRESHOLD = 10_000;
+    private final long[] arr;
+    private final int lo, hi;
+
+    ParallelSum(long[] arr, int lo, int hi) {
+        this.arr = arr; this.lo = lo; this.hi = hi;
+    }
+
+    @Override
+    protected Long compute() {
+        if (hi - lo <= THRESHOLD) {
+            long s = 0;
+            for (int i = lo; i < hi; i++) s += arr[i];
+            return s;
+        }
+        int mid = (lo + hi) >>> 1;
+        ParallelSum left  = new ParallelSum(arr, lo, mid);
+        ParallelSum right = new ParallelSum(arr, mid, hi);
+        left.fork();                        // schedule the left half
+        long rightResult = right.compute(); // run the right half on this thread
+        long leftResult  = left.join();     // wait for left to finish
+        return leftResult + rightResult;
+    }
+
+    public static void main(String[] args) {
+        long[] data = new long[10_000_000];
+        for (int i = 0; i < data.length; i++) data[i] = i + 1;
+
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        long start = System.currentTimeMillis();
+        long total = pool.invoke(new ParallelSum(data, 0, data.length));
+        long ms = System.currentTimeMillis() - start;
+        System.out.println("sum=" + total + " in " + ms + " ms");
+    }
+}
+```
+
+### Level 2 — RecursiveAction: parallel array increment
+```java
+import java.util.concurrent.*;
+
+public class ParallelIncrement extends RecursiveAction {
+    private static final int THRESHOLD = 20_000;
+    private final int[] arr;
+    private final int lo, hi;
+
+    ParallelIncrement(int[] arr, int lo, int hi) {
+        this.arr = arr; this.lo = lo; this.hi = hi;
+    }
+
+    @Override
+    protected void compute() {
+        if (hi - lo <= THRESHOLD) {
+            for (int i = lo; i < hi; i++) arr[i]++;
+            return;
+        }
+        int mid = (lo + hi) >>> 1;
+        invokeAll(new ParallelIncrement(arr, lo, mid),
+                  new ParallelIncrement(arr, mid, hi));
+    }
+
+    public static void main(String[] args) {
+        int[] data = new int[10_000_000];
+        ForkJoinPool.commonPool().invoke(new ParallelIncrement(data, 0, data.length));
+        System.out.println("data[0]=" + data[0] + " data[999999]=" + data[999999]);
+    }
+}
+```
+
+### Level 3 — Directory-size walker
+```java
+import java.io.File;
+import java.util.concurrent.RecursiveTask;
+
+public class DirSize extends RecursiveTask<Long> {
+    private final File dir;
+    DirSize(File dir) { this.dir = dir; }
+
+    @Override
+    protected Long compute() {
+        File[] children = dir.listFiles();
+        if (children == null) return 0L;
+
+        long localSize = 0;
+        java.util.List<DirSize> subtasks = new java.util.ArrayList<>();
+        for (File f : children) {
+            if (f.isFile()) localSize += f.length();
+            else if (f.isDirectory()) {
+                DirSize sub = new DirSize(f);
+                sub.fork();
+                subtasks.add(sub);
+            }
+        }
+        for (DirSize sub : subtasks) localSize += sub.join();
+        return localSize;
+    }
+
+    public static void main(String[] args) {
+        long size = new DirSize(new File(".")).invoke();
+        System.out.printf("total = %.2f MB%n", size / 1024.0 / 1024.0);
+    }
+}
+```
+
+### Level 4 — Custom pool + measuring work stealing
+```java
+import java.util.concurrent.ForkJoinPool;
+
+public class SizedPool {
+    public static void main(String[] args) throws Exception {
+        ForkJoinPool pool = new ForkJoinPool(4);
+        long start = System.currentTimeMillis();
+
+        long[] data = new long[5_000_000];
+        for (int i = 0; i < data.length; i++) data[i] = i;
+
+        Long sum = pool.submit(new ParallelSum(data, 0, data.length)).get();
+
+        long ms = System.currentTimeMillis() - start;
+        System.out.println("sum=" + sum + " ms=" + ms);
+        System.out.println("stealCount=" + pool.getStealCount()
+                + " activeThreads=" + pool.getActiveThreadCount()
+                + " runningThreads=" + pool.getRunningThreadCount()
+                + " queuedTasks=" + pool.getQueuedTaskCount());
+        pool.shutdown();
+    }
+}
+```
+`getStealCount()` reveals how much re-balancing happened. On a well-balanced workload it's low; on an unbalanced tree walk it grows large.
+
+### Level 5 — ForkJoin vs sequential — benchmark
+```java
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.LongStream;
+
+public class ForkJoinBench {
+    public static void main(String[] args) throws Exception {
+        long[] data = LongStream.rangeClosed(1, 50_000_000).toArray();
+
+        // Sequential
+        long start = System.nanoTime();
+        long seq = 0;
+        for (long x : data) seq += x;
+        System.out.printf("sequential : %d ms  (sum=%d)%n",
+                (System.nanoTime() - start) / 1_000_000, seq);
+
+        // Parallel stream (commonPool)
+        start = System.nanoTime();
+        long par = java.util.Arrays.stream(data).parallel().sum();
+        System.out.printf("parallel   : %d ms  (sum=%d)%n",
+                (System.nanoTime() - start) / 1_000_000, par);
+
+        // Custom ForkJoin
+        start = System.nanoTime();
+        Long fj = ForkJoinPool.commonPool()
+                .invoke(new ParallelSum(data, 0, data.length));
+        System.out.printf("forkjoin   : %d ms  (sum=%d)%n",
+                (System.nanoTime() - start) / 1_000_000, fj);
+
+        // On 8-core machine, sequential ≈ 40ms, parallel ≈ 8-12ms → ~4x speedup.
+    }
+}
+```
+
+## REAL_WORLD
+
+**Log aggregation.** A cost-tracking service reads 10 GB of daily log files and computes per-account aggregates. Sequential parsing takes 12 minutes; deadlines force it under 3 minutes. Refactoring:
+
+```java
+public class LogAggregator extends RecursiveTask<Map<String, Long>> {
+    private static final int LINE_BATCH = 50_000;
+    private final List<String> lines;
+
+    // compute() splits the list in halves, uses invokeAll for balanced subtasks
+    protected Map<String, Long> compute() {
+        if (lines.size() <= LINE_BATCH) return aggregate(lines);
+        int mid = lines.size() / 2;
+        LogAggregator left  = new LogAggregator(lines.subList(0, mid));
+        LogAggregator right = new LogAggregator(lines.subList(mid, lines.size()));
+        invokeAll(left, right);
+        return merge(left.join(), right.join());
+    }
+    /* aggregate() / merge() omitted */
+}
+```
+Runtime drops from 12 min → 2 min on an 8-core node. The change is 40 lines and required only a THRESHOLD picked by experiment (`50_000` gave the best throughput here). This is the sweet spot for Fork/Join — CPU-bound recursive aggregation over large data.
+
+## INTERVIEW
+
+**Q: What is work stealing?**
+A: A load-balancing strategy where each worker thread has its own task deque. When a worker's deque is empty, it steals a task from the BOTTOM of a random busy worker's deque. Workers push and pop from the TOP (LIFO, cache-friendly), so steals rarely conflict with owners. Result: near-optimal core utilization without a global scheduler.
+
+**Q: When should you use `ForkJoinPool` vs `ThreadPoolExecutor`?**
+A: `ForkJoinPool` for CPU-bound recursive divide-and-conquer where subtasks fork more subtasks. `ThreadPoolExecutor` for independent tasks, especially those that block on I/O. Blocking on `ForkJoinPool` stalls workers — no other task can run on the stalled worker.
+
+**Q: What's `RecursiveTask` vs `RecursiveAction`?**
+A: `RecursiveTask<V>` returns a value from `compute()`. `RecursiveAction` returns void — for side-effecting parallel work (mutating an array in place, writing files).
+
+**Q: Why not just `parallelStream().sum()` instead of writing a `RecursiveTask`?**
+A: `parallelStream` DOES use `ForkJoinPool` and works great for arrays and lists. You need custom Fork/Join tasks when: (a) the recursion tree isn't a flat range (directory walk), (b) you need a custom threshold, (c) you want an isolated `ForkJoinPool` (not `commonPool`), (d) you need fine control over splitting or merging.
+
+**Q: What is `ForkJoinPool.commonPool` and why should you be careful?**
+A: A JVM-wide singleton pool used by `parallelStream`, `CompletableFuture.supplyAsync` (no-executor form), and any `ForkJoinTask.invoke()` without a specific pool. Blocking work on `commonPool` starves everything else. In production always specify your own pool for blocking or long-running tasks.
+
+**Q: What's the idiomatic split pattern in `compute()`?**
+A: `left.fork(); rightResult = right.compute(); leftResult = left.join();`. That way the current worker computes ONE subtask directly (no context-switch overhead) and only forks the other. Forking BOTH would double the coordination cost.
+
+## FEYNMAN CHECK
+
+Explain to a 10-year-old:
+> Fork/Join is a group of kids folding a giant laundry pile. Each kid has their own basket of clothes. When one kid finishes, they don't sit and wait — they sneak over and grab a shirt from the bottom of a busy kid's basket ("stealing"). Because they steal from the BOTTOM and the busy kid works from the TOP, they don't bump into each other. This way NO kid ever sits idle if anyone still has work — the whole pile finishes as fast as possible.
+
+## BUILD
+
+Build a **parallel merge sort**:
+1. `RecursiveAction MergeSort(int[] arr, int lo, int hi)`.
+2. If length ≤ 1000, use `Arrays.sort` on the slice (in-place, base case).
+3. Otherwise split at mid, `invokeAll(left, right)`, then merge in a scratch array.
+4. Compare wall-clock time vs `Arrays.sort` (single-threaded) for a 10M-element int array.
+5. **Bonus**: implement `parallelSum` and `parallelSort` in the same file with the same THRESHOLD constant; measure where the threshold sweet spot is for each.
+
+## SPACED REVIEW
+
+**Day 1**: What is the difference between `fork()` and `invoke()`?
+**Day 3**: Why should `compute()` compute one subtask directly and fork the other, instead of forking both?
+**Day 7**: Explain "work stealing" and why LIFO/FIFO deque access is the trick.
+**Day 14**: Give three cases where `ForkJoinPool` is the WRONG tool.
+

@@ -18,7 +18,347 @@ If 10 different applications need this exact same data, do you really want to co
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "SQLVisualizer", "state": "sql-views" }
+{
+  "language": "sql",
+  "fileName": "views.sql",
+  "steps": [
+    {
+      "title": "Regular views",
+      "description": "View = named query. Runs each time you query it. Encapsulates logic. Not stored data (except materialized).",
+      "code": "-- Basic view\nCREATE VIEW active_users AS\nSELECT * FROM users WHERE deleted_at IS NULL;\n\n-- Query it like a table\nSELECT * FROM active_users WHERE country = 'IN';\n\n-- Replace (update definition)\nCREATE OR REPLACE VIEW active_users AS\nSELECT * FROM users WHERE deleted_at IS NULL AND is_banned = false;\n\n-- Drop\nDROP VIEW active_users;\nDROP VIEW IF EXISTS active_users;\n\n-- Rename\nALTER VIEW active_users RENAME TO current_users;\n\n-- Use cases:\n-- - Encapsulate business logic (\"active\", \"vip\", \"paid_users\")\n-- - Restrict columns (hide password_hash, PII)\n-- - Compatibility layer during schema migrations\n-- - Simplify complex queries for reporting\n\n-- Aggregation view\nCREATE VIEW daily_sales AS\nSELECT date_trunc('day', created_at) AS day,\n       count(*) AS orders,\n       sum(total) AS revenue\nFROM orders\nGROUP BY day;\n\n-- Multi-table join view\nCREATE VIEW order_summary AS\nSELECT o.id, o.created_at, o.total,\n       u.email, u.name AS customer_name,\n       count(oi.id) AS item_count\nFROM orders o\nJOIN users u ON u.id = o.user_id\nJOIN order_items oi ON oi.order_id = o.id\nGROUP BY o.id, u.email, u.name;\n\n-- Views can reference other views\nCREATE VIEW recent_orders AS\nSELECT * FROM order_summary WHERE created_at > NOW() - INTERVAL '7 days';\n\n-- View permissions (grant SELECT without exposing base tables)\nGRANT SELECT ON active_users TO reporting_role;\n-- users may not be directly accessible",
+      "highlight": [
+        2,
+        3,
+        6,
+        9,
+        10,
+        13,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        44,
+        45,
+        48,
+        49,
+        50
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "View basics",
+        "items": [
+          {
+            "label": "Named query",
+            "color": "#10b981",
+            "value": "No stored data",
+            "highlight": true
+          },
+          {
+            "label": "CREATE OR REPLACE",
+            "color": "#818cf8",
+            "value": "Update definition safely"
+          },
+          {
+            "label": "Encapsulate logic",
+            "color": "#f59e0b",
+            "value": "Business rules in one place"
+          },
+          {
+            "label": "Permission boundary",
+            "color": "#60a5fa",
+            "value": "Hide base tables from role"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Materialized views",
+      "description": "Result stored on disk. Fast reads, but stale until refreshed. Great for expensive aggregates.",
+      "code": "-- Materialized view = precomputed + stored\nCREATE MATERIALIZED VIEW daily_sales_mv AS\nSELECT date_trunc('day', created_at) AS day,\n       count(*) AS orders,\n       sum(total) AS revenue\nFROM orders\nGROUP BY day;\n\n-- Now reads are fast (no aggregation)\nSELECT * FROM daily_sales_mv WHERE day > NOW() - INTERVAL '30 days';\n\n-- Add indexes! (materialized views are stored data)\nCREATE UNIQUE INDEX ON daily_sales_mv (day);\nCREATE INDEX ON daily_sales_mv (revenue);\n\n-- Refresh (recompute from base tables)\nREFRESH MATERIALIZED VIEW daily_sales_mv;\n\n-- CONCURRENTLY: no exclusive lock during refresh (needs unique index!)\nREFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales_mv;\n\n-- Schedule refreshes (cron or pg_cron)\nSELECT cron.schedule('refresh-sales', '*/15 * * * *',\n  'REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales_mv');\n\n-- Use cases:\n-- - Dashboards on huge tables\n-- - Reports refreshed hourly/daily\n-- - Precomputed rollups\n-- - Denormalized read models\n\n-- Trade-offs:\n-- ✅ Very fast reads\n-- ✅ Indexed\n-- ❌ Stale until refresh\n-- ❌ Storage overhead\n-- ❌ Refresh can be expensive on huge datasets\n\n-- Check freshness\nSELECT relname, last_refresh\nFROM pg_stat_all_tables\nWHERE relname = 'daily_sales_mv';\n\n-- Drop\nDROP MATERIALIZED VIEW daily_sales_mv;\n\n-- Continuous aggregates (TimescaleDB) — auto-refreshed\n-- Or use tools: dbt for scheduled model refresh",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        13,
+        14,
+        17,
+        20,
+        23,
+        24,
+        27,
+        28,
+        29,
+        30,
+        31,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        41,
+        42,
+        43,
+        44,
+        47,
+        48,
+        50
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "CREATE MATERIALIZED VIEW",
+            "done": true
+          },
+          {
+            "label": "Add UNIQUE index for CONCURRENTLY",
+            "done": true
+          },
+          {
+            "label": "REFRESH periodically (cron)",
+            "active": true
+          },
+          {
+            "label": "Fast reads on stale data"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Updatable views and rules",
+      "description": "Simple views can be UPDATE'd/DELETE'd. Complex ones need INSTEAD OF triggers or rules.",
+      "code": "-- Simple view (single table, no aggregate) — auto-updatable\nCREATE VIEW active_users AS\nSELECT id, name, email FROM users WHERE deleted_at IS NULL;\n\nUPDATE active_users SET name = 'Alice B' WHERE id = 1;    -- ✅ works\nINSERT INTO active_users (name, email) VALUES ('X', 'x@y'); -- ✅ works\nDELETE FROM active_users WHERE id = 42;                     -- ✅ works\n\n-- WITH CHECK OPTION — prevent inserts that would fall outside the view\nCREATE VIEW active_users AS\nSELECT * FROM users WHERE deleted_at IS NULL\nWITH CHECK OPTION;\n\nINSERT INTO active_users (deleted_at) VALUES (NOW());    -- ❌ blocked!\n\n-- Complex view (joins, aggregates) — NOT auto-updatable\nCREATE VIEW order_summary AS\nSELECT u.id, u.name, count(o.id) AS orders\nFROM users u LEFT JOIN orders o ON o.user_id = u.id\nGROUP BY u.id, u.name;\n\nUPDATE order_summary SET orders = 5;    -- ❌ error\n\n-- Fix with INSTEAD OF trigger\nCREATE OR REPLACE FUNCTION order_summary_update() RETURNS TRIGGER AS $$\nBEGIN\n  UPDATE users SET name = NEW.name WHERE id = NEW.id;\n  RETURN NEW;\nEND $$ LANGUAGE plpgsql;\n\nCREATE TRIGGER order_summary_update_trg\nINSTEAD OF UPDATE ON order_summary\nFOR EACH ROW EXECUTE FUNCTION order_summary_update();\n\nUPDATE order_summary SET name = 'Bob' WHERE id = 1;    -- now works\n\n-- PostgreSQL RULES (alternative to triggers, less common)\nCREATE RULE au_update AS ON UPDATE TO active_users\nDO INSTEAD UPDATE users SET name = NEW.name WHERE id = NEW.id;\n\n-- Rules can be surprising — prefer triggers or updatable simple views\n\n-- Application layer usually handles this:\n-- - App writes to base tables\n-- - App reads from views\n-- - Views are read-oriented",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        14,
+        17,
+        18,
+        19,
+        20,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        35,
+        38,
+        39,
+        42
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Updatable views",
+        "items": [
+          {
+            "label": "Simple view = auto-updatable",
+            "color": "#10b981",
+            "value": "Single table, no aggregate",
+            "highlight": true
+          },
+          {
+            "label": "WITH CHECK OPTION",
+            "color": "#818cf8",
+            "value": "Prevent \"escape\" inserts"
+          },
+          {
+            "label": "Complex = INSTEAD OF trigger",
+            "color": "#f59e0b",
+            "value": "Explicit update logic"
+          },
+          {
+            "label": "App writes to base tables",
+            "color": "#60a5fa",
+            "value": "Views usually read-only"
+          }
+        ]
+      }
+    },
+    {
+      "title": "View best practices",
+      "description": "Name clearly. Column list explicit. Avoid deep view chains. Prefer materialized for expensive queries.",
+      "code": "-- ✅ Explicit column list (survives base table changes better)\nCREATE VIEW customer_summary AS\nSELECT id, name, email, country FROM users;\n-- vs SELECT * — breaks if users adds columns you don't want exposed\n\n-- ✅ Clear naming\nCREATE VIEW active_users_v AS ...;         -- some teams use _v suffix\nCREATE VIEW mv_daily_sales AS ...;          -- mv_ prefix for materialized\n\n-- ✅ Document with COMMENT\nCOMMENT ON VIEW active_users IS 'Users not soft-deleted; used by app + reports';\nCOMMENT ON COLUMN active_users.email IS 'Lowercased email — indexed';\n\n-- ❌ Avoid deep view chains\n-- v3 SELECT FROM v2 SELECT FROM v1 SELECT FROM base_table\n-- Debugging: which view added what filter?\n-- Perf: planner may not optimize across many views\n\n-- ✅ Prefer CTE / inline for one-off complex logic\n-- View is right when: reused across many queries + logic stable\n\n-- ✅ Version views if you change semantics\nCREATE VIEW active_users_v1 AS ...;\n-- Later:\nCREATE VIEW active_users_v2 AS ...;    -- new definition\n-- Deprecate v1 after apps updated\n\n-- ✅ Grant appropriately\nGRANT SELECT ON active_users TO reporting_role;\nREVOKE ALL ON users FROM reporting_role;\n\n-- ✅ Consider security-invoker vs security-definer\nCREATE VIEW active_users\nWITH (security_barrier)\nAS SELECT * FROM users WHERE ...;\n-- security_barrier: prevents pushing predicates that could leak data\n\n-- Materialized view choices:\n-- - Refresh on schedule (cron / pg_cron)\n-- - Trigger-based refresh (on base table change)\n-- - Manual refresh from application\n\n-- Monitor:\n-- - How often is the view queried? (pg_stat_statements)\n-- - Refresh time? (log to a metrics table)\n-- - Storage size? (pg_total_relation_size)\n\nSELECT relname, pg_size_pretty(pg_total_relation_size(relname::regclass))\nFROM pg_matviews;\n\n-- ❌ Views can't be indexed (unless materialized)\n-- Regular views inherit the base tables' plans + indexes\n\n-- ❌ CREATE INDEX on view → error (except materialized)\nCREATE INDEX ON active_users (email);    -- ❌ regular view\nCREATE INDEX ON mv_daily_sales (day);    -- ✅ materialized view",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        11,
+        12,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        29,
+        30,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        52,
+        53,
+        54,
+        55
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "View discipline",
+        "items": [
+          {
+            "label": "Explicit columns",
+            "color": "#10b981",
+            "value": "Avoid SELECT * in views",
+            "highlight": true
+          },
+          {
+            "label": "Clear naming + comments",
+            "color": "#818cf8",
+            "value": "Purpose obvious"
+          },
+          {
+            "label": "Avoid deep chains",
+            "color": "#ef4444",
+            "value": "Hard to debug + optimize"
+          },
+          {
+            "label": "Materialized for cost",
+            "color": "#f59e0b",
+            "value": "Refresh on schedule"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Views vs CTEs vs functions",
+      "description": "View: reusable, saved. CTE: one-shot in a query. Function: parameterized, returns rows or values.",
+      "code": "-- View: reusable saved query\nCREATE VIEW recent_orders AS\nSELECT * FROM orders WHERE created_at > NOW() - INTERVAL '7 days';\n\nSELECT * FROM recent_orders WHERE user_id = 42;\n\n-- CTE: query-scoped, one-off\nWITH recent AS (SELECT * FROM orders WHERE created_at > NOW() - INTERVAL '7 days')\nSELECT * FROM recent WHERE user_id = 42;\n\n-- Function (returns setof records)\nCREATE OR REPLACE FUNCTION orders_for_user(uid BIGINT)\nRETURNS SETOF orders AS $$\n  SELECT * FROM orders WHERE user_id = uid;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM orders_for_user(42);\n\n-- Function with parameters\nCREATE OR REPLACE FUNCTION recent_orders_for(uid BIGINT, days INT DEFAULT 7)\nRETURNS SETOF orders AS $$\n  SELECT * FROM orders\n  WHERE user_id = uid AND created_at > NOW() - (days || ' days')::INTERVAL;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM recent_orders_for(42, 30);\n\n-- When to use each:\n\n-- View:\n-- ✅ Reused across many queries\n-- ✅ Encapsulate logic + permissions\n-- ✅ Simplify complex JOINs\n-- ❌ Can't take parameters (except via WHERE at query time)\n\n-- CTE:\n-- ✅ Break down complex query into steps\n-- ✅ Recursive queries\n-- ✅ Multi-DML (with RETURNING)\n-- ❌ Not reusable outside the query\n\n-- Function:\n-- ✅ Parameterized logic\n-- ✅ Callable from app or SQL\n-- ✅ Can encapsulate procedural logic (PL/pgSQL)\n-- ❌ Planner treats as opaque (unless STABLE/IMMUTABLE + inlineable)\n\n-- Materialized view:\n-- ✅ Very fast reads on expensive aggregates\n-- ❌ Stale data between refreshes\n\n-- Table function returning composite rows\nCREATE FUNCTION user_stats(uid BIGINT)\nRETURNS TABLE (order_count INT, total_spent NUMERIC) AS $$\n  SELECT count(*)::INT, coalesce(sum(total), 0)\n  FROM orders WHERE user_id = uid;\n$$ LANGUAGE sql STABLE;\n\nSELECT * FROM user_stats(42);",
+      "highlight": [
+        2,
+        3,
+        5,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        38,
+        39,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Query abstractions",
+        "items": [
+          {
+            "label": "View",
+            "color": "#10b981",
+            "value": "Reusable, no parameters",
+            "highlight": true
+          },
+          {
+            "label": "CTE",
+            "color": "#818cf8",
+            "value": "Query-scoped, ephemeral"
+          },
+          {
+            "label": "Function",
+            "color": "#f59e0b",
+            "value": "Parameterized, callable"
+          },
+          {
+            "label": "MView",
+            "color": "#60a5fa",
+            "value": "Cached results + indexed"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

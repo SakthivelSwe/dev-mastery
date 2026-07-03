@@ -13,7 +13,449 @@ Database engines are optimized for **Set-Based Processing**. They are designed t
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "CodeRunner", "state": "sql-dml-advanced" }
+{
+  "language": "sql",
+  "fileName": "dml-advanced.sql",
+  "steps": [
+    {
+      "title": "Bulk INSERT with COPY",
+      "description": "COPY is 10-100x faster than INSERT loops. Load CSV, TSV, binary. From files or streams.",
+      "code": "-- COPY loads bulk data\n-- Server-side (needs file on server)\nCOPY users (email, name, country) FROM '/tmp/users.csv'\nWITH (FORMAT csv, HEADER true, DELIMITER ',');\n\n-- Client-side (from psql — file on client)\n\\copy users (email, name, country) FROM 'users.csv' CSV HEADER\n\n-- Programmatic (Node.js + pg-copy-streams)\n// const { pipeline } = require('stream/promises');\n// const copyFrom = require('pg-copy-streams').from;\n// const stream = client.query(copyFrom('COPY users(email,name) FROM STDIN CSV'));\n// await pipeline(fs.createReadStream('users.csv'), stream);\n\n-- Bulk INSERT batching (when COPY not available)\nINSERT INTO users (email, name) VALUES\n  ('a@x.com', 'A'), ('b@x.com', 'B'), ('c@x.com', 'C'),\n  -- ... hundreds per statement\n  ('z@x.com', 'Z');\n\n-- Batch sizes:\n-- 100-1000 rows per INSERT statement is a sweet spot\n-- Beyond ~5000 diminishing returns\n\n-- INSERT ... SELECT for copying between tables\nINSERT INTO archived_orders\nSELECT * FROM orders WHERE created_at < '2025-01-01';\n\n-- WITH data source\nINSERT INTO users (email, name)\nSELECT email, name FROM external_source WHERE valid = true;\n\n-- COPY vs INSERT performance\n-- 1M rows INSERT one-by-one: ~10 min\n-- 1M rows INSERT batched (1000/batch): ~30 sec\n-- 1M rows COPY: ~5 sec\n\n-- Speed tips for bulk loading:\n-- 1. Disable indexes → load → re-create\n-- 2. Disable triggers if safe (WHERE valid)\n-- 3. Use UNLOGGED tables for staging (no WAL)\n-- 4. Increase maintenance_work_mem\n-- 5. Wrap in single transaction\n\nCREATE UNLOGGED TABLE staging (LIKE users);\nCOPY staging FROM 'huge.csv' CSV;\nINSERT INTO users SELECT * FROM staging;    -- final\nDROP TABLE staging;\n\n-- COPY with WHERE (PG 14+)\nCOPY (SELECT * FROM users WHERE country = 'IN') TO '/tmp/india_users.csv' CSV HEADER;\n\n-- Export data\nCOPY users TO '/tmp/users_export.csv' CSV HEADER;\n\\copy users TO 'users.csv' CSV HEADER    -- client-side\n\n-- Binary COPY (faster, less portable)\nCOPY events TO '/tmp/events.dat' WITH (FORMAT binary);",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        31,
+        32,
+        34,
+        35,
+        36,
+        37,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        46,
+        47,
+        48,
+        49,
+        52,
+        53,
+        55,
+        56,
+        57,
+        58
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Bulk load",
+        "items": [
+          {
+            "label": "COPY = 10-100x",
+            "color": "#10b981",
+            "value": "Server or client side",
+            "highlight": true
+          },
+          {
+            "label": "Batch INSERT (1000/stmt)",
+            "color": "#818cf8",
+            "value": "Second best"
+          },
+          {
+            "label": "UNLOGGED staging",
+            "color": "#f59e0b",
+            "value": "Skip WAL for temp data"
+          },
+          {
+            "label": "Drop + recreate indexes",
+            "color": "#60a5fa",
+            "value": "After massive loads"
+          }
+        ]
+      }
+    },
+    {
+      "title": "UPSERT (ON CONFLICT)",
+      "description": "Insert or update in one statement. Idempotent inserts. Handle race conditions safely.",
+      "code": "-- Basic UPSERT\nINSERT INTO users (id, email, name)\nVALUES (42, 'a@x.com', 'Alice')\nON CONFLICT (id) DO UPDATE\nSET email = EXCLUDED.email,\n    name = EXCLUDED.name,\n    updated_at = NOW();\n\n-- EXCLUDED refers to \"what would have been inserted\"\n\n-- Do nothing on conflict (idempotent inserts)\nINSERT INTO logs (id, message)\nVALUES ('abc-123', 'user logged in')\nON CONFLICT (id) DO NOTHING;\n\n-- Multiple conflict targets\nINSERT INTO user_prefs (user_id, key, value)\nVALUES (42, 'theme', 'dark')\nON CONFLICT (user_id, key) DO UPDATE\nSET value = EXCLUDED.value;\n\n-- Conditional update (only if changed)\nINSERT INTO products (sku, name, price)\nVALUES ('ABC', 'Widget', 9.99)\nON CONFLICT (sku) DO UPDATE\nSET price = EXCLUDED.price\nWHERE products.price != EXCLUDED.price;\n\n-- Batch UPSERT\nINSERT INTO products (sku, name, price) VALUES\n  ('A', 'Widget', 10),\n  ('B', 'Gadget', 20),\n  ('C', 'Gizmo',  30)\nON CONFLICT (sku) DO UPDATE\nSET name = EXCLUDED.name, price = EXCLUDED.price;\n\n-- RETURNING (get affected rows)\nINSERT INTO users (email, name) VALUES ('x@y.com', 'X')\nON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name\nRETURNING id, xmax = 0 AS inserted;   -- true if new insert, false if update\n\n-- MERGE (SQL:2003 — PG 15+, SQL Server, Oracle)\nMERGE INTO products p\nUSING (VALUES ('ABC', 9.99)) AS s(sku, price)\nON p.sku = s.sku\nWHEN MATCHED THEN UPDATE SET price = s.price\nWHEN NOT MATCHED THEN INSERT (sku, price) VALUES (s.sku, s.price);\n\n-- MySQL: ON DUPLICATE KEY UPDATE\nINSERT INTO users (id, email, name)\nVALUES (42, 'a@x.com', 'Alice')\nON DUPLICATE KEY UPDATE\n  email = VALUES(email),\n  name = VALUES(name);\n\n-- SQLite: INSERT OR REPLACE (deletes + reinserts — beware triggers!)\nINSERT OR REPLACE INTO users (id, email) VALUES (42, 'a@x.com');\n\n-- Idempotency key pattern (dedupe requests)\nINSERT INTO payments (idempotency_key, amount)\nVALUES ($1, $2)\nON CONFLICT (idempotency_key) DO NOTHING\nRETURNING *;\n-- If no row returned → already processed, look up existing result",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        57,
+        58,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "UPSERT flavors",
+        "items": [
+          {
+            "label": "ON CONFLICT (PG)",
+            "color": "#10b981",
+            "value": "DO UPDATE / DO NOTHING",
+            "highlight": true
+          },
+          {
+            "label": "MERGE (SQL:2003)",
+            "color": "#818cf8",
+            "value": "PG 15+, SQL Server"
+          },
+          {
+            "label": "ON DUPLICATE KEY",
+            "color": "#f59e0b",
+            "value": "MySQL/MariaDB"
+          },
+          {
+            "label": "Idempotency key",
+            "color": "#60a5fa",
+            "value": "Dedupe API requests"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Bulk UPDATE + DELETE",
+      "description": "FROM/USING for join. Batched for locks. Use RETURNING. Beware whole-table without WHERE.",
+      "code": "-- UPDATE FROM (join in update)\nUPDATE orders o\nSET user_email = u.email\nFROM users u\nWHERE u.id = o.user_id AND o.user_email IS NULL;\n\n-- MySQL equivalent (UPDATE ... JOIN)\nUPDATE orders o\nJOIN users u ON u.id = o.user_id\nSET o.user_email = u.email;\n\n-- UPDATE from CTE\nWITH stale_prices AS (\n  SELECT id, new_price FROM external_source\n)\nUPDATE products p\nSET price = s.new_price, updated_at = NOW()\nFROM stale_prices s\nWHERE p.id = s.id AND p.price != s.new_price;\n\n-- Bulk UPDATE with values list\nUPDATE users u\nSET status = v.status\nFROM (VALUES\n  (1, 'active'),\n  (2, 'banned'),\n  (3, 'pending')\n) AS v(id, status)\nWHERE u.id = v.id;\n\n-- DELETE USING (join in delete)\nDELETE FROM orders o\nUSING users u\nWHERE u.id = o.user_id AND u.deleted_at IS NOT NULL;\n\n-- DELETE with subquery\nDELETE FROM orders\nWHERE user_id IN (SELECT id FROM users WHERE deleted_at IS NOT NULL);\n\n-- Batch delete (avoid huge lock)\nDO $$\nDECLARE deleted INTEGER;\nBEGIN\n  LOOP\n    DELETE FROM logs\n    WHERE id IN (\n      SELECT id FROM logs\n      WHERE created_at < NOW() - INTERVAL '90 days'\n      LIMIT 10000\n    );\n    GET DIAGNOSTICS deleted = ROW_COUNT;\n    EXIT WHEN deleted = 0;\n    COMMIT;\n  END LOOP;\nEND $$;\n\n-- RETURNING (see what was affected)\nDELETE FROM sessions WHERE expires_at < NOW()\nRETURNING id, user_id;\n\nUPDATE users SET is_vip = true WHERE spend > 10000\nRETURNING id, email;\n\n-- Safe pattern: preview in transaction\nBEGIN;\nDELETE FROM users WHERE created_at < '2020-01-01';\nSELECT count(*) FROM users;    -- verify\nROLLBACK;    -- or COMMIT\n\n-- Common trap: UPDATE without WHERE\nUPDATE users SET is_active = false;    -- ❌ updates ALL users!\n\n-- Set statement_timeout to catch runaways\nSET statement_timeout = '30s';",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        58,
+        60,
+        61,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        70,
+        71,
+        72,
+        73
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Bulk mods",
+        "items": [
+          {
+            "label": "UPDATE FROM / USING",
+            "color": "#10b981",
+            "value": "Join in DML",
+            "highlight": true
+          },
+          {
+            "label": "VALUES list update",
+            "color": "#818cf8",
+            "value": "Batch different values per row"
+          },
+          {
+            "label": "Batched delete",
+            "color": "#f59e0b",
+            "value": "LIMIT + loop + COMMIT"
+          },
+          {
+            "label": "statement_timeout",
+            "color": "#60a5fa",
+            "value": "Catch runaway writes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Concurrency and race conditions",
+      "description": "FOR UPDATE, atomic increment, upsert races, SELECT-then-UPDATE bugs.",
+      "code": "-- ❌ Race condition: SELECT + logic + UPDATE\n-- Client 1:\nSELECT balance FROM accounts WHERE id = 1;   -- 100\n-- ... calculate ...\nUPDATE accounts SET balance = balance - 100 WHERE id = 1;   -- 0\n\n-- Client 2 interleaves:\nSELECT balance FROM accounts WHERE id = 1;   -- 100 (still)\nUPDATE accounts SET balance = balance - 50 WHERE id = 1;   -- 50\n-- Sum of updates: -150 but started with 100!\n\n-- ✅ Fix 1: Atomic single-statement UPDATE\nUPDATE accounts SET balance = balance - 100\nWHERE id = 1 AND balance >= 100\nRETURNING balance;\n-- Check RETURNING; empty = insufficient funds\n\n-- ✅ Fix 2: Pessimistic lock (FOR UPDATE)\nBEGIN;\nSELECT balance FROM accounts WHERE id = 1 FOR UPDATE;\n-- Now no other txn can modify row 1\nUPDATE accounts SET balance = balance - 100 WHERE id = 1;\nCOMMIT;\n\n-- ✅ Fix 3: Optimistic lock (version)\nBEGIN;\nSELECT id, balance, version FROM accounts WHERE id = 1;    -- version=5\n-- ... calculate ...\nUPDATE accounts\nSET balance = balance - 100, version = version + 1\nWHERE id = 1 AND version = 5;\n-- If 0 rows affected → someone else changed it, retry\nCOMMIT;\n\n-- Atomic increment (safe)\nUPDATE posts SET view_count = view_count + 1 WHERE id = 42;\n-- No race — DB handles as single atomic operation\n\n-- UPSERT race condition prevention\nINSERT INTO users (email, name)\nVALUES ('a@x.com', 'A')\nON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name;\n-- Postgres handles the race internally (index-level lock)\n\n-- Queue pattern (multiple workers)\n-- ❌ Naive: two workers grab same job\nSELECT * FROM jobs WHERE status = 'pending' LIMIT 1;\nUPDATE jobs SET status = 'processing' WHERE id = ?;\n\n-- ✅ Atomic claim with SKIP LOCKED\nBEGIN;\nSELECT * FROM jobs\nWHERE status = 'pending'\nORDER BY created_at\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n-- Other workers skip this locked row → pick different job\nUPDATE jobs SET status = 'processing', worker_id = $1 WHERE id = $job_id;\nCOMMIT;\n\n-- Idempotency for retries\nINSERT INTO payments (idempotency_key, amount)\nVALUES ($1, $2)\nON CONFLICT (idempotency_key) DO NOTHING\nRETURNING id;\n\n-- Distributed lock (advisory lock)\nSELECT pg_advisory_xact_lock(hashtext('refresh-cache'));\n-- Held for duration of transaction\n\n-- Or session lock (must release)\nSELECT pg_advisory_lock(42);\n-- ... critical section ...\nSELECT pg_advisory_unlock(42);",
+      "highlight": [
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        39,
+        40,
+        41,
+        42,
+        43,
+        45,
+        46,
+        47,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        60,
+        61,
+        62,
+        63,
+        64,
+        66,
+        67,
+        68,
+        70,
+        71,
+        72
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Race prevention",
+        "items": [
+          {
+            "label": "Atomic UPDATE with WHERE",
+            "color": "#10b981",
+            "value": "balance >= 100 in same stmt",
+            "highlight": true
+          },
+          {
+            "label": "FOR UPDATE lock",
+            "color": "#818cf8",
+            "value": "Pessimistic"
+          },
+          {
+            "label": "version column",
+            "color": "#f59e0b",
+            "value": "Optimistic + retry"
+          },
+          {
+            "label": "SKIP LOCKED for queue",
+            "color": "#60a5fa",
+            "value": "Worker parallelism"
+          }
+        ]
+      }
+    },
+    {
+      "title": "RETURNING and CTE chains",
+      "description": "RETURNING for chained DML. Multi-statement writes in one query. Atomic + auditable.",
+      "code": "-- RETURNING captures the affected rows\nINSERT INTO orders (user_id, total) VALUES (42, 99.99)\nRETURNING id, created_at;\n\nUPDATE users SET is_vip = true WHERE spend > 10000\nRETURNING id, email, spend;\n\nDELETE FROM sessions WHERE expires_at < NOW()\nRETURNING id, user_id;\n\n-- Compose with CTE — atomic multi-step ops\n\n-- Move rows atomically\nWITH deleted AS (\n  DELETE FROM active_users WHERE last_login < '2024-01-01'\n  RETURNING *\n)\nINSERT INTO archived_users SELECT * FROM deleted;\n\n-- Update + insert audit log\nWITH updated AS (\n  UPDATE users SET status = 'banned'\n  WHERE last_login < NOW() - INTERVAL '2 years'\n  RETURNING id, email\n)\nINSERT INTO audit_log (user_id, action, details)\nSELECT id, 'banned', jsonb_build_object('email', email, 'reason', 'inactive')\nFROM updated;\n\n-- Insert then get ID + use in another insert\nWITH new_order AS (\n  INSERT INTO orders (user_id, total) VALUES (42, 99.99) RETURNING id\n)\nINSERT INTO order_items (order_id, product_id, qty)\nSELECT new_order.id, 1, 3 FROM new_order;\n\n-- Complex example: transfer stock\nWITH decremented AS (\n  UPDATE inventory SET stock = stock - 1\n  WHERE product_id = 42 AND stock > 0\n  RETURNING product_id, stock\n),\nsale AS (\n  INSERT INTO sales (product_id, sold_at)\n  SELECT product_id, NOW() FROM decremented\n  RETURNING id\n)\nINSERT INTO analytics (event_type, data)\nSELECT 'sale', jsonb_build_object('sale_id', id) FROM sale;\n\n-- Only inserts sale + analytics if stock was decremented\n-- If stock was 0 → decremented is empty → sale + analytics skipped\n\n-- Batch upsert + return status\nWITH upserted AS (\n  INSERT INTO users (email, name) VALUES\n    ('a@x.com', 'A'), ('b@x.com', 'B')\n  ON CONFLICT (email) DO UPDATE\n  SET name = EXCLUDED.name\n  RETURNING id, email, xmax = 0 AS inserted\n)\nSELECT count(*) FILTER (WHERE inserted) AS created,\n       count(*) FILTER (WHERE NOT inserted) AS updated\nFROM upserted;\n\n-- App gets counts back atomically\n\n-- One-statement audit trigger alternative\n-- Use CTE + RETURNING instead of trigger for explicit control",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        8,
+        9,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "RETURNING captures rows",
+            "done": true
+          },
+          {
+            "label": "CTE chains DML atomically",
+            "done": true
+          },
+          {
+            "label": "Conditional multi-table writes",
+            "active": true
+          },
+          {
+            "label": "xmax=0 detects insert vs update"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

@@ -11,10 +11,12 @@ const nextConfig = {
   experimental: {},
 
   webpack: (config) => {
-    // Force all packages to use the same single React instance
-    // Prevents "multiple React versions" error from @mdx-js/react etc.
-    config.resolve.alias['react'] = path.resolve('./node_modules/react');
-    config.resolve.alias['react-dom'] = path.resolve('./node_modules/react-dom');
+    // NOTE: A previous version aliased `react`/`react-dom` to force a single
+    // instance. In this npm-workspace setup there is exactly one hoisted
+    // copy of React at the root `node_modules`, so aliasing is unnecessary
+    // and actively breaks Next.js 15's React Server Components manifest
+    // (subpaths like `react-dom/server.edge`, internal Next `layout-router`,
+    // `metadata-boundary`, etc.). Leave module resolution to Node.
     return config;
   },
 

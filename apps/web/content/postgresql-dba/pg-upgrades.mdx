@@ -16,7 +16,312 @@ As a DBA, upgrading a massive 5-Terabyte database to a new major version with ze
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-upgrades" }
+{
+  "language": "bash",
+  "fileName": "upgrades.sh",
+  "steps": [
+    {
+      "title": "Minor vs major upgrades",
+      "description": "Minor (15.3 → 15.4): safe, restart only. Major (14 → 15): binary incompatibility — need pg_upgrade or logical replication.",
+      "code": "# Check version\n$ psql -c \"SELECT version()\"\nPostgreSQL 15.4 on x86_64-pc-linux-gnu\n\n# Minor upgrade (15.3 → 15.4)\n# 1. Read release notes\n# 2. Test on staging\n# 3. In prod: install new binaries, restart\n\n$ apt install postgresql-15=15.4-1.pgdg22.04+1\n$ systemctl restart postgresql\n# Data files compatible, no changes\n\n# Major upgrade (14 → 15) — much more involved\n# Options:\n# 1. pg_upgrade — offline, minutes downtime, byte-copy or hardlink\n# 2. Logical replication — near-zero downtime\n# 3. pg_dumpall + restore — simplest but longest downtime\n\n# Major version breaking changes to check:\n# - Removed features / deprecated syntax\n# - Behavior changes in edge cases\n# - Extension compatibility (recompile custom C extensions)\n# - Client library version\n\n# Release schedule\n# - Major version yearly (14, 15, 16, 17, 18...)\n# - 5 years of support per major version\n# - Minor releases every 3 months\n\n# Support lifecycle\n# 15: supported until Nov 2027\n# 14: supported until Nov 2026\n# 13: supported until Nov 2025",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        15,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Upgrade types",
+        "items": [
+          {
+            "label": "Minor: restart only",
+            "color": "#10b981",
+            "value": "15.3 → 15.4 = 1 minute downtime",
+            "highlight": true
+          },
+          {
+            "label": "Major: binary format change",
+            "color": "#818cf8",
+            "value": "14 → 15 needs migration tool"
+          },
+          {
+            "label": "5-year support",
+            "color": "#f59e0b",
+            "value": "Upgrade before EOL for security"
+          },
+          {
+            "label": "Quarterly minor releases",
+            "color": "#60a5fa",
+            "value": "Apply promptly — security fixes"
+          }
+        ]
+      }
+    },
+    {
+      "title": "pg_upgrade — in-place major upgrade",
+      "description": "pg_upgrade converts data files in place. Fast: minutes for 100GB. Downtime = length of pg_upgrade run.",
+      "code": "# Prep: install new version alongside old\n$ apt install postgresql-16\n\n# Stop both\n$ systemctl stop postgresql\n\n# Initialize new cluster (empty)\n$ /usr/lib/postgresql/16/bin/initdb -D /var/lib/postgresql/16/main\n\n# Check upgrade readiness (no changes made)\n$ /usr/lib/postgresql/16/bin/pg_upgrade \\\n    --old-datadir=/var/lib/postgresql/15/main \\\n    --new-datadir=/var/lib/postgresql/16/main \\\n    --old-bindir=/usr/lib/postgresql/15/bin \\\n    --new-bindir=/usr/lib/postgresql/16/bin \\\n    --check\n\n# Actual upgrade\n$ /usr/lib/postgresql/16/bin/pg_upgrade \\\n    --old-datadir=/var/lib/postgresql/15/main \\\n    --new-datadir=/var/lib/postgresql/16/main \\\n    --old-bindir=/usr/lib/postgresql/15/bin \\\n    --new-bindir=/usr/lib/postgresql/16/bin \\\n    --link                                    # hardlink instead of copy — very fast!\n\n# --link: file system hardlinks (minutes for TBs)\n# Without --link: full copy (much slower)\n\n# Start new version\n$ systemctl start postgresql@16-main\n\n# Analyze (statistics NOT copied)\n$ psql -c \"ANALYZE\"\n# Or: /usr/lib/postgresql/16/bin/vacuumdb --all --analyze-in-stages\n\n# Update port + configs, remove old\n$ pg_dropcluster --stop 15 main\n$ apt remove postgresql-15",
+      "highlight": [
+        2,
+        5,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        30,
+        33,
+        34,
+        37,
+        38
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Install new version alongside old",
+            "done": true
+          },
+          {
+            "label": "pg_upgrade --check (validate)",
+            "done": true
+          },
+          {
+            "label": "pg_upgrade --link (fast conversion)",
+            "active": true
+          },
+          {
+            "label": "ANALYZE (rebuild statistics)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Logical replication upgrade",
+      "description": "Set up new version as subscriber. Near-zero downtime — just cutover switch. Slower but no maintenance window needed.",
+      "code": "# Step 1: Set up PG 16 alongside PG 15\n$ apt install postgresql-16\n$ pg_createcluster 16 main --port 5433\n\n# Step 2: On PG 15 (publisher)\n# Enable logical replication\nALTER SYSTEM SET wal_level = 'logical';\n# Restart\n\nCREATE PUBLICATION upgrade_pub FOR ALL TABLES;\n\n# Step 3: On PG 16 (subscriber)\n# Create matching schema\n$ pg_dump -h old-pg -s devmastery | psql -p 5433 devmastery\n\n# Create subscription\nCREATE SUBSCRIPTION upgrade_sub\nCONNECTION 'host=old-pg port=5432 dbname=devmastery user=repluser'\nPUBLICATION upgrade_pub;\n\n# Step 4: Wait for initial sync + catch up\nSELECT * FROM pg_stat_subscription;\n# Wait until latest_end_time is current\n\n# Step 5: Verify data\nSELECT count(*) FROM users;   # on both — should match\n\n# Step 6: Cutover (brief downtime)\n# a. Stop apps\n# b. Stop writes on PG 15 (final sync)\n# c. Sync sequences (logical repl doesn't handle)\nSELECT 'SELECT setval('''||relname||''', ' || last_value || ');'\nFROM pg_sequences;\n# d. Update app connection string to PG 16 port 5433\n# e. Start apps\n\n# Step 7: Cleanup\nDROP SUBSCRIPTION upgrade_sub;\n# Decommission PG 15\n\n# Downtime typically < 1 minute!",
+      "highlight": [
+        3,
+        7,
+        8,
+        10,
+        13,
+        14,
+        17,
+        18,
+        19,
+        22,
+        23,
+        26,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "App",
+          "PG15",
+          "PG16",
+          "Rep"
+        ],
+        "messages": [
+          {
+            "from": "PG15",
+            "to": "Rep",
+            "label": "CREATE PUBLICATION"
+          },
+          {
+            "from": "PG16",
+            "to": "Rep",
+            "label": "CREATE SUBSCRIPTION"
+          },
+          {
+            "from": "Rep",
+            "to": "PG16",
+            "label": "initial sync + stream"
+          },
+          {
+            "from": "App",
+            "to": "PG15",
+            "label": "writes"
+          },
+          {
+            "from": "PG15",
+            "to": "PG16",
+            "label": "replicated changes"
+          },
+          {
+            "from": "App",
+            "to": "PG16",
+            "label": "cutover — switch conn"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Testing upgrades",
+      "description": "Always test on staging first. Verify data integrity, application compatibility, performance regressions.",
+      "code": "# Pre-upgrade checklist:\n\n# 1. Backup!\n$ pg_basebackup -D /backup/pre-upgrade\n$ pg_dumpall > pre-upgrade.sql\n\n# 2. Check extension compatibility\nSELECT extname, extversion FROM pg_extension;\n# Verify each is available in new version\n\n# 3. Read release notes for target version\n# https://www.postgresql.org/docs/release/\n\n# 4. Run pg_upgrade --check\n$ pg_upgrade --check ...\n# Fails if incompatibilities exist\n\n# 5. Test on staging clone\n# Take snapshot of prod, restore to staging, upgrade\n# Run application tests against new version\n\n# 6. Performance test with real workload\npgbench -h staging -T 60\n# Compare TPS before/after\n\n# 7. Test rollback plan\n# If upgrade fails: restore from backup, point app back\n\n# 8. Check application queries\n# Deprecated syntax? Removed operators?\n# EXPLAIN new plans — may differ across versions\n\n# 9. Schedule maintenance window\n# Announce to users\n# Prepare communications\n\n# 10. Post-upgrade\n# - ANALYZE all tables\n# - REINDEX if needed (rare)\n# - Update pg_stat_statements settings\n# - Monitor for anomalies over the following week\n\n$ vacuumdb --all --analyze-in-stages\n$ psql -c \"SELECT pg_stat_statements_reset()\"",
+      "highlight": [
+        3,
+        4,
+        7,
+        8,
+        11,
+        14,
+        15,
+        18,
+        19,
+        22,
+        23,
+        26,
+        27,
+        30,
+        31,
+        34,
+        35,
+        37,
+        38,
+        39,
+        40,
+        41,
+        43,
+        44
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Backup + verify",
+            "done": true
+          },
+          {
+            "label": "pg_upgrade --check on staging",
+            "done": true
+          },
+          {
+            "label": "Perf test with real workload",
+            "active": true
+          },
+          {
+            "label": "ANALYZE post-upgrade + monitor"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Managed database upgrades",
+      "description": "AWS RDS, Google Cloud SQL, Azure — upgrades via console/CLI. Test on non-prod, use blue-green for zero-downtime.",
+      "code": "# AWS RDS: minor version auto-apply\n$ aws rds modify-db-instance \\\n    --db-instance-identifier devmastery-prod \\\n    --engine-version 15.4 \\\n    --auto-minor-version-upgrade \\\n    --apply-immediately\n\n# Major version upgrade\n$ aws rds modify-db-instance \\\n    --db-instance-identifier devmastery-prod \\\n    --engine-version 16.1 \\\n    --allow-major-version-upgrade \\\n    --apply-immediately\n# Downtime: usually 10-30 min\n\n# Blue-Green Deployment (RDS, ~zero downtime)\n$ aws rds create-blue-green-deployment \\\n    --blue-green-deployment-name upgrade-to-16 \\\n    --source arn:aws:rds:... \\\n    --target-engine-version 16.1\n\n# Green = new version, syncs from blue\n# Test on green\n# Switchover: seconds of downtime\n\n$ aws rds switchover-blue-green-deployment \\\n    --blue-green-deployment-identifier upgrade-to-16\n\n# Google Cloud SQL major upgrade\n$ gcloud sql instances patch devmastery \\\n    --database-version=POSTGRES_16\n\n# Azure Flexible Server\naz postgres flexible-server upgrade --name devmastery --version 16\n\n# Supabase: managed via dashboard or CLI\nsupabase db upgrade --version 16\n\n# Before any upgrade:\n# 1. Take manual snapshot\n# 2. Test on staging\n# 3. Schedule maintenance window\n# 4. Notify team + users\n# 5. Monitor after upgrade",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        30,
+        31,
+        34,
+        35,
+        37,
+        38,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Managed upgrade paths",
+        "items": [
+          {
+            "label": "RDS Blue-Green",
+            "color": "#10b981",
+            "value": "Best: seconds of downtime",
+            "highlight": true
+          },
+          {
+            "label": "In-place upgrade",
+            "color": "#818cf8",
+            "value": "10-30 min downtime"
+          },
+          {
+            "label": "Test on staging",
+            "color": "#f59e0b",
+            "value": "Snapshot → upgrade → validate"
+          },
+          {
+            "label": "Take backup",
+            "color": "#ef4444",
+            "value": "Always — before any change"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

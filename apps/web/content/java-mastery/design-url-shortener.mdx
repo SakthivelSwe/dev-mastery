@@ -85,9 +85,174 @@ Peak (5x avg): 200 writes/sec, 20,000 reads/sec
 **Reality:** A URL shortener is a **redirect service with 1000:1 read-to-write ratio**, making the read path the dominant performance concern. The database is a fallback — most reads should hit edge cache (CDN) or Redis. The write path needs deduplication (returning the same short URL for the same long URL), abuse detection, and analytics tracking. The "just a database" architecture works at 100 URLs/day but breaks down at 100K/sec.
 
 ## VISUALIZATION_CONFIG
-
 ```json
-{ "component": "SequenceDiagram", "state": "java-mastery-design-url-shortener" }
+{
+  "language": "java",
+  "fileName": "UrlShortener.java",
+  "steps": [
+    {
+      "title": "Requirements and estimations",
+      "description": "Input: long URL. Output: 6-char short code (62^6 = 56 billion combos). 100M writes/day = 1160/s. 10B reads/day = 115K/s. Read-heavy.",
+      "code": "// Scale: 1160 writes/s, 115,000 reads/s\n// Storage: 100M URLs/day × 500 bytes = 50 GB/day\n// Short code: 6 chars from [a-zA-Z0-9] = 56 billion unique codes",
+      "diagram": {
+        "kind": "boxes",
+        "title": "Estimates",
+        "items": [
+          {
+            "label": "writes",
+            "value": "1.1k/s",
+            "color": "#818cf8"
+          },
+          {
+            "label": "reads",
+            "value": "115k/s (100× more)",
+            "color": "#10b981",
+            "highlight": true
+          },
+          {
+            "label": "strategy: optimize for reads",
+            "color": "#10b981"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Short code generation",
+      "description": "Use a counter + base62 encode OR hash the long URL. Counter gives sequential IDs. Hash gives distributed generation but needs collision check.",
+      "code": "class Base62 {\n    private static final String CHARS = \"0-9A-Za-z\";\n    static String encode(long n) {\n        StringBuilder sb = new StringBuilder();\n        while (n > 0) { sb.append(CHARS.charAt((int)(n % 62))); n /= 62; }\n        return sb.reverse().toString();\n    }\n}\n// Or: SHA-256(longUrl) → take first 7 chars → check collision",
+      "highlight": [
+        3,
+        4,
+        5
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "Client",
+          "API",
+          "IDGen",
+          "DB"
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "API",
+            "label": "POST /shorten {longUrl}"
+          },
+          {
+            "from": "API",
+            "to": "IDGen",
+            "label": "nextId()"
+          },
+          {
+            "from": "IDGen",
+            "to": "API",
+            "label": "long id → base62 → \"abc12Z\""
+          },
+          {
+            "from": "API",
+            "to": "DB",
+            "label": "INSERT (abc12Z, longUrl)"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Redirect flow",
+      "description": "GET /{code} → lookup in cache → if miss, query DB → 301 Permanent Redirect (browsers cache) or 302 Temporary (analytics accurate).",
+      "code": "@GetMapping(\"/{code}\")\npublic ResponseEntity<Void> redirect(@PathVariable String code) {\n    String longUrl = cache.getIfPresent(code);\n    if (longUrl == null) {\n        longUrl = urlRepo.findByCode(code).orElseThrow();\n        cache.put(code, longUrl);\n    }\n    return ResponseEntity.status(302).location(URI.create(longUrl)).build();\n}",
+      "highlight": [
+        3,
+        4,
+        5,
+        8
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "GET /abc12Z",
+            "done": true
+          },
+          {
+            "label": "cache hit? → 302 redirect (< 1ms)",
+            "done": true
+          },
+          {
+            "label": "cache miss → DB lookup → cache → 302",
+            "active": true
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cache strategy",
+      "description": "Cache hot URLs in Redis (most popular 20% served from cache 80% of time). Use LRU eviction. TTL matching URL expiry.",
+      "code": "Cache<String, String> urlCache = Caffeine.newBuilder()\n    .maximumSize(10_000_000)\n    .expireAfterWrite(1, TimeUnit.HOURS)\n    .build();\n// 10M entries * ~200 bytes each = ~2 GB memory",
+      "highlight": [
+        1,
+        3
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Caching layer",
+        "items": [
+          {
+            "label": "Caffeine (in-process)",
+            "color": "#10b981",
+            "value": "sub-ms",
+            "highlight": true
+          },
+          {
+            "label": "Redis (distributed)",
+            "color": "#818cf8",
+            "value": "~1ms, shared"
+          },
+          {
+            "label": "DB (Postgres)",
+            "color": "#f59e0b",
+            "value": "~10ms, source of truth"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Analytics and scalability",
+      "description": "Track click counts with Redis incr. Scale writes with a Kafka queue (producer publishes, consumer batch-inserts). Scale reads with read replicas.",
+      "code": "// Click tracking: fast, async\nredis.incr(\"clicks:\" + code);\nkafka.send(\"url-clicks\", new ClickEvent(code, userAgent, referer));\n// Batch consumer writes to analytics DB\n// Partition by code for ordering guarantees per URL",
+      "highlight": [
+        2,
+        3
+      ],
+      "diagram": {
+        "kind": "sequence",
+        "actors": [
+          "API",
+          "Redis",
+          "Kafka",
+          "AnalyticsDB"
+        ],
+        "messages": [
+          {
+            "from": "API",
+            "to": "Redis",
+            "label": "INCR clicks:abc12Z"
+          },
+          {
+            "from": "API",
+            "to": "Kafka",
+            "label": "publish ClickEvent"
+          },
+          {
+            "from": "Kafka",
+            "to": "AnalyticsDB",
+            "label": "batch insert (async)"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

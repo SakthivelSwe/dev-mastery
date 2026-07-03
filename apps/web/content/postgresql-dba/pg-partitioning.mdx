@@ -20,7 +20,280 @@ If your `orders` table has 10 million rows, Postgres handles it perfectly. If it
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "DBVisualizer", "state": "pg-partitioning" }
+{
+  "language": "sql",
+  "fileName": "partitioning.sql",
+  "steps": [
+    {
+      "title": "Why partition tables",
+      "description": "Partitioning splits a huge table into smaller ones. Faster scans (partition pruning), easier bulk deletes, simpler maintenance, better parallel execution.",
+      "code": "-- Problem: 1 billion row events table\n-- - Sequential scans take minutes\n-- - Indexes are huge\n-- - VACUUM takes hours\n-- - DELETE old rows locks for a long time\n\n-- Solution: partition by date\nCREATE TABLE events (\n  id BIGINT,\n  user_id BIGINT,\n  type TEXT,\n  data JSONB,\n  created_at TIMESTAMPTZ NOT NULL\n) PARTITION BY RANGE (created_at);\n\n-- Create partitions per month\nCREATE TABLE events_2026_06 PARTITION OF events\n  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- Query behaves like single table\nSELECT * FROM events WHERE created_at > '2026-07-01';\n-- Planner scans only 2026_07 partition (partition pruning)\n\n-- Benefits:\n-- ✅ Partition pruning: only scan relevant partitions\n-- ✅ DROP old partition = instant (no DELETE!)\n-- ✅ Parallel operations on partitions\n-- ✅ Smaller indexes per partition",
+      "highlight": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partitioning wins",
+        "items": [
+          {
+            "label": "Partition pruning",
+            "color": "#10b981",
+            "value": "Scan only relevant partitions",
+            "highlight": true
+          },
+          {
+            "label": "DROP partition = instant",
+            "color": "#818cf8",
+            "value": "Delete old data in ms"
+          },
+          {
+            "label": "Smaller indexes",
+            "color": "#f59e0b",
+            "value": "Faster inserts, less bloat"
+          },
+          {
+            "label": "Per-partition VACUUM",
+            "color": "#60a5fa",
+            "value": "Parallel maintenance"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partition strategies",
+      "description": "RANGE: time-based, ID ranges. LIST: enum values (country, status). HASH: even distribution. Combine for sub-partitioning.",
+      "code": "-- RANGE partitioning (most common — time series)\nCREATE TABLE metrics (id BIGSERIAL, value NUMERIC, ts TIMESTAMPTZ)\nPARTITION BY RANGE (ts);\n\nCREATE TABLE metrics_2026_07 PARTITION OF metrics\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- LIST partitioning (categorical)\nCREATE TABLE users (id BIGSERIAL, name TEXT, country TEXT)\nPARTITION BY LIST (country);\n\nCREATE TABLE users_us PARTITION OF users FOR VALUES IN ('US');\nCREATE TABLE users_eu PARTITION OF users FOR VALUES IN ('DE', 'FR', 'IT', 'ES');\nCREATE TABLE users_other PARTITION OF users DEFAULT;\n\n-- HASH partitioning (even distribution)\nCREATE TABLE orders (id BIGSERIAL, user_id BIGINT, total NUMERIC)\nPARTITION BY HASH (user_id);\n\nCREATE TABLE orders_p0 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 0);\nCREATE TABLE orders_p1 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 1);\nCREATE TABLE orders_p2 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 2);\nCREATE TABLE orders_p3 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 3);\n\n-- Composite (sub-partitioning)\nCREATE TABLE events (id BIGSERIAL, ts TIMESTAMPTZ, type TEXT)\nPARTITION BY RANGE (ts);\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')\n  PARTITION BY LIST (type);\n\nCREATE TABLE events_2026_07_view PARTITION OF events_2026_07 FOR VALUES IN ('view');\nCREATE TABLE events_2026_07_click PARTITION OF events_2026_07 FOR VALUES IN ('click');",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        9,
+        10,
+        12,
+        13,
+        14,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        29,
+        30,
+        31,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partition strategies",
+        "items": [
+          {
+            "label": "RANGE",
+            "color": "#10b981",
+            "value": "Time series, ID ranges",
+            "highlight": true
+          },
+          {
+            "label": "LIST",
+            "color": "#818cf8",
+            "value": "Enum: country, status, tenant"
+          },
+          {
+            "label": "HASH",
+            "color": "#f59e0b",
+            "value": "Even distribution across partitions"
+          },
+          {
+            "label": "Composite",
+            "color": "#60a5fa",
+            "value": "Sub-partitioning: time + type"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Automated partition management",
+      "description": "Create future partitions automatically. Drop old ones. Use pg_partman extension or write custom scheduler.",
+      "code": "-- pg_partman: partition automation\nCREATE EXTENSION pg_partman;\n\n-- Configure partitioning\nSELECT partman.create_parent(\n  p_parent_table => 'public.events',\n  p_control => 'created_at',\n  p_type => 'range',\n  p_interval => 'monthly',\n  p_premake => 4,       -- create 4 future partitions\n  p_start_partition => '2026-01-01'\n);\n\n-- Retention (drop old partitions automatically)\nUPDATE partman.part_config\nSET retention = '12 months',\n    retention_keep_table = false    -- actually drop\nWHERE parent_table = 'public.events';\n\n-- Run maintenance (creates/drops partitions)\nSELECT partman.run_maintenance();\n\n-- Automate via cron or pg_cron\nCREATE EXTENSION pg_cron;\nSELECT cron.schedule('partman-hourly', '0 * * * *', 'SELECT partman.run_maintenance()');\n\n-- Manual approach without pg_partman:\nDO $$\nDECLARE\n  next_month DATE := (CURRENT_DATE + INTERVAL '1 month')::DATE;\n  next_month_end DATE := (next_month + INTERVAL '1 month')::DATE;\n  partition_name TEXT := 'events_' || to_char(next_month, 'YYYY_MM');\nBEGIN\n  EXECUTE format(\n    'CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',\n    partition_name, next_month, next_month_end\n  );\nEND $$;\n\n-- Drop old partition (bye-bye old data — instant!)\nDROP TABLE events_2025_01;    -- millions of rows gone in ms",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        15,
+        16,
+        17,
+        18,
+        21,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        41
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "pg_partman configures partitioning",
+            "done": true
+          },
+          {
+            "label": "run_maintenance() creates future partitions",
+            "done": true
+          },
+          {
+            "label": "Auto-drop old per retention policy",
+            "active": true
+          },
+          {
+            "label": "pg_cron schedules it hourly"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Indexes and constraints on partitions",
+      "description": "PG 11+: indexes on parent auto-create on children. Primary keys must include partition key. Unique constraints per partition (unless PK includes partition key).",
+      "code": "-- Create partitioned table\nCREATE TABLE events (\n  id BIGSERIAL,\n  user_id BIGINT NOT NULL,\n  created_at TIMESTAMPTZ NOT NULL,\n  PRIMARY KEY (id, created_at)      -- MUST include partition key\n) PARTITION BY RANGE (created_at);\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- Index on parent → auto-created on all partitions (including future ones)\nCREATE INDEX idx_events_user ON events (user_id);\n-- Under the hood: partitioned index; children each get idx_events_user_2026_07 etc.\n\n-- Unique constraint requires partition key\nALTER TABLE events ADD CONSTRAINT events_unique UNIQUE (id, created_at);\n\n-- Foreign keys (PG 12+: parent can be referenced as FK target)\nCREATE TABLE event_metadata (\n  event_id BIGINT,\n  event_created_at TIMESTAMPTZ,\n  meta JSONB,\n  FOREIGN KEY (event_id, event_created_at) REFERENCES events (id, created_at)\n);\n\n-- CONCURRENTLY on partitioned indexes\nCREATE INDEX CONCURRENTLY idx_events_type ON events (type);\n\n-- Reindex specific partition\nREINDEX INDEX CONCURRENTLY idx_events_user_2026_07;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        13,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        28,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partition constraints",
+        "items": [
+          {
+            "label": "Parent index → all children",
+            "color": "#10b981",
+            "value": "Auto-managed",
+            "highlight": true
+          },
+          {
+            "label": "PK must include partition key",
+            "color": "#818cf8",
+            "value": "Unique across all partitions"
+          },
+          {
+            "label": "FK to partitioned table (PG 12+)",
+            "color": "#f59e0b",
+            "value": "Requires composite key"
+          },
+          {
+            "label": "Individual REINDEX",
+            "color": "#60a5fa",
+            "value": "Per-partition maintenance"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partition pruning in EXPLAIN",
+      "description": "Planner and executor prune partitions based on WHERE clauses. Verify with EXPLAIN. Missing pruning = full scan of all partitions.",
+      "code": "-- Good: partition pruning works\nEXPLAIN SELECT * FROM events WHERE created_at >= '2026-07-15';\n\n Append  (cost=0..1000)\n   ->  Seq Scan on events_2026_07 (cost=0..1000)   ← ONLY this partition scanned\n\n-- Bad: pruning didn't work\nEXPLAIN SELECT * FROM events WHERE DATE(created_at) = '2026-07-15';\n Append\n   ->  Seq Scan on events_2026_01\n   ->  Seq Scan on events_2026_02\n   ...\n   ->  Seq Scan on events_2026_12    ← scans ALL partitions!\n\n-- Reason: DATE() function on column blocks pruning\n-- Fix:\nEXPLAIN SELECT * FROM events WHERE created_at BETWEEN '2026-07-15' AND '2026-07-15 23:59:59';\n\n-- Pruning at execution time (dynamic values)\nEXPLAIN SELECT * FROM events WHERE created_at > NOW() - INTERVAL '1 day';\n-- With PG 12+: execution-time pruning works even with runtime values\n\n-- Force pruning inspection\nSET constraint_exclusion = partition;\n\n-- View partition list\nSELECT partitionname, partitionrangestart, partitionrangeend\nFROM pg_partitions\nWHERE tablename = 'events';\n\n-- Or\nSELECT c.relname, pg_get_expr(c.relpartbound, c.oid, true) AS bound\nFROM pg_inherits i\nJOIN pg_class c ON c.oid = i.inhrelid\nWHERE i.inhparent = 'events'::regclass;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        20,
+        21,
+        24,
+        27,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "WHERE with partition key column → pruning",
+            "done": true
+          },
+          {
+            "label": "Function on column blocks pruning",
+            "done": true
+          },
+          {
+            "label": "Execution-time pruning for runtime values",
+            "active": true
+          },
+          {
+            "label": "Verify with EXPLAIN: single partition scan"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

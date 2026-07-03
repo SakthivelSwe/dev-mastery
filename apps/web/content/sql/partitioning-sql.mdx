@@ -20,7 +20,415 @@ When you partition a table, the `logs` table becomes a "Logical" table. It holds
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "sql-partitioning" }
+{
+  "language": "sql",
+  "fileName": "partitioning.sql",
+  "steps": [
+    {
+      "title": "What is partitioning",
+      "description": "Split one big table into smaller physical pieces (partitions). Query one partition = smaller scan. Great for time-series.",
+      "code": "-- Partitioning: one logical table, many physical pieces\n-- Query hits only relevant partitions (partition pruning)\n\n-- Benefits:\n-- ✅ Smaller working set per query (faster)\n-- ✅ Drop old data by dropping partitions (instant vs slow DELETE)\n-- ✅ Bulk load can target one partition\n-- ✅ Different indexes per partition possible\n\n-- Costs:\n-- ❌ Schema more complex\n-- ❌ Some queries can't prune (must scan all)\n-- ❌ Foreign keys have restrictions (PG 12+ improved this)\n-- ❌ Global unique constraints only if part of partition key\n\n-- When to use:\n-- - Table > 10M rows AND queries filter by natural time/range\n-- - Log data, events, metrics, historical records\n-- - Regular data expiration (drop old partitions)\n\n-- When NOT to use:\n-- - Small tables (overhead > benefit)\n-- - No natural partition key\n-- - Random access across all data\n\n-- Types of partitioning:\n-- RANGE     — by ranges of values (dates, IDs)\n-- LIST      — by explicit values (country codes, regions)\n-- HASH      — by hash of key (even distribution)\n-- COMPOSITE — combinations\n\n-- Postgres declarative partitioning (PG 10+)\nCREATE TABLE events (\n  id BIGSERIAL,\n  user_id BIGINT NOT NULL,\n  event_type TEXT NOT NULL,\n  created_at TIMESTAMPTZ NOT NULL,\n  data JSONB\n) PARTITION BY RANGE (created_at);\n\n-- Now create partitions\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\nCREATE TABLE events_2026_08 PARTITION OF events\n  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');\n\n-- Query normally — planner routes\nINSERT INTO events (user_id, event_type, created_at, data)\nVALUES (42, 'login', NOW(), '{}');\n\nSELECT * FROM events WHERE created_at >= '2026-07-15';\n-- Only scans events_2026_07",
+      "highlight": [
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        27,
+        28,
+        29,
+        30,
+        31,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        42,
+        43,
+        45,
+        46,
+        49,
+        50,
+        51,
+        53
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partitioning basics",
+        "items": [
+          {
+            "label": "One logical table",
+            "color": "#10b981",
+            "value": "Many physical pieces",
+            "highlight": true
+          },
+          {
+            "label": "Partition pruning",
+            "color": "#818cf8",
+            "value": "Scan only relevant"
+          },
+          {
+            "label": "DROP for expiration",
+            "color": "#f59e0b",
+            "value": "Instant vs slow DELETE"
+          },
+          {
+            "label": "Best for time-series",
+            "color": "#60a5fa",
+            "value": "Or clear range keys"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Range partitioning",
+      "description": "Most common. Partition by date ranges. Auto-create partitions with pg_partman or scheduled DDL.",
+      "code": "-- RANGE partitioning (typical: by month)\nCREATE TABLE events (\n  id BIGSERIAL,\n  created_at TIMESTAMPTZ NOT NULL,\n  ...\n) PARTITION BY RANGE (created_at);\n\n-- Monthly partitions\nCREATE TABLE events_2026_01 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');\nCREATE TABLE events_2026_02 PARTITION OF events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');\n-- ... continue for each month\n\n-- Default partition (catches out-of-range values)\nCREATE TABLE events_default PARTITION OF events DEFAULT;\n\n-- Sub-partitioning (RANGE by month → HASH by user_id)\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')\n  PARTITION BY HASH (user_id);\n\nCREATE TABLE events_2026_07_p0 PARTITION OF events_2026_07\n  FOR VALUES WITH (MODULUS 4, REMAINDER 0);\nCREATE TABLE events_2026_07_p1 PARTITION OF events_2026_07\n  FOR VALUES WITH (MODULUS 4, REMAINDER 1);\nCREATE TABLE events_2026_07_p2 PARTITION OF events_2026_07\n  FOR VALUES WITH (MODULUS 4, REMAINDER 2);\nCREATE TABLE events_2026_07_p3 PARTITION OF events_2026_07\n  FOR VALUES WITH (MODULUS 4, REMAINDER 3);\n\n-- Detach + drop old partition (instant, no DELETE cost)\nALTER TABLE events DETACH PARTITION events_2025_01;\nDROP TABLE events_2025_01;\n\n-- Or archive first\nALTER TABLE events DETACH PARTITION events_2025_01;\n-- Now events_2025_01 is standalone — export/backup, then drop\n\n-- pg_partman (auto-management extension)\nCREATE EXTENSION pg_partman;\nSELECT partman.create_parent(\n  p_parent_table => 'public.events',\n  p_control => 'created_at',\n  p_type => 'range',\n  p_interval => 'monthly',\n  p_premake => 6              -- create 6 months ahead\n);\n\n-- Retention (keep 12 months, drop older)\nUPDATE partman.part_config\nSET retention = '12 months',\n    retention_keep_table = false\nWHERE parent_table = 'public.events';\n\n-- Run maintenance\nSELECT partman.run_maintenance('public.events');\n\n-- Schedule via pg_cron\nSELECT cron.schedule('partman-maint', '0 3 * * *',\n  'SELECT partman.run_maintenance()');",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        48,
+        49,
+        50,
+        51,
+        52,
+        54,
+        55,
+        57,
+        58,
+        59
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "PARTITION BY RANGE (date)",
+            "done": true
+          },
+          {
+            "label": "Create monthly/weekly partitions",
+            "done": true
+          },
+          {
+            "label": "DETACH + DROP for expiration",
+            "active": true
+          },
+          {
+            "label": "pg_partman for automation"
+          }
+        ]
+      }
+    },
+    {
+      "title": "List and hash partitioning",
+      "description": "LIST for discrete values (country, tenant). HASH for even distribution. Combine for multi-dimensional.",
+      "code": "-- LIST partitioning — explicit values\nCREATE TABLE orders (\n  id BIGSERIAL,\n  country CHAR(2),\n  total NUMERIC\n) PARTITION BY LIST (country);\n\nCREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('US');\nCREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('DE', 'FR', 'ES', 'IT', 'NL');\nCREATE TABLE orders_asia PARTITION OF orders FOR VALUES IN ('IN', 'JP', 'CN', 'KR');\nCREATE TABLE orders_other PARTITION OF orders DEFAULT;\n\n-- Query pruning:\nSELECT * FROM orders WHERE country = 'IN';    -- only scans orders_asia\n\n-- Use cases:\n-- - Multi-region deployments (data residency)\n-- - Multi-tenant (partition per tenant or tenant group)\n-- - Category-based data isolation\n\n-- HASH partitioning — even distribution by hash of key\nCREATE TABLE user_activity (\n  user_id BIGINT NOT NULL,\n  action TEXT,\n  created_at TIMESTAMPTZ\n) PARTITION BY HASH (user_id);\n\nCREATE TABLE user_activity_p0 PARTITION OF user_activity FOR VALUES WITH (MODULUS 8, REMAINDER 0);\nCREATE TABLE user_activity_p1 PARTITION OF user_activity FOR VALUES WITH (MODULUS 8, REMAINDER 1);\n-- ... p2 through p7\n\n-- Use cases:\n-- - Even distribution of writes (avoids hotspot on one partition)\n-- - No natural time/range key\n-- - Sharding-like locality\n\n-- Pruning only works for equality:\nSELECT * FROM user_activity WHERE user_id = 42;    -- ✅ prunes to 1 partition\nSELECT * FROM user_activity WHERE user_id > 100;   -- ❌ scans all partitions\n\n-- Composite partitioning\nCREATE TABLE events (\n  created_at TIMESTAMPTZ,\n  tenant_id BIGINT,\n  ...\n) PARTITION BY LIST (tenant_id);\n\nCREATE TABLE events_tenant_1 PARTITION OF events FOR VALUES IN (1)\n  PARTITION BY RANGE (created_at);\n\nCREATE TABLE events_tenant_1_2026_07 PARTITION OF events_tenant_1\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- Enables per-tenant retention + per-month expiration\n\n-- Row inserted into wrong partition? No — Postgres routes based on key\n-- If value doesn't fit any partition and no DEFAULT → error\n\n-- ⚠️ Partition key MUST be in every INSERT / lookup for good pruning\n-- If you filter only on other columns → scans all partitions",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        56,
+        57,
+        59,
+        60
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "List / Hash",
+        "items": [
+          {
+            "label": "LIST",
+            "color": "#10b981",
+            "value": "Discrete values (country, tenant)",
+            "highlight": true
+          },
+          {
+            "label": "HASH",
+            "color": "#818cf8",
+            "value": "Even distribution"
+          },
+          {
+            "label": "Composite (LIST + RANGE)",
+            "color": "#f59e0b",
+            "value": "Multi-dim: tenant + time"
+          },
+          {
+            "label": "Need equality for HASH prune",
+            "color": "#ef4444",
+            "value": "Range filter → all partitions"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partition maintenance",
+      "description": "Add partitions ahead of time. Detach + drop old. Move partitions between tablespaces. Reindex per partition.",
+      "code": "-- Add partitions ahead of time (schedule this)\nCREATE TABLE events_2026_08 PARTITION OF events\n  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');\n\n-- pg_partman auto-creates future partitions\nSELECT partman.run_maintenance('public.events');\n\n-- List all partitions\nSELECT tablename FROM pg_tables WHERE tablename LIKE 'events_%';\n\n-- Or:\nSELECT inhrelid::regclass AS partition\nFROM pg_inherits\nWHERE inhparent = 'events'::regclass;\n\n-- Size per partition\nSELECT relname, pg_size_pretty(pg_relation_size(oid))\nFROM pg_class\nWHERE relname LIKE 'events_%'\nORDER BY pg_relation_size(oid) DESC;\n\n-- Detach partition (removes from parent, keeps table)\nALTER TABLE events DETACH PARTITION events_2025_01;\n-- Now events_2025_01 is a standalone table\n\n-- Drop partition (removes data)\nDROP TABLE events_2025_01;\n\n-- Attach existing table as partition\nCREATE TABLE events_2027_01 (LIKE events INCLUDING ALL);\n-- ... load data ...\nALTER TABLE events ATTACH PARTITION events_2027_01\n  FOR VALUES FROM ('2027-01-01') TO ('2027-02-01');\n\n-- Move to different tablespace (cold storage)\nALTER TABLE events_2024_01 SET TABLESPACE cold_storage;\n\n-- Indexes on partitioned tables\nCREATE INDEX ON events (user_id);\n-- PG 11+: creates index on all existing + future partitions\n\n-- Partition-specific index (rare)\nCREATE INDEX ON events_2026_07 (something_partition_specific);\n\n-- REINDEX per partition\nREINDEX TABLE CONCURRENTLY events_2026_07;\n\n-- VACUUM per partition (autovacuum usually handles)\nVACUUM ANALYZE events_2026_07;\n\n-- Constraint exclusion (legacy) vs partition pruning (modern)\n-- Ensure PG version has partition pruning enabled (default in 11+)\nSHOW enable_partition_pruning;    -- should be on\n\n-- Verify pruning works\nEXPLAIN SELECT * FROM events WHERE created_at >= '2026-07-01';\n-- Look for \"Partitions: 1\" or list of only pruned partitions\n\n-- Migration to partitioning (existing table)\n-- 1. Rename original: ALTER TABLE events RENAME TO events_old\n-- 2. Create new partitioned table: CREATE TABLE events (...) PARTITION BY RANGE\n-- 3. Create partitions\n-- 4. Copy data: INSERT INTO events SELECT * FROM events_old\n-- 5. Verify counts + integrity\n-- 6. Drop old: DROP TABLE events_old\n-- (Use pg_partman.partition_data_time or similar helpers)",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        8,
+        9,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        37,
+        38,
+        39,
+        41,
+        42,
+        44,
+        45,
+        47,
+        48,
+        50,
+        51,
+        52,
+        54,
+        55,
+        56,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partition ops",
+        "items": [
+          {
+            "label": "Create ahead",
+            "color": "#10b981",
+            "value": "pg_partman automates",
+            "highlight": true
+          },
+          {
+            "label": "DETACH + DROP old",
+            "color": "#818cf8",
+            "value": "Instant expiration"
+          },
+          {
+            "label": "ATTACH loaded table",
+            "color": "#f59e0b",
+            "value": "Bulk import pattern"
+          },
+          {
+            "label": "Verify pruning",
+            "color": "#60a5fa",
+            "value": "EXPLAIN \"Partitions: N\""
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partitioning gotchas",
+      "description": "UNIQUE must include partition key. FKs limited. Partition key on every query. Cross-partition joins expensive.",
+      "code": "-- ❌ Gotcha 1: UNIQUE without partition key\nCREATE TABLE users (\n  email TEXT UNIQUE       -- ❌ error: unique must include partition key\n) PARTITION BY HASH (id);\n\n-- ✅ Include partition key\nCREATE TABLE users (\n  id BIGINT,\n  email TEXT,\n  UNIQUE (id, email)      -- ✅ but email only unique per id (not global)\n) PARTITION BY HASH (id);\n\n-- Or use partitioning that groups by uniqueness:\n-- Partition by email hash if you need global email uniqueness\n\n-- ❌ Gotcha 2: FK from partitioned to non-partitioned tricky (PG < 12)\n-- PG 12+ supports FK from partitioned tables to regular tables\n\n-- ❌ Gotcha 3: Missing partition key in WHERE\nSELECT * FROM events WHERE user_id = 42;\n-- If partitioned by created_at → scans ALL partitions\n-- Solution: include partition key\nSELECT * FROM events\nWHERE user_id = 42 AND created_at > NOW() - INTERVAL '30 days';\n\n-- ❌ Gotcha 4: Query using function on partition key\nWHERE date(created_at) = '2026-07-01'    -- may not prune\n-- Fix:\nWHERE created_at >= '2026-07-01' AND created_at < '2026-07-02'\n\n-- ❌ Gotcha 5: Too many partitions → overhead\n-- Each SELECT parses all partition metadata\n-- Keep < 1000 partitions ideally\n-- Aggregate by year if 10 years * 12 months = 120 monthly → OK\n\n-- ❌ Gotcha 6: Insert bulk with mixed partition keys\n-- Postgres routes each row → many tiny inserts per partition\n-- COPY works well; INSERT ... SELECT can be slow if unsorted\n\n-- ✅ Sort input by partition key for faster loads\n\n-- ❌ Gotcha 7: ALTER TABLE ... ADD COLUMN with default\n-- On huge partitioned tables — slow (rewrite each partition)\n-- Solution (PG 11+): nullable columns add instantly\n\n-- ❌ Gotcha 8: Different indexes per partition → maintenance nightmare\n-- Prefer parent-level indexes (auto-propagated)\n\n-- ❌ Gotcha 9: Cross-partition JOINs\nSELECT * FROM events e JOIN users u ON u.id = e.user_id\nWHERE e.created_at > NOW() - INTERVAL '7 days';\n-- Prune events, then join → fine\nSELECT * FROM events e1 JOIN events e2 ON e1.user_id = e2.user_id;\n-- Self-join across all partitions → slow\n\n-- ❌ Gotcha 10: Autovacuum per partition\n-- Many partitions → autovacuum workers busy\n-- Tune: autovacuum_max_workers, per-partition settings\n\n-- Diagnostic queries\n-- List partitions + sizes\nSELECT partitionname, pg_size_pretty(pg_relation_size(partitionname::regclass))\nFROM (SELECT tablename AS partitionname FROM pg_tables WHERE tablename LIKE 'events_%') t;\n\n-- Confirm pruning\nEXPLAIN (BUFFERS, ANALYZE)\nSELECT * FROM events WHERE created_at BETWEEN '2026-07-01' AND '2026-07-15';\n-- Expect: single or few partition scans\n\n-- Alternatives to partitioning:\n-- - BRIN index (very small footprint, great for time-series)\n-- - Materialized views (pre-aggregated summaries)\n-- - Archive tables (manual move to cold storage)",
+      "highlight": [
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        16,
+        17,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        26,
+        27,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        42,
+        43,
+        44,
+        46,
+        47,
+        49,
+        50,
+        51,
+        52,
+        53,
+        55,
+        56,
+        57,
+        58,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partitioning traps",
+        "items": [
+          {
+            "label": "UNIQUE needs partition key",
+            "color": "#ef4444",
+            "value": "No global uniqueness else",
+            "highlight": true
+          },
+          {
+            "label": "Partition key in WHERE",
+            "color": "#f59e0b",
+            "value": "Or no pruning"
+          },
+          {
+            "label": "Function on col = no prune",
+            "color": "#818cf8",
+            "value": "Rewrite predicates"
+          },
+          {
+            "label": "< 1000 partitions ideal",
+            "color": "#60a5fa",
+            "value": "Metadata overhead"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE
