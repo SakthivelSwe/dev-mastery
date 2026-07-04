@@ -8,16 +8,16 @@ export const runtime = 'edge';
 
 export const metadata: Metadata = {
   title: {
-    default: 'DevMastery — Master Every Technology. Miss Nothing.',
-    template: '%s | DevMastery',
+    default: 'DevMastery',
+    template: '%s · DevMastery',
   },
   description:
-    'From Zero to 10-Year Senior Engineer. Depth-first, concept-complete, AI-assisted learning. Master Java, DSA, Spring Boot, System Design and more.',
-  keywords: ['java', 'dsa', 'spring boot', 'system design', 'interview preparation', 'programming', 'coding', 'learning platform'],
+    'A depth-first, concept-complete engineering study workspace. Structured paths, animated concepts, and honest interview prep.',
+  keywords: ['java', 'dsa', 'spring boot', 'system design', 'interview preparation', 'programming'],
   authors: [{ name: 'DevMastery' }],
   openGraph: {
-    title: 'DevMastery — Master Every Technology. Miss Nothing.',
-    description: 'Structured, depth-first learning platform. From beginner to senior engineer.',
+    title: 'DevMastery',
+    description: 'A depth-first engineering study workspace.',
     type: 'website',
     locale: 'en_US',
   },
@@ -28,7 +28,7 @@ export const metadata: Metadata = {
 
 // Next.js 15 moved themeColor / viewport out of metadata into its own export.
 export const viewport: Viewport = {
-  themeColor: '#0d1117',
+  themeColor: '#0B0E14',
 };
 
 // Flash-free dark mode: runs synchronously BEFORE the first paint
@@ -64,7 +64,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link
           rel="stylesheet"
-          href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap"
+          href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap"
         />
       </head>
       <body

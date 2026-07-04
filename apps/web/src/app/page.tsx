@@ -1,189 +1,105 @@
 'use client';
 
-import { useState } from 'react';
 import Link from 'next/link';
+import {
+  ArrowRight,
+  Boxes,
+  Braces,
+  Coffee,
+  Cpu,
+  Layers3,
+  Network,
+  Puzzle,
+  Sparkles,
+  Sprout,
+  Target,
+  Waves,
+} from 'lucide-react';
 
-/* ─── Learning Path data — slugs MUST match learning_paths.slug in the DB ─── */
-const LEARNING_PATHS = [
-  {
-    slug: 'java-mastery',
-    title: 'Java Mastery',
-    description: 'Core Java → OOP → Collections → Streams → Concurrency → JVM Internals',
-    icon: '☕',
-    accent: 'var(--accent-java)',
-    level: '1–5',
-    topics: 120,
-    hours: 120,
-    gradient: 'gradient-java',
-  },
-  {
-    slug: 'dsa',
-    title: 'DSA Mastery',
-    description: 'Arrays → Trees → Graphs → DP → Greedy → Backtracking. Crack any coding interview.',
-    icon: '🧩',
-    accent: 'var(--accent-dsa)',
-    level: '1–5',
-    topics: 95,
-    hours: 100,
-    gradient: 'gradient-kotlin',
-  },
-  {
-    slug: 'spring-boot',
-    title: 'Spring Boot Mastery',
-    description: 'Spring Core → REST → JPA → Security → Microservices → Kafka → Valkey',
-    icon: '🌱',
-    accent: 'var(--accent-spring)',
-    level: '2–5',
-    topics: 80,
-    hours: 90,
-    gradient: 'gradient-spring',
-  },
-  {
-    slug: 'react',
-    title: 'React',
-    description: 'Hooks → State Management → Performance → Patterns → Next.js → RxJS',
-    icon: '⚛️',
-    accent: 'var(--accent-react)',
-    level: '1–5',
-    topics: 70,
-    hours: 80,
-    gradient: 'gradient-react',
-  },
-  {
-    slug: 'system-design',
-    title: 'System Design',
-    description: 'Scalability → CAP Theorem → Caching → Sharding → Message Queues → Case Studies',
-    icon: '🏗️',
-    accent: 'var(--accent-system)',
-    level: '3–5',
-    topics: 50,
-    hours: 60,
-    gradient: 'gradient-java',
-  },
-  {
-    slug: 'software-architecture',
-    title: 'Software Architecture',
-    description: 'Layered, Hexagonal, Event-driven, Microservices, DDD, CQRS, Saga patterns.',
-    icon: '🔷',
-    accent: 'var(--accent-ai)',
-    level: '2–5',
-    topics: 45,
-    hours: 50,
-    gradient: 'gradient-ai',
-  },
-  {
-    slug: 'leetcode-patterns',
-    title: 'LeetCode Patterns',
-    description: '20 universal coding patterns · Two pointers, sliding window, BFS/DFS, DP, and more.',
-    icon: '🎯',
-    accent: 'var(--accent-interview)',
-    level: '2–5',
-    topics: 40,
-    hours: 40,
-    gradient: 'gradient-spring',
-  },
-  {
-    slug: 'microservices',
-    title: 'Microservices with Spring',
-    description: 'Design and ship production-grade microservices · Spring Cloud, Resilience4j, Kafka, Kubernetes.',
-    icon: '🧬',
-    accent: 'var(--accent-spring)',
-    level: '1–5',
-    topics: 28,
-    hours: 120,
-    gradient: 'gradient-spring',
-  },
+/* ────────────────────────────────────────────────────────────────
+   Learning paths — slugs MUST match learning_paths.slug in the DB.
+   Icons are monochrome (lucide) to keep the layout calm.
+   ──────────────────────────────────────────────────────────────── */
+type Path = {
+  slug: string;
+  title: string;
+  blurb: string;
+  Icon: typeof Coffee;
+  accent: string;
+  level: string;
+  topics: number;
+};
+
+const PATHS: Path[] = [
+  { slug: 'java-mastery',          title: 'Java',                 blurb: 'Core Java → OOP → Collections → Streams → Concurrency → JVM.',        Icon: Coffee,   accent: 'var(--accent-java)',      level: '1–5', topics: 120 },
+  { slug: 'dsa',                   title: 'Data Structures & Algorithms', blurb: 'Arrays → Trees → Graphs → DP → Greedy → Backtracking.',        Icon: Puzzle,   accent: 'var(--accent-dsa)',       level: '1–5', topics: 95  },
+  { slug: 'spring-boot',           title: 'Spring Boot',          blurb: 'Spring Core → REST → JPA → Security → Kafka → Observability.',        Icon: Sprout,   accent: 'var(--accent-spring)',    level: '2–5', topics: 80  },
+  { slug: 'react',                 title: 'React',                blurb: 'Hooks → State → Performance → Patterns → Next.js → RxJS.',            Icon: Waves,    accent: 'var(--accent-react)',     level: '1–5', topics: 70  },
+  { slug: 'system-design',         title: 'System Design',        blurb: 'Scalability → CAP → Caching → Sharding → Queues → Case studies.',    Icon: Network,  accent: 'var(--accent-ai)',        level: '3–5', topics: 50  },
+  { slug: 'software-architecture', title: 'Software Architecture', blurb: 'Layered, Hexagonal, Event-driven, DDD, CQRS, Saga patterns.',        Icon: Layers3,  accent: 'var(--accent-kotlin)',    level: '2–5', topics: 45  },
+  { slug: 'leetcode-patterns',     title: 'LeetCode Patterns',    blurb: 'Twenty universal patterns: two pointers, sliding window, BFS/DFS…',   Icon: Target,   accent: 'var(--accent-interview)', level: '2–5', topics: 40  },
+  { slug: 'microservices',         title: 'Microservices',        blurb: 'Spring Cloud, Resilience4j, Kafka, service discovery, K8s.',          Icon: Boxes,    accent: 'var(--accent-spring)',    level: '2–5', topics: 28  },
 ];
 
-/* ─── Feature highlights ─────────────────────────────────────── */
-const FEATURES = [
-  {
-    icon: '🎬',
-    title: 'DSA Visualizer',
-    description: 'Step-by-step animated visualizations for 40+ algorithms. D3.js powered, with synchronized code highlighting.',
-  },
-  {
-    icon: '🤖',
-    title: 'AI Mentor (DevMentor)',
-    description: 'Powered by Google Gemini — answers doubts, debugs code, runs mock interviews adapted to your skill level.',
-  },
-  {
-    icon: '⚡',
-    title: 'In-Browser Code Lab',
-    description: 'Monaco Editor (VS Code engine) + Judge0 CE. Run Java, Python, TypeScript, Kotlin in your browser. Unlimited.',
-  },
-  {
-    icon: '📐',
-    title: '6-Layer Teaching Model',
-    description: 'Every topic: WHY → Theory → Visual → Code → Real World → Interview. Nothing skipped. Nothing left vague.',
-  },
-  {
-    icon: '🏆',
-    title: 'Gamification',
-    description: 'Daily streaks, XP, badges (Apprentice → Master), leaderboards, and completion certificates.',
-  },
-  {
-    icon: '📱',
-    title: 'Android App',
-    description: 'Native Kotlin + Jetpack Compose app with offline-first support. Learn anywhere, sync automatically.',
-  },
+/* ────────────────────────────────────────────────────────────────
+   The six teaching layers.
+   ──────────────────────────────────────────────────────────────── */
+const LAYERS = [
+  { n: '01', label: 'Why',        text: 'What problem does this concept solve, and why does it exist at all?' },
+  { n: '02', label: 'Theory',     text: 'The full conceptual model, with analogies grounded in real systems.' },
+  { n: '03', label: 'Visual',     text: 'Animated, step-by-step visualisations for algorithms and data flow.' },
+  { n: '04', label: 'Code',       text: 'Runnable code with inline commentary, from beginner to expert.' },
+  { n: '05', label: 'Real world', text: 'How the concept shows up in production systems you actually use.' },
+  { n: '06', label: 'Interview',  text: 'Conceptual, coding and edge-case questions — with honest answers.' },
 ];
 
-/* ─── Navbar ─────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────────
+   Navbar
+   ──────────────────────────────────────────────────────────────── */
 function Navbar() {
   return (
     <nav
-      className="fixed top-0 left-0 right-0 z-50 border-b"
+      className="fixed top-0 left-0 right-0 z-50 border-b backdrop-blur-md"
       style={{
-        background: 'rgba(13, 17, 23, 0.85)',
-        backdropFilter: 'blur(16px)',
-        WebkitBackdropFilter: 'blur(16px)',
+        background: 'color-mix(in oklab, var(--bg-primary) 82%, transparent)',
         borderColor: 'var(--border-default)',
       }}
     >
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
-        {/* Logo */}
+      <div className="max-w-6xl mx-auto px-5 sm:px-6 h-14 flex items-center justify-between">
         <Link href="/" className="flex items-center gap-2 group" id="nav-logo">
           <span
-            className="text-2xl font-bold"
-            style={{ fontFamily: 'var(--font-display)', color: 'var(--text-primary)' }}
+            className="inline-flex w-7 h-7 rounded-md items-center justify-center"
+            style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
           >
-            Dev<span style={{ color: 'var(--accent-java)' }}>Mastery</span>
+            <Sparkles size={15} />
+          </span>
+          <span
+            className="text-[15px] font-medium tracking-tight"
+            style={{ color: 'var(--text-primary)' }}
+          >
+            DevMastery
           </span>
         </Link>
 
-        {/* Nav links */}
-        <div className="hidden md:flex items-center gap-6">
-          {['Paths', 'Visualizer', 'Code Lab', 'AI Mentor'].map((item) => (
-            <a
-              key={item}
-              href={`#${item.toLowerCase().replace(' ', '-')}`}
-              className="text-sm transition-colors duration-150"
-              style={{ color: 'var(--text-secondary)' }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-primary)')}
-              onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-secondary)')}
-            >
-              {item}
+        <div className="hidden md:flex items-center gap-1">
+          {([
+            { href: '#paths',    label: 'Paths'    },
+            { href: '#method',   label: 'Method'   },
+            { href: '#features', label: 'Features' },
+          ]).map((item) => (
+            <a key={item.href} href={item.href} className="btn-quiet">
+              {item.label}
             </a>
           ))}
         </div>
 
-        {/* CTA */}
-        <div className="flex items-center gap-3">
-          <Link
-            href="/login"
-            id="nav-signin"
-            className="btn-ghost text-sm px-4 py-2"
-            style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-default)' }}
-          >
-            Sign In
+        <div className="flex items-center gap-2">
+          <Link href="/login" id="nav-signin" className="btn-quiet">
+            Sign in
           </Link>
-          <Link
-            href="/register"
-            id="nav-getstarted"
-            className="btn-primary text-sm px-4 py-2"
-          >
-            Get Started Free
+          <Link href="/dashboard" id="nav-continue" className="btn-primary text-sm px-4 py-2">
+            Open workspace
+            <ArrowRight size={14} />
           </Link>
         </div>
       </div>
@@ -191,356 +107,287 @@ function Navbar() {
   );
 }
 
-/* ─── Hero Section ───────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────────
+   Hero — quiet, no marketing chatter
+   ──────────────────────────────────────────────────────────────── */
 function Hero() {
   return (
     <section
-      className="relative min-h-screen flex items-center justify-center text-center px-4"
-      style={{
-        background: 'radial-gradient(ellipse at 50% -20%, rgba(66,133,244,0.12) 0%, transparent 60%), var(--bg-primary)',
-      }}
       id="hero"
+      className="relative pt-28 pb-24 sm:pt-36 sm:pb-32 overflow-hidden"
     >
-      {/* Grid background */}
+      {/* soft radial wash */}
       <div
-        className="absolute inset-0 opacity-20"
+        aria-hidden
+        className="pointer-events-none absolute inset-0"
         style={{
-          backgroundImage: 'linear-gradient(var(--border-default) 1px, transparent 1px), linear-gradient(90deg, var(--border-default) 1px, transparent 1px)',
-          backgroundSize: '40px 40px',
-          maskImage: 'radial-gradient(ellipse at center, black 30%, transparent 80%)',
+          background:
+            'radial-gradient(1200px 500px at 50% -10%, var(--accent-soft) 0%, transparent 60%)',
+        }}
+      />
+      {/* faint grid */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 opacity-[0.35]"
+        style={{
+          backgroundImage:
+            'linear-gradient(var(--border-default) 1px, transparent 1px), linear-gradient(90deg, var(--border-default) 1px, transparent 1px)',
+          backgroundSize: '56px 56px',
+          maskImage:
+            'radial-gradient(ellipse 60% 50% at 50% 30%, black 40%, transparent 85%)',
+          WebkitMaskImage:
+            'radial-gradient(ellipse 60% 50% at 50% 30%, black 40%, transparent 85%)',
         }}
       />
 
-      <div className="relative max-w-4xl mx-auto pt-24 pb-20">
-        {/* Badge */}
+      <div className="relative max-w-3xl mx-auto px-5 sm:px-6 text-center">
         <div
-          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium mb-8"
+          className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] font-medium"
           style={{
-            background: 'rgba(66,133,244,0.1)',
-            border: '1px solid rgba(66,133,244,0.3)',
-            color: 'var(--accent-ai)',
+            border: '1px solid var(--border-default)',
+            color: 'var(--text-secondary)',
+            background: 'var(--bg-surface)',
           }}
         >
-          <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-          100% Free Stack · Powered by Google Gemini · Oracle Cloud Free Tier
+          <span
+            className="w-1.5 h-1.5 rounded-full"
+            style={{ background: 'var(--accent)' }}
+          />
+          Personal engineering workspace
         </div>
 
-        {/* Heading */}
         <h1
-          className="text-5xl sm:text-6xl md:text-7xl font-extrabold mb-6 leading-tight"
-          style={{ fontFamily: 'var(--font-display)' }}
+          className="mt-6 text-balance"
+          style={{
+            fontFamily: 'var(--font-display)',
+            fontSize: 'clamp(2.5rem, 7vw, 5rem)',
+            lineHeight: 1.02,
+            letterSpacing: '-0.02em',
+          }}
         >
-          Master Every Technology.
-          <br />
-          <span
-            style={{
-              background: 'linear-gradient(135deg, var(--accent-java) 0%, var(--accent-ai) 50%, var(--accent-kotlin) 100%)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-              backgroundClip: 'text',
-            }}
-          >
-            Miss Nothing.
-          </span>
+          A quieter place to&nbsp;
+          <em style={{ fontStyle: 'italic', color: 'var(--accent)' }}>
+            master engineering
+          </em>
+          .
         </h1>
 
-        {/* Subtitle */}
         <p
-          className="text-lg sm:text-xl max-w-2xl mx-auto mb-10 leading-relaxed"
-          style={{ color: 'var(--text-secondary)' }}
+          className="mt-6 mx-auto text-pretty"
+          style={{
+            color: 'var(--text-secondary)',
+            fontSize: '1.075rem',
+            lineHeight: 1.65,
+            maxWidth: '36rem',
+          }}
         >
-          From complete beginner to senior engineer. Depth-first, concept-complete learning with
-          animated visualizations, AI mentoring, and a real code lab.
+          Structured paths, animated concepts, honest interview prep. Every topic taught across six
+          layers — from <span style={{ color: 'var(--text-primary)' }}>why</span> to
+          production usage. Nothing skipped, nothing exercised-for-the-reader.
         </p>
 
-        {/* CTA buttons */}
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-          <Link
-            href="/register"
-            id="hero-start"
-            className="btn-primary text-base px-8 py-3.5 w-full sm:w-auto"
-          >
-            Start Learning Free →
+        <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-3">
+          <Link href="/dashboard" id="hero-continue" className="btn-primary px-6 py-3">
+            Continue where you left off
+            <ArrowRight size={16} />
           </Link>
-          <a
-            href="#paths"
-            id="hero-paths"
-            className="btn-ghost text-base px-8 py-3.5 w-full sm:w-auto"
-          >
-            Browse Learning Paths
+          <a href="#paths" id="hero-paths" className="btn-ghost px-6 py-3">
+            Browse paths
           </a>
         </div>
 
-        {/* Stats */}
-        <div
-          className="flex flex-wrap justify-center gap-8 mt-16 pt-10"
-          style={{ borderTop: '1px solid var(--border-default)' }}
-        >
-          {[
-            { value: '7', label: 'Learning Paths' },
-            { value: '450+', label: 'DSA Problems' },
-            { value: '2000+', label: 'Quiz Questions' },
-            { value: '40+', label: 'Visualizations' },
-          ].map(({ value, label }) => (
-            <div key={label} className="text-center">
-              <div
-                className="text-3xl font-bold mb-1"
-                style={{ fontFamily: 'var(--font-display)', color: 'var(--text-primary)' }}
-              >
-                {value}
-              </div>
-              <div className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                {label}
-              </div>
-            </div>
-          ))}
+        <div className="mt-10 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-[13px]"
+             style={{ color: 'var(--text-muted)' }}>
+          <span>8 paths</span>
+          <span>·</span>
+          <span>6-layer method</span>
+          <span>·</span>
+          <span>Animated visualisations</span>
+          <span>·</span>
+          <span>Feynman check-ins</span>
         </div>
       </div>
     </section>
   );
 }
 
-/* ─── Path Card ──────────────────────────────────────────────── */
-function PathCard({ path }: { path: typeof LEARNING_PATHS[0] }) {
-  const [hovered, setHovered] = useState(false);
-
+/* ────────────────────────────────────────────────────────────────
+   Paths grid
+   ──────────────────────────────────────────────────────────────── */
+function PathCard({ path }: { path: Path }) {
+  const { Icon } = path;
   return (
     <Link
       href={`/learn/${path.slug}/roadmap`}
       id={`path-card-${path.slug}`}
-      className="relative block rounded-xl border cursor-pointer overflow-hidden transition-all duration-300 no-underline"
-      style={{
-        background: hovered
-          ? `linear-gradient(135deg, rgba(${path.accent.includes('java') ? '248,152,32' : path.accent.includes('spring') ? '109,179,63' : '66,133,244'}, 0.06) 0%, var(--bg-surface) 60%)`
-          : 'var(--bg-surface)',
-        borderColor: hovered ? path.accent : 'var(--border-default)',
-        transform: hovered ? 'translateY(-4px)' : 'translateY(0)',
-        boxShadow: hovered ? `0 8px 30px rgba(0,0,0,0.4)` : 'none',
-        padding: '24px',
-      }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      className="group card p-5 sm:p-6 block"
     >
-      {/* Left accent border */}
-      <div
-        className="absolute left-0 top-0 bottom-0 w-0.5 transition-opacity duration-300"
-        style={{ background: path.accent, opacity: hovered ? 1 : 0 }}
-      />
-
-      {/* Icon + title */}
-      <div className="flex items-start gap-3 mb-3">
-        <span className="text-2xl">{path.icon}</span>
-        <div>
-          <h3
-            className="font-bold text-lg mb-0.5"
-            style={{
-              fontFamily: 'var(--font-display)',
-              color: hovered ? path.accent : 'var(--text-primary)',
-              transition: 'color 0.2s ease',
-            }}
-          >
-            {path.title}
-          </h3>
-          <div className="flex gap-2">
-            <span
-              className="text-xs px-1.5 py-0.5 rounded"
-              style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}
+      <div className="flex items-start gap-4">
+        <span
+          className="shrink-0 inline-flex w-10 h-10 rounded-lg items-center justify-center border transition-colors"
+          style={{
+            background: 'var(--bg-elevated)',
+            borderColor: 'var(--border-default)',
+            color: path.accent,
+          }}
+        >
+          <Icon size={18} strokeWidth={1.6} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <h3
+              className="text-[17px] font-medium tracking-tight truncate"
+              style={{
+                color: 'var(--text-primary)',
+                fontFamily: 'var(--font-body)',
+              }}
             >
-              Level {path.level}
-            </span>
-            <span
-              className="text-xs px-1.5 py-0.5 rounded"
-              style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}
-            >
-              {path.hours}h
-            </span>
+              {path.title}
+            </h3>
+            <ArrowRight
+              size={16}
+              className="opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all"
+              style={{ color: 'var(--accent)' }}
+            />
+          </div>
+          <p className="mt-1.5 text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+            {path.blurb}
+          </p>
+          <div className="mt-4 flex items-center gap-2">
+            <span className="chip">L {path.level}</span>
+            <span className="chip">{path.topics} topics</span>
           </div>
         </div>
-      </div>
-
-      {/* Description */}
-      <p className="text-sm leading-relaxed mb-4" style={{ color: 'var(--text-secondary)' }}>
-        {path.description}
-      </p>
-
-      {/* Footer */}
-      <div className="flex items-center justify-between">
-        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
-          {path.topics} topics
-        </span>
-        <span
-          className="text-xs font-medium transition-colors duration-200"
-          style={{ color: hovered ? path.accent : 'var(--text-secondary)' }}
-        >
-          Start path →
-        </span>
       </div>
     </Link>
   );
 }
 
-/* ─── Paths Section ──────────────────────────────────────────── */
 function PathsSection() {
   return (
-    <section
-      id="paths"
-      className="max-w-7xl mx-auto px-4 sm:px-6 py-24"
-    >
-      <div className="text-center mb-16">
-        <div
-          className="inline-block text-xs font-medium px-3 py-1 rounded-full mb-4"
-          style={{
-            background: 'rgba(248,152,32,0.1)',
-            color: 'var(--accent-java)',
-            border: '1px solid rgba(248,152,32,0.2)',
-          }}
-        >
-          LEARNING PATHS
-        </div>
-        <h2
-          className="text-4xl font-extrabold mb-4"
-          style={{ fontFamily: 'var(--font-display)' }}
-        >
-          Choose Your Path
-        </h2>
-        <p className="text-lg max-w-xl mx-auto" style={{ color: 'var(--text-secondary)' }}>
-          7 structured learning tracks. Each topic taught across 6 layers — from WHY to production
-          usage to interview prep. Nothing skipped.
+    <section id="paths" className="max-w-6xl mx-auto px-5 sm:px-6 py-20 sm:py-28">
+      <div className="text-center">
+        <span className="section-eyebrow">Learning paths</span>
+        <h2 className="section-title">Pick a track. Go deep.</h2>
+        <p className="section-sub">
+          Eight structured tracks. Each topic passes through six teaching layers before it is marked
+          complete.
         </p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-        {LEARNING_PATHS.map((path) => (
-          <PathCard key={path.slug} path={path} />
+      <div className="mt-14 grid grid-cols-1 md:grid-cols-2 gap-4">
+        {PATHS.map((p) => (
+          <PathCard key={p.slug} path={p} />
         ))}
       </div>
     </section>
   );
 }
 
-/* ─── Features Section ───────────────────────────────────────── */
-function FeaturesSection() {
+/* ────────────────────────────────────────────────────────────────
+   Method (six layers)
+   ──────────────────────────────────────────────────────────────── */
+function MethodSection() {
   return (
     <section
-      id="features"
-      className="py-24"
-      style={{ background: 'var(--bg-surface)', borderTop: '1px solid var(--border-default)', borderBottom: '1px solid var(--border-default)' }}
+      id="method"
+      className="py-20 sm:py-28"
+      style={{
+        background: 'var(--bg-surface)',
+        borderTop: '1px solid var(--border-default)',
+        borderBottom: '1px solid var(--border-default)',
+      }}
     >
-      <div className="max-w-7xl mx-auto px-4 sm:px-6">
-        <div className="text-center mb-16">
-          <h2
-            className="text-4xl font-extrabold mb-4"
-            style={{ fontFamily: 'var(--font-display)' }}
-          >
-            Everything You Need to Go{' '}
-            <span
-              style={{
-                background: 'linear-gradient(135deg, var(--accent-ai) 0%, var(--accent-kotlin) 100%)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                backgroundClip: 'text',
-              }}
-            >
-              Senior
-            </span>
-          </h2>
-          <p className="text-lg max-w-xl mx-auto" style={{ color: 'var(--text-secondary)' }}>
-            Not just videos. Not just theory. A complete system to build real understanding.
+      <div className="max-w-6xl mx-auto px-5 sm:px-6">
+        <div className="text-center">
+          <span className="section-eyebrow">The method</span>
+          <h2 className="section-title">Six layers, in order.</h2>
+          <p className="section-sub">
+            Every single topic is taught the same way. No shortcuts, no “exercise for the reader”.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {FEATURES.map((feature) => (
-            <div
-              key={feature.title}
-              id={`feature-${feature.title.toLowerCase().replace(/\s+/g, '-')}`}
-              className="rounded-xl p-6 transition-all duration-200"
+        <ol className="mt-14 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {LAYERS.map((l) => (
+            <li
+              key={l.n}
+              className="p-5 rounded-[10px] border"
               style={{
-                background: 'var(--bg-elevated)',
-                border: '1px solid var(--border-default)',
+                background: 'var(--bg-primary)',
+                borderColor: 'var(--border-default)',
               }}
             >
-              <div className="text-3xl mb-4">{feature.icon}</div>
-              <h3
-                className="font-bold text-lg mb-2"
-                style={{ fontFamily: 'var(--font-display)', color: 'var(--text-primary)' }}
-              >
-                {feature.title}
-              </h3>
-              <p className="text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                {feature.description}
+              <div className="flex items-baseline gap-3">
+                <span
+                  className="text-[13px] tabular-nums"
+                  style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-code)' }}
+                >
+                  {l.n}
+                </span>
+                <span
+                  className="text-[15px]"
+                  style={{
+                    color: 'var(--text-primary)',
+                    fontFamily: 'var(--font-display)',
+                    fontStyle: 'italic',
+                  }}
+                >
+                  {l.label}
+                </span>
+              </div>
+              <p className="mt-2 text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                {l.text}
               </p>
-            </div>
+            </li>
           ))}
-        </div>
+        </ol>
       </div>
     </section>
   );
 }
 
-/* ─── 6-Layer Teaching Model Section ────────────────────────── */
-function TeachingModelSection() {
-  const layers = [
-    { num: '01', label: 'WHY', desc: 'Why does this concept exist? What problem does it solve?', color: 'var(--accent-ai)' },
-    { num: '02', label: 'THEORY', desc: 'Complete conceptual explanation with real analogies', color: 'var(--accent-kotlin)' },
-    { num: '03', label: 'VISUAL', desc: 'Animated step-by-step visualization of algorithms and data flow', color: 'var(--accent-react)' },
-    { num: '04', label: 'CODE', desc: 'Runnable code with inline comments, beginner → expert versions', color: 'var(--accent-java)' },
-    { num: '05', label: 'REAL WORLD', desc: 'How this is used in production (e.g., HashMap in Spring Cache)', color: 'var(--accent-spring)' },
-    { num: '06', label: 'INTERVIEW', desc: 'All question types: conceptual, coding, tricky edge cases', color: 'var(--accent-interview)' },
-  ];
+/* ────────────────────────────────────────────────────────────────
+   Features
+   ──────────────────────────────────────────────────────────────── */
+const FEATURES = [
+  { Icon: Cpu,      title: 'Animated visualisers',       text: 'Step-by-step animations for algorithms, data flow and JVM internals, wired to the code you are reading.' },
+  { Icon: Sparkles, title: 'Grounded AI mentor',         text: 'Answers doubts, debugs code and runs Feynman check-ins — always cited against your current topic.' },
+  { Icon: Braces,   title: 'In-browser code lab',        text: 'Monaco Editor with a persistent scratch area. Run Java, Python, TypeScript, Kotlin — no setup.' },
+  { Icon: Layers3,  title: 'Six-layer coverage',         text: 'Why → Theory → Visual → Code → Real world → Interview. Progress locks until each layer is done.' },
+  { Icon: Target,   title: 'Honest interview prep',      text: 'Real interview questions, edge cases, and follow-ups — with the answers a senior engineer would give.' },
+  { Icon: Network,  title: 'Spaced review',              text: 'Topics you complete return on a spaced schedule so nothing quietly rots out of memory.' },
+];
 
+function FeaturesSection() {
   return (
-    <section className="max-w-7xl mx-auto px-4 sm:px-6 py-24">
-      <div className="text-center mb-16">
-        <div
-          className="inline-block text-xs font-medium px-3 py-1 rounded-full mb-4"
-          style={{
-            background: 'rgba(66,133,244,0.1)',
-            color: 'var(--accent-ai)',
-            border: '1px solid rgba(66,133,244,0.2)',
-          }}
-        >
-          THE METHOD
-        </div>
-        <h2
-          className="text-4xl font-extrabold mb-4"
-          style={{ fontFamily: 'var(--font-display)' }}
-        >
-          The 6-Layer Teaching Model
-        </h2>
-        <p className="text-lg max-w-xl mx-auto" style={{ color: 'var(--text-secondary)' }}>
-          Every single topic is taught across all 6 layers. No exceptions.
-          No "exercise for the reader." No skipping.
-        </p>
+    <section id="features" className="max-w-6xl mx-auto px-5 sm:px-6 py-20 sm:py-28">
+      <div className="text-center">
+        <span className="section-eyebrow">Features</span>
+        <h2 className="section-title">What&apos;s inside.</h2>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        {layers.map((layer) => (
+      <div className="mt-14 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {FEATURES.map((f) => (
           <div
-            key={layer.num}
-            className="rounded-xl p-5 flex gap-4"
-            style={{
-              background: 'var(--bg-surface)',
-              border: '1px solid var(--border-default)',
-            }}
+            key={f.title}
+            id={`feature-${f.title.toLowerCase().replace(/\s+/g, '-')}`}
+            className="card p-5 sm:p-6"
           >
-            <div
-              className="text-2xl font-black shrink-0"
-              style={{ fontFamily: 'var(--font-display)', color: layer.color, opacity: 0.3 }}
+            <span
+              className="inline-flex w-9 h-9 rounded-md items-center justify-center"
+              style={{ background: 'var(--bg-elevated)', color: 'var(--accent)' }}
             >
-              {layer.num}
-            </div>
-            <div>
-              <div
-                className="text-xs font-bold tracking-widest mb-1"
-                style={{ color: layer.color }}
-              >
-                {layer.label}
-              </div>
-              <p className="text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                {layer.desc}
-              </p>
-            </div>
+              <f.Icon size={17} strokeWidth={1.6} />
+            </span>
+            <h3
+              className="mt-4 text-[16px] font-medium tracking-tight"
+              style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-body)' }}
+            >
+              {f.title}
+            </h3>
+            <p className="mt-1.5 text-[13.5px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              {f.text}
+            </p>
           </div>
         ))}
       </div>
@@ -548,85 +395,75 @@ function TeachingModelSection() {
   );
 }
 
-/* ─── CTA Section ────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────────
+   Quiet CTA
+   ──────────────────────────────────────────────────────────────── */
 function CtaSection() {
   return (
     <section
-      className="py-24"
+      className="py-20 sm:py-28"
       style={{
-        background: 'radial-gradient(ellipse at 50% 50%, rgba(66,133,244,0.08) 0%, transparent 70%)',
         borderTop: '1px solid var(--border-default)',
+        background:
+          'radial-gradient(ellipse at 50% 40%, var(--accent-soft) 0%, transparent 60%)',
       }}
     >
-      <div className="max-w-3xl mx-auto px-4 text-center">
-        <h2
-          className="text-4xl sm:text-5xl font-extrabold mb-6"
-          style={{ fontFamily: 'var(--font-display)' }}
-        >
-          Start Your Journey Today.
-          <br />
-          <span style={{ color: 'var(--text-secondary)', fontWeight: 400, fontSize: '0.8em' }}>
-            100% free. No credit card.
-          </span>
-        </h2>
-        <p className="text-lg mb-10" style={{ color: 'var(--text-secondary)' }}>
-          Join developers who chose depth over shortcuts.
+      <div className="max-w-2xl mx-auto px-5 text-center">
+        <h2 className="section-title">Continue where you left off.</h2>
+        <p className="section-sub">
+          Your progress, streak, and next topics live in the workspace.
         </p>
-        <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <Link
-            href="/register"
-            id="cta-start"
-            className="btn-primary text-base px-10 py-4"
-          >
-            Start Learning Free →
+        <div className="mt-8 flex flex-col sm:flex-row gap-3 justify-center">
+          <Link href="/dashboard" id="cta-continue" className="btn-primary px-6 py-3">
+            Open workspace
+            <ArrowRight size={16} />
           </Link>
-          <a
-            href="https://github.com/devmastery/dev-mastery"
-            target="_blank"
-            rel="noopener noreferrer"
-            id="cta-github"
-            className="btn-ghost text-base px-10 py-4"
-          >
-            ⭐ Star on GitHub
-          </a>
-        </div>
-
-        <div className="mt-12 text-xs" style={{ color: 'var(--text-muted)' }}>
-          Powered by Google Gemini AI · Hosted on Oracle Cloud Always Free · ₹0/month operating cost
+          <Link href="/login" id="cta-signin" className="btn-ghost px-6 py-3">
+            Sign in
+          </Link>
         </div>
       </div>
     </section>
   );
 }
 
-/* ─── Footer ─────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────────
+   Footer
+   ──────────────────────────────────────────────────────────────── */
 function Footer() {
   return (
     <footer
       className="py-10"
-      style={{ borderTop: '1px solid var(--border-default)', background: 'var(--bg-surface)' }}
+      style={{
+        borderTop: '1px solid var(--border-default)',
+        background: 'var(--bg-surface)',
+      }}
     >
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-4">
-        <div
-          className="text-lg font-bold"
-          style={{ fontFamily: 'var(--font-display)', color: 'var(--text-primary)' }}
-        >
-          Dev<span style={{ color: 'var(--accent-java)' }}>Mastery</span>
+      <div className="max-w-6xl mx-auto px-5 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-[13px]"
+           style={{ color: 'var(--text-muted)' }}>
+        <div className="flex items-center gap-2">
+          <span
+            className="inline-flex w-5 h-5 rounded items-center justify-center"
+            style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+          >
+            <Sparkles size={11} />
+          </span>
+          <span style={{ color: 'var(--text-secondary)' }}>DevMastery</span>
         </div>
-        <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
-          100% Free & Open Source · Apache 2.0 · Built with ☕ + 🌱
-        </div>
-        <div className="flex gap-4 text-xs" style={{ color: 'var(--text-secondary)' }}>
-          <a href="/paths" className="hover:text-white transition-colors">Paths</a>
-          <a href="/api-docs" className="hover:text-white transition-colors">API</a>
-          <a href="https://github.com" className="hover:text-white transition-colors">GitHub</a>
+        <div>Personal edition · {new Date().getFullYear()}</div>
+        <div className="flex gap-5">
+          <Link href="/dashboard" className="hover:text-[--text-primary] transition-colors">Workspace</Link>
+          <a href="#paths"    className="hover:text-[--text-primary] transition-colors">Paths</a>
+          <a href="#method"   className="hover:text-[--text-primary] transition-colors">Method</a>
         </div>
       </div>
     </footer>
   );
 }
 
-/* ─── Page ───────────────────────────────────────────────────── */
+/* ────────────────────────────────────────────────────────────────
+   Page
+   ──────────────────────────────────────────────────────────────── */
 export default function HomePage() {
   return (
     <>
@@ -634,7 +471,7 @@ export default function HomePage() {
       <main>
         <Hero />
         <PathsSection />
-        <TeachingModelSection />
+        <MethodSection />
         <FeaturesSection />
         <CtaSection />
       </main>

@@ -60,7 +60,7 @@ export default function RegisterPage() {
           <h1 className="text-3xl font-bold font-syne tracking-tight">
             Dev<span className="text-primary">Mastery</span>
           </h1>
-          <p className="text-muted-foreground mt-2">Create your free account.</p>
+          <p className="text-muted-foreground mt-2">Create your account.</p>
         </div>
 
         {error && (
