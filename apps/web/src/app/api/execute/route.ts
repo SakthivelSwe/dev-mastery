@@ -3,17 +3,20 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'edge';
 
 // ─── Judge0 Configuration ──────────────────────────────────────────────────
-// Supports three modes:
-//   1. RapidAPI (Judge0 CE):  set JUDGE0_API_KEY + JUDGE0_API_HOST
-//   2. Self-hosted Judge0:    set JUDGE0_API_URL to your instance
-//   3. Execution service:     set JUDGE0_API_URL to your Spring Boot service /v1/execution/submit
+// ONE set of env vars — identical for local dev and production.
 //
-// Free RapidAPI plan: https://rapidapi.com/judge0-official/api/judge0-ce (50 req/day free)
+// Local:      set in apps/web/.env.local
+// Production: set in Cloudflare Pages → Settings → Environment Variables
+//             (same variable names, same values — no separate config needed)
+//
+// JUDGE0_API_URL  = https://judge029.p.rapidapi.com
+// JUDGE0_API_KEY  = your RapidAPI key
+// JUDGE0_API_HOST = judge029.p.rapidapi.com
 // ─────────────────────────────────────────────────────────────────────────────
 
-const JUDGE0_API_URL  = process.env.JUDGE0_API_URL  || 'https://judge0-ce.p.rapidapi.com';
+const JUDGE0_API_URL  = process.env.JUDGE0_API_URL  || 'https://judge029.p.rapidapi.com';
 const JUDGE0_API_KEY  = process.env.JUDGE0_API_KEY  || '';
-const JUDGE0_API_HOST = process.env.JUDGE0_API_HOST || 'judge0-ce.p.rapidapi.com';
+const JUDGE0_API_HOST = process.env.JUDGE0_API_HOST || 'judge029.p.rapidapi.com';
 
 const MAX_POLL_ATTEMPTS = 20;   // 20 × 500ms = 10 seconds max wait
 const POLL_DELAY_MS     = 600;
@@ -64,7 +67,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'sourceCode and languageId are required' }, { status: 400 });
   }
 
-  if (!JUDGE0_API_KEY && JUDGE0_API_URL.includes('rapidapi.com')) {
+  if (!JUDGE0_API_KEY) {
     return NextResponse.json({
       stdout: null, stderr: null, compileOutput: null,
       message: 'Code execution is not configured. Add JUDGE0_API_KEY to environment variables.\nGet a free key at: https://rapidapi.com/judge0-official/api/judge0-ce',

@@ -203,12 +203,13 @@ export function CodeEditorShell({ initialCode, languageId, languageString = 'jav
                     <pre
                       className="text-[11px] rounded p-3 mb-3"
                       style={{ background: 'rgba(0,0,0,0.4)', color: '#62C97A' }}
-                    >{`# .env.local
+                    >{`# .env.local  (local)  OR  Cloudflare Pages → Environment Variables  (prod)
+# Same 3 vars — identical config for both environments:
+JUDGE0_API_URL=https://judge029.p.rapidapi.com
 JUDGE0_API_KEY=your_rapidapi_key_here
-JUDGE0_API_HOST=judge0-ce.p.rapidapi.com
-JUDGE0_API_URL=https://judge0-ce.p.rapidapi.com`}</pre>
+JUDGE0_API_HOST=judge029.p.rapidapi.com`}</pre>
                     <a
-                      href="https://rapidapi.com/judge0-official/api/judge0-ce"
+                      href="https://rapidapi.com/dishis-technologies-judge0/api/judge029"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold"
