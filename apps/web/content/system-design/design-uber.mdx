@@ -25,7 +25,133 @@ To make geospatial searching $O(1)$, we must turn 2D coordinates into a 1D strin
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "uber-architecture" }
+{
+  "steps": [
+    {
+      "title": "Core Requirements",
+      "description": "Match riders to nearby drivers in real-time. Track driver location. Calculate fares.",
+      "code": "// Functional\n// - Rider requests ride → match nearest driver\n// - Driver location updated every 5 seconds\n// - Real-time tracking during trip\n// - Fare calculation based on distance/time\n\n// Non-functional\n// - Match latency < 1 second\n// - Location updates: 1M drivers × 12/min = 720K writes/min\n// - Availability: 99.99%\n// - Geo queries: nearest N drivers within 5km\n\n// Key challenge: efficient geospatial queries at scale",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        10,
+        12
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Rider requests",
+          "Find nearby drivers",
+          "Match best driver",
+          "Notify driver",
+          "Track trip"
+        ]
+      }
+    },
+    {
+      "title": "Location Storage",
+      "description": "Driver locations stored in Redis Geo — O(log n) nearest-neighbor queries.",
+      "code": "// Redis GEO commands\n// Store driver location\nawait redis.geoadd('drivers', longitude, latitude, driverId);\n// Update every 5 seconds\nawait redis.geoadd('drivers', newLon, newLat, driverId);\n\n// Find nearest drivers within 5km\nconst nearbyDrivers = await redis.georadius(\n  'drivers',\n  riderLon, riderLat,\n  5, 'km',\n  'WITHCOORD', 'WITHDIST',\n  'COUNT', 20,\n  'ASC' // sorted by distance\n);",
+      "highlight": [
+        3,
+        4,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Driver updates GPS",
+          "GEOADD to Redis",
+          "Rider requests",
+          "GEORADIUS query",
+          "20 nearest drivers"
+        ]
+      }
+    },
+    {
+      "title": "Matching Algorithm",
+      "description": "Score nearby drivers by distance, ETA, rating, and acceptance rate.",
+      "code": "async function matchDriver(riderId, riderLocation) {\n  // 1. Get nearby drivers\n  const nearby = await redis.georadius('drivers', ...riderLocation, 5, 'km');\n\n  // 2. Get driver details (batch)\n  const drivers = await getDriverDetails(nearby.map(d => d.id));\n\n  // 3. Score each driver\n  const scored = drivers.map(d => ({\n    ...d,\n    score: calcScore(d, {\n      distance: nearby.find(n => n.id === d.id).dist,\n      rating: d.rating,          // weight: 0.2\n      acceptance: d.acceptRate,  // weight: 0.3\n      eta: calcETA(d, riderLocation), // weight: 0.5\n    })\n  }));\n\n  return scored.sort((a, b) => b.score - a.score)[0];\n}",
+      "highlight": [
+        3,
+        5,
+        7,
+        8,
+        9,
+        12,
+        13,
+        16
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Nearby drivers",
+          "Get details",
+          "Score: distance+ETA+rating",
+          "Sort by score",
+          "Offer to best driver"
+        ]
+      }
+    },
+    {
+      "title": "Trip Tracking",
+      "description": "Real-time tracking via WebSocket — broadcast driver location to rider app.",
+      "code": "// WebSocket server for real-time tracking\nio.on('connection', (socket) => {\n  socket.on('track_trip', async (tripId) => {\n    socket.join(`trip:${tripId}`);\n  });\n});\n\n// Driver location update → broadcast to rider\nfunction onDriverLocationUpdate(driverId, location) {\n  const tripId = activeTripByDriver.get(driverId);\n  if (tripId) {\n    io.to(`trip:${tripId}`).emit('location_update', {\n      lat: location.lat,\n      lng: location.lng,\n      timestamp: Date.now()\n    });\n  }\n}",
+      "highlight": [
+        3,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Driver sends GPS",
+          "Server receives",
+          "Broadcast to trip room",
+          "Rider app receives",
+          "Map updates"
+        ]
+      }
+    },
+    {
+      "title": "Surge Pricing",
+      "description": "Dynamic pricing based on supply/demand ratio in geographic cells.",
+      "code": "// H3 hexagonal grid (Uber's library)\nconst h3 = require('h3-js');\n\n// Get cell for location\nconst cell = h3.latLngToCell(lat, lng, 9); // resolution 9 ≈ 0.1km^2\n\n// Calculate surge for cell\nasync function getSurge(cell) {\n  const supply = await redis.scard(`drivers:${cell}`);  // drivers in cell\n  const demand = await redis.get(`requests:${cell}`);   // open requests\n  const ratio = demand / Math.max(supply, 1);\n\n  if (ratio < 1.5) return 1.0;\n  if (ratio < 2.5) return 1.5;\n  if (ratio < 4.0) return 2.0;\n  return 2.5; // max 2.5x surge\n}",
+      "highlight": [
+        5,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "H3 cell calculated",
+          "Count supply (drivers)",
+          "Count demand (requests)",
+          "Ratio = D/S",
+          "Surge multiplier"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

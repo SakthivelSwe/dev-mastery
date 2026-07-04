@@ -19,7 +19,173 @@ If you have 10GB of RAM, and you try to write the 11th Gigabyte, the cache must 
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "distributed-cache" }
+{
+  "steps": [
+    {
+      "title": "Distributed Cache Design",
+      "description": "Design Memcached/Redis-like distributed cache with consistent hashing.",
+      "code": "// Requirements:\n// - Store key-value pairs (up to 1MB per value)\n// - get(key), set(key, value, ttl), delete(key)\n// - 1M QPS, < 1ms latency\n// - Distributed: data spread across N nodes\n// - Fault tolerant: node failure doesn't cause data loss\n\n// Scale estimates:\n// 10M cached items, avg 1KB = 10GB total data\n// 10 nodes × 16GB RAM each = 160GB capacity\n// Each node handles 100K QPS",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "c",
+            "label": "Client",
+            "color": "#9e9e9e"
+          },
+          {
+            "id": "n1",
+            "label": "Cache Node 1",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "n2",
+            "label": "Cache Node 2",
+            "color": "#43a047"
+          },
+          {
+            "id": "n3",
+            "label": "Cache Node 3",
+            "color": "#fb8c00"
+          }
+        ],
+        "connections": [
+          {
+            "from": "c",
+            "to": "n1"
+          },
+          {
+            "from": "c",
+            "to": "n2"
+          },
+          {
+            "from": "c",
+            "to": "n3"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Consistent Hashing for Routing",
+      "description": "Route cache keys to nodes using consistent hashing — minimal data movement on changes.",
+      "code": "class DistributedCache {\n  constructor(nodes) {\n    this.ring = new ConsistentHashRing(nodes, virtualNodes=150);\n  }\n\n  async get(key) {\n    const node = this.ring.getNode(key);\n    return node.get(key);\n  }\n\n  async set(key, value, ttl) {\n    const node = this.ring.getNode(key);\n    return node.set(key, value, ttl);\n  }\n\n  async addNode(newNode) {\n    this.ring.addNode(newNode);\n    await this.rebalance(); // move ~1/N of keys\n  }\n}",
+      "highlight": [
+        3,
+        6,
+        7,
+        11,
+        12,
+        16,
+        17
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "key → hash",
+          "Consistent hash ring",
+          "Find next node",
+          "GET/SET on that node",
+          "Add node → 1/N migrates"
+        ]
+      }
+    },
+    {
+      "title": "Eviction and Memory Management",
+      "description": "LRU eviction with a doubly-linked list + hash map for O(1) operations.",
+      "code": "class LRUCache {\n  constructor(capacity) {\n    this.capacity = capacity;\n    this.map = new Map();            // key → node\n    this.head = { next: null };      // dummy head (most recent)\n    this.tail = { prev: null };      // dummy tail (least recent)\n    this.head.next = this.tail;\n    this.tail.prev = this.head;\n  }\n\n  get(key) {\n    if (!this.map.has(key)) return -1;\n    const node = this.map.get(key);\n    this.moveToFront(node); // mark as recently used\n    return node.value;\n  }\n\n  set(key, value) {\n    if (this.map.size >= this.capacity) this.evict();\n    // ...\n  }\n}",
+      "highlight": [
+        4,
+        5,
+        6,
+        13,
+        14,
+        18,
+        19
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "GET: move to front",
+          "SET: add to front",
+          "Capacity full",
+          "Evict from tail (LRU)",
+          "O(1) all operations"
+        ]
+      }
+    },
+    {
+      "title": "Replication for HA",
+      "description": "Each shard has primary + replica. Failover when primary dies.",
+      "code": "// Master-replica per shard\nclass CacheCluster {\n  constructor() {\n    this.shards = [\n      { primary: 'node-1', replica: 'node-1r' },\n      { primary: 'node-2', replica: 'node-2r' },\n      { primary: 'node-3', replica: 'node-3r' },\n    ];\n  }\n\n  // Writes go to primary, sync to replica\n  async set(key, value, ttl) {\n    const shard = this.getShard(key);\n    await shard.primary.set(key, value, ttl);\n    await shard.replica.set(key, value, ttl); // async replication\n  }\n\n  // Reads: try primary, fallback to replica\n  async get(key) {\n    try { return await shard.primary.get(key); }\n    catch { return shard.replica.get(key); }\n  }\n}",
+      "highlight": [
+        5,
+        6,
+        7,
+        13,
+        14,
+        19,
+        20
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Write → Primary",
+          "Replicate → Replica",
+          "Primary fails",
+          "Promote replica",
+          "Reads continue"
+        ]
+      }
+    },
+    {
+      "title": "Monitoring and Metrics",
+      "description": "Track hit rate, eviction rate, latency p99 — alert on degradation.",
+      "code": "// Key cache metrics\nconst metrics = {\n  hitRate: hits / (hits + misses),     // target: > 95%\n  evictionRate: evictions / requests,  // alert if > 1%\n  memoryUsage: usedMem / totalMem,    // alert if > 80%\n  p99Latency: latencyHistogram.p99,   // target: < 1ms\n  connectionsActive: pool.size,\n};\n\n// Prometheus metrics\ncacheHitsTotal.inc();\ncacheMissesTotal.inc();\ncacheLatency.observe(latencyMs);\n\n// Alert rules:\n// hit_rate < 0.90 → investigate eviction/TTL\n// p99 > 10ms → investigate hotspots",
+      "highlight": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        10,
+        11,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "h",
+            "label": "Hit Rate > 95%",
+            "color": "#43a047"
+          },
+          {
+            "id": "l",
+            "label": "p99 < 1ms",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "m",
+            "label": "Memory < 80%",
+            "color": "#fb8c00"
+          }
+        ],
+        "connections": []
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

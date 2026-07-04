@@ -19,7 +19,158 @@ For a table with 1 billion rows, a B-Tree index finds the value in `log2(1,000,0
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "sd-indexing" }
+{
+  "steps": [
+    {
+      "title": "Why Indexes?",
+      "description": "Full table scan: O(n). Index scan: O(log n). For 1M rows, that's 1M vs 20 operations.",
+      "code": "-- Without index: full table scan\nEXPLAIN SELECT * FROM users WHERE email = 'alice@example.com';\n-- Seq Scan on users (cost=0.00..18334.00 rows=1 width=72)\n-- Scans ALL 1M rows\n\n-- With index: B-tree index scan\nCREATE INDEX idx_users_email ON users(email);\nEXPLAIN SELECT * FROM users WHERE email = 'alice@example.com';\n-- Index Scan using idx_users_email (cost=0.43..8.45 rows=1)\n-- Reads 20 nodes in B-tree ← 50,000x faster",
+      "highlight": [
+        2,
+        6,
+        7,
+        9
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Query: WHERE email=",
+          "No index → scan 1M rows",
+          "Index → B-tree O(log n)",
+          "20 comparisons",
+          "Return row"
+        ]
+      }
+    },
+    {
+      "title": "B-Tree Index",
+      "description": "B-tree is the default index — supports equality, range, ORDER BY, and IS NULL.",
+      "code": "-- B-tree: balanced tree, all leaves at same depth\n-- Good for: =, <, >, BETWEEN, LIKE 'prefix%', ORDER BY\nCREATE INDEX idx_orders_date ON orders(created_at);\n\n-- Composite index: order matters!\n-- (a, b) index can satisfy: WHERE a=1, WHERE a=1 AND b=2\n-- Cannot satisfy: WHERE b=2 alone\nCREATE INDEX idx_users_name ON users(last_name, first_name);\n\n-- Covering index: all needed columns in index\nCREATE INDEX idx_covering ON orders(user_id, status, total)\n-- Query can be satisfied from index alone (no table fetch)",
+      "highlight": [
+        3,
+        8,
+        10,
+        11
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "r",
+            "label": "Root Node",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "b",
+            "label": "Branch Nodes",
+            "color": "#42a5f5"
+          },
+          {
+            "id": "l",
+            "label": "Leaf Nodes (data)",
+            "color": "#90caf9"
+          }
+        ],
+        "connections": [
+          {
+            "from": "r",
+            "to": "b"
+          },
+          {
+            "from": "b",
+            "to": "l"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Hash and GiST Indexes",
+      "description": "Hash for equality only; GiST/GIN for full-text, JSON, geometric data.",
+      "code": "-- Hash index: O(1) equality only\nCREATE INDEX idx_hash ON sessions USING HASH (token);\n-- Faster than B-tree for = only, no range queries\n\n-- GIN index: full-text search, JSONB, arrays\nCREATE INDEX idx_gin ON products USING GIN (description_tsvector);\nCREATE INDEX idx_jsonb ON events USING GIN (payload);\n-- Query JSONB:\nSELECT * FROM events WHERE payload @> '{\"type\": \"purchase\"}';\n\n-- GiST: geometric, range types\nCREATE INDEX idx_location ON stores USING GIST (coordinates);\nSELECT * FROM stores ORDER BY coordinates <-> point(40.7,-74.0) LIMIT 5;",
+      "highlight": [
+        2,
+        5,
+        6,
+        8,
+        11,
+        12
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "bt",
+            "label": "B-Tree: range/eq",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "h",
+            "label": "Hash: eq only",
+            "color": "#43a047"
+          },
+          {
+            "id": "gin",
+            "label": "GIN: FTS/JSON",
+            "color": "#fb8c00"
+          },
+          {
+            "id": "gi",
+            "label": "GiST: geo/range",
+            "color": "#8e24aa"
+          }
+        ],
+        "connections": []
+      }
+    },
+    {
+      "title": "Index Selection Strategy",
+      "description": "Not all queries need indexes — over-indexing slows down writes.",
+      "code": "-- Guidelines:\n-- Index columns in WHERE, JOIN, ORDER BY, GROUP BY\n-- Selectivity: index only if < 10-15% rows returned\n-- Write overhead: each index = extra write on INSERT/UPDATE/DELETE\n\n-- EXPLAIN ANALYZE for real query cost:\nEXPLAIN (ANALYZE, BUFFERS) \nSELECT u.name, COUNT(o.id)\nFROM users u JOIN orders o ON u.id = o.user_id\nWHERE o.status = 'pending'\nGROUP BY u.id;\n-- Look for: Seq Scan (bad), Index Scan (good)\n\n-- pg_stat_user_indexes: find unused indexes\nSELECT indexname, idx_scan FROM pg_stat_user_indexes\nWHERE idx_scan = 0 AND schemaname = 'public';",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Query written",
+          "EXPLAIN ANALYZE",
+          "Seq Scan found",
+          "Add index",
+          "Index Scan",
+          "Monitor writes"
+        ]
+      }
+    },
+    {
+      "title": "Partial and Expression Indexes",
+      "description": "Index only a subset of rows or index computed expressions.",
+      "code": "-- Partial index: index only matching rows\nCREATE INDEX idx_active ON users(email) WHERE status = 'active';\n-- Only indexes active users (maybe 10% of table)\n-- Smaller index, faster for active user queries\n\n-- Expression index: index computed value\nCREATE INDEX idx_lower_email ON users(LOWER(email));\n-- Now this uses index:\nSELECT * FROM users WHERE LOWER(email) = 'alice@example.com';\n\n-- Functional: index timestamp truncated to day\nCREATE INDEX idx_date ON events(DATE_TRUNC('day', created_at));\nSELECT * FROM events WHERE DATE_TRUNC('day', created_at) = '2024-01-01';",
+      "highlight": [
+        2,
+        7,
+        9,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Partial: WHERE clause",
+          "Expression: LOWER()",
+          "Only matching rows indexed",
+          "Smaller + faster",
+          "Used in queries"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

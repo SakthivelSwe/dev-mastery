@@ -48,7 +48,18 @@ const batchFiles = fs2.readdirSync(__dirname)
   .sort();
 for (const bf of batchFiles) {
   try {
-    mergeDeep(CONFIGS, require(path2.join(__dirname, bf)));
+    let loaded = require(path2.join(__dirname, bf));
+    // Support array format: [{ path, slug, steps, ... }]
+    if (Array.isArray(loaded)) {
+      const obj = {};
+      for (const item of loaded) {
+        const { path: p, slug, ...rest } = item;
+        if (!obj[p]) obj[p] = {};
+        obj[p][slug] = rest;
+      }
+      loaded = obj;
+    }
+    mergeDeep(CONFIGS, loaded);
     console.log(`  loaded batch: ${bf}`);
   } catch(e) {
     console.error(`  FAILED loading ${bf}: ${e.message}`);

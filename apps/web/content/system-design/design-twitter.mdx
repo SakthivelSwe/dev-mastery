@@ -19,7 +19,147 @@ Twitter's solution: **Pre-compute** the feeds! When a tweet is posted, push it t
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "design-twitter" }
+{
+  "steps": [
+    {
+      "title": "Twitter Scale Requirements",
+      "description": "100M DAU, 500M tweets/day, 28B timeline reads/day — extreme read:write ratio.",
+      "code": "// Scale numbers\n// Users: 100M DAU, 400M total\n// Tweets: 500M/day = 5,787/sec writes\n// Timeline reads: 28B/day = 324K reads/sec\n// Followers per celebrity: up to 100M\n\n// Key challenge: fanout\n// When @elonmusk tweets → push to 100M timelines\n// Simple push: 100M writes per tweet!\n\n// Solution: push vs pull hybrid\n// Regular users: push to follower cache (fanout on write)\n// Celebrities: pull and merge on read (fanout on read)",
+      "highlight": [
+        5,
+        6,
+        7,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Tweet created",
+          "Fanout service",
+          "Regular → push to followers",
+          "Celebrity → pull on read",
+          "Timeline assembled"
+        ]
+      }
+    },
+    {
+      "title": "Timeline Generation",
+      "description": "Each user has a pre-computed timeline cache in Redis — sorted by tweet timestamp.",
+      "code": "// Timeline stored in Redis sorted set\n// Key: timeline:{userId}\n// Score: tweet timestamp\n// Value: tweetId\n\n// Write path: fanout\nasync function postTweet(authorId, content) {\n  const tweet = await saveTweet({ authorId, content });\n  const followers = await getFollowers(authorId); // could be 100M!\n\n  // Async fanout via queue\n  await fanoutQueue.add({ tweetId: tweet.id, followers });\n}\n\n// Fanout worker\nfollowers.forEach(uid => {\n  redis.zadd(`timeline:${uid}`, tweet.timestamp, tweet.id);\n  redis.zremrangebyrank(`timeline:${uid}`, 0, -801); // keep latest 800\n});",
+      "highlight": [
+        7,
+        8,
+        11,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "t",
+            "label": "Tweet stored",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "q",
+            "label": "Fanout queue",
+            "color": "#43a047"
+          },
+          {
+            "id": "c",
+            "label": "Redis timelines",
+            "color": "#fb8c00"
+          }
+        ],
+        "connections": [
+          {
+            "from": "t",
+            "to": "q"
+          },
+          {
+            "from": "q",
+            "to": "c"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Timeline Read",
+      "description": "Read timeline from Redis, hydrate tweet details, merge celebrity tweets.",
+      "code": "async function getTimeline(userId, cursor, limit = 20) {\n  // 1. Get tweet IDs from Redis sorted set\n  const tweetIds = await redis.zrevrange(\n    `timeline:${userId}`, cursor, cursor + limit - 1\n  );\n\n  // 2. Get celebrity tweets (fanout on read)\n  const followedCelebs = await getCelebFollows(userId);\n  const celebTweets = await getCelebRecentTweets(followedCelebs);\n\n  // 3. Merge and sort\n  const allIds = mergeSorted([tweetIds, celebTweets]);\n\n  // 4. Batch fetch tweet details\n  const tweets = await redis.mget(allIds.map(id => `tweet:${id}`));\n  return tweets;\n}",
+      "highlight": [
+        3,
+        4,
+        8,
+        9,
+        11,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Get IDs from Redis",
+          "Merge celeb tweets",
+          "Sort by timestamp",
+          "Batch fetch details",
+          "Return timeline"
+        ]
+      }
+    },
+    {
+      "title": "Search Architecture",
+      "description": "Real-time tweet search with Elasticsearch — index tweets as they arrive.",
+      "code": "// Kafka → Elasticsearch pipeline\nkafkaConsumer.run({\n  eachMessage: async ({ message }) => {\n    const tweet = JSON.parse(message.value);\n\n    // Index in ES for search\n    await elasticsearch.index({\n      index: 'tweets',\n      id: tweet.id,\n      document: {\n        text: tweet.content,\n        author: tweet.authorId,\n        timestamp: tweet.createdAt,\n        hashtags: extractHashtags(tweet.content)\n      }\n    });\n  }\n});",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Tweet created",
+          "Kafka topic",
+          "ES consumer",
+          "Indexed in ES",
+          "Searchable instantly"
+        ]
+      }
+    },
+    {
+      "title": "Trending Topics",
+      "description": "Count hashtag frequency in sliding windows using Redis sorted sets.",
+      "code": "// Count hashtag occurrences in 24hr window\n// Use time-bucketed counters (1hr buckets)\nasync function trackHashtag(hashtag) {\n  const bucket = Math.floor(Date.now() / 3600000); // 1hr bucket\n  await redis.zincrby(`trends:${bucket}`, 1, hashtag);\n  await redis.expire(`trends:${bucket}`, 86400); // keep 24hrs\n}\n\n// Get trending: sum last 24 buckets\nasync function getTrending() {\n  const buckets = last24Buckets();\n  const counts = await Promise.all(\n    buckets.map(b => redis.zrevrangewithscores(`trends:${b}`, 0, 99))\n  );\n  return mergeSortedCounts(counts).slice(0, 10); // top 10\n}",
+      "highlight": [
+        4,
+        5,
+        9,
+        11,
+        12,
+        14
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Tweet with #AI",
+          "zincrby trends:bucket",
+          "24 hourly buckets",
+          "Sum all buckets",
+          "Top 10 trends"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

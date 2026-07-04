@@ -17,7 +17,140 @@ Google Drive uses a combination of both. It conceptually acts like Block Storage
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "google-drive" }
+{
+  "steps": [
+    {
+      "title": "File Storage Architecture",
+      "description": "Files split into chunks, deduplicated, stored in distributed object storage.",
+      "code": "// Chunking for large files\n// File → 4MB chunks → SHA-256 hash each chunk\n// Upload only chunks not already on server (dedup!)\n\nasync function uploadFile(file) {\n  const chunks = splitIntoChunks(file, 4 * 1024 * 1024); // 4MB\n  const hashes = chunks.map(c => sha256(c));\n\n  // Check which chunks already exist\n  const missing = await server.checkChunks(hashes);\n\n  // Upload only missing chunks (content-addressed)\n  await Promise.all(missing.map((hash, i) =>\n    server.uploadChunk(hashes[i], chunks[i])\n  ));\n\n  // Register file metadata\n  await server.registerFile({ name: file.name, chunkHashes: hashes });\n}",
+      "highlight": [
+        5,
+        6,
+        8,
+        11,
+        12,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "File → 4MB chunks",
+          "Hash each chunk",
+          "Check server has chunk",
+          "Upload missing only",
+          "Register metadata"
+        ]
+      }
+    },
+    {
+      "title": "Sync Protocol",
+      "description": "Detect local changes, sync to server, propagate to other devices.",
+      "code": "// Google Drive sync mechanism\n// 1. File system watcher detects changes\nconst watcher = chokidar.watch(syncFolder);\nwatcher.on('change', async (filePath) => {\n  const file = await readFile(filePath);\n  const newHash = sha256(file);\n  const currentHash = await db.getFileHash(filePath);\n\n  if (newHash !== currentHash) {\n    await uploadDelta(filePath, file); // only changed chunks\n    await server.notifyChange(fileId, newHash);\n    await db.updateHash(filePath, newHash);\n  }\n});\n\n// Other devices get notified via SSE/WebSocket\n// They download only changed chunks",
+      "highlight": [
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        14,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Local file changes",
+          "Hash check",
+          "Delta upload",
+          "Server notifies",
+          "Other devices sync"
+        ]
+      }
+    },
+    {
+      "title": "Metadata Service",
+      "description": "File tree, permissions, and revision history stored in relational DB.",
+      "code": "-- File metadata\nCREATE TABLE files (\n  id         UUID PRIMARY KEY,\n  parent_id  UUID REFERENCES files(id),\n  owner_id   BIGINT NOT NULL,\n  name       TEXT NOT NULL,\n  size       BIGINT,\n  mime_type  TEXT,\n  is_folder  BOOLEAN DEFAULT FALSE,\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n\n-- Sharing permissions\nCREATE TABLE file_permissions (\n  file_id UUID, user_id BIGINT,\n  permission ENUM('viewer','editor','owner')\n);\n\n-- Revisions for version history\nCREATE TABLE file_revisions (\n  file_id UUID, revision INT,\n  chunk_hashes TEXT[],  -- array of SHA-256 hashes\n  created_at TIMESTAMPTZ\n);",
+      "highlight": [
+        2,
+        13,
+        14,
+        18,
+        20,
+        21
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "f",
+            "label": "files (tree)",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "p",
+            "label": "permissions",
+            "color": "#43a047"
+          },
+          {
+            "id": "r",
+            "label": "revisions (history)",
+            "color": "#fb8c00"
+          }
+        ],
+        "connections": []
+      }
+    },
+    {
+      "title": "Conflict Resolution",
+      "description": "When two users edit simultaneously, create conflict copies.",
+      "code": "// Optimistic concurrency with version vector\nasync function saveFile(fileId, content, clientVersion) {\n  const serverVersion = await db.getVersion(fileId);\n\n  if (clientVersion === serverVersion) {\n    // No conflict: save normally\n    await db.update(fileId, { content, version: serverVersion + 1 });\n  } else {\n    // Conflict: create duplicate file\n    const conflictName = `[Conflicted] ${fileName} (${username})`;\n    await db.insert({ name: conflictName, content });\n    // Both versions preserved\n    // User resolves manually\n  }\n}",
+      "highlight": [
+        5,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Edit A (version 1)",
+          "Edit B (version 1)",
+          "A saves first",
+          "B conflict detected",
+          "Create conflict copy",
+          "User resolves"
+        ]
+      }
+    },
+    {
+      "title": "Block Storage Deduplication",
+      "description": "Content-addressed storage: same content = same hash = stored once.",
+      "code": "// Deduplication savings\n// 1000 users upload same PDF\n// Without dedup: 1000 × 10MB = 10GB stored\n// With dedup: 10MB stored (hash matches!)\n\n// Implementation\nconst blockStore = new Map(); // hash → block data\n\nasync function storeBlock(data) {\n  const hash = sha256(data);\n  if (!blockStore.has(hash)) {\n    await s3.put(`blocks/${hash}`, data);\n  }\n  // Always store reference in user's file\n  return hash; // reference only\n}\n// Typical dedup ratio: 30-50% storage savings",
+      "highlight": [
+        9,
+        10,
+        11,
+        13,
+        15
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Hash = sha256(block)",
+          "Block exists in S3?",
+          "YES → reuse reference",
+          "NO → upload block",
+          "30-50% space saved"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

@@ -23,7 +23,142 @@ The core challenge: Given a long URL like `https://www.example.com/very/long/pat
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "design-url-shortener" }
+{
+  "steps": [
+    {
+      "title": "Requirements Analysis",
+      "description": "Functional: shorten URLs, redirect. Non-functional: 100M URLs, 10B clicks/day.",
+      "code": "// Functional\n// POST /shorten   → returns short.ly/abc123\n// GET  /{shortId} → 301/302 redirect to original\n// GET  /{shortId}/stats → click analytics\n\n// Non-Functional\n// Availability: 99.99%\n// Latency: redirect < 10ms\n// Read >> Write: 100:1\n// Write: ~1160/sec, Read: ~115K/sec\n\n// Short ID: 7 chars, 62^7 = 3.5 trillion possible\n// 62 = [0-9][a-z][A-Z]",
+      "highlight": [
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        11,
+        12
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "POST /shorten",
+          "Generate short ID",
+          "Store mapping",
+          "GET /{id}",
+          "Lookup + redirect"
+        ]
+      }
+    },
+    {
+      "title": "Short ID Generation",
+      "description": "Use Base62 encoding of an ID from a counter service or hash of the URL.",
+      "code": "// Approach 1: Counter + Base62\nconst BASE62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';\n\nfunction toBase62(num) {\n  let result = '';\n  while (num > 0) {\n    result = BASE62[num % 62] + result;\n    num = Math.floor(num / 62);\n  }\n  return result.padStart(7, '0');\n}\n\n// Counter from DB: SELECT NEXTVAL('url_id_seq')\n// 1000 → 'g8'\n// 1000000 → '4c92'",
+      "highlight": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "DB sequence NEXTVAL",
+          "Get ID: 1234567",
+          "Base62 encode",
+          "Short ID: abcd123",
+          "7 chars"
+        ]
+      }
+    },
+    {
+      "title": "Database Design",
+      "description": "Simple key-value: shortId → longUrl. Add analytics with a separate clicks table.",
+      "code": "-- URL mapping table\nCREATE TABLE urls (\n  id         BIGSERIAL PRIMARY KEY,\n  short_id   CHAR(7)   NOT NULL UNIQUE,\n  long_url   TEXT      NOT NULL,\n  user_id    BIGINT,\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  expires_at TIMESTAMPTZ,\n  is_active  BOOLEAN DEFAULT TRUE\n);\nCREATE INDEX idx_short_id ON urls(short_id);\n\n-- Analytics (separate table, high write volume)\nCREATE TABLE clicks (\n  id         BIGSERIAL PRIMARY KEY,\n  short_id   CHAR(7)   NOT NULL,\n  clicked_at TIMESTAMPTZ DEFAULT NOW(),\n  country    TEXT,\n  user_agent TEXT\n) PARTITION BY RANGE (clicked_at);",
+      "highlight": [
+        4,
+        5,
+        11,
+        14,
+        15,
+        16,
+        17
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "u",
+            "label": "urls table",
+            "color": "#1e88e5"
+          },
+          {
+            "id": "c",
+            "label": "clicks table (partitioned)",
+            "color": "#43a047"
+          }
+        ],
+        "connections": [
+          {
+            "from": "c",
+            "to": "u"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Redirect Architecture",
+      "description": "Use Redis cache for hot URLs — 301 (permanent) vs 302 (temporary) redirect.",
+      "code": "// Redirect handler\nasync function redirect(shortId) {\n  // 1. Redis cache (microseconds)\n  let url = await redis.get(`url:${shortId}`);\n\n  // 2. Database fallback (milliseconds)\n  if (!url) {\n    const row = await db.findOne('urls', { short_id: shortId });\n    if (!row) return null;\n    url = row.long_url;\n    await redis.setex(`url:${shortId}`, 3600, url); // cache 1hr\n  }\n\n  // 3. Async click tracking (don't block redirect)\n  setImmediate(() => trackClick(shortId, requestInfo));\n\n  // 301: permanent (browser caches → no server hit next time)\n  // 302: temporary (server always hit → accurate analytics)\n  return { url, status: 302 };\n}",
+      "highlight": [
+        4,
+        7,
+        9,
+        13,
+        16,
+        17,
+        18
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "GET /abc123",
+          "Redis lookup (1ms)",
+          "HIT → redirect",
+          "MISS → DB lookup",
+          "Cache + redirect",
+          "Async track click"
+        ]
+      }
+    },
+    {
+      "title": "Scaling",
+      "description": "Scale reads with Redis cluster + CDN. Counter generation via Redis INCR (atomic).",
+      "code": "// High-scale architecture\n// Read path (115K QPS):\n// CDN edge → Redis Cluster → (DB fallback)\n// Most redirects served from CDN or Redis\n\n// Write path (1160 QPS):\n// API servers → Zookeeper-managed counters\n// Redis INCR for distributed counter (atomic)\n// Postgres for durable storage\n\n// Analytics (10B clicks/day = 115K writes/sec):\n// Kafka stream → async consumers → ClickHouse\n// ClickHouse: OLAP, columnar, 100M rows/sec ingestion\n\n// Total: 3 Redis nodes, 2 PG primaries, 5 API servers",
+      "highlight": [
+        3,
+        7,
+        10,
+        11,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "CDN (cached)",
+          "Redis Cluster",
+          "PostgreSQL",
+          "Click → Kafka",
+          "ClickHouse analytics"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE

@@ -18,7 +18,143 @@ To achieve this, the entire architecture must be designed around **Idempotency**
 
 ## VISUALIZATION_CONFIG
 ```json
-{ "component": "ArchitectureVisualizer", "state": "payment-system" }
+{
+  "steps": [
+    {
+      "title": "Payment Flow",
+      "description": "Payment: authorization → capture → settlement — each step with idempotency.",
+      "code": "// Payment lifecycle\n// 1. Authorization: reserve funds ($100 held)\n// 2. Capture: actually charge ($100 collected)\n// 3. Settlement: funds moved to merchant (T+1 or T+2)\n\n// Idempotency key: prevents double charges\nconst idempotencyKey = uuid(); // unique per payment attempt\n\nawait stripe.paymentIntents.create({\n  amount: 10000, // $100 in cents\n  currency: 'usd',\n  payment_method: cardId,\n}, {\n  idempotencyKey // same key = same result, no duplicate\n});",
+      "highlight": [
+        3,
+        4,
+        6,
+        8,
+        9,
+        10,
+        11,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Authorization",
+          "Funds reserved",
+          "Capture",
+          "Funds collected",
+          "Settlement T+1/T+2"
+        ]
+      }
+    },
+    {
+      "title": "Ledger Design",
+      "description": "Double-entry bookkeeping — every debit has a matching credit.",
+      "code": "-- Double-entry ledger\nCREATE TABLE ledger_entries (\n  id         UUID PRIMARY KEY,\n  account_id UUID NOT NULL,\n  amount     DECIMAL(19,4) NOT NULL, -- positive = debit, negative = credit\n  currency   CHAR(3),\n  type       TEXT, -- 'debit' or 'credit'\n  ref_id     UUID, -- transaction reference\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n\n-- Payment: debit customer, credit merchant\n-- $100 payment:\n-- Debit:  customer account  $100 (outflow)\n-- Credit: merchant account  $100 (inflow)\n-- Credit: platform fees     $3   (commission)\n-- Debit:  merchant account  $3   (net out)",
+      "highlight": [
+        4,
+        5,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "boxes": [
+          {
+            "id": "c",
+            "label": "Customer -$100",
+            "color": "#e53935"
+          },
+          {
+            "id": "m",
+            "label": "Merchant +$97",
+            "color": "#43a047"
+          },
+          {
+            "id": "p",
+            "label": "Platform +$3",
+            "color": "#1e88e5"
+          }
+        ],
+        "connections": []
+      }
+    },
+    {
+      "title": "Reconciliation",
+      "description": "Daily reconciliation catches discrepancies between internal ledger and payment processor.",
+      "code": "// Reconciliation process (runs nightly)\nasync function reconcile(date) {\n  // 1. Fetch our records\n  const internalTxns = await db.query(\n    'SELECT * FROM transactions WHERE date = $1', [date]\n  );\n\n  // 2. Fetch processor records\n  const processorTxns = await stripe.charges.list({ created: date });\n\n  // 3. Match by transaction ID\n  const discrepancies = [];\n  for (const txn of internalTxns) {\n    const match = processorTxns.find(p => p.metadata.txnId === txn.id);\n    if (!match || match.amount !== txn.amount) {\n      discrepancies.push({ txn, match });\n    }\n  }\n\n  await alertTeam(discrepancies);\n}",
+      "highlight": [
+        4,
+        8,
+        12,
+        13,
+        14,
+        18
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Our records",
+          "Stripe records",
+          "Match by ID",
+          "Discrepancies?",
+          "Alert team",
+          "Manual review"
+        ]
+      }
+    },
+    {
+      "title": "Fraud Detection",
+      "description": "Rule-based + ML fraud detection — block suspicious transactions in real-time.",
+      "code": "// Real-time fraud checks (< 100ms)\nasync function fraudCheck(payment) {\n  const signals = [\n    // Rule-based checks\n    isSuspiciousAmount(payment.amount),\n    isNewCard(payment.cardId),\n    isVelocityBreach(payment.userId, payment.amount),\n    isGeoAnomaly(payment.userId, payment.location),\n\n    // ML model score\n    await mlFraudModel.score(payment)\n  ];\n\n  const riskScore = signals.reduce((sum, s) => sum + s.weight, 0);\n  if (riskScore > 0.8) return { action: 'block' };\n  if (riskScore > 0.5) return { action: 'review' };\n  return { action: 'approve' };\n}",
+      "highlight": [
+        5,
+        6,
+        7,
+        8,
+        10,
+        13,
+        14,
+        15,
+        16
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Payment attempt",
+          "Rule checks",
+          "ML model score",
+          "Risk score",
+          ">0.8: block",
+          ">0.5: review",
+          "<0.5: approve"
+        ]
+      }
+    },
+    {
+      "title": "PCI DSS Compliance",
+      "description": "Never store raw card numbers — use tokenization. PCI DSS mandates encryption and audit logs.",
+      "code": "// PCI DSS: Payment Card Industry Data Security Standard\n// NEVER store: full card number, CVV, PIN\n// Can store: token (reference to card)\n\n// Tokenization flow\nasync function tokenizeCard(cardNumber, expiry, cvv) {\n  // Send to PCI-compliant vault (Stripe, Braintree, etc.)\n  const token = await vault.tokenize({ cardNumber, expiry, cvv });\n  // Only store the token\n  await db.insert('payment_methods', { userId, token, last4: cardNumber.slice(-4) });\n  return token;\n}\n\n// Charge uses token (vault handles decryption)\nawait stripe.charge({ amount: 1000, source: token });",
+      "highlight": [
+        6,
+        8,
+        9,
+        13
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          "Card entered",
+          "Vault tokenizes",
+          "Token stored in DB",
+          "Card data NEVER touches your servers",
+          "Charge via token"
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ## CODE
