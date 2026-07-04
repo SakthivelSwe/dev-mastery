@@ -8,200 +8,247 @@ import { Sidebar } from '@/components/shell/Sidebar';
 import { Topbar } from '@/components/shell/Topbar';
 import { CommandPalette } from '@/components/shell/CommandPalette';
 import {
-  User, Mail, Trophy, Flame, Star, BookOpen,
-  LogOut, Settings, ChevronRight, Zap, Award,
-  TrendingUp, CheckCircle2, Calendar, Edit3
+  Zap, Flame, CheckCircle2, BookOpen,
+  LogOut, Settings, ChevronRight, Calendar, TrendingUp, Award,
 } from 'lucide-react';
 import Link from 'next/link';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://devmastery-core.onrender.com';
+const RANK_THRESHOLDS = [
+  { label: 'Apprentice',      next: 'Developer',       xpNeeded: 1000  },
+  { label: 'Developer',       next: 'Mid engineer',    xpNeeded: 3000  },
+  { label: 'Mid engineer',    next: 'Senior engineer', xpNeeded: 6000  },
+  { label: 'Senior engineer', next: 'Tech lead',       xpNeeded: 12000 },
+  { label: 'Tech lead',       next: 'Staff engineer',  xpNeeded: 20000 },
+];
 
-function rankColor(rank: string) {
-  if (rank.includes('Staff'))  return 'text-amber-400 bg-amber-400/10 border-amber-400/30';
-  if (rank.includes('Senior')) return 'text-purple-400 bg-purple-400/10 border-purple-400/30';
-  if (rank.includes('Mid'))    return 'text-blue-400 bg-blue-400/10 border-blue-400/30';
-  if (rank.includes('Junior')) return 'text-green-400 bg-green-400/10 border-green-400/30';
-  return 'text-slate-400 bg-slate-400/10 border-slate-400/30';
-}
-
-function rankNext(rank: string) {
-  if (rank.includes('Beginner')) return { next: 'Junior Engineer', xpNeeded: 500 };
-  if (rank.includes('Junior'))   return { next: 'Mid Engineer', xpNeeded: 3000 };
-  if (rank.includes('Mid'))      return { next: 'Senior Engineer', xpNeeded: 10000 };
-  if (rank.includes('Senior'))   return { next: 'Staff Engineer', xpNeeded: 25000 };
-  return null;
+function getProgressToNext(rank: string, xp: number) {
+  const entry = RANK_THRESHOLDS.find(r => r.label.toLowerCase() === rank.toLowerCase());
+  if (!entry) return null;
+  const progress = Math.min(100, Math.round((xp / entry.xpNeeded) * 100));
+  const remaining = Math.max(0, entry.xpNeeded - xp);
+  return { next: entry.next, progress, remaining };
 }
 
 export default function ProfilePage() {
   const router = useRouter();
   const { user, token, isAuthenticated, logout } = useAuthStore();
   const { dashboard, isLoading } = useDashboard();
-  const [joined, setJoined] = useState<string>('');
+  const [joined, setJoined] = useState('');
 
   useEffect(() => {
     useAuthStore.getState().hydrate();
-    if (!isAuthenticated && !localStorage.getItem('auth_token')) {
-      router.push('/login');
-    }
+    if (!isAuthenticated && !localStorage.getItem('auth_token')) router.push('/login');
   }, [isAuthenticated, router]);
 
   useEffect(() => {
-    // Derive join date from JWT iat claim
     if (token) {
       try {
         const payload = JSON.parse(atob(token.split('.')[1]));
         if (payload.iat) {
-          setJoined(new Date(payload.iat * 1000).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }));
+          setJoined(
+            new Date(payload.iat * 1000).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+          );
         }
       } catch { /* ignore */ }
     }
   }, [token]);
 
-  const handleLogout = () => {
-    logout();
-    router.push('/');
-  };
+  const { totalCompleted, streak, totalXp, rank, pathProgress } = dashboard;
+  const rankInfo    = getProgressToNext(rank, totalXp);
+  const activePaths = pathProgress.filter(p => p.completedTopics > 0);
+  const initials    = (user?.fullName || user?.email || 'U')
+    .split(' ').filter(Boolean).map((w: string) => w[0]).join('').toUpperCase().slice(0, 2);
 
-  const totalCompleted = dashboard.totalCompleted;
-  const streak         = dashboard.streak;
-  const totalXp        = dashboard.totalXp;
-  const rank           = dashboard.rank;
-  const rankInfo       = rankNext(rank);
-  const xpToNext       = rankInfo ? Math.max(0, rankInfo.xpNeeded - totalXp) : 0;
-  const xpProgress     = rankInfo
-    ? Math.min(100, Math.round((totalXp / rankInfo.xpNeeded) * 100))
-    : 100;
-
-  const initials = (user?.fullName || user?.email || 'U')
-    .split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
-
-  const activePaths = dashboard.pathProgress.filter(p => p.completedTopics > 0);
+  const ACHIEVEMENTS = [
+    { label: 'First day',     earned: streak >= 1,       icon: '🔥' },
+    { label: 'First XP',      earned: totalXp > 0,        icon: '⚡' },
+    { label: 'First topic',   earned: totalCompleted >= 1, icon: '📖' },
+    { label: '10 topics',     earned: totalCompleted >= 10,icon: '🎯' },
+    { label: '7-day streak',  earned: streak >= 7,        icon: '🚀' },
+    { label: '30-day streak', earned: streak >= 30,       icon: '💎' },
+    { label: '50 topics',     earned: totalCompleted >= 50,icon: '🏆' },
+    { label: 'Senior rank',   earned: rank.toLowerCase().includes('senior') || rank.toLowerCase().includes('staff'), icon: '⭐' },
+  ];
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[--bg-primary]">
+    <div className="flex flex-col h-screen overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
       <Topbar />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="flex-1 overflow-y-auto p-6 lg:p-8">
-          <div className="max-w-4xl mx-auto space-y-6">
+        <main className="flex-1 overflow-y-auto p-5 sm:p-8">
+          <div className="max-w-3xl mx-auto space-y-5">
 
-            {/* ── Hero Card ─────────────────────────────────── */}
-            <div className="relative bg-gradient-to-br from-indigo-500/10 via-[--bg-surface] to-purple-500/5 border border-[--border-default] rounded-2xl p-8 overflow-hidden">
-              {/* Background glow */}
-              <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/5 to-transparent pointer-events-none" />
-
-              <div className="relative flex flex-col sm:flex-row items-start sm:items-center gap-6">
+            {/* ── Identity card ──────────────────────────────── */}
+            <div
+              className="rounded-[14px] border p-6 sm:p-7"
+              style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+            >
+              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-5">
                 {/* Avatar */}
-                <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-3xl font-bold text-white shrink-0 shadow-lg shadow-indigo-500/20">
+                <div
+                  className="w-16 h-16 rounded-[14px] flex items-center justify-center text-xl font-semibold shrink-0"
+                  style={{
+                    background: 'var(--accent-soft)',
+                    border: '1px solid var(--border-default)',
+                    color: 'var(--accent)',
+                    fontFamily: 'var(--font-display)',
+                  }}
+                >
                   {initials}
                 </div>
 
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-3 flex-wrap">
-                    <h1 className="text-2xl font-bold text-[--text-primary]">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <h1
+                      className="text-[20px] font-medium tracking-tight"
+                      style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}
+                    >
                       {user?.fullName || 'Developer'}
                     </h1>
-                    <span className={`text-xs font-semibold px-2.5 py-1 rounded-full border ${rankColor(rank)}`}>
+                    <span
+                      className="text-[11px] font-semibold px-2 py-0.5 rounded"
+                      style={{
+                        background: 'var(--accent-soft)',
+                        color: 'var(--accent)',
+                        border: '1px solid var(--border-default)',
+                      }}
+                    >
                       {rank}
                     </span>
                   </div>
-                  <p className="text-[--text-muted] text-sm mt-1">{user?.email}</p>
+                  <p className="text-[13px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{user?.email}</p>
                   {joined && (
-                    <p className="text-[--text-muted] text-xs mt-1 flex items-center gap-1">
-                      <Calendar size={11} /> Member since {joined}
+                    <p className="text-[12px] mt-1 flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
+                      <Calendar size={11} strokeWidth={1.75} /> Member since {joined}
                     </p>
                   )}
                 </div>
 
                 <div className="flex gap-2 shrink-0">
-                  <Link
-                    href="/settings"
-                    className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg bg-[--bg-elevated] border border-[--border-default] hover:border-indigo-500/50 text-[--text-secondary] hover:text-[--text-primary] transition-all"
-                  >
-                    <Settings size={14} /> Settings
+                  <Link href="/settings" className="btn-ghost text-[13px] px-3 py-1.5">
+                    <Settings size={13} /> Settings
                   </Link>
                   <button
-                    onClick={handleLogout}
-                    className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-red-400 transition-all"
+                    onClick={() => { logout(); router.push('/'); }}
+                    className="btn-ghost text-[13px] px-3 py-1.5"
+                    style={{ color: 'var(--error)', borderColor: 'color-mix(in oklab, var(--error) 30%, var(--border-default))' }}
                   >
-                    <LogOut size={14} /> Sign out
+                    <LogOut size={13} /> Sign out
                   </button>
                 </div>
               </div>
 
-              {/* Rank progress bar */}
+              {/* Rank progress */}
               {rankInfo && (
-                <div className="relative mt-6">
-                  <div className="flex justify-between text-xs text-[--text-muted] mb-1.5">
+                <div className="mt-5">
+                  <div
+                    className="flex justify-between text-[12px] mb-1.5"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
                     <span>{rank}</span>
-                    <span>{xpToNext.toLocaleString()} XP to {rankInfo.next}</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {rankInfo.remaining.toLocaleString()} XP to {rankInfo.next}
+                    </span>
                   </div>
-                  <div className="h-2 bg-[--bg-elevated] rounded-full overflow-hidden">
+                  <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-inset)' }}>
                     <div
-                      className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-700"
-                      style={{ width: `${xpProgress}%` }}
+                      className="h-full rounded-full transition-all duration-700"
+                      style={{ width: `${rankInfo.progress}%`, background: 'var(--accent)' }}
                     />
                   </div>
                 </div>
               )}
             </div>
 
-            {/* ── Stats Grid ───────────────────────────────── */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {/* ── Stats ─────────────────────────────────────── */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               {[
-                { icon: Zap,         label: 'Total XP',        value: totalXp.toLocaleString(),    color: 'text-amber-400' },
-                { icon: Flame,       label: 'Day Streak',       value: streak.toString(),           color: 'text-orange-400' },
-                { icon: CheckCircle2,label: 'Topics Completed', value: totalCompleted.toString(),   color: 'text-green-400' },
-                { icon: BookOpen,    label: 'Paths Active',     value: activePaths.length.toString(),color: 'text-blue-400' },
-              ].map(({ icon: Icon, label, value, color }) => (
-                <div key={label} className="bg-[--bg-surface] border border-[--border-default] rounded-xl p-4">
-                  <Icon size={18} className={`${color} mb-2`} />
-                  <div className="text-2xl font-bold text-[--text-primary]">{isLoading ? '–' : value}</div>
-                  <div className="text-xs text-[--text-muted] mt-0.5">{label}</div>
+                { Icon: Zap,          label: 'Total XP',       value: totalXp.toLocaleString(), accent: 'var(--accent)' },
+                { Icon: Flame,        label: 'Day streak',     value: `${streak}`,              accent: 'var(--warning)' },
+                { Icon: CheckCircle2, label: 'Topics done',    value: `${totalCompleted}`,      accent: 'var(--success)' },
+                { Icon: BookOpen,     label: 'Paths active',   value: `${activePaths.length}`,  accent: 'var(--accent-dsa)' },
+              ].map(({ Icon, label, value, accent }) => (
+                <div
+                  key={label}
+                  className="rounded-[10px] border p-4"
+                  style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+                >
+                  <Icon size={15} strokeWidth={1.75} style={{ color: accent, marginBottom: '8px' }} />
+                  <div
+                    className="text-[20px] font-medium tabular-nums"
+                    style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}
+                  >
+                    {isLoading ? '–' : value}
+                  </div>
+                  <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{label}</div>
                 </div>
               ))}
             </div>
 
-            {/* ── Active Learning Paths ─────────────────── */}
-            <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-6">
-              <h2 className="text-base font-bold text-[--text-primary] flex items-center gap-2 mb-4">
-                <TrendingUp size={16} className="text-indigo-400" />
-                Active Learning Paths
+            {/* ── Active paths ──────────────────────────────── */}
+            <div
+              className="rounded-[14px] border p-5"
+              style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+            >
+              <h2
+                className="flex items-center gap-2 text-[14px] font-medium mb-4"
+                style={{ color: 'var(--text-primary)' }}
+              >
+                <TrendingUp size={14} strokeWidth={1.75} style={{ color: 'var(--accent)' }} />
+                Active paths
               </h2>
               {isLoading ? (
-                <div className="text-sm text-[--text-muted]">Loading…</div>
+                <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>Loading…</p>
               ) : activePaths.length === 0 ? (
-                <div className="text-sm text-[--text-muted] text-center py-6">
-                  No paths started yet. <Link href="/dashboard" className="text-indigo-400 hover:underline">Browse paths →</Link>
-                </div>
+                <p className="text-[13px] text-center py-4" style={{ color: 'var(--text-muted)' }}>
+                  No paths started.{' '}
+                  <Link href="/dashboard" style={{ color: 'var(--accent)' }}>Browse paths</Link>
+                </p>
               ) : (
-                <div className="space-y-3">
+                <div className="space-y-1">
                   {activePaths.map(p => {
                     const pct = p.totalTopics > 0 ? Math.round((p.completedTopics / p.totalTopics) * 100) : 0;
                     return (
                       <Link
                         key={p.pathSlug}
                         href={`/learn/${p.pathSlug}/roadmap`}
-                        className="flex items-center gap-4 p-3 rounded-xl hover:bg-[--bg-elevated] transition-colors group"
+                        className="flex items-center gap-4 p-2.5 rounded-md transition-colors group"
+                        onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                       >
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center justify-between mb-1">
-                            <span className="text-sm font-medium text-[--text-primary] capitalize">
+                            <span
+                              className="text-[13px] font-medium capitalize"
+                              style={{ color: 'var(--text-primary)' }}
+                            >
                               {p.pathSlug.replace(/-/g, ' ')}
                             </span>
-                            <span className="text-xs text-[--text-muted]">{pct}%</span>
+                            <span
+                              className="text-[11px] tabular-nums"
+                              style={{ color: 'var(--accent)' }}
+                            >
+                              {pct}%
+                            </span>
                           </div>
-                          <div className="h-1.5 bg-[--bg-elevated] rounded-full overflow-hidden">
+                          <div className="h-1 rounded-full overflow-hidden" style={{ background: 'var(--bg-inset)' }}>
                             <div
-                              className="h-full bg-indigo-500 rounded-full transition-all"
-                              style={{ width: `${pct}%` }}
+                              className="h-full rounded-full transition-all"
+                              style={{ width: `${pct}%`, background: 'var(--accent)' }}
                             />
                           </div>
-                          <span className="text-xs text-[--text-muted] mt-1 block">
+                          <span
+                            className="text-[11px] mt-0.5 tabular-nums block"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
                             {p.completedTopics} / {p.totalTopics || '?'} topics
                           </span>
                         </div>
-                        <ChevronRight size={14} className="text-[--text-muted] group-hover:text-[--text-primary] shrink-0 transition-colors" />
+                        <ChevronRight
+                          size={13}
+                          className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                          style={{ color: 'var(--text-secondary)' }}
+                        />
                       </Link>
                     );
                   })}
@@ -209,34 +256,41 @@ export default function ProfilePage() {
               )}
             </div>
 
-            {/* ── Achievements ──────────────────────────── */}
-            <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-6">
-              <h2 className="text-base font-bold text-[--text-primary] flex items-center gap-2 mb-4">
-                <Award size={16} className="text-amber-400" />
+            {/* ── Achievements ──────────────────────────────── */}
+            <div
+              className="rounded-[14px] border p-5"
+              style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+            >
+              <h2
+                className="flex items-center gap-2 text-[14px] font-medium mb-4"
+                style={{ color: 'var(--text-primary)' }}
+              >
+                <Award size={14} strokeWidth={1.75} style={{ color: 'var(--warning)' }} />
                 Achievements
               </h2>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {[
-                  { icon: '🔥', label: 'First Streak',   earned: streak >= 1 },
-                  { icon: '⚡', label: 'First XP',       earned: totalXp > 0 },
-                  { icon: '📚', label: 'First Topic',    earned: totalCompleted >= 1 },
-                  { icon: '🎯', label: '10 Topics',      earned: totalCompleted >= 10 },
-                  { icon: '🚀', label: '7-day Streak',   earned: streak >= 7 },
-                  { icon: '💎', label: '30-day Streak',  earned: streak >= 30 },
-                  { icon: '🏆', label: '50 Topics',      earned: totalCompleted >= 50 },
-                  { icon: '⭐', label: 'Senior Dev',     earned: rank.includes('Senior') || rank.includes('Staff') },
-                ].map(a => (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                {ACHIEVEMENTS.map(a => (
                   <div
                     key={a.label}
-                    className={`flex flex-col items-center gap-1.5 p-3 rounded-xl border text-center transition-all ${
-                      a.earned
-                        ? 'bg-amber-500/10 border-amber-500/30'
-                        : 'bg-[--bg-elevated] border-[--border-default] opacity-40'
-                    }`}
+                    className="flex flex-col items-center gap-1.5 p-3 rounded-[10px] border text-center"
+                    style={{
+                      background: a.earned ? 'color-mix(in oklab, var(--warning) 8%, var(--bg-elevated))' : 'var(--bg-elevated)',
+                      borderColor: a.earned ? 'color-mix(in oklab, var(--warning) 30%, var(--border-default))' : 'var(--border-default)',
+                      opacity: a.earned ? 1 : 0.4,
+                    }}
                   >
-                    <span className="text-2xl">{a.icon}</span>
-                    <span className="text-xs font-medium text-[--text-secondary]">{a.label}</span>
-                    {a.earned && <span className="text-[9px] text-amber-400 font-semibold">EARNED</span>}
+                    <span className="text-xl">{a.icon}</span>
+                    <span className="text-[11.5px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+                      {a.label}
+                    </span>
+                    {a.earned && (
+                      <span
+                        className="text-[9px] font-bold uppercase tracking-wider"
+                        style={{ color: 'var(--warning)' }}
+                      >
+                        Earned
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -249,4 +303,3 @@ export default function ProfilePage() {
     </div>
   );
 }
-

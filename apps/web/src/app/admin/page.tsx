@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { Layers, CheckCircle, FileEdit, AlertCircle } from 'lucide-react';
+import { Layers, CheckCircle2, FileEdit, AlertCircle, Loader2 } from 'lucide-react';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
@@ -29,100 +29,173 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     fetch(`${API_BASE}/admin/topics/stats`)
-      .then((res) => res.json())
-      .then((data) => {
-        setStats(data);
-        setLoading(false);
-      })
-      .catch((err) => {
-        console.error('Failed to fetch admin stats:', err);
-        setLoading(false);
-      });
+      .then(r => r.json())
+      .then(data => { setStats(data); setLoading(false); })
+      .catch(err => { console.error(err); setLoading(false); });
   }, []);
 
   if (loading) {
-    return <div className="p-8 text-[#8B949E]">Loading Admin Dashboard...</div>;
+    return (
+      <div className="flex items-center justify-center h-screen" style={{ background: 'var(--bg-primary)' }}>
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 size={22} className="animate-spin" style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px]" style={{ color: 'var(--text-secondary)' }}>Loading admin data…</span>
+        </div>
+      </div>
+    );
   }
 
   if (!stats) {
-    return <div className="p-8 text-red-500">Failed to load dashboard stats. Is content-service running?</div>;
+    return (
+      <div className="flex items-center justify-center h-screen" style={{ background: 'var(--bg-primary)' }}>
+        <p className="text-[14px]" style={{ color: 'var(--error)' }}>
+          Failed to load dashboard stats. Is the backend running?
+        </p>
+      </div>
+    );
   }
 
   return (
-    <div className="max-w-6xl mx-auto p-8 font-sans">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-[#E6EDF3] mb-2">DevMastery Content Admin</h1>
-        <p className="text-[#8B949E]">Manage all 989 topics across 18 learning paths</p>
-      </div>
+    <div
+      className="min-h-screen p-6 sm:p-8"
+      style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
+    >
+      <div className="max-w-6xl mx-auto">
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-        <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-6 flex flex-col items-center justify-center">
-          <Layers className="text-[#58A6FF] mb-2" size={32} />
-          <div className="text-3xl font-bold text-[#E6EDF3]">{stats.totalTopics}</div>
-          <div className="text-sm text-[#8B949E]">Total Topics</div>
+        {/* Header */}
+        <div className="mb-8">
+          <h1
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: '1.9rem',
+              letterSpacing: '-0.015em',
+              color: 'var(--text-primary)',
+            }}
+          >
+            Content admin
+          </h1>
+          <p className="text-[13.5px] mt-1" style={{ color: 'var(--text-muted)' }}>
+            {stats.totalTopics} topics across all learning paths
+          </p>
         </div>
-        <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-6 flex flex-col items-center justify-center">
-          <CheckCircle className="text-[#3FB950] mb-2" size={32} />
-          <div className="text-3xl font-bold text-[#E6EDF3]">{stats.totalPublished}</div>
-          <div className="text-sm text-[#8B949E]">Published</div>
-        </div>
-        <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-6 flex flex-col items-center justify-center">
-          <FileEdit className="text-[#D29922] mb-2" size={32} />
-          <div className="text-3xl font-bold text-[#E6EDF3]">{stats.totalDrafts}</div>
-          <div className="text-sm text-[#8B949E]">Drafts</div>
-        </div>
-        <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-6 flex flex-col items-center justify-center">
-          <AlertCircle className="text-[#F85149] mb-2" size={32} />
-          <div className="text-3xl font-bold text-[#E6EDF3]">{stats.totalNeedingContent}</div>
-          <div className="text-sm text-[#8B949E]">Needs Content</div>
-        </div>
-      </div>
 
-      <div className="bg-[#161B22] border border-[#30363D] rounded-lg overflow-hidden">
-        <div className="px-6 py-4 border-b border-[#30363D] bg-[#0D1117]">
-          <h2 className="text-xl font-semibold text-[#E6EDF3]">Learning Paths</h2>
+        {/* Stat tiles */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
+          {([
+            { Icon: Layers,       label: 'Total topics',   value: stats.totalTopics,           color: 'var(--accent)' },
+            { Icon: CheckCircle2, label: 'Published',      value: stats.totalPublished,         color: 'var(--success)' },
+            { Icon: FileEdit,     label: 'Drafts',         value: stats.totalDrafts,            color: 'var(--warning)' },
+            { Icon: AlertCircle,  label: 'Needs content',  value: stats.totalNeedingContent,    color: 'var(--error)' },
+          ]).map(({ Icon, label, value, color }) => (
+            <div
+              key={label}
+              className="rounded-[10px] border p-4 flex flex-col items-center justify-center text-center"
+              style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+            >
+              <Icon size={18} strokeWidth={1.75} style={{ color, marginBottom: '8px' }} />
+              <div
+                className="text-[28px] font-medium tabular-nums"
+                style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}
+              >
+                {value}
+              </div>
+              <div className="text-[11.5px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{label}</div>
+            </div>
+          ))}
         </div>
-        <table className="w-full text-left border-collapse">
-          <thead>
-            <tr className="border-b border-[#30363D]">
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Path Name</th>
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Total</th>
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Published</th>
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Drafts</th>
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Needs Content</th>
-              <th className="px-6 py-3 text-sm font-semibold text-[#8B949E]">Progress</th>
-            </tr>
-          </thead>
-          <tbody>
-            {stats.pathStats.map((path) => {
-              const progressPct = path.totalTopics > 0 
-                ? Math.round((path.publishedTopics / path.totalTopics) * 100) 
-                : 0;
-                
-              return (
-                <tr key={path.pathSlug} className="border-b border-[#30363D] hover:bg-[#21262D] transition-colors">
-                  <td className="px-6 py-4">
-                    <Link href={`/admin/paths/${path.pathSlug}/topics`} className="text-[#58A6FF] hover:underline font-medium">
-                      {path.pathTitle}
-                    </Link>
-                  </td>
-                  <td className="px-6 py-4 text-[#E6EDF3]">{path.totalTopics}</td>
-                  <td className="px-6 py-4 text-[#3FB950]">{path.publishedTopics}</td>
-                  <td className="px-6 py-4 text-[#D29922]">{path.draftTopics}</td>
-                  <td className="px-6 py-4 text-[#F85149]">{path.needingContentTopics}</td>
-                  <td className="px-6 py-4">
-                    <div className="flex items-center gap-2">
-                      <div className="w-full bg-[#0D1117] rounded-full h-2">
-                        <div className="bg-[#3FB950] h-2 rounded-full" style={{ width: `${progressPct}%` }}></div>
-                      </div>
-                      <span className="text-xs text-[#8B949E] w-8">{progressPct}%</span>
-                    </div>
-                  </td>
+
+        {/* Paths table */}
+        <div
+          className="rounded-[14px] border overflow-hidden"
+          style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+        >
+          <div
+            className="px-5 py-3.5 border-b"
+            style={{ background: 'var(--bg-inset)', borderColor: 'var(--border-default)' }}
+          >
+            <h2 className="text-[14px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              Learning paths
+            </h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--border-default)' }}>
+                  {['Path', 'Total', 'Published', 'Drafts', 'Needs content', 'Progress'].map(h => (
+                    <th
+                      key={h}
+                      className="px-5 py-2.5 text-[11px] font-semibold uppercase tracking-wider"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      {h}
+                    </th>
+                  ))}
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              </thead>
+              <tbody>
+                {stats.pathStats.map(p => {
+                  const pct = p.totalTopics > 0
+                    ? Math.round((p.publishedTopics / p.totalTopics) * 100)
+                    : 0;
+                  return (
+                    <tr
+                      key={p.pathSlug}
+                      style={{ borderBottom: '1px solid var(--border-default)' }}
+                      onMouseEnter={(e) => { (e.currentTarget as HTMLTableRowElement).style.background = 'var(--bg-elevated)'; }}
+                      onMouseLeave={(e) => { (e.currentTarget as HTMLTableRowElement).style.background = 'transparent'; }}
+                    >
+                      <td className="px-5 py-3">
+                        <Link
+                          href={`/admin/paths/${p.pathSlug}/topics`}
+                          className="text-[13.5px] font-medium transition-colors"
+                          style={{ color: 'var(--accent)' }}
+                          onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--accent-hover)'; }}
+                          onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--accent)'; }}
+                        >
+                          {p.pathTitle}
+                        </Link>
+                      </td>
+                      <td className="px-5 py-3 text-[13px] tabular-nums" style={{ color: 'var(--text-primary)' }}>
+                        {p.totalTopics}
+                      </td>
+                      <td className="px-5 py-3 text-[13px] tabular-nums" style={{ color: 'var(--success)' }}>
+                        {p.publishedTopics}
+                      </td>
+                      <td className="px-5 py-3 text-[13px] tabular-nums" style={{ color: 'var(--warning)' }}>
+                        {p.draftTopics}
+                      </td>
+                      <td className="px-5 py-3 text-[13px] tabular-nums" style={{ color: 'var(--error)' }}>
+                        {p.needingContentTopics}
+                      </td>
+                      <td className="px-5 py-3">
+                        <div className="flex items-center gap-2">
+                          <div
+                            className="flex-1 h-1 rounded-full overflow-hidden"
+                            style={{ background: 'var(--bg-inset)' }}
+                          >
+                            <div
+                              className="h-full rounded-full"
+                              style={{
+                                width: `${pct}%`,
+                                background: pct === 100 ? 'var(--success)' : 'var(--accent)',
+                              }}
+                            />
+                          </div>
+                          <span
+                            className="text-[11px] tabular-nums w-8 text-right"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
+                            {pct}%
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   );

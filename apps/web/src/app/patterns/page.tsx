@@ -59,52 +59,65 @@ export default function PatternsPage() {
     );
   }, [patterns, search]);
 
-  const difficultyColor = (lvl?: string) => {
-    const v = (lvl ?? '').toLowerCase();
-    if (v.startsWith('easy')) return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30';
-    if (v.startsWith('hard')) return 'text-red-400 bg-red-500/10 border-red-500/30';
-    return 'text-amber-400 bg-amber-500/10 border-amber-500/30';
-  };
 
   if (loading) {
     return (
       <div className="h-full w-full flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3 text-[--text-muted]">
-          <Loader2 className="animate-spin" size={28} />
-          <span className="text-sm">Loading patterns…</span>
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="animate-spin" size={22} style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px]" style={{ color: 'var(--text-secondary)' }}>Loading patterns…</span>
         </div>
       </div>
     );
   }
 
+  const difficultyStyle = (lvl?: string): React.CSSProperties => {
+    const v = (lvl ?? '').toLowerCase();
+    if (v.startsWith('easy')) return { color: 'var(--success)', background: 'color-mix(in oklab, var(--success) 12%, transparent)', border: '1px solid color-mix(in oklab, var(--success) 25%, transparent)' };
+    if (v.startsWith('hard')) return { color: 'var(--error)', background: 'color-mix(in oklab, var(--error) 12%, transparent)', border: '1px solid color-mix(in oklab, var(--error) 25%, transparent)' };
+    return { color: 'var(--warning)', background: 'color-mix(in oklab, var(--warning) 12%, transparent)', border: '1px solid color-mix(in oklab, var(--warning) 25%, transparent)' };
+  };
+
   return (
     <div className="flex h-full w-full overflow-hidden">
       {/* ── Patterns list (left rail) ─────────────────────────── */}
-      <aside className="w-80 border-r border-[--border-default] bg-[--bg-surface] flex flex-col overflow-hidden shrink-0">
-        <div className="p-5 border-b border-[--border-default] shrink-0">
-          <div className="flex items-center gap-2 mb-1">
-            <Cpu size={18} className="text-indigo-400" />
-            <h1 className="text-lg font-bold text-[--text-primary]">LeetCode Patterns</h1>
+      <aside
+        className="w-72 flex flex-col overflow-hidden shrink-0 border-r"
+        style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+      >
+        <div className="p-4 border-b shrink-0" style={{ borderColor: 'var(--border-default)' }}>
+          <div className="flex items-center gap-2 mb-0.5">
+            <Cpu size={15} strokeWidth={1.75} style={{ color: 'var(--accent)' }} />
+            <h1 className="text-[15px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              LeetCode Patterns
+            </h1>
           </div>
-          <p className="text-xs text-[--text-muted]">
-            Master {patterns.length} essential coding patterns.
+          <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+            {patterns.length} patterns
           </p>
 
           <div className="relative mt-3">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[--text-muted]" />
+            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-muted)' }} />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter patterns…"
-              className="w-full bg-[--bg-elevated] border border-[--border-default] rounded-lg pl-8 pr-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 text-[--text-primary] placeholder:text-[--text-muted]"
+              placeholder="Filter…"
+              className="w-full pl-8 pr-3 py-1.5 rounded-md text-[13px] outline-none"
+              style={{
+                background: 'var(--bg-inset)',
+                border: '1px solid var(--border-default)',
+                color: 'var(--text-primary)',
+              }}
+              onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+              onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; }}
             />
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto py-2">
+        <div className="flex-1 overflow-y-auto py-1.5">
           {filtered.length === 0 && (
-            <div className="text-center text-xs text-[--text-muted] py-8 px-4">
+            <div className="text-center text-[12px] py-8 px-4" style={{ color: 'var(--text-muted)' }}>
               No patterns match &quot;{search}&quot;
             </div>
           )}
@@ -114,26 +127,43 @@ export default function PatternsPage() {
               <button
                 key={p.id ?? p.slug}
                 onClick={() => setActiveSlug(p.slug)}
-                className={`group w-full text-left px-4 py-3 flex items-start gap-3 transition-colors border-l-2 ${
-                  isActive
-                    ? 'bg-[--bg-elevated] border-l-indigo-500'
-                    : 'border-l-transparent hover:bg-[--bg-elevated]/60'
-                }`}
+                className="w-full text-left px-4 py-2.5 flex items-start gap-3 transition-colors group"
+                style={{
+                  background: isActive ? 'var(--bg-elevated)' : 'transparent',
+                  borderLeft: `2px solid ${isActive ? 'var(--accent)' : 'transparent'}`,
+                  paddingLeft: isActive ? '14px' : '16px',
+                }}
+                onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
               >
-                <span className="shrink-0 mt-0.5 w-7 h-7 rounded-md bg-[--bg-elevated] border border-[--border-default] flex items-center justify-center text-[11px] font-mono text-[--text-muted]">
+                <span
+                  className="shrink-0 mt-0.5 w-7 h-7 rounded-md flex items-center justify-center text-[10px] tabular-nums"
+                  style={{
+                    background: 'var(--bg-inset)',
+                    border: '1px solid var(--border-default)',
+                    color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-code)',
+                  }}
+                >
                   {String(idx + 1).padStart(2, '0')}
                 </span>
                 <div className="flex-1 min-w-0">
-                  <div className={`text-sm font-medium truncate ${isActive ? 'text-[--text-primary]' : 'text-[--text-secondary] group-hover:text-[--text-primary]'}`}>
+                  <div
+                    className="text-[13px] font-medium truncate"
+                    style={{ color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+                  >
                     {p.name}
                   </div>
                   {p.difficultyLevel && (
-                    <span className={`inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded border ${difficultyColor(p.difficultyLevel)}`}>
+                    <span
+                      className="inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded"
+                      style={difficultyStyle(p.difficultyLevel)}
+                    >
                       {p.difficultyLevel}
                     </span>
                   )}
                 </div>
-                {isActive && <ChevronRight size={14} className="text-indigo-400 shrink-0 mt-1" />}
+                {isActive && <ChevronRight size={13} style={{ color: 'var(--accent)' }} className="shrink-0 mt-1" />}
               </button>
             );
           })}
@@ -141,14 +171,17 @@ export default function PatternsPage() {
       </aside>
 
       {/* ── Main pattern detail ───────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-primary)' }}>
         {activePattern ? (
           <div className="max-w-5xl mx-auto px-6 py-8">
             <PatternVisualizer pattern={activePattern} />
           </div>
         ) : (
-          <div className="h-full flex items-center justify-center text-[--text-muted] text-sm">
-            Select a pattern from the left to start learning.
+          <div
+            className="h-full flex items-center justify-center text-[13px]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            Select a pattern from the list.
           </div>
         )}
       </div>

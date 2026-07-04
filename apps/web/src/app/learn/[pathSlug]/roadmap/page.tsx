@@ -5,7 +5,8 @@ import { useParams } from 'next/navigation';
 import type { PathRoadmapResponse } from '@/components/roadmap/RoadmapCanvas';
 import { RoadmapListView } from '@/components/roadmap/RoadmapListView';
 import { fetchRoadmap } from '@/lib/api';
-import { Loader2, Trophy, Target, Flame } from 'lucide-react';
+import { Loader2, Target, ArrowLeft } from 'lucide-react';
+import Link from 'next/link';
 
 export default function PathRoadmapPage() {
   const params = useParams();
@@ -32,9 +33,11 @@ export default function PathRoadmapPage() {
   if (loading) {
     return (
       <div className="h-full w-full flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3 text-[--text-muted]">
-          <Loader2 className="animate-spin" size={28} />
-          <span className="text-sm">Loading roadmap…</span>
+        <div className="flex flex-col items-center gap-3" style={{ color: 'var(--text-muted)' }}>
+          <Loader2 className="animate-spin" size={22} style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px]" style={{ color: 'var(--text-secondary)' }}>
+            Loading roadmap…
+          </span>
         </div>
       </div>
     );
@@ -42,92 +45,146 @@ export default function PathRoadmapPage() {
 
   if (!roadmapData) {
     return (
-      <div className="h-full w-full flex items-center justify-center text-[--text-secondary]">
-        <h2 className="text-lg">Failed to load roadmap data.</h2>
+      <div
+        className="h-full w-full flex items-center justify-center"
+        style={{ color: 'var(--text-secondary)' }}
+      >
+        <p className="text-[14px]">Failed to load roadmap data.</p>
       </div>
     );
   }
 
-  // ── Stats ──────────────────────────────────────────────
   let totalTopics = 0;
   let completedTopics = 0;
   roadmapData.levels.forEach(l => {
     totalTopics += l.topicCount;
     completedTopics += l.completedCount;
   });
-  const completionPercentage = totalTopics > 0 ? Math.round((completedTopics / totalTopics) * 100) : 0;
+  const completionPct = totalTopics > 0 ? Math.round((completedTopics / totalTopics) * 100) : 0;
   const nextLevel = roadmapData.levels.find(l => l.completedCount < l.topicCount);
 
   return (
     <div className="h-full w-full overflow-y-auto">
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-24">
+      <div className="max-w-5xl mx-auto px-5 sm:px-6 lg:px-8 py-8 pb-16">
 
-        {/* ── Hero Header ───────────────────────────────────── */}
-        <div className="relative overflow-hidden rounded-2xl border border-[--border-default] bg-gradient-to-br from-indigo-500/10 via-[--bg-surface] to-purple-500/5 p-8 mb-8">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(99,102,241,0.15),transparent_50%)] pointer-events-none" />
-          <div className="relative flex flex-col lg:flex-row items-start lg:items-end justify-between gap-6">
+        {/* ── Header ───────────────────────────────────────────── */}
+        <div
+          className="rounded-[14px] border p-6 sm:p-8 mb-8"
+          style={{
+            background: 'var(--bg-surface)',
+            borderColor: 'var(--border-default)',
+          }}
+        >
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center gap-1.5 text-[12.5px] mb-4 transition-colors"
+            style={{ color: 'var(--text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
+          >
+            <ArrowLeft size={13} />
+            Dashboard
+          </Link>
+
+          <div className="flex flex-col lg:flex-row items-start lg:items-end justify-between gap-6">
             <div>
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-400 mb-3">
-                <Target size={14} /> Learning Path
+              <div
+                className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest mb-3"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                <Target size={12} strokeWidth={1.75} />
+                Learning path
               </div>
-              <h1 className="text-4xl sm:text-5xl font-bold font-display text-[--text-primary] mb-3 leading-tight">
+              <h1
+                className="mb-3 text-balance"
+                style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: 'clamp(2rem, 4vw, 3rem)',
+                  lineHeight: 1.05,
+                  letterSpacing: '-0.02em',
+                  color: 'var(--text-primary)',
+                }}
+              >
                 {roadmapData.path.title}
               </h1>
-              <p className="text-[--text-secondary] max-w-2xl">
-                Master all <span className="text-[--text-primary] font-semibold">{roadmapData.path.totalTopics}</span> topics
-                from Foundation to Expert. {nextLevel
-                  ? <>Next up: <span className="text-indigo-400 font-medium">Level {nextLevel.level} — {nextLevel.label}</span></>
-                  : <span className="text-emerald-400 font-medium">🎉 You&apos;ve mastered every level!</span>}
+              <p className="text-[14px] max-w-2xl" style={{ color: 'var(--text-secondary)' }}>
+                {roadmapData.path.totalTopics} topics from Foundation to Expert.{' '}
+                {nextLevel ? (
+                  <>Next up:{' '}
+                    <span style={{ color: 'var(--accent)', fontWeight: 500 }}>
+                      Level {nextLevel.level} · {nextLevel.label}
+                    </span>
+                  </>
+                ) : (
+                  <span style={{ color: 'var(--success)', fontWeight: 500 }}>
+                    Every level complete.
+                  </span>
+                )}
               </p>
             </div>
 
-            {/* Stat Cards */}
+            {/* Stats */}
             <div className="flex gap-3 shrink-0">
-              <StatCard
-                icon={<Flame size={16} className="text-orange-400" />}
-                label="Progress"
-                value={`${completionPercentage}%`}
-                accent="text-emerald-400"
-              />
-              <StatCard
-                icon={<Trophy size={16} className="text-amber-400" />}
-                label="Topics Done"
-                value={`${completedTopics} / ${totalTopics}`}
-                accent="text-[--text-primary]"
-              />
+              <MiniStat label="Progress" value={`${completionPct}%`} />
+              <MiniStat label="Completed" value={`${completedTopics} / ${totalTopics}`} />
             </div>
           </div>
 
-          {/* Big progress bar */}
-          <div className="relative mt-8">
-            <div className="h-2.5 bg-[--bg-elevated] rounded-full overflow-hidden">
+          {/* Progress bar */}
+          <div className="mt-6">
+            <div
+              className="h-1.5 rounded-full overflow-hidden"
+              style={{ background: 'var(--bg-inset)' }}
+            >
               <div
-                className="h-full bg-gradient-to-r from-emerald-500 via-emerald-400 to-emerald-500 rounded-full transition-all duration-700 ease-out shadow-[0_0_18px_rgba(16,185,129,0.45)]"
-                style={{ width: `${completionPercentage}%` }}
+                className="h-full rounded-full transition-all duration-700 ease-out"
+                style={{
+                  width: `${completionPct}%`,
+                  background:
+                    completionPct === 100
+                      ? 'var(--success)'
+                      : 'var(--accent)',
+                }}
               />
             </div>
-            <div className="flex justify-between mt-2 text-xs text-[--text-muted]">
+            <div
+              className="flex justify-between mt-1.5 text-[11px]"
+              style={{ color: 'var(--text-muted)' }}
+            >
               <span>Start</span>
               <span>Mastery</span>
             </div>
           </div>
         </div>
 
-        {/* ── List ───────────────────────────────────────────── */}
+        {/* ── List ─────────────────────────────────────────────── */}
         <RoadmapListView data={roadmapData} />
       </div>
     </div>
   );
 }
 
-function StatCard({ icon, label, value, accent }: { icon: React.ReactNode; label: string; value: string; accent: string }) {
+function MiniStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="bg-[--bg-elevated]/80 backdrop-blur-sm border border-[--border-default] rounded-xl px-5 py-3 min-w-[120px]">
-      <div className="flex items-center gap-1.5 text-xs text-[--text-muted] mb-1">
-        {icon}
-        <span>{label}</span>
+    <div
+      className="rounded-[10px] border px-4 py-2.5 min-w-[120px]"
+      style={{
+        background: 'var(--bg-elevated)',
+        borderColor: 'var(--border-default)',
+      }}
+    >
+      <div
+        className="text-[10.5px] font-semibold uppercase tracking-widest mb-0.5"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        {label}
       </div>
-      <div className={`text-2xl font-bold ${accent}`}>{value}</div>
+      <div
+        className="text-[18px] font-medium tabular-nums"
+        style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}
+      >
+        {value}
+      </div>
     </div>
   );
 }

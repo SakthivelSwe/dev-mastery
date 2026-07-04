@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/shell/Sidebar';
 import { Topbar } from '@/components/shell/Topbar';
 import { CommandPalette } from '@/components/shell/CommandPalette';
-import { Settings, Bell, Shield, Palette, User, Check, LogOut } from 'lucide-react';
+import { Settings, Bell, Shield, Sun, Moon, User, Check, LogOut } from 'lucide-react';
 
 export default function SettingsPage() {
   const router = useRouter();
@@ -17,9 +17,7 @@ export default function SettingsPage() {
 
   useEffect(() => {
     useAuthStore.getState().hydrate();
-    if (!isAuthenticated && !localStorage.getItem('auth_token')) {
-      router.push('/login');
-    }
+    if (!isAuthenticated && !localStorage.getItem('auth_token')) router.push('/login');
     const stored = localStorage.getItem('theme') as 'dark' | 'light' | null;
     if (stored) setTheme(stored);
     const goal = localStorage.getItem('daily_goal');
@@ -34,104 +32,130 @@ export default function SettingsPage() {
     setTimeout(() => setSaved(false), 2000);
   };
 
+  const Section = ({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) => (
+    <div
+      className="rounded-[14px] border p-5 space-y-4"
+      style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+    >
+      <h2
+        className="flex items-center gap-2 text-[13px] font-semibold uppercase tracking-wider"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        {icon}
+        {title}
+      </h2>
+      {children}
+    </div>
+  );
+
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[--bg-primary]">
+    <div className="flex flex-col h-screen overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
       <Topbar />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="flex-1 overflow-y-auto p-6 lg:p-8">
-          <div className="max-w-2xl mx-auto space-y-6">
+        <main className="flex-1 overflow-y-auto p-5 sm:p-8">
+          <div className="max-w-2xl mx-auto space-y-5">
 
-            <div>
-              <h1 className="text-2xl font-bold text-[--text-primary] flex items-center gap-2">
-                <Settings size={22} /> Settings
+            <div className="mb-2">
+              <h1
+                className="flex items-center gap-2.5 mb-1"
+                style={{
+                  fontFamily: 'var(--font-display)',
+                  fontSize: '1.75rem',
+                  color: 'var(--text-primary)',
+                  lineHeight: 1.1,
+                }}
+              >
+                <Settings size={20} strokeWidth={1.75} style={{ color: 'var(--accent)' }} />
+                Settings
               </h1>
-              <p className="text-sm text-[--text-muted] mt-1">Manage your account and preferences.</p>
+              <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
+                Manage your account and workspace preferences.
+              </p>
             </div>
 
-            {/* Profile info */}
-            <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-6 space-y-4">
-              <h2 className="text-sm font-semibold text-[--text-secondary] flex items-center gap-2">
-                <User size={14} /> Account
-              </h2>
-              <div className="grid gap-3">
-                <div>
-                  <label className="text-xs text-[--text-muted] mb-1 block">Full Name</label>
-                  <div className="px-3 py-2 rounded-lg bg-[--bg-elevated] border border-[--border-default] text-sm text-[--text-primary]">
-                    {user?.fullName || '—'}
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-[--text-muted] mb-1 block">Email</label>
-                  <div className="px-3 py-2 rounded-lg bg-[--bg-elevated] border border-[--border-default] text-sm text-[--text-muted]">
-                    {user?.email || '—'}
-                  </div>
-                </div>
+            {/* Account */}
+            <Section icon={<User size={13} strokeWidth={1.75} />} title="Account">
+              <div className="space-y-3">
+                <ReadonlyField label="Full name" value={user?.fullName || '—'} />
+                <ReadonlyField label="Email" value={user?.email || '—'} muted />
               </div>
-            </div>
+            </Section>
 
             {/* Appearance */}
-            <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-6 space-y-4">
-              <h2 className="text-sm font-semibold text-[--text-secondary] flex items-center gap-2">
-                <Palette size={14} /> Appearance
-              </h2>
+            <Section icon={<Sun size={13} strokeWidth={1.75} />} title="Appearance">
               <div className="flex gap-3">
                 {(['dark', 'light'] as const).map(t => (
                   <button
                     key={t}
                     onClick={() => setTheme(t)}
-                    className={`flex-1 py-3 rounded-xl border text-sm font-medium capitalize transition-all ${
-                      theme === t
-                        ? 'border-indigo-500 bg-indigo-500/10 text-indigo-400'
-                        : 'border-[--border-default] text-[--text-muted] hover:border-[--text-muted]/40'
-                    }`}
+                    className="flex-1 py-2.5 rounded-[10px] border text-[13px] font-medium capitalize transition-all"
+                    style={{
+                      background: theme === t ? 'var(--accent-soft)' : 'var(--bg-elevated)',
+                      borderColor: theme === t ? 'var(--accent)' : 'var(--border-default)',
+                      color: theme === t ? 'var(--accent)' : 'var(--text-secondary)',
+                    }}
                   >
-                    {t === 'dark' ? '🌙 Dark' : '☀️ Light'}
+                    {t === 'dark' ? <><Moon size={13} className="inline mr-1.5" />Dark</> : <><Sun size={13} className="inline mr-1.5" />Light</>}
                   </button>
                 ))}
               </div>
-            </div>
+            </Section>
 
-            {/* Learning */}
-            <div className="bg-[--bg-surface] border border-[--border-default] rounded-2xl p-6 space-y-4">
-              <h2 className="text-sm font-semibold text-[--text-secondary] flex items-center gap-2">
-                <Bell size={14} /> Learning Goals
-              </h2>
+            {/* Learning goals */}
+            <Section icon={<Bell size={13} strokeWidth={1.75} />} title="Learning goals">
               <div>
-                <label className="text-xs text-[--text-muted] mb-2 block">
-                  Daily XP Goal: <span className="text-[--text-primary] font-bold">{dailyGoal} XP</span>
+                <label
+                  className="block text-[12.5px] mb-3"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  Daily XP goal:{' '}
+                  <span className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                    {dailyGoal} XP
+                  </span>
                 </label>
                 <input
                   type="range" min={50} max={500} step={50}
                   value={dailyGoal}
                   onChange={e => setDailyGoal(Number(e.target.value))}
-                  className="w-full accent-indigo-500"
+                  className="w-full h-1.5 rounded-full appearance-none cursor-pointer"
+                  style={{ accentColor: 'var(--accent)' }}
                 />
-                <div className="flex justify-between text-[10px] text-[--text-muted] mt-1">
+                <div
+                  className="flex justify-between text-[10.5px] mt-1.5"
+                  style={{ color: 'var(--text-muted)' }}
+                >
                   <span>50</span><span>150</span><span>300</span><span>500</span>
                 </div>
               </div>
-            </div>
+            </Section>
 
             {/* Danger zone */}
-            <div className="bg-[--bg-surface] border border-red-500/20 rounded-2xl p-6 space-y-4">
-              <h2 className="text-sm font-semibold text-red-400 flex items-center gap-2">
-                <Shield size={14} /> Account Actions
-              </h2>
+            <Section
+              icon={<Shield size={13} strokeWidth={1.75} />}
+              title="Account actions"
+            >
               <button
                 onClick={() => { logout(); router.push('/'); }}
-                className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-red-400 transition-all"
+                className="flex items-center gap-2 text-[13px] px-4 py-2 rounded-md border transition-colors"
+                style={{
+                  background: 'color-mix(in oklab, var(--error) 8%, transparent)',
+                  borderColor: 'color-mix(in oklab, var(--error) 30%, var(--border-default))',
+                  color: 'var(--error)',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'color-mix(in oklab, var(--error) 15%, transparent)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'color-mix(in oklab, var(--error) 8%, transparent)'; }}
               >
-                <LogOut size={14} /> Sign out of all devices
+                <LogOut size={13} /> Sign out of all devices
               </button>
-            </div>
+            </Section>
 
             {/* Save */}
             <button
               onClick={handleSave}
-              className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-500 hover:bg-indigo-400 text-white font-semibold text-sm transition-all active:scale-95"
+              className="btn-primary w-full py-2.5"
             >
-              {saved ? <><Check size={15} /> Saved!</> : 'Save Changes'}
+              {saved ? <><Check size={14} /> Saved</> : 'Save changes'}
             </button>
 
           </div>
@@ -142,3 +166,25 @@ export default function SettingsPage() {
   );
 }
 
+function ReadonlyField({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
+  return (
+    <div>
+      <label
+        className="block text-[11.5px] mb-1"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        {label}
+      </label>
+      <div
+        className="px-3 py-2 rounded-md text-[13.5px]"
+        style={{
+          background: 'var(--bg-inset)',
+          border: '1px solid var(--border-default)',
+          color: muted ? 'var(--text-muted)' : 'var(--text-primary)',
+        }}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
