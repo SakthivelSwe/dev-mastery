@@ -5,8 +5,9 @@ import { useParams } from 'next/navigation';
 import type { PathRoadmapResponse } from '@/components/roadmap/RoadmapCanvas';
 import { RoadmapListView } from '@/components/roadmap/RoadmapListView';
 import { fetchRoadmap } from '@/lib/api';
-import { Loader2, Target, ArrowLeft } from 'lucide-react';
+import { Loader2, Target, ArrowLeft, Sparkles, BookOpen, Trophy } from 'lucide-react';
 import Link from 'next/link';
+import { motion } from 'framer-motion';
 
 export default function PathRoadmapPage() {
   const params = useParams();
@@ -33,22 +34,36 @@ export default function PathRoadmapPage() {
   if (loading) {
     return (
       <div className="h-full w-full flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3" style={{ color: 'var(--text-muted)' }}>
-          <Loader2 className="animate-spin" size={22} style={{ color: 'var(--accent)' }} />
-          <span className="text-[13px]" style={{ color: 'var(--text-secondary)' }}>
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="flex flex-col items-center gap-4"
+        >
+          <div className="relative">
+            <div
+              className="w-12 h-12 rounded-full"
+              style={{
+                background: 'var(--accent-soft)',
+                border: '1px solid var(--border-default)',
+              }}
+            />
+            <Loader2
+              className="animate-spin absolute inset-0 m-auto"
+              size={22}
+              style={{ color: 'var(--accent)' }}
+            />
+          </div>
+          <span className="text-[13px] font-medium" style={{ color: 'var(--text-muted)' }}>
             Loading roadmap…
           </span>
-        </div>
+        </motion.div>
       </div>
     );
   }
 
   if (!roadmapData) {
     return (
-      <div
-        className="h-full w-full flex items-center justify-center"
-        style={{ color: 'var(--text-secondary)' }}
-      >
+      <div className="h-full w-full flex items-center justify-center" style={{ color: 'var(--text-secondary)' }}>
         <p className="text-[14px]">Failed to load roadmap data.</p>
       </div>
     );
@@ -65,126 +80,199 @@ export default function PathRoadmapPage() {
 
   return (
     <div className="h-full w-full overflow-y-auto">
-      <div className="max-w-5xl mx-auto px-5 sm:px-6 lg:px-8 py-8 pb-16">
+      {/* Ambient background glow */}
+      <div
+        className="fixed top-0 left-0 right-0 h-[500px] pointer-events-none"
+        style={{ background: 'var(--gradient-glow)', zIndex: 0 }}
+      />
 
-        {/* ── Header ───────────────────────────────────────────── */}
-        <div
-          className="rounded-[14px] border p-6 sm:p-8 mb-8"
+      <div className="relative max-w-5xl mx-auto px-5 sm:px-6 lg:px-8 py-8 pb-20" style={{ zIndex: 1 }}>
+
+        {/* ── Header Card ─────────────────────────────────────────── */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, ease: [0.25, 0.46, 0.45, 0.94] }}
+          className="rounded-[18px] border mb-8 overflow-hidden"
           style={{
-            background: 'var(--bg-surface)',
+            background: 'linear-gradient(145deg, var(--bg-surface) 0%, var(--bg-elevated) 100%)',
             borderColor: 'var(--border-default)',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.03) inset',
           }}
         >
-          <Link
-            href="/dashboard"
-            className="inline-flex items-center gap-1.5 text-[12.5px] mb-4 transition-colors"
-            style={{ color: 'var(--text-muted)' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-          >
-            <ArrowLeft size={13} />
-            Dashboard
-          </Link>
+          {/* Top accent bar */}
+          <div
+            className="h-[2px] w-full"
+            style={{ background: 'var(--gradient-accent)' }}
+          />
 
-          <div className="flex flex-col lg:flex-row items-start lg:items-end justify-between gap-6">
-            <div>
-              <div
-                className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest mb-3"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                <Target size={12} strokeWidth={1.75} />
-                Learning path
-              </div>
-              <h1
-                className="mb-3 text-balance"
-                style={{
-                  fontFamily: 'var(--font-display)',
-                  fontSize: 'clamp(2rem, 4vw, 3rem)',
-                  lineHeight: 1.05,
-                  letterSpacing: '-0.02em',
-                  color: 'var(--text-primary)',
-                }}
-              >
-                {roadmapData.path.title}
-              </h1>
-              <p className="text-[14px] max-w-2xl" style={{ color: 'var(--text-secondary)' }}>
-                {roadmapData.path.totalTopics} topics from Foundation to Expert.{' '}
-                {nextLevel ? (
-                  <>Next up:{' '}
-                    <span style={{ color: 'var(--accent)', fontWeight: 500 }}>
-                      Level {nextLevel.level} · {nextLevel.label}
-                    </span>
-                  </>
-                ) : (
-                  <span style={{ color: 'var(--success)', fontWeight: 500 }}>
-                    Every level complete.
-                  </span>
-                )}
-              </p>
-            </div>
-
-            {/* Stats */}
-            <div className="flex gap-3 shrink-0">
-              <MiniStat label="Progress" value={`${completionPct}%`} />
-              <MiniStat label="Completed" value={`${completedTopics} / ${totalTopics}`} />
-            </div>
-          </div>
-
-          {/* Progress bar */}
-          <div className="mt-6">
-            <div
-              className="h-1.5 rounded-full overflow-hidden"
-              style={{ background: 'var(--bg-inset)' }}
-            >
-              <div
-                className="h-full rounded-full transition-all duration-700 ease-out"
-                style={{
-                  width: `${completionPct}%`,
-                  background:
-                    completionPct === 100
-                      ? 'var(--success)'
-                      : 'var(--accent)',
-                }}
-              />
-            </div>
-            <div
-              className="flex justify-between mt-1.5 text-[11px]"
+          <div className="p-6 sm:p-8">
+            {/* Back link */}
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 text-[12.5px] font-medium mb-5 transition-all duration-150 group"
               style={{ color: 'var(--text-muted)' }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--accent)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
             >
-              <span>Start</span>
-              <span>Mastery</span>
+              <ArrowLeft size={13} className="transition-transform group-hover:-translate-x-0.5" />
+              Dashboard
+            </Link>
+
+            <div className="flex flex-col lg:flex-row items-start lg:items-end justify-between gap-6">
+              <div className="flex-1 min-w-0">
+                {/* Eyebrow */}
+                <div
+                  className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.18em] mb-3"
+                  style={{ color: 'var(--accent)' }}
+                >
+                  <Target size={11} strokeWidth={2.5} />
+                  Learning Path
+                </div>
+
+                {/* Title */}
+                <h1
+                  className="mb-3 text-balance"
+                  style={{
+                    fontFamily: 'var(--font-display)',
+                    fontSize: 'clamp(2rem, 4.5vw, 3.2rem)',
+                    fontWeight: 800,
+                    lineHeight: 1.08,
+                    letterSpacing: '-0.03em',
+                    color: 'var(--text-primary)',
+                  }}
+                >
+                  {roadmapData.path.title}
+                </h1>
+
+                {/* Description */}
+                <p
+                  className="text-[14px] leading-relaxed max-w-xl"
+                  style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-body)' }}
+                >
+                  {roadmapData.path.totalTopics} topics from Foundation to Expert.{' '}
+                  {nextLevel ? (
+                    <>
+                      Next up:{' '}
+                      <span
+                        className="font-semibold"
+                        style={{ color: 'var(--accent)' }}
+                      >
+                        Level {nextLevel.level} · {nextLevel.label}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="font-semibold" style={{ color: 'var(--success)' }}>
+                      <Sparkles size={12} className="inline mr-1" />
+                      Every level complete!
+                    </span>
+                  )}
+                </p>
+              </div>
+
+              {/* Stats */}
+              <div className="flex gap-3 shrink-0">
+                <MiniStat
+                  label="Progress"
+                  value={`${completionPct}%`}
+                  icon={<Target size={13} />}
+                  accent={completionPct === 100 ? 'var(--success)' : 'var(--accent)'}
+                />
+                <MiniStat
+                  label="Completed"
+                  value={`${completedTopics} / ${totalTopics}`}
+                  icon={<BookOpen size={13} />}
+                  accent="var(--accent)"
+                />
+              </div>
+            </div>
+
+            {/* Progress bar */}
+            <div className="mt-7">
+              <div
+                className="h-2 rounded-full overflow-hidden"
+                style={{ background: 'var(--bg-inset)', border: '1px solid var(--border-default)' }}
+              >
+                <motion.div
+                  className="h-full rounded-full"
+                  initial={{ width: 0 }}
+                  animate={{ width: `${completionPct}%` }}
+                  transition={{ duration: 1.2, ease: [0.25, 0.46, 0.45, 0.94], delay: 0.3 }}
+                  style={{
+                    background: completionPct === 100
+                      ? 'linear-gradient(90deg, var(--success), #86efac)'
+                      : 'var(--gradient-accent)',
+                    boxShadow: completionPct > 0 ? '0 0 10px var(--accent-glow)' : 'none',
+                  }}
+                />
+              </div>
+              <div
+                className="flex justify-between mt-2 text-[11px] font-medium"
+                style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-body)' }}
+              >
+                <span>Start</span>
+                <span className="flex items-center gap-1">
+                  <Trophy size={10} />
+                  Mastery
+                </span>
+              </div>
             </div>
           </div>
-        </div>
+        </motion.div>
 
-        {/* ── List ─────────────────────────────────────────────── */}
-        <RoadmapListView data={roadmapData} />
+        {/* ── Level List ────────────────────────────────────────────── */}
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.2, duration: 0.4 }}
+        >
+          <RoadmapListView data={roadmapData} />
+        </motion.div>
       </div>
     </div>
   );
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
+function MiniStat({
+  label,
+  value,
+  icon,
+  accent,
+}: {
+  label: string;
+  value: string;
+  icon?: React.ReactNode;
+  accent?: string;
+}) {
   return (
-    <div
-      className="rounded-[10px] border px-4 py-2.5 min-w-[120px]"
+    <motion.div
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.4, ease: [0.34, 1.56, 0.64, 1] }}
+      className="rounded-[12px] border px-4 py-3 min-w-[120px]"
       style={{
         background: 'var(--bg-elevated)',
         borderColor: 'var(--border-default)',
+        boxShadow: 'var(--shadow-sm)',
       }}
     >
       <div
-        className="text-[10.5px] font-semibold uppercase tracking-widest mb-0.5"
-        style={{ color: 'var(--text-muted)' }}
+        className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-[0.15em] mb-1"
+        style={{ color: accent || 'var(--text-muted)' }}
       >
+        {icon}
         {label}
       </div>
       <div
-        className="text-[18px] font-medium tabular-nums"
-        style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}
+        className="text-[20px] font-extrabold tabular-nums"
+        style={{
+          color: 'var(--text-primary)',
+          fontFamily: 'var(--font-display)',
+          letterSpacing: '-0.02em',
+        }}
       >
         {value}
       </div>
-    </div>
+    </motion.div>
   );
 }
