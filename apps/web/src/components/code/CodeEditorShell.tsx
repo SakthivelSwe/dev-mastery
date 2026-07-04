@@ -36,7 +36,7 @@ export function CodeEditorShell({ initialCode, languageId, languageString = 'jav
 
   const isSuccess     = result?.statusId === STATUS_SUCCESS;
   const isNotConfig   = result?.statusId === STATUS_NOT_CONFIGURED && result?.statusDescription === 'Not Configured';
-  const isConnErr     = result?.statusDescription === 'Connection Error' || result?.statusDescription === 'Timeout';
+  const isConnErr     = result?.statusDescription === 'Connection Error' || result?.statusDescription === 'Timeout' || result?.statusDescription === 'Cold Start';
 
   return (
     <div
