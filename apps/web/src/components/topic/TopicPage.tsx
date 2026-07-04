@@ -1,10 +1,14 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import Link from 'next/link';
 import { useTopicStore, TabState } from '@/store/useTopicStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import LessonNav from './LessonNav';
-import { Bot, ChevronRight, Check, ChevronLeft, Loader2, Zap, RefreshCw, AlertCircle } from 'lucide-react';
+import {
+  Bot, ChevronRight, Check, ChevronLeft, Loader2, RefreshCw, AlertCircle,
+  X, Send, Sparkles,
+} from 'lucide-react';
 import VisualizerShell from '../visualizer/VisualizerShell';
 import { CodeEditorShell } from '@/components/code/CodeEditorShell';
 import { CodeLayerView } from '@/components/code/CodeLayerView';
@@ -16,27 +20,28 @@ import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { fetchTopic, markLayerComplete } from '@/lib/api';
 
-const COLD_START_TIMEOUT_MS = 15_000; // after 15s show "backend waking up" message
+const COLD_START_TIMEOUT_MS = 15_000;
 
 interface TopicPageProps {
-  topicSlug:  string;
-  topic:       Topic | null;
+  topicSlug: string;
+  pathSlug?: string;
+  topic:     Topic | null;
 }
 
-export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageProps) {
+export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: TopicPageProps) {
   const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
   const { user, token } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
-    topicSlug: topicSlug,
+    topicSlug,
     sectionType: activeTab,
   });
-  const [chatInput, setChatInput]   = useState('');
+  const [chatInput, setChatInput] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
-  const [xpFlash, setXpFlash]       = useState(false);
+  const [xpFlash, setXpFlash] = useState(false);
   const startTime = useRef(Date.now());
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Client-side fallback: if SSR returned null (cold backend), retry here
+  // Client-side fallback if SSR returned null (cold backend)
   const [topic, setTopic] = useState<Topic | null>(initialTopic);
   const [fetchError, setFetchError] = useState(false);
   const [waitingTooLong, setWaitingTooLong] = useState(false);
@@ -47,11 +52,8 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
     setWaitingTooLong(false);
     try {
       const data = await fetchTopic(topicSlug);
-      if (data) {
-        setTopic(data);
-      } else {
-        setFetchError(true);
-      }
+      if (data) setTopic(data);
+      else setFetchError(true);
     } catch {
       setFetchError(true);
     }
@@ -59,34 +61,22 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
 
   useEffect(() => {
     if (initialTopic) { setTopic(initialTopic); return; }
-    // SSR returned null — start client-side fetch
     loadTopic();
-    // After COLD_START_TIMEOUT_MS show a "waking up" hint
     retryRef.current = setTimeout(() => setWaitingTooLong(true), COLD_START_TIMEOUT_MS);
     return () => { if (retryRef.current) clearTimeout(retryRef.current); };
   }, [topicSlug, initialTopic, loadTopic]);
 
-  // Scroll AI chat to bottom on new messages
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  // Reset start timer when changing tabs
-  useEffect(() => {
-    startTime.current = Date.now();
-  }, [activeTab]);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => { startTime.current = Date.now(); }, [activeTab]);
 
   const handleMarkComplete = async () => {
     setIsCompleting(true);
     try {
       const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
-      if (user) {
-        await markLayerComplete(user.id, topicSlug, activeTab, timeSpent, token);
-      }
+      if (user) await markLayerComplete(user.id, topicSlug, activeTab, timeSpent, token);
       markTabCompleted(activeTab);
       setXpFlash(true);
       setTimeout(() => setXpFlash(false), 2000);
-      // Invalidate dashboard SWR cache so stats refresh automatically
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('devmastery:progress-update'));
       }
@@ -101,26 +91,37 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
     if (!topic) {
       if (fetchError) {
         return (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-[--text-muted]">
-            <AlertCircle size={32} className="text-red-400" />
-            <span className="text-sm text-[--text-secondary] font-medium">Could not load topic content.</span>
-            <button
-              onClick={loadTopic}
-              className="flex items-center gap-2 text-xs px-4 py-2 rounded-lg bg-[--bg-elevated] border border-[--border-default] hover:border-indigo-500/50 transition-all"
-            >
+          <div
+            className="flex flex-col items-center justify-center h-full gap-4"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <AlertCircle size={26} style={{ color: 'var(--error)' }} />
+            <span className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+              Could not load topic content.
+            </span>
+            <button onClick={loadTopic} className="btn-ghost text-[13px] px-4 py-2">
               <RefreshCw size={13} /> Retry
             </button>
           </div>
         );
       }
       return (
-        <div className="flex flex-col items-center justify-center h-full gap-3 text-[--text-muted]">
-          <Loader2 className="animate-spin text-indigo-400" size={32} />
-          <span className="text-sm font-medium text-[--text-secondary]">Loading topic content…</span>
+        <div
+          className="flex flex-col items-center justify-center h-full gap-3"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          <Loader2 className="animate-spin" size={26} style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+            Loading topic content…
+          </span>
           {waitingTooLong && (
-            <div className="flex flex-col items-center gap-2 mt-1 max-w-xs text-center">
-              <span className="text-xs text-amber-400">⚡ The backend is waking up from sleep (Render free tier).</span>
-              <span className="text-xs text-[--text-muted]">This can take up to 60 s on first visit. Subsequent loads will be instant.</span>
+            <div className="mt-2 max-w-sm text-center space-y-1">
+              <p className="text-[12px]" style={{ color: 'var(--warning)' }}>
+                The backend is waking up from sleep.
+              </p>
+              <p className="text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
+                This can take up to a minute on first visit. Subsequent loads will be instant.
+              </p>
             </div>
           )}
         </div>
@@ -128,12 +129,9 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
     }
 
     switch (activeTab as TabState) {
-      case 'why':
-        return <MarkdownView source={topic.layers.why} />;
-      case 'theory':
-        return <MarkdownView source={topic.layers.theory} />;
-      case 'visualizer':
-        return <VisualizerShell topicSlug={topicSlug} visualLayer={topic.layers.visual} />;
+      case 'why':          return <MarkdownView source={topic.layers.why} />;
+      case 'theory':       return <MarkdownView source={topic.layers.theory} />;
+      case 'visualizer':   return <VisualizerShell topicSlug={topicSlug} visualLayer={topic.layers.visual} />;
       case 'code':
         return (
           <div className="h-full">
@@ -141,140 +139,241 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
               ? <CodeLayerView codeContent={topic.layers.code} language="java" />
               : (
                 <div className="h-full -m-6">
-                  <CodeEditorShell initialCode="// Write your code here..." languageString="java" />
+                  <CodeEditorShell initialCode="// Write your code here…" languageString="java" />
                 </div>
               )
             }
           </div>
         );
-      case 'real-world':
-        return <MarkdownView source={topic.layers.realWorld} />;
-      case 'interview':
-        return <MarkdownView source={topic.layers.interview} />;
-      case 'feynman':
-        return <FeynmanCheckPanel topicSlug={topicSlug} topicTitle={topic.title} />;
-      case 'build':
-        return <BuildChallengePanel buildContent={topic.layers.build} />;
-      case 'spaced-review':
-        return <SpacedReviewWidget topicSlug={topicSlug} spacedReviewContent={topic.layers.spacedReview} />;
+      case 'real-world':   return <MarkdownView source={topic.layers.realWorld} />;
+      case 'interview':    return <MarkdownView source={topic.layers.interview} />;
+      case 'feynman':      return <FeynmanCheckPanel topicSlug={topicSlug} topicTitle={topic.title} />;
+      case 'build':        return <BuildChallengePanel buildContent={topic.layers.build} />;
+      case 'spaced-review':return <SpacedReviewWidget topicSlug={topicSlug} spacedReviewContent={topic.layers.spacedReview} />;
       default:
         return (
-          <div className="flex items-center justify-center h-full text-[--text-muted]">
+          <div
+            className="flex items-center justify-center h-full text-[13px]"
+            style={{ color: 'var(--text-muted)' }}
+          >
             Content for {activeTab} is coming soon.
           </div>
         );
     }
   };
 
-  const pathTitle = topic?.pathTitle || topicSlug;
-  const topicTitle = topic?.title || topicSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  const pathTitle  = topic?.pathTitle  || (pathSlug ? pathSlug.replace(/-/g, ' ') : '');
+  const topicTitle = topic?.title      || topicSlug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] w-full overflow-hidden">
-      {/* ── Left Sidebar: Topic Navigation ─────────────────── */}
+    // Parent (LearnLayout) already reserves Topbar's h-14 (3.5rem).
+    <div className="flex h-full w-full overflow-hidden">
+      {/* ── Lesson layers nav ─────────────────────────────────────── */}
       <LessonNav />
 
-      {/* ── Main Content Area ──────────────────────────────── */}
-      <div className="flex-1 flex flex-col relative overflow-hidden bg-[--bg-primary]">
-
-        {/* Topic Header Bar */}
-        <div className="h-14 border-b border-[--border-default] flex items-center px-6 justify-between bg-[--bg-surface]/50 backdrop-blur-sm shrink-0">
-          <div className="flex items-center text-sm text-[--text-muted]">
-            <span className="text-[--text-secondary]">{pathTitle}</span>
-            <ChevronRight size={14} className="mx-2" />
-            <span className="text-[--text-primary] font-medium">{topicTitle}</span>
+      {/* ── Main pane ────────────────────────────────────────────── */}
+      <div
+        className="flex-1 flex flex-col relative overflow-hidden"
+        style={{ background: 'var(--bg-primary)' }}
+      >
+        {/* Topic header */}
+        <header
+          className="h-12 flex items-center px-5 sm:px-6 justify-between shrink-0 border-b backdrop-blur-sm"
+          style={{
+            background: 'color-mix(in oklab, var(--bg-surface) 82%, transparent)',
+            borderColor: 'var(--border-default)',
+          }}
+        >
+          <nav
+            className="flex items-center text-[12.5px] min-w-0"
+            style={{ color: 'var(--text-muted)' }}
+            aria-label="Breadcrumb"
+          >
+            {pathSlug && (
+              <Link
+                href={`/learn/${pathSlug}/roadmap`}
+                className="truncate capitalize transition-colors"
+                style={{ color: 'var(--text-secondary)' }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+              >
+                {pathTitle}
+              </Link>
+            )}
+            <ChevronRight size={12} className="mx-1.5 shrink-0" />
+            <span className="truncate font-medium" style={{ color: 'var(--text-primary)' }}>
+              {topicTitle}
+            </span>
             {topic && (
-              <span className="ml-3 text-xs bg-[--bg-elevated] border border-[--border-default] text-[--text-muted] px-2 py-0.5 rounded-full">
-                Level {topic.level} · {topic.estimatedMins}min · {topic.xpReward}XP
+              <span
+                className="ml-3 hidden md:inline-flex items-center gap-2 text-[11px] px-2 py-0.5 rounded-full tabular-nums"
+                style={{
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border-default)',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <span>L{topic.level}</span>
+                <span style={{ opacity: 0.5 }}>·</span>
+                <span>{topic.estimatedMins}m</span>
+                <span style={{ opacity: 0.5 }}>·</span>
+                <span>{topic.xpReward} XP</span>
               </span>
             )}
-          </div>
+          </nav>
 
           <button
             onClick={toggleAiDrawer}
-            className="flex items-center gap-2 bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 px-3 py-1.5 rounded-full text-sm font-medium transition-all duration-200 border border-indigo-500/20 hover:border-indigo-500/40"
+            className="flex items-center gap-1.5 text-[12.5px] font-medium px-2.5 py-1 rounded-md transition-colors"
+            style={{
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              border: '1px solid transparent',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent-ring)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'transparent'; }}
           >
-            <Bot size={15} />
+            <Sparkles size={13} />
             Ask AI
           </button>
-        </div>
+        </header>
 
-        {/* Dynamic Content Pane */}
-        <div className="flex-1 overflow-y-auto px-8 py-6">
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto px-6 sm:px-8 py-6">
           {renderContent()}
         </div>
 
-        {/* Footer Navigation Bar */}
-        <div className="h-16 border-t border-[--border-default] flex items-center justify-between px-6 bg-[--bg-surface]/50 backdrop-blur-sm shrink-0">
-          <button className="flex items-center gap-2 text-sm text-[--text-muted] hover:text-[--text-primary] px-4 py-2 rounded-lg hover:bg-[--bg-elevated] transition-all">
-            <ChevronLeft size={16} />
+        {/* Footer nav */}
+        <footer
+          className="h-14 flex items-center justify-between px-5 sm:px-6 shrink-0 border-t"
+          style={{
+            background: 'var(--bg-surface)',
+            borderColor: 'var(--border-default)',
+          }}
+        >
+          <button
+            className="btn-quiet text-[13px]"
+            disabled
+            title="Previous topic navigation coming soon"
+          >
+            <ChevronLeft size={14} />
             Previous
           </button>
 
-          {/* XP flash animation */}
           {xpFlash && (
-            <div className="absolute bottom-20 right-32 flex items-center gap-1 text-[--accent-java] font-bold text-sm animate-bounce">
-              <Zap size={16} />+{topic?.xpReward ?? 10} XP
+            <div
+              className="absolute bottom-16 right-32 flex items-center gap-1 text-[13px] font-semibold animate-bounce"
+              style={{ color: 'var(--accent)' }}
+            >
+              <Sparkles size={13} /> +{topic?.xpReward ?? 10} XP
             </div>
           )}
 
           <button
             onClick={handleMarkComplete}
             disabled={isCompleting}
-            className="flex items-center gap-2 bg-[--accent-java] hover:brightness-110 text-white px-6 py-2 rounded-lg text-sm font-bold transition-all duration-200 active:scale-95 disabled:opacity-50 shadow-lg shadow-[--accent-java]/20"
+            className="btn-primary text-[13px] px-4 py-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            {isCompleting ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
-            {isCompleting ? 'Saving...' : 'Mark Complete'}
+            {isCompleting ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+            {isCompleting ? 'Saving…' : 'Mark complete'}
           </button>
-        </div>
+        </footer>
       </div>
 
-      {/* ── AI Bot Drawer ────────────────────────────────────── */}
+      {/* ── AI drawer ─────────────────────────────────────────────── */}
       {isAiDrawerOpen && (
-        <div className="w-80 border-l border-[--border-default] bg-[--bg-surface] flex flex-col shadow-2xl">
-          <div className="h-14 border-b border-[--border-default] flex items-center px-4 justify-between bg-indigo-500/5 shrink-0">
-            <div className="flex items-center gap-2 text-indigo-400 font-medium text-sm">
-              <Bot size={17} />
-              Gemini AI Assistant
+        <aside
+          className="w-[340px] shrink-0 flex flex-col border-l"
+          style={{
+            background: 'var(--bg-surface)',
+            borderColor: 'var(--border-default)',
+          }}
+        >
+          <div
+            className="h-12 flex items-center px-4 justify-between shrink-0 border-b"
+            style={{ borderColor: 'var(--border-default)' }}
+          >
+            <div className="flex items-center gap-2 text-[13px] font-medium" style={{ color: 'var(--accent)' }}>
+              <Bot size={14} strokeWidth={1.75} />
+              AI mentor
             </div>
-            <button onClick={toggleAiDrawer} className="text-[--text-muted] hover:text-[--text-primary] transition-colors text-lg leading-none">
-              ×
+            <button
+              onClick={toggleAiDrawer}
+              className="p-1.5 rounded-md transition-colors"
+              style={{ color: 'var(--text-muted)' }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = 'var(--bg-elevated)';
+                e.currentTarget.style.color = 'var(--text-primary)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'transparent';
+                e.currentTarget.style.color = 'var(--text-muted)';
+              }}
+              aria-label="Close AI drawer"
+            >
+              <X size={15} />
             </button>
           </div>
 
-          <div className="flex-1 p-4 overflow-y-auto flex flex-col gap-3 text-sm">
+          <div className="flex-1 p-4 overflow-y-auto flex flex-col gap-2.5 text-[13px]">
             {messages.length === 0 && (
-              <div className="text-center text-[--text-muted] text-xs mt-8 px-4">
-                <Bot size={28} className="mx-auto mb-2 opacity-40" />
-                Ask any question about <strong className="text-[--text-secondary]">{topicTitle}</strong>
+              <div className="text-center mt-8 px-4" style={{ color: 'var(--text-muted)' }}>
+                <Bot size={22} className="mx-auto mb-2 opacity-50" />
+                <p className="text-[12.5px]">
+                  Ask anything about{' '}
+                  <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>
+                    {topicTitle}
+                  </span>.
+                </p>
               </div>
             )}
             {messages.map((msg, i) => (
               <div
                 key={i}
-                className={`p-3 rounded-xl text-sm leading-relaxed ${
+                className="px-3 py-2 rounded-md text-[13px] leading-relaxed"
+                style={
                   msg.role === 'ai'
-                    ? 'bg-[--bg-elevated] text-[--text-secondary] border border-[--border-muted]'
-                    : 'bg-indigo-500/15 text-indigo-100 border border-indigo-500/25 self-end ml-4'
-                }`}
+                    ? {
+                        background: 'var(--bg-elevated)',
+                        border: '1px solid var(--border-default)',
+                        color: 'var(--text-secondary)',
+                      }
+                    : {
+                        background: 'var(--accent-soft)',
+                        border: '1px solid var(--border-default)',
+                        color: 'var(--text-primary)',
+                        alignSelf: 'flex-end',
+                        marginLeft: '2rem',
+                      }
+                }
               >
                 {msg.content}
               </div>
             ))}
             {aiLoading && (
-              <div className="flex items-center gap-2 text-[--text-muted] text-xs p-3 bg-[--bg-elevated] rounded-xl w-fit">
-                <Loader2 size={12} className="animate-spin" />
-                Thinking...
+              <div
+                className="flex items-center gap-2 text-[12px] px-3 py-2 rounded-md w-fit"
+                style={{
+                  background: 'var(--bg-elevated)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border-default)',
+                }}
+              >
+                <Loader2 size={11} className="animate-spin" />
+                Thinking…
               </div>
             )}
             <div ref={messagesEndRef} />
           </div>
 
-          <div className="p-4 border-t border-[--border-default] shrink-0">
+          <div
+            className="p-3 border-t shrink-0"
+            style={{ borderColor: 'var(--border-default)' }}
+          >
             <div className="flex gap-2">
               <input
                 type="text"
-                placeholder="Ask a question..."
+                placeholder="Ask a question…"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -283,18 +382,32 @@ export default function TopicPage({ topicSlug, topic: initialTopic }: TopicPageP
                     setChatInput('');
                   }
                 }}
-                className="flex-1 bg-[--bg-elevated] border border-[--border-default] rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 text-[--text-primary] placeholder:text-[--text-muted]"
+                className="flex-1 rounded-md px-3 py-2 text-[13px] outline-none transition-all"
+                style={{
+                  background: 'var(--bg-inset)',
+                  border: '1px solid var(--border-default)',
+                  color: 'var(--text-primary)',
+                }}
+                onFocus={(e) => {
+                  e.currentTarget.style.borderColor = 'var(--accent)';
+                  e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-ring)';
+                }}
+                onBlur={(e) => {
+                  e.currentTarget.style.borderColor = 'var(--border-default)';
+                  e.currentTarget.style.boxShadow = 'none';
+                }}
               />
               <button
                 onClick={() => { if (chatInput.trim()) { sendMessage(chatInput); setChatInput(''); } }}
                 disabled={!chatInput.trim() || aiLoading}
-                className="px-3 py-2 bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 disabled:opacity-40 transition-colors"
+                className="btn-primary text-[13px] px-2.5 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                aria-label="Send"
               >
-                <ChevronRight size={16} />
+                <Send size={13} />
               </button>
             </div>
           </div>
-        </div>
+        </aside>
       )}
     </div>
   );
