@@ -154,7 +154,7 @@ function InteractiveScene() {
         bucket.nodes[existing] = { ...bucket.nodes[existing], value: val, isNew: true };
       } else {
         addLog(`➕ PUT  bucket[${idx}] key="${key}", value="${val}"  (hash=${hc})`);
-        bucket.nodes.push({ key, value: val, hash: hc, isNew: true });
+        bucket.nodes.push({ key, value: val, hash: hc, isNew: true, highlight: false });
         setTotalEntries(t => t + 1);
       }
 
