@@ -340,15 +340,88 @@ function ApplyDecorationsBridge({
 // ─── Diagrams ──────────────────────────────────────────────────────────────
 
 function DiagramRenderer({ diagram }: { diagram: Diagram }) {
-  switch (diagram.kind) {
-    case 'memory':     return <MemoryDiagram   {...diagram} />;
-    case 'threads':    return <ThreadsDiagram  {...diagram} />;
-    case 'boxes':      return <BoxesDiagram    {...diagram} />;
-    case 'flow':       return <FlowDiagram     {...diagram} />;
-    case 'sequence':   return <SequenceDiagram {...diagram} />;
-    case 'threadpool': return <ThreadPoolDiagram {...diagram} />;
+  // Defensive normalization: some authored configs used slightly different
+  // field names or primitive shortcuts. Coerce everything to the strict
+  // schema so no diagram ever crashes at render time.
+  const d = normalizeDiagram(diagram);
+  switch (d.kind) {
+    case 'memory':     return <MemoryDiagram   {...d} />;
+    case 'threads':    return <ThreadsDiagram  {...d} />;
+    case 'boxes':      return <BoxesDiagram    {...d} />;
+    case 'flow':       return <FlowDiagram     {...d} />;
+    case 'sequence':   return <SequenceDiagram {...d} />;
+    case 'threadpool': return <ThreadPoolDiagram {...d} />;
     default:
       return <div className="text-sm text-[--text-muted]">Unknown diagram kind.</div>;
+  }
+}
+
+/**
+ * Normalize authored diagram objects so both the strict schema and looser
+ * author-friendly shapes work at runtime:
+ *
+ *  - flow.steps: accept `string[]` and convert to `FlowStep[]`
+ *  - boxes.items: accept `boxes` as an alias for `items` (older configs)
+ *  - boxes items strings → { label } objects
+ *  - threads: guarantee array
+ *  - threadpool: guarantee arrays + numeric capacity
+ *  - sequence: guarantee arrays
+ */
+function normalizeDiagram(diagram: any): Diagram {
+  if (!diagram || typeof diagram !== 'object' || !diagram.kind) {
+    return { kind: 'flow', steps: [] };
+  }
+  switch (diagram.kind) {
+    case 'flow': {
+      const raw = Array.isArray(diagram.steps) ? diagram.steps : [];
+      const steps: FlowStep[] = raw.map((s: any) =>
+        typeof s === 'string'
+          ? { label: s }
+          : s && typeof s === 'object' && typeof s.label === 'string'
+            ? s
+            : { label: String(s ?? '') }
+      );
+      return { kind: 'flow', steps };
+    }
+    case 'boxes': {
+      const rawItems = Array.isArray(diagram.items)
+        ? diagram.items
+        : Array.isArray(diagram.boxes)
+          ? diagram.boxes
+          : [];
+      const items: BoxItem[] = rawItems.map((b: any) =>
+        typeof b === 'string'
+          ? { label: b }
+          : b && typeof b === 'object' && typeof b.label === 'string'
+            ? { label: b.label, value: b.value, highlight: b.highlight, color: b.color }
+            : { label: String(b ?? '') }
+      );
+      return { kind: 'boxes', title: diagram.title, items };
+    }
+    case 'threads': {
+      const threads: ThreadRow[] = Array.isArray(diagram.threads) ? diagram.threads : [];
+      return { kind: 'threads', threads, monitor: diagram.monitor };
+    }
+    case 'threadpool': {
+      const workers: ThreadRow[] = Array.isArray(diagram.workers) ? diagram.workers : [];
+      const queue: BoxItem[] = Array.isArray(diagram.queue) ? diagram.queue : [];
+      const capacity = typeof diagram.capacity === 'number' ? diagram.capacity : Math.max(queue.length, 8);
+      return { kind: 'threadpool', workers, queue, capacity };
+    }
+    case 'sequence': {
+      const actors: string[] = Array.isArray(diagram.actors) ? diagram.actors : [];
+      const messages: SequenceMsg[] = Array.isArray(diagram.messages) ? diagram.messages : [];
+      return { kind: 'sequence', actors, messages };
+    }
+    case 'memory': {
+      return {
+        kind: 'memory',
+        stack: Array.isArray(diagram.stack) ? diagram.stack : [],
+        heap:  Array.isArray(diagram.heap)  ? diagram.heap  : [],
+      };
+    }
+    default:
+      return diagram as Diagram;
   }
 }
 
@@ -452,11 +525,12 @@ function stateColor(s: string): string {
 
 // Boxes: horizontal or wrapping row of labeled boxes (e.g., queue, ring buffer)
 function BoxesDiagram({ title, items }: { title?: string; items: BoxItem[] }) {
+  const list = Array.isArray(items) ? items : [];
   return (
     <Panel title={title ?? 'State'}>
       <div className="flex flex-wrap gap-2">
-        {items.length === 0 && <Empty>empty</Empty>}
-        {items.map((b, i) => (
+        {list.length === 0 && <Empty>empty</Empty>}
+        {list.map((b, i) => (
           <div key={i}
             className={`px-3 py-2 rounded border font-mono text-sm min-w-[64px] text-center ${
               b.highlight
@@ -475,10 +549,12 @@ function BoxesDiagram({ title, items }: { title?: string; items: BoxItem[] }) {
 
 // Flow: vertical list of steps with done / active indicators
 function FlowDiagram({ steps }: { steps: FlowStep[] }) {
+  const list = Array.isArray(steps) ? steps : [];
   return (
     <Panel title="Flow">
       <div className="flex flex-col gap-1">
-        {steps.map((s, i) => (
+        {list.length === 0 && <Empty>no steps</Empty>}
+        {list.map((s, i) => (
           <div key={i} className="flex items-start gap-2">
             <div className={`mt-1 w-5 h-5 shrink-0 rounded-full flex items-center justify-center text-[10px] font-bold ${
               s.done
