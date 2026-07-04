@@ -1,7 +1,9 @@
 'use client';
 
 import Link from 'next/link';
-import { Search, Bell, Sun, Moon, UserCircle2, LogOut, Settings, User, ChevronDown } from 'lucide-react';
+import {
+  Search, Sun, Moon, LogOut, Settings, User, ChevronDown, Sparkles, LayoutDashboard,
+} from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useRouter } from 'next/navigation';
@@ -13,14 +15,12 @@ export function Topbar() {
   const { user, isAuthenticated, logout } = useAuthStore();
   const router = useRouter();
 
-  // Hydrate auth state on mount
   useEffect(() => {
     useAuthStore.getState().hydrate();
     const stored = localStorage.getItem('theme');
     if (stored === 'light') setIsDark(false);
   }, []);
 
-  // Close dropdown when clicking outside
   useEffect(() => {
     function handler(e: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
@@ -46,94 +46,199 @@ export function Topbar() {
     router.push('/');
   };
 
+  const displayName = user?.fullName || user?.email || '';
   const initials = user
-    ? (user.fullName || user.email || 'U').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)
+    ? (displayName || 'U').split(' ').filter(Boolean).map(w => w[0]).join('').toUpperCase().slice(0, 2)
     : null;
 
+  const openSearch = () =>
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }));
+
   return (
-    <header className="h-16 border-b border-[--border-default] flex items-center px-6 bg-[--bg-surface]/80 backdrop-blur-md shrink-0 z-40 gap-4">
+    <header
+      className="h-14 flex items-center px-4 sm:px-5 shrink-0 z-40 gap-3 border-b backdrop-blur-md"
+      style={{
+        background: 'color-mix(in oklab, var(--bg-surface) 82%, transparent)',
+        borderColor: 'var(--border-default)',
+      }}
+    >
       {/* Logo */}
-      <Link href="/" className="font-display font-bold text-lg text-[--text-primary] tracking-tight mr-2">
-        Dev<span className="text-[--accent-ai]">Mastery</span>
+      <Link href="/" className="flex items-center gap-2 mr-1">
+        <span
+          className="inline-flex w-7 h-7 rounded-md items-center justify-center"
+          style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        >
+          <Sparkles size={15} />
+        </span>
+        <span
+          className="hidden sm:inline text-[15px] font-medium tracking-tight"
+          style={{ color: 'var(--text-primary)' }}
+        >
+          DevMastery
+        </span>
       </Link>
 
-      {/* Search trigger */}
+      {/* Search */}
       <button
-        onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }))}
-        className="flex items-center gap-3 flex-1 max-w-sm bg-[--bg-elevated] border border-[--border-default] rounded-lg px-3 py-2 text-sm text-[--text-muted] hover:border-[--text-muted]/40 hover:text-[--text-secondary] transition-all"
+        onClick={openSearch}
+        className="group flex items-center gap-2.5 flex-1 max-w-md px-3 py-1.5 rounded-md text-[13px] transition-all"
+        style={{
+          background: 'var(--bg-inset)',
+          border: '1px solid var(--border-default)',
+          color: 'var(--text-muted)',
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--border-strong)'; }}
+        onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; }}
       >
-        <Search size={14} />
-        <span className="flex-1 text-left">Search topics…</span>
-        <kbd className="text-[10px] bg-[--bg-surface] border border-[--border-default] px-1.5 py-0.5 rounded">⌘K</kbd>
+        <Search size={13} />
+        <span className="flex-1 text-left" style={{ color: 'var(--text-secondary)' }}>
+          Search topics…
+        </span>
+        <kbd
+          className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+          style={{
+            background: 'var(--bg-surface)',
+            border: '1px solid var(--border-default)',
+            color: 'var(--text-muted)',
+          }}
+        >
+          ⌘K
+        </kbd>
       </button>
 
-      {/* Right Actions */}
       <div className="ml-auto flex items-center gap-1">
-        {/* Notifications — placeholder until backend supports it */}
-        <button className="p-2 rounded-lg text-[--text-muted] hover:text-[--text-primary] hover:bg-[--bg-elevated] transition-all" aria-label="Notifications">
-          <Bell size={18} />
+        <button
+          onClick={toggleTheme}
+          className="p-2 rounded-md transition-colors"
+          style={{ color: 'var(--text-muted)' }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'var(--bg-elevated)';
+            e.currentTarget.style.color = 'var(--text-primary)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'transparent';
+            e.currentTarget.style.color = 'var(--text-muted)';
+          }}
+          aria-label="Toggle theme"
+        >
+          {isDark ? <Sun size={16} /> : <Moon size={16} />}
         </button>
 
-        {/* Theme toggle */}
-        <button onClick={toggleTheme} className="p-2 rounded-lg text-[--text-muted] hover:text-[--text-primary] hover:bg-[--bg-elevated] transition-all" aria-label="Toggle theme">
-          {isDark ? <Sun size={18} /> : <Moon size={18} />}
-        </button>
-
-        {/* Avatar / user menu */}
         {isAuthenticated && user ? (
           <div className="relative ml-1" ref={menuRef}>
             <button
               onClick={() => setShowMenu(p => !p)}
-              className="flex items-center gap-2 pl-1 pr-2 py-1 rounded-lg hover:bg-[--bg-elevated] transition-all"
+              className="flex items-center gap-2 pl-1 pr-2 py-1 rounded-md transition-colors"
+              style={{ color: 'var(--text-primary)' }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
               aria-label="User menu"
             >
-              {/* Avatar circle */}
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-xs font-bold text-white">
+              <div
+                className="w-7 h-7 rounded-md flex items-center justify-center text-[11px] font-semibold"
+                style={{
+                  background: 'var(--accent-soft)',
+                  color: 'var(--accent)',
+                  border: '1px solid var(--border-default)',
+                }}
+              >
                 {initials}
               </div>
-              <span className="text-sm text-[--text-secondary] hidden sm:block max-w-[120px] truncate">
-                {user.fullName || user.email}
+              <span
+                className="text-[13px] hidden sm:block max-w-[140px] truncate"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                {displayName}
               </span>
-              <ChevronDown size={12} className="text-[--text-muted] hidden sm:block" />
+              <ChevronDown size={11} className="hidden sm:block" style={{ color: 'var(--text-muted)' }} />
             </button>
 
-            {/* Dropdown */}
             {showMenu && (
-              <div className="absolute right-0 top-full mt-2 w-52 bg-[--bg-surface] border border-[--border-default] rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50">
-                <div className="px-4 py-3 border-b border-[--border-default]">
-                  <p className="text-xs font-semibold text-[--text-primary] truncate">{user.fullName}</p>
-                  <p className="text-xs text-[--text-muted] truncate">{user.email}</p>
+              <div
+                className="absolute right-0 top-full mt-2 w-56 rounded-[10px] overflow-hidden z-50 shadow-xl"
+                style={{
+                  background: 'var(--bg-surface)',
+                  border: '1px solid var(--border-default)',
+                  boxShadow: '0 20px 40px rgba(0,0,0,0.4)',
+                }}
+              >
+                <div
+                  className="px-3.5 py-3 border-b"
+                  style={{ borderColor: 'var(--border-default)' }}
+                >
+                  <p
+                    className="text-[13px] font-medium truncate"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    {user.fullName || 'User'}
+                  </p>
+                  <p className="text-[11.5px] truncate" style={{ color: 'var(--text-muted)' }}>
+                    {user.email}
+                  </p>
                 </div>
                 <div className="py-1">
-                  <Link href="/profile" onClick={() => setShowMenu(false)}
-                    className="flex items-center gap-3 px-4 py-2.5 text-sm text-[--text-secondary] hover:bg-[--bg-elevated] hover:text-[--text-primary] transition-colors">
-                    <User size={14} /> Profile
-                  </Link>
-                  <Link href="/settings" onClick={() => setShowMenu(false)}
-                    className="flex items-center gap-3 px-4 py-2.5 text-sm text-[--text-secondary] hover:bg-[--bg-elevated] hover:text-[--text-primary] transition-colors">
-                    <Settings size={14} /> Settings
-                  </Link>
-                  <Link href="/dashboard" onClick={() => setShowMenu(false)}
-                    className="flex items-center gap-3 px-4 py-2.5 text-sm text-[--text-secondary] hover:bg-[--bg-elevated] hover:text-[--text-primary] transition-colors">
-                    <Search size={14} /> Dashboard
-                  </Link>
+                  <MenuItem href="/dashboard" icon={<LayoutDashboard size={13} />} onSelect={() => setShowMenu(false)}>
+                    Dashboard
+                  </MenuItem>
+                  <MenuItem href="/profile" icon={<User size={13} />} onSelect={() => setShowMenu(false)}>
+                    Profile
+                  </MenuItem>
+                  <MenuItem href="/settings" icon={<Settings size={13} />} onSelect={() => setShowMenu(false)}>
+                    Settings
+                  </MenuItem>
                 </div>
-                <div className="border-t border-[--border-default] py-1">
-                  <button onClick={handleLogout}
-                    className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-red-400 hover:bg-red-500/10 transition-colors">
-                    <LogOut size={14} /> Sign out
+                <div className="border-t py-1" style={{ borderColor: 'var(--border-default)' }}>
+                  <button
+                    onClick={handleLogout}
+                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] transition-colors"
+                    style={{ color: 'var(--error)' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(224,122,122,0.08)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    <LogOut size={13} /> Sign out
                   </button>
                 </div>
               </div>
             )}
           </div>
         ) : (
-          <Link href="/login"
-            className="ml-1 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/20 hover:bg-indigo-500/20 text-indigo-400 text-sm font-medium transition-all">
-            <UserCircle2 size={16} /> Sign in
+          <Link
+            href="/login"
+            className="btn-primary text-[13px] px-3 py-1.5 ml-1"
+          >
+            Sign in
           </Link>
         )}
       </div>
     </header>
+  );
+}
+
+function MenuItem({
+  href, icon, children, onSelect,
+}: {
+  href: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  onSelect: () => void;
+}) {
+  return (
+    <Link
+      href={href}
+      onClick={onSelect}
+      className="flex items-center gap-2.5 px-3.5 py-2 text-[13px] transition-colors"
+      style={{ color: 'var(--text-secondary)' }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.background = 'var(--bg-elevated)';
+        e.currentTarget.style.color = 'var(--text-primary)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.background = 'transparent';
+        e.currentTarget.style.color = 'var(--text-secondary)';
+      }}
+    >
+      {icon}
+      {children}
+    </Link>
   );
 }

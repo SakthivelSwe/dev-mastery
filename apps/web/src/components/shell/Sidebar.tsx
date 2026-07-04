@@ -80,24 +80,43 @@ export function Sidebar({ className = '' }: SidebarProps) {
   return (
     <aside
       className={`
-        flex flex-col border-r border-[--border-default] bg-[--bg-surface] transition-all duration-300 shrink-0
+        flex flex-col border-r transition-all duration-300 shrink-0
         ${collapsed ? 'w-14' : 'w-56'}
         ${className}
       `}
+      style={{
+        background: 'var(--bg-surface)',
+        borderColor: 'var(--border-default)',
+      }}
     >
-      {/* Sidebar Header */}
-      <div className="h-16 flex items-center justify-between px-3 border-b border-[--border-default] shrink-0">
+      {/* Sidebar Header — matches Topbar height (h-14) */}
+      <div
+        className="h-14 flex items-center justify-between px-3 border-b shrink-0"
+        style={{ borderColor: 'var(--border-default)' }}
+      >
         {!collapsed && (
-          <Link href="/" className="font-display font-bold text-base text-[--text-primary] tracking-tight">
-            Dev<span className="text-[--accent-ai]">Mastery</span>
-          </Link>
+          <span
+            className="text-[11px] font-semibold tracking-widest uppercase"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            Paths
+          </span>
         )}
         <button
           onClick={() => setCollapsed(!collapsed)}
-          className="p-1.5 rounded-md text-[--text-muted] hover:text-[--text-primary] hover:bg-[--bg-elevated] transition-all ml-auto"
+          className="p-1.5 rounded-md ml-auto transition-colors"
+          style={{ color: 'var(--text-muted)' }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'var(--bg-elevated)';
+            e.currentTarget.style.color = 'var(--text-primary)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'transparent';
+            e.currentTarget.style.color = 'var(--text-muted)';
+          }}
           aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
-          {collapsed ? <Menu size={18} /> : <X size={18} />}
+          {collapsed ? <Menu size={16} /> : <X size={16} />}
         </button>
       </div>
 
@@ -112,7 +131,10 @@ export function Sidebar({ className = '' }: SidebarProps) {
               {!collapsed && (
                 <button
                   onClick={() => toggleGroup(group)}
-                  className="w-full flex items-center justify-between px-2 py-1.5 text-[10px] font-semibold tracking-widest text-[--text-muted] uppercase hover:text-[--text-secondary] transition-colors rounded"
+                  className="w-full flex items-center justify-between px-2 py-1.5 text-[10px] font-semibold tracking-widest uppercase transition-colors rounded"
+                  style={{ color: 'var(--text-muted)' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
                 >
                   {group}
                   {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
@@ -131,20 +153,32 @@ export function Sidebar({ className = '' }: SidebarProps) {
                         key={path.slug}
                         href={targetHref}
                         title={path.label}
-                        className={`
-                          flex items-center gap-2.5 px-2 py-2 rounded-lg text-sm transition-all duration-150 group
-                          ${isActive
-                            ? 'bg-[--bg-elevated] text-[--text-primary] font-medium'
-                            : 'text-[--text-secondary] hover:bg-[--bg-elevated]/60 hover:text-[--text-primary]'}
-                        `}
-                        style={isActive ? { borderLeft: `3px solid ${path.color}`, paddingLeft: '9px' } : {}}
+                        className="flex items-center gap-2.5 px-2 py-1.5 rounded-md text-[13px] transition-all duration-150 group"
+                        style={{
+                          background: isActive ? 'var(--bg-elevated)' : 'transparent',
+                          color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                          fontWeight: isActive ? 500 : 400,
+                        }}
+                        onMouseEnter={(e) => {
+                          if (!isActive) {
+                            e.currentTarget.style.background = 'var(--bg-elevated)';
+                            e.currentTarget.style.color = 'var(--text-primary)';
+                          }
+                        }}
+                        onMouseLeave={(e) => {
+                          if (!isActive) {
+                            e.currentTarget.style.background = 'transparent';
+                            e.currentTarget.style.color = 'var(--text-secondary)';
+                          }
+                        }}
                       >
-                        <span style={{ color: isActive ? path.color : 'currentColor' }} className="shrink-0 transition-colors group-hover:text-inherit">
+                        <span
+                          className="shrink-0"
+                          style={{ color: isActive ? path.color : 'var(--text-muted)' }}
+                        >
                           {path.icon}
                         </span>
-                        {!collapsed && (
-                          <span className="truncate text-[13px]">{path.label}</span>
-                        )}
+                        {!collapsed && <span className="truncate">{path.label}</span>}
                       </Link>
                     );
                   })}
@@ -155,15 +189,24 @@ export function Sidebar({ className = '' }: SidebarProps) {
         })}
       </nav>
 
-      {/* Sidebar Footer — XP / Streak teaser */}
+      {/* Sidebar Footer */}
       {!collapsed && (
-        <div className="p-3 border-t border-[--border-default] shrink-0">
+        <div
+          className="p-2.5 border-t shrink-0"
+          style={{ borderColor: 'var(--border-default)' }}
+        >
           <Link
             href="/dashboard"
-            className="flex items-center gap-2 px-3 py-2 rounded-lg bg-[--bg-elevated] hover:bg-[--border-default] transition-colors text-sm"
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[13px] transition-colors"
+            style={{
+              background: 'var(--bg-elevated)',
+              color: 'var(--text-secondary)',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
           >
-            <Zap size={15} className="text-[--accent-java] shrink-0" />
-            <span className="text-[--text-secondary] text-xs">View Dashboard</span>
+            <Zap size={13} style={{ color: 'var(--accent)' }} className="shrink-0" />
+            <span>Open dashboard</span>
           </Link>
         </div>
       )}

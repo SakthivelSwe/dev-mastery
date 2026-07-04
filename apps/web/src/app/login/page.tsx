@@ -1,8 +1,10 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useRouter } from 'next/navigation';
+import { ArrowRight, Loader2, Sparkles } from 'lucide-react';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
@@ -27,16 +29,15 @@ export default function LoginPage() {
       });
 
       if (!res.ok) {
-        let msg = `Login failed (${res.status})`;
+        let msg = `Sign-in failed (${res.status})`;
         try {
           const errorData = await res.json();
           msg = errorData.message || errorData.error || msg;
-        } catch { /* non-JSON response */ }
+        } catch { /* non-JSON */ }
         throw new Error(msg);
       }
 
       const data = await res.json();
-      // Backend shape: { token, user: { id, email, fullName, roles } }
       login(data.token, {
         id: data.user.id,
         email: data.user.email,
@@ -53,57 +54,171 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background">
-      <div className="w-full max-w-md bg-card border border-border p-8 rounded-xl shadow-2xl">
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold font-syne tracking-tight">
-            Dev<span className="text-primary">Mastery</span>
+    <div
+      className="min-h-screen flex items-center justify-center px-5 py-12 relative overflow-hidden"
+      style={{ background: 'var(--bg-primary)' }}
+    >
+      {/* soft radial */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            'radial-gradient(900px 400px at 50% -10%, var(--accent-soft) 0%, transparent 55%)',
+        }}
+      />
+
+      <div className="relative w-full max-w-sm">
+        <Link
+          href="/"
+          className="mb-8 inline-flex items-center gap-2 text-[15px]"
+          style={{ color: 'var(--text-primary)' }}
+        >
+          <span
+            className="inline-flex w-7 h-7 rounded-md items-center justify-center"
+            style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+          >
+            <Sparkles size={15} />
+          </span>
+          <span className="font-medium tracking-tight">DevMastery</span>
+        </Link>
+
+        <div
+          className="rounded-[14px] border p-7"
+          style={{
+            background: 'var(--bg-surface)',
+            borderColor: 'var(--border-default)',
+          }}
+        >
+          <h1
+            className="mb-1"
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: '1.75rem',
+              lineHeight: 1.15,
+              letterSpacing: '-0.01em',
+            }}
+          >
+            Welcome back.
           </h1>
-          <p className="text-muted-foreground mt-2">Sign in to continue your learning journey.</p>
+          <p className="text-[13.5px]" style={{ color: 'var(--text-secondary)' }}>
+            Sign in to continue where you left off.
+          </p>
+
+          {error && (
+            <div
+              className="mt-5 px-3 py-2.5 rounded-md text-[13px]"
+              style={{
+                background: 'rgba(224, 122, 122, 0.08)',
+                border: '1px solid rgba(224, 122, 122, 0.25)',
+                color: 'var(--error)',
+              }}
+            >
+              {error}
+            </div>
+          )}
+
+          <form onSubmit={handleLogin} className="mt-6 flex flex-col gap-4">
+            <Field
+              label="Email"
+              type="email"
+              value={email}
+              onChange={setEmail}
+              placeholder="you@example.com"
+              autoFocus
+            />
+            <Field
+              label="Password"
+              type="password"
+              value={password}
+              onChange={setPassword}
+              placeholder="Your password"
+            />
+
+            <button
+              type="submit"
+              disabled={submitting}
+              className="btn-primary w-full mt-2 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {submitting ? (
+                <>
+                  <Loader2 size={15} className="animate-spin" />
+                  Signing in…
+                </>
+              ) : (
+                <>
+                  Sign in
+                  <ArrowRight size={15} />
+                </>
+              )}
+            </button>
+          </form>
         </div>
 
-        {error && (
-          <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-md mb-6 text-sm">
-            {error}
-          </div>
-        )}
-
-        <form onSubmit={handleLogin} className="flex flex-col gap-5">
-          <div>
-            <label className="text-sm font-medium text-foreground">Email</label>
-            <input 
-              type="email" 
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="mt-1 w-full bg-background border border-border rounded-md px-4 py-2 text-sm focus:outline-none focus:border-primary"
-              placeholder="you@example.com"
-            />
-          </div>
-          <div>
-            <label className="text-sm font-medium text-foreground">Password</label>
-            <input 
-              type="password" 
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 w-full bg-background border border-border rounded-md px-4 py-2 text-sm focus:outline-none focus:border-primary"
-              placeholder="••••••••"
-            />
-          </div>
-          <button 
-            type="submit" 
-            disabled={submitting}
-            className="w-full bg-primary text-primary-foreground font-semibold py-2.5 rounded-md hover:opacity-90 transition-opacity mt-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        <p
+          className="mt-6 text-center text-[13px]"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          Don't have an account?{' '}
+          <Link
+            href="/register"
+            className="font-medium"
+            style={{ color: 'var(--accent)' }}
           >
-            {submitting ? 'Signing in…' : 'Sign In'}
-          </button>
-        </form>
-        
-        <p className="mt-6 text-center text-sm text-muted-foreground">
-          Don't have an account? <a href="/register" className="text-primary hover:underline">Sign up</a>
+            Create one
+          </Link>
         </p>
       </div>
     </div>
+  );
+}
+
+/* ── Local field primitive ────────────────────────────────────── */
+function Field({
+  label,
+  type,
+  value,
+  onChange,
+  placeholder,
+  autoFocus,
+}: {
+  label: string;
+  type: 'text' | 'email' | 'password';
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  autoFocus?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span
+        className="block mb-1.5 text-[12.5px] font-medium"
+        style={{ color: 'var(--text-secondary)' }}
+      >
+        {label}
+      </span>
+      <input
+        type={type}
+        required
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        autoFocus={autoFocus}
+        className="w-full px-3 py-2.5 rounded-md text-[14px] outline-none transition-all"
+        style={{
+          background: 'var(--bg-inset)',
+          border: '1px solid var(--border-default)',
+          color: 'var(--text-primary)',
+        }}
+        onFocus={(e) => {
+          e.currentTarget.style.borderColor = 'var(--accent)';
+          e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-ring)';
+        }}
+        onBlur={(e) => {
+          e.currentTarget.style.borderColor = 'var(--border-default)';
+          e.currentTarget.style.boxShadow = 'none';
+        }}
+      />
+    </label>
   );
 }

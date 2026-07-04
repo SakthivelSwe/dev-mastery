@@ -21,27 +21,37 @@ export default function DashboardClient() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="flex flex-col items-center gap-3 text-[--text-muted]">
-          <Loader2 className="animate-spin" size={28} />
-          <span className="text-sm">Loading your dashboard...</span>
+        <div className="flex flex-col items-center gap-3" style={{ color: 'var(--text-muted)' }}>
+          <Loader2 className="animate-spin" size={22} style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px]">Loading your dashboard…</span>
         </div>
       </div>
     );
   }
 
+  const firstName = user?.fullName ? user.fullName.split(' ')[0] : '';
+
   return (
     <div className="h-full overflow-y-auto">
-      <div className="max-w-7xl mx-auto px-6 py-8">
+      <div className="max-w-6xl mx-auto px-6 py-10">
 
         {/* ── Header ────────────────────────────────────────── */}
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold font-display text-[--text-primary] mb-1">
-            {greeting()}{user?.fullName ? `, ${user.fullName.split(' ')[0]}` : ''} 👋
+        <div className="mb-10">
+          <h1
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: 'clamp(1.75rem, 3.5vw, 2.5rem)',
+              lineHeight: 1.1,
+              letterSpacing: '-0.015em',
+              color: 'var(--text-primary)',
+            }}
+          >
+            {greeting()}{firstName ? `, ${firstName}` : ''}.
           </h1>
-          <p className="text-[--text-secondary] text-sm">
+          <p className="mt-2 text-[14px]" style={{ color: 'var(--text-secondary)' }}>
             {dashboard.streak > 0
-              ? `You're on a ${dashboard.streak}-day streak. Keep it going!`
-              : 'Start a topic today to begin your streak!'}
+              ? `You are on a ${dashboard.streak}-day streak. One more topic keeps it alive.`
+              : 'Open a topic today to start a streak.'}
           </p>
         </div>
 
@@ -61,7 +71,6 @@ export default function DashboardClient() {
           <ContinueLearning pathProgress={dashboard.pathProgress} />
         </div>
 
-        {/* ── Footer Padding ────────────────────────────────── */}
         <div className="h-8" />
       </div>
     </div>
