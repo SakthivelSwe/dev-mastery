@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect, useRef, use } from 'react';
+import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Save, Sparkles, Send, Check } from 'lucide-react';
+import { ArrowLeft, Save, Sparkles, Check, Loader2 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
-import { MDXRemote } from 'next-mdx-remote';
+import { MarkdownView } from '@/components/topic/MarkdownView';
 
 const SECTIONS = ['why', 'theory', 'visual', 'code', 'realworld', 'interview'];
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
@@ -20,68 +20,41 @@ interface TopicData {
   isPublished: boolean;
   pathSlug: string;
   tags: string[];
-  lessons: {
-    sectionType: string;
-    contentMdx: string;
-  }[];
+  lessons: { sectionType: string; contentMdx: string }[];
 }
 
 export default function AdminTopicEditor({ params }: { params: Promise<{ topicSlug: string }> }) {
   const { topicSlug } = use(params);
-  
+
   const [topic, setTopic] = useState<TopicData | null>(null);
   const [activeSection, setActiveSection] = useState<string>('why');
   const [content, setContent] = useState<Record<string, string>>({});
-  const [serializedMdx, setSerializedMdx] = useState<any>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
 
-  // Fetch topic data
+  // Fetch topic
   useEffect(() => {
     fetch(`${API_BASE}/v1/topics/${topicSlug}`)
-      .then((res) => res.json())
+      .then(r => r.json())
       .then((data: TopicData) => {
         setTopic(data);
-        const contentMap: Record<string, string> = {};
+        const map: Record<string, string> = {};
         SECTIONS.forEach(sec => {
           const lesson = data.lessons?.find(l => l.sectionType === sec);
-          contentMap[sec] = lesson ? lesson.contentMdx : '';
+          map[sec] = lesson?.contentMdx ?? '';
         });
-        setContent(contentMap);
+        setContent(map);
       })
-      .catch((err) => console.error('Failed to fetch topic:', err));
+      .catch(err => console.error('Failed to fetch topic:', err));
   }, [topicSlug]);
 
-  // Handle MDX Serialization for Preview
-  useEffect(() => {
-    const currentText = content[activeSection] || '';
-    if (!currentText.trim()) {
-      setSerializedMdx(null);
-      return;
-    }
-    const timer = setTimeout(() => {
-      fetch('/api/admin/mdx-preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mdxSource: currentText })
-      })
-        .then(res => res.json())
-        .then(data => {
-          if (data.serialized) setSerializedMdx(data.serialized);
-        })
-        .catch(err => console.error('MDX serialization failed', err));
-    }, 500); // debounce preview
-    return () => clearTimeout(timer);
-  }, [content, activeSection]);
-
-  // Handle Auto-save
+  // Auto-save every 10 s on change
   useEffect(() => {
     if (!topic) return;
-    const timer = setTimeout(() => {
-      handleSave();
-    }, 10000); // auto-save every 10s if changed
-    return () => clearTimeout(timer);
+    const t = setTimeout(handleSave, 10_000);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [content]);
 
   const handleSave = async () => {
@@ -98,16 +71,13 @@ export default function AdminTopicEditor({ params }: { params: Promise<{ topicSl
           estimatedMins: topic.estimatedMins,
           hasVisualizer: topic.hasVisualizer,
           hasCodeLab: topic.hasCodeLab,
-          tags: topic.tags || [],
-          sections: Object.keys(content).map(key => ({
-            sectionType: key,
-            contentMdx: content[key]
-          }))
-        })
+          tags: topic.tags ?? [],
+          sections: Object.keys(content).map(k => ({ sectionType: k, contentMdx: content[k] })),
+        }),
       });
       setLastSaved(new Date());
-    } catch (error) {
-      console.error('Failed to save', error);
+    } catch (err) {
+      console.error('Failed to save', err);
     } finally {
       setIsSaving(false);
     }
@@ -125,122 +95,173 @@ export default function AdminTopicEditor({ params }: { params: Promise<{ topicSl
           topicTitle: topic.title,
           pathSlug: topic.pathSlug,
           level: topic.level,
-          sectionType: activeSection
-        })
+          sectionType: activeSection,
+        }),
       });
       const data = await res.json();
-      if (data.content) {
-        setContent(prev => ({
-          ...prev,
-          [activeSection]: data.content
-        }));
-      }
-    } catch (error) {
-      console.error('AI generation failed', error);
+      if (data.content) setContent(prev => ({ ...prev, [activeSection]: data.content }));
+    } catch (err) {
+      console.error('AI generation failed', err);
     } finally {
       setIsGenerating(false);
     }
   };
 
   if (!topic) {
-    return <div className="p-8 text-[#8B949E]">Loading Editor...</div>;
+    return (
+      <div className="flex items-center justify-center h-screen" style={{ background: 'var(--bg-primary)' }}>
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 size={20} className="animate-spin" style={{ color: 'var(--accent)' }} />
+          <span className="text-[13px]" style={{ color: 'var(--text-muted)' }}>Loading editor…</span>
+        </div>
+      </div>
+    );
   }
 
+  const wordCount = (content[activeSection] ?? '').split(/\s+/).filter(Boolean).length;
+
   return (
-    <div className="flex flex-col h-screen bg-[#0D1117] font-sans">
-      {/* TOP BAR */}
-      <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-[#30363D] bg-[#161B22]">
-        <div className="flex items-center gap-4">
-          <Link href={`/admin/paths/${topic.pathSlug}/topics`} className="text-[#8B949E] hover:text-[#58A6FF]">
-            <ArrowLeft size={20} />
+    <div
+      className="flex flex-col h-screen"
+      style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)', fontFamily: 'var(--font-body)' }}
+    >
+      {/* ── TOP BAR ─────────────────────────────────────────────────── */}
+      <header
+        className="flex-shrink-0 flex items-center justify-between px-5 py-3 border-b"
+        style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-default)' }}
+      >
+        <div className="flex items-center gap-3">
+          <Link
+            href={`/admin/paths/${topic.pathSlug}/topics`}
+            style={{ color: 'var(--text-muted)' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
+          >
+            <ArrowLeft size={18} />
           </Link>
           <div>
-            <h1 className="text-xl font-bold text-[#E6EDF3]">{topic.title}</h1>
-            <div className="text-sm text-[#8B949E] mt-1 flex gap-4">
-              <span>Slug: {topic.slug}</span>
-              <span>Level: {topic.level}</span>
+            <h1 className="text-[15px] font-semibold leading-none" style={{ color: 'var(--text-primary)' }}>
+              {topic.title}
+            </h1>
+            <div className="flex gap-3 mt-0.5 text-[11.5px]" style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-code)' }}>
+              <span>{topic.slug}</span>
+              <span>L{topic.level}</span>
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-4">
-          <div className="text-sm text-[#8B949E] flex items-center gap-1">
-            {isSaving ? 'Saving...' : lastSaved ? <><Check size={14}/> Saved at {lastSaved.toLocaleTimeString()}</> : ''}
-          </div>
-          <button 
+
+        <div className="flex items-center gap-3">
+          <span className="text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
+            {isSaving ? 'Saving…' : lastSaved ? `Saved ${lastSaved.toLocaleTimeString()}` : ''}
+          </span>
+          <button
             onClick={handleSave}
-            className="flex items-center gap-2 px-4 py-2 bg-[#21262D] hover:bg-[#30363D] border border-[#30363D] rounded-md text-[#E6EDF3] text-sm"
+            disabled={isSaving}
+            className="inline-flex items-center gap-1.5 text-[13px] font-medium px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-50"
+            style={{ background: 'var(--bg-elevated)', borderColor: 'var(--border-default)', color: 'var(--text-secondary)' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-ring)'; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
           >
-            <Save size={16} /> Save Now
+            {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+            Save
           </button>
         </div>
-      </div>
+      </header>
 
-      {/* SECTION TABS */}
-      <div className="flex-shrink-0 flex items-center px-6 border-b border-[#30363D] bg-[#0D1117]">
+      {/* ── SECTION TABS ────────────────────────────────────────────── */}
+      <div
+        className="flex-shrink-0 flex items-center px-5 gap-1 border-b overflow-x-auto"
+        style={{ background: 'var(--bg-primary)', borderColor: 'var(--border-default)' }}
+      >
         {SECTIONS.map(sec => (
           <button
             key={sec}
             onClick={() => setActiveSection(sec)}
-            className={`px-6 py-3 text-sm font-semibold uppercase tracking-wider border-b-2 transition-colors ${
-              activeSection === sec 
-                ? 'border-[#58A6FF] text-[#E6EDF3]' 
-                : 'border-transparent text-[#8B949E] hover:text-[#E6EDF3]'
-            }`}
+            className="px-4 py-2.5 text-[12px] font-semibold uppercase tracking-wider border-b-2 transition-colors whitespace-nowrap"
+            style={{
+              borderColor: activeSection === sec ? 'var(--accent)' : 'transparent',
+              color: activeSection === sec ? 'var(--text-primary)' : 'var(--text-muted)',
+              background: 'transparent',
+            }}
+            onMouseEnter={e => { if (activeSection !== sec) (e.currentTarget as HTMLElement).style.color = 'var(--text-secondary)'; }}
+            onMouseLeave={e => { if (activeSection !== sec) (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
           >
             {sec}
           </button>
         ))}
-        <div className="ml-auto">
-          <button 
+        <div className="ml-auto pl-4">
+          <button
             onClick={generateAIAssist}
             disabled={isGenerating}
-            className="flex items-center gap-2 px-3 py-1.5 bg-[#1F6FEB] hover:bg-[#388BFD] text-white text-sm rounded-md font-medium shadow-sm disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 text-[12.5px] font-medium px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+            style={{ background: 'var(--accent)', color: '#fff' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.opacity = '0.88'; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
           >
-            <Sparkles size={16} />
-            {isGenerating ? 'Generating...' : 'AI Assist'}
+            {isGenerating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+            {isGenerating ? 'Generating…' : 'AI Assist'}
           </button>
         </div>
       </div>
 
-      {/* TWO PANEL LAYOUT */}
+      {/* ── EDITOR + PREVIEW ─────────────────────────────────────────── */}
       <div className="flex-1 flex min-h-0">
-        {/* EDITOR (60%) */}
-        <div className="w-[60%] border-r border-[#30363D] flex flex-col">
-          <div className="bg-[#161B22] border-b border-[#30363D] px-4 py-2 text-xs font-mono text-[#8B949E] flex justify-between">
-            <span>{activeSection.toUpperCase()}.mdx</span>
-            <span>Words: {(content[activeSection] || '').split(/\s+/).filter(Boolean).length}</span>
+
+        {/* Editor — 60% */}
+        <div className="w-[60%] flex flex-col border-r" style={{ borderColor: 'var(--border-default)' }}>
+          <div
+            className="flex-shrink-0 flex items-center justify-between px-4 py-1.5 border-b text-[11px]"
+            style={{
+              background: 'var(--bg-inset)',
+              borderColor: 'var(--border-default)',
+              color: 'var(--text-muted)',
+              fontFamily: 'var(--font-code)',
+            }}
+          >
+            <span>{activeSection}.mdx</span>
+            <span>{wordCount} words</span>
           </div>
           <div className="flex-1 relative">
             <Editor
               height="100%"
               theme="vs-dark"
               language="markdown"
-              value={content[activeSection] || ''}
-              onChange={(val) => setContent(prev => ({ ...prev, [activeSection]: val || '' }))}
+              value={content[activeSection] ?? ''}
+              onChange={val => setContent(prev => ({ ...prev, [activeSection]: val ?? '' }))}
               options={{
                 minimap: { enabled: false },
                 wordWrap: 'on',
                 lineNumbers: 'off',
                 padding: { top: 16 },
-                fontSize: 14,
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                fontSize: 13.5,
+                fontFamily: 'var(--font-code)',
+                scrollBeyondLastLine: false,
               }}
             />
           </div>
         </div>
 
-        {/* PREVIEW (40%) */}
-        <div className="w-[40%] flex flex-col bg-[#0D1117]">
-          <div className="bg-[#161B22] border-b border-[#30363D] px-4 py-2 text-xs font-mono text-[#8B949E]">
+        {/* Preview — 40% */}
+        <div className="w-[40%] flex flex-col" style={{ background: 'var(--bg-primary)' }}>
+          <div
+            className="flex-shrink-0 px-4 py-1.5 border-b text-[11px]"
+            style={{
+              background: 'var(--bg-inset)',
+              borderColor: 'var(--border-default)',
+              color: 'var(--text-muted)',
+              fontFamily: 'var(--font-code)',
+            }}
+          >
             LIVE PREVIEW
           </div>
-          <div className="flex-1 overflow-y-auto p-8 prose prose-invert prose-blue max-w-none">
-            {serializedMdx ? (
-              <MDXRemote {...serializedMdx} />
+          <div className="flex-1 overflow-y-auto p-6">
+            {(content[activeSection] ?? '').trim() ? (
+              <MarkdownView source={content[activeSection]} />
             ) : (
-              <div className="text-center text-[#8B949E] mt-20">
-                <p>Start typing in the editor to see preview...</p>
-                <p className="text-sm mt-2">Or click "AI Assist" to generate draft content.</p>
+              <div className="flex flex-col items-center justify-center h-full gap-2 text-center">
+                <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
+                  Start typing or click AI Assist to generate content…
+                </p>
               </div>
             )}
           </div>
