@@ -4,10 +4,13 @@ import com.devmastery.ai.api.AiService;
 import com.devmastery.content.api.ContentService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -18,8 +21,9 @@ import java.util.UUID;
 
 /**
  * Direct Gemini integration via {@link WebClient}.
- * Pinned to {@code gemini-1.5-flash} by default — overridable through
- * {@code app.ai.gemini.model}.
+ * Primary model comes from {@code app.ai.gemini.model} (env {@code GEMINI_MODEL}).
+ * Automatically falls back to {@code app.ai.gemini.fallback-model} on 429/5xx —
+ * this protects users when the Pro tier free quota is exhausted.
  *
  * <p>Other modules MUST NOT call Gemini directly — they call this
  * service via the {@link AiService} interface.</p>
@@ -27,19 +31,25 @@ import java.util.UUID;
 @Service
 class GeminiAiService implements AiService {
 
+    private static final Logger log = LoggerFactory.getLogger(GeminiAiService.class);
+
     private final WebClient client;
     private final ObjectMapper json = new ObjectMapper();
     private final String apiKey;
     private final String model;
+    private final String fallbackModel;
     private final ContentService content;
 
     GeminiAiService(WebClient.Builder builder,
                     @Value("${app.ai.gemini.api-key}") String apiKey,
-                    @Value("${app.ai.gemini.model:gemini-1.5-flash}") String model,
+                    @Value("${app.ai.gemini.model:gemini-2.5-flash}") String model,
+                    @Value("${app.ai.gemini.fallback-model:gemini-2.5-flash}") String fallbackModel,
                     ContentService content) {
         this.client = builder.baseUrl("https://generativelanguage.googleapis.com").build();
         this.apiKey = apiKey;
         this.model = model;
+        // Only use fallback if it's different from primary; otherwise nothing to fall back to.
+        this.fallbackModel = model.equalsIgnoreCase(fallbackModel) ? null : fallbackModel;
         this.content = content;
     }
 
@@ -49,11 +59,25 @@ class GeminiAiService implements AiService {
         String system = buildSystemPrompt(topicSlug, sectionType);
         Map<String, Object> body = buildRequest(system, history, userQuery);
 
+        return streamChat(model, body)
+                .onErrorResume(WebClientResponseException.class, ex -> {
+                    if (shouldFallback(ex) && fallbackModel != null) {
+                        log.warn("Gemini model '{}' returned {} — falling back to '{}'",
+                                model, ex.getStatusCode().value(), fallbackModel);
+                        return streamChat(fallbackModel, body)
+                                .onErrorResume(WebClientResponseException.class,
+                                        e2 -> Flux.just(friendlyMessage(e2)));
+                    }
+                    return Flux.just(friendlyMessage(ex));
+                });
+    }
+
+    private Flux<String> streamChat(String modelName, Map<String, Object> body) {
         return client.post()
                 .uri(uriBuilder -> uriBuilder.path("/v1beta/models/{model}:streamGenerateContent")
                         .queryParam("alt", "sse")
                         .queryParam("key", apiKey)
-                        .build(model))
+                        .build(modelName))
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
@@ -73,9 +97,23 @@ class GeminiAiService implements AiService {
 
         Map<String, Object> body = buildRequest("You are a strict JSON-only grader.", List.of(), prompt);
 
+        return callFeynman(model, body)
+                .onErrorResume(WebClientResponseException.class, ex -> {
+                    if (shouldFallback(ex) && fallbackModel != null) {
+                        log.warn("Gemini model '{}' returned {} on feynman — falling back to '{}'",
+                                model, ex.getStatusCode().value(), fallbackModel);
+                        return callFeynman(fallbackModel, body)
+                                .onErrorResume(WebClientResponseException.class,
+                                        e2 -> Mono.just(new FeynmanScore(5, friendlyMessage(e2), List.of(), List.of())));
+                    }
+                    return Mono.just(new FeynmanScore(5, friendlyMessage(ex), List.of(), List.of()));
+                });
+    }
+
+    private Mono<FeynmanScore> callFeynman(String modelName, Map<String, Object> body) {
         return client.post()
                 .uri(uriBuilder -> uriBuilder.path("/v1beta/models/{model}:generateContent")
-                        .queryParam("key", apiKey).build(model))
+                        .queryParam("key", apiKey).build(modelName))
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
@@ -84,6 +122,26 @@ class GeminiAiService implements AiService {
     }
 
     // ─── helpers ───────────────────────────────────────────
+
+    private static boolean shouldFallback(WebClientResponseException ex) {
+        int code = ex.getStatusCode().value();
+        return code == 429 || code >= 500;
+    }
+
+    private static String friendlyMessage(WebClientResponseException ex) {
+        int code = ex.getStatusCode().value();
+        if (code == 429) {
+            return "The AI service is temporarily rate-limited (Gemini free-tier quota reached). " +
+                    "Please try again in a minute, or ask an administrator to upgrade the Gemini plan.";
+        }
+        if (code == 401 || code == 403) {
+            return "The AI service rejected the request. The Gemini API key may be invalid or expired.";
+        }
+        if (code >= 500) {
+            return "The AI service is currently unavailable (Gemini returned " + code + "). Please try again shortly.";
+        }
+        return "The AI service returned an error (" + code + "). Please try again.";
+    }
 
     private String buildSystemPrompt(String topicSlug, String sectionType) {
         String summary = "";
