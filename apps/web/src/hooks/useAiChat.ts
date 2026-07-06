@@ -1,7 +1,11 @@
 import { useState, useCallback, useRef } from 'react';
 import { useAuthStore } from '@/store/useAuthStore';
 
-const AI_API = process.env.NEXT_PUBLIC_AI_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+// Always use local edge routes — they proxy to Render backend.
+// This works on both local dev and Cloudflare Pages production
+// without needing any environment variables.
+const AI_CHAT_URL    = '/api/ai/chat';
+const AI_FEYNMAN_URL = '/api/ai/feynman';
 
 /** Build headers with optional Authorization. */
 function authHeaders(token: string | null | undefined): HeadersInit {
@@ -56,7 +60,7 @@ export function useAiChat(options: UseAiChatOptions = {}) {
     setIsLoading(true);
 
     try {
-      const response = await fetch(`${AI_API}/v1/ai/chat`, {
+      const response = await fetch(AI_CHAT_URL, {
         method:  'POST',
         headers: authHeaders(token),
         body:    JSON.stringify({
@@ -157,7 +161,7 @@ export function useFeynmanScore() {
     setResult(null);
 
     try {
-      const res = await fetch(`${AI_API}/v1/ai/feynman/score`, {
+      const res = await fetch(AI_FEYNMAN_URL, {
         method:  'POST',
         headers: authHeaders(token),
         body:    JSON.stringify({ topicSlug, topicTitle, explanation }),

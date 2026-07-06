@@ -43,18 +43,17 @@ export function AiChatDrawer({ topicSlug, topicTitle, sectionType, isOpen, onClo
       // Add empty AI message that will be streamed into
       setMessages(prev => [...prev, { role: 'ai', content: '', isStreaming: true }]);
 
-      // NOTE: We connect to the backend ai-bot-service directly (port 8084)
-      const API_BASE = process.env.NEXT_PUBLIC_AI_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
-      const response = await fetch(`${API_BASE}/v1/ai/chat`, {
+      // Use local edge route — works on Cloudflare Pages and local dev
+      const response = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          // Assuming the user has a JWT, it should be passed here in a real scenario
         },
         body: JSON.stringify({
-          message: userMessage,
+          userQuery: userMessage,   // ← matches ChatRequest.userQuery() on backend
           topicSlug,
-          sectionType
+          sectionType,
+          history: [],
         })
       });
 
