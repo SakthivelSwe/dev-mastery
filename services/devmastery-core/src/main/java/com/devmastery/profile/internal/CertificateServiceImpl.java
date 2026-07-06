@@ -2,6 +2,8 @@ package com.devmastery.profile.internal;
 
 import com.devmastery.common.exception.ResourceNotFoundException;
 import com.devmastery.profile.api.CertificateService;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -14,16 +16,23 @@ class CertificateServiceImpl implements CertificateService {
 
     private final CertificateRepository repo;
     private final JdbcTemplate jdbc;
+    private final ApplicationEventPublisher events;
+    private final String appBaseUrl;
 
-    CertificateServiceImpl(CertificateRepository repo, JdbcTemplate jdbc) {
-        this.repo = repo;
-        this.jdbc = jdbc;
+    CertificateServiceImpl(
+            CertificateRepository repo,
+            JdbcTemplate jdbc,
+            ApplicationEventPublisher events,
+            @Value("${app.base-url:https://devmastery.io}") String appBaseUrl) {
+        this.repo       = repo;
+        this.jdbc       = jdbc;
+        this.events     = events;
+        this.appBaseUrl = appBaseUrl;
     }
 
     @Override
     @Transactional
     public CertificateView issue(UUID userId, String pathSlug) {
-        // Return existing certificate if already issued
         return repo.findByUserIdAndPathSlug(userId, pathSlug)
                 .map(this::toView)
                 .orElseGet(() -> {
@@ -41,6 +50,17 @@ class CertificateServiceImpl implements CertificateService {
                     cert.setTotalTopics(stats.total());
                     cert.setAvgQuizScore(stats.avgScore());
                     repo.save(cert);
+
+                    // Trigger async PDF generation + upload (non-blocking)
+                    events.publishEvent(new CertificateIssuedEvent(
+                            cert.getId(),
+                            cert.getCredentialId(),
+                            userId,
+                            stats.pathTitle(),
+                            stats.total(),
+                            stats.avgScore(),
+                            appBaseUrl));
+
                     return toView(cert);
                 });
     }
@@ -70,14 +90,12 @@ class CertificateServiceImpl implements CertificateService {
     }
 
     private CompletionStats calcCompletionStats(UUID userId, String pathSlug) {
-        // Count published topics in path
         Integer total = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM topics t " +
                 "JOIN learning_paths lp ON lp.id = t.path_id " +
                 "WHERE lp.slug = ? AND t.is_published = true",
                 Integer.class, pathSlug);
 
-        // Count completed topics for this user
         Integer completed = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM user_topic_progress utp " +
                 "JOIN topics t ON t.id = utp.topic_id " +
@@ -85,7 +103,6 @@ class CertificateServiceImpl implements CertificateService {
                 "WHERE utp.user_id = ? AND lp.slug = ? AND utp.completed = true",
                 Integer.class, userId, pathSlug);
 
-        // Average quiz score for this path
         Double avgScore = jdbc.queryForObject(
                 "SELECT AVG(score_pct) FROM quiz_attempts qa " +
                 "JOIN topics t ON t.id = qa.topic_id " +
@@ -97,7 +114,7 @@ class CertificateServiceImpl implements CertificateService {
                 "SELECT title FROM learning_paths WHERE slug = ?",
                 String.class, pathSlug);
 
-        int t = total   != null ? total   : 0;
+        int t = total     != null ? total     : 0;
         int c = completed != null ? completed : 0;
         return new CompletionStats(pathTitle, t, c, avgScore);
     }
@@ -106,4 +123,3 @@ class CertificateServiceImpl implements CertificateService {
         boolean allComplete() { return total > 0 && completed >= total; }
     }
 }
-

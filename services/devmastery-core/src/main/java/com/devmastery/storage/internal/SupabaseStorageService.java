@@ -62,6 +62,19 @@ class SupabaseStorageService implements StorageService {
     }
 
     @Override
+    public String uploadBytes(String bucket, String path, byte[] content, String contentType) {
+        client.post()
+                .uri("/object/{bucket}/{path}", bucket, path)
+                .contentType(MediaType.parseMediaType(contentType))
+                .header("x-upsert", "true")
+                .bodyValue(content)
+                .retrieve()
+                .toBodilessEntity()
+                .block();
+        return publicUrl(bucket, path);
+    }
+
+    @Override
     public void delete(String bucket, String path) {
         client.delete()
                 .uri("/object/{bucket}/{path}", bucket, path)

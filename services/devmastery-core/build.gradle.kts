@@ -48,6 +48,15 @@ dependencies {
     implementation("org.mapstruct:mapstruct:1.6.2")
     annotationProcessor("org.mapstruct:mapstruct-processor:1.6.2")
 
+    // --- PDF certificate generation (iText7 Community — AGPL) ---
+    implementation("com.itextpdf:kernel:7.2.5")
+    implementation("com.itextpdf:layout:7.2.5")
+    implementation("com.itextpdf:io:7.2.5")
+
+    // --- QR code generation (ZXing) ---
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.google.zxing:javase:3.5.3")
+
     // --- Testing ---
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.springframework.security:spring-security-test")

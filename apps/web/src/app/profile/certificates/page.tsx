@@ -1,8 +1,6 @@
-'use client';
-
-import { useEffect, useState } from 'react';
+﻿'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-
 interface Certificate {
   id: string;
   credentialId: string;
@@ -14,7 +12,6 @@ interface Certificate {
   pdfUrl: string | null;
   revoked: boolean;
 }
-
 const LEARNING_PATHS = [
   { slug: 'java-mastery', title: 'Java Mastery' },
   { slug: 'spring-boot', title: 'Spring Boot' },
@@ -23,7 +20,6 @@ const LEARNING_PATHS = [
   { slug: 'dsa', title: 'Data Structures & Algorithms' },
   { slug: 'projects', title: 'Real-World Projects' },
 ];
-
 async function fetchCertificates(token: string): Promise<Certificate[]> {
   const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/v1/certificates`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -31,7 +27,6 @@ async function fetchCertificates(token: string): Promise<Certificate[]> {
   if (!res.ok) return [];
   return res.json();
 }
-
 async function claimCertificate(pathSlug: string, token: string): Promise<Certificate | null> {
   const res = await fetch(
     `${process.env.NEXT_PUBLIC_API_URL}/v1/certificates/${pathSlug}`,
@@ -43,8 +38,7 @@ async function claimCertificate(pathSlug: string, token: string): Promise<Certif
   }
   return res.json();
 }
-
-function verdictBadge(score: number | null) {
+function VerdictBadge({ score }: { score: number | null }) {
   if (score === null) return null;
   const pct = Math.round(score);
   const color =
@@ -57,24 +51,42 @@ function verdictBadge(score: number | null) {
     </span>
   );
 }
-
 export default function CertificatesPage() {
   const [certs, setCerts] = useState<Certificate[]>([]);
   const [loading, setLoading] = useState(true);
   const [claiming, setClaiming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // Get token from session storage (set by auth flow)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const token = typeof window !== 'undefined'
     ? (sessionStorage.getItem('access_token') ?? '') : '';
-
-  useEffect(() => {
-    if (!token) { setLoading(false); return; }
-    fetchCertificates(token)
-      .then(setCerts)
-      .finally(() => setLoading(false));
+  const loadCerts = useCallback((): Promise<Certificate[]> => {
+    if (!token) return Promise.resolve([]);
+    return fetchCertificates(token).then(data => { setCerts(data); return data; });
   }, [token]);
-
+  useEffect(() => {
+    loadCerts().finally(() => setLoading(false));
+  }, [loadCerts]);
+  useEffect(() => {
+    const hasPending = certs.some(c => !c.revoked && !c.pdfUrl);
+    if (hasPending && !pollRef.current) {
+      pollRef.current = setInterval(() => {
+        loadCerts().then(updated => {
+          const stillPending = updated.some(c => !c.revoked && !c.pdfUrl);
+          if (!stillPending && pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        });
+      }, 4000);
+    }
+    if (!hasPending && pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    return () => {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    };
+  }, [certs, loadCerts]);
   const handleClaim = async (pathSlug: string) => {
     setError(null);
     setClaiming(pathSlug);
@@ -87,9 +99,7 @@ export default function CertificatesPage() {
       setClaiming(null);
     }
   };
-
   const earnedSlugs = new Set(certs.filter(c => !c.revoked).map(c => c.pathSlug));
-
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-8">
       <div>
@@ -99,15 +109,12 @@ export default function CertificatesPage() {
           certificate. Share the public credential link with employers — no account required to verify.
         </p>
       </div>
-
       {error && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 text-red-700
           dark:text-red-400 px-4 py-3 text-sm">
           {error}
         </div>
       )}
-
-      {/* Earned certificates */}
       {loading ? (
         <div className="text-muted-foreground text-sm">Loading certificates…</div>
       ) : certs.length > 0 ? (
@@ -120,14 +127,14 @@ export default function CertificatesPage() {
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xl">🏆</span>
                   <span className="font-semibold">{cert.pathTitle}</span>
-                  {verdictBadge(cert.avgQuizScore)}
+                  <VerdictBadge score={cert.avgQuizScore} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Issued {new Date(cert.issuedAt).toLocaleDateString('en-US', {
                     year: 'numeric', month: 'long', day: 'numeric'
                   })} · {cert.totalTopics} topics completed
                 </p>
-                <div className="flex gap-3 mt-2 flex-wrap">
+                <div className="flex gap-3 mt-2 flex-wrap items-center">
                   <Link
                     href={`/certificates/verify/${cert.credentialId}`}
                     className="text-xs text-primary underline underline-offset-2"
@@ -135,11 +142,21 @@ export default function CertificatesPage() {
                   >
                     Public verification link ↗
                   </Link>
-                  {cert.pdfUrl && (
+                  {cert.pdfUrl ? (
                     <a href={cert.pdfUrl} download
                       className="text-xs text-primary underline underline-offset-2">
                       Download PDF ↓
                     </a>
+                  ) : (
+                    <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                      <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-25" cx="12" cy="12" r="10"
+                          stroke="currentColor" strokeWidth="4"/>
+                        <path className="opacity-75" fill="currentColor"
+                          d="M4 12a8 8 0 018-8v4l3-3-3-3V0a12 12 0 100 24v-4l-3 3 3 3v4A12 12 0 014 12z"/>
+                      </svg>
+                      PDF being generated…
+                    </span>
                   )}
                 </div>
               </div>
@@ -155,12 +172,10 @@ export default function CertificatesPage() {
           No certificates yet — complete a learning path to claim yours.
         </div>
       )}
-
-      {/* Claimable paths */}
       <section className="space-y-3">
         <h2 className="font-semibold text-lg">Paths You Can Certify</h2>
         <p className="text-muted-foreground text-sm">
-          If you've finished all topics in a path, click "Claim" to generate your certificate.
+          If you have finished all topics in a path, click Claim to generate your certificate.
         </p>
         <div className="grid gap-3 sm:grid-cols-2">
           {LEARNING_PATHS.map(path => {
@@ -171,7 +186,7 @@ export default function CertificatesPage() {
                 <div>
                   <p className="font-medium text-sm">{path.title}</p>
                   {already && (
-                    <p className="text-xs text-green-600 dark:text-green-400">✓ Certificate earned</p>
+                    <p className="text-xs text-green-600 dark:text-green-400">Certificate earned</p>
                   )}
                 </div>
                 {already ? (
@@ -192,15 +207,13 @@ export default function CertificatesPage() {
           })}
         </div>
       </section>
-
-      {/* How it works */}
       <section className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground space-y-1">
         <p className="font-medium text-foreground">How verification works</p>
-        <p>Each certificate has a unique <code className="text-xs bg-accent px-1 rounded">credentialId</code> URL.</p>
-        <p>Anyone can visit <code className="text-xs bg-accent px-1 rounded">/certificates/verify/&lt;id&gt;</code> — no login required.</p>
-        <p>The page shows your name, path, issue date, and topic count — all signed by DevMastery.</p>
+        <p>Each certificate has a unique credentialId URL.</p>
+        <p>Anyone can visit /certificates/verify/id — no login required.</p>
+        <p>The page shows name, path, issue date, and topic count — all signed by DevMastery.</p>
+        <p>A downloadable PDF is generated within seconds of claiming.</p>
       </section>
     </div>
   );
 }
-

@@ -39,8 +39,10 @@ public class SecurityConfig {
                     "/v1/execute", "/v1/execute/**",
                     "/v1/topics/**", "/v1/paths/**", "/v1/patterns/**",
                     "/v1/system-design/**", "/v1/search/**",
+                    "/v1/certificates/verify/**",  // public certificate verification
                     "/swagger-ui/**", "/v3/api-docs/**"
                 ).permitAll()
+                .requestMatchers(org.springframework.http.HttpMethod.GET, "/v1/comments/**").permitAll()
                 .requestMatchers("/v1/admin/**").hasRole("ADMIN")
                 .anyRequest().authenticated())
             .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
