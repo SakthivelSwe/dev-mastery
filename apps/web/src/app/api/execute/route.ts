@@ -186,13 +186,22 @@ async function tryRenderBackend(
   const SUPPORTED = new Set(['java']);
   if (!SUPPORTED.has(language)) return null;
 
+  // Warm the instance first — Render free tier goes to sleep after 15 min idle.
+  // If it's cold this returns 502/503 quickly; the real execute call below then
+  // succeeds once the JVM is booted.
+  try {
+    await fetch(`${RENDER_API_URL.replace(/\/$/, '')}/v1/execute/health`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch { /* ignore — the main call handles retries via its own timeout */ }
+
   try {
     const res = await fetch(`${RENDER_API_URL.replace(/\/$/, '')}/v1/execute`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: sourceCode, language, stdin }),
-      // Render free tier cold starts can take 30-45 s.
-      signal: AbortSignal.timeout(60_000),
+      // Keep well under Cloudflare's 30 s request budget.
+      signal: AbortSignal.timeout(25_000),
     });
     if (!res.ok) return null;
     return await res.json();
