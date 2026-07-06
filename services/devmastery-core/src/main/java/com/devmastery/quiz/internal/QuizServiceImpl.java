@@ -18,11 +18,14 @@ class QuizServiceImpl implements QuizService {
 
     private final QuizRepository quizzes;
     private final QuizQuestionRepository questions;
+    private final QuizDifficultyRepository difficulties;
     private final ApplicationEventPublisher events;
 
     QuizServiceImpl(QuizRepository quizzes, QuizQuestionRepository questions,
+                    QuizDifficultyRepository difficulties,
                     ApplicationEventPublisher events) {
-        this.quizzes = quizzes; this.questions = questions; this.events = events;
+        this.quizzes = quizzes; this.questions = questions;
+        this.difficulties = difficulties; this.events = events;
     }
 
     @Override
@@ -39,8 +42,10 @@ class QuizServiceImpl implements QuizService {
     @Override
     @Transactional
     public QuizResult submit(UUID userId, UUID quizId, Map<UUID, String> answers) {
+        QuizEntity quiz = quizzes.findById(quizId)
+                .orElseThrow(() -> new ResourceNotFoundException("Quiz not found"));
         var qs = questions.findByQuizIdOrderByDisplayOrder(quizId);
-        if (qs.isEmpty()) throw new ResourceNotFoundException("Quiz not found");
+        if (qs.isEmpty()) throw new ResourceNotFoundException("Quiz has no questions");
 
         Map<UUID, Boolean> per = new HashMap<>();
         int score = 0;
@@ -50,7 +55,40 @@ class QuizServiceImpl implements QuizService {
             per.put(q.getId(), ok);
             if (ok) score++;
         }
+
+        // Update adaptive difficulty for this user + topic
+        String topicSlug = resolveTopicSlug(quiz.getTopicId());
+        int newLevel = updateDifficulty(userId, topicSlug, score, qs.size());
+
         events.publishEvent(new QuizSubmittedEvent(userId, quizId, score, qs.size(), Instant.now()));
-        return new QuizResult(quizId, score, qs.size(), per);
+        return new QuizResult(quizId, score, qs.size(), per, newLevel);
+    }
+
+    @Override
+    public int getDifficultyLevel(UUID userId, String topicSlug) {
+        return difficulties.findByIdUserIdAndIdTopicSlug(userId, topicSlug)
+                .map(QuizDifficultyEntity::getCurrentLevel)
+                .orElse(2);  // default: Intermediate
+    }
+
+    // ── helpers ──────────────────────────────────────────────────
+
+    private int updateDifficulty(UUID userId, String topicSlug, int scored, int outOf) {
+        QuizDifficultyEntity diff = difficulties
+                .findByIdUserIdAndIdTopicSlug(userId, topicSlug)
+                .orElseGet(() -> QuizDifficultyEntity.initial(userId, topicSlug));
+        diff.recordResult(scored, outOf);
+        difficulties.save(diff);
+        return diff.getCurrentLevel();
+    }
+
+    private String resolveTopicSlug(UUID topicId) {
+        // Null-safe: if topic not found, return a default slug for difficulty tracking
+        if (topicId == null) return "unknown";
+        try {
+            return quizzes.findTopicSlugByTopicId(topicId);
+        } catch (Exception e) {
+            return topicId.toString();
+        }
     }
 }

@@ -1,0 +1,387 @@
+---
+slug: "project-search-engine"
+title: "Build a Full-Text Search Engine"
+level: 4
+---
+
+## WHY
+
+Every application with more than a few hundred records needs search. More
+importantly, "just use `LIKE '%query%'`" is the wrong answer, and you need
+to know exactly why and what to use instead. Building a search engine —
+even a simple one — teaches you: inverted indexes, TF-IDF ranking, tokenisation,
+stemming, Postgres full-text search (the production choice for 90% of apps),
+and when you actually need Elasticsearch.
+
+The interview question "how does Google search work?" is unanswerable without
+understanding inverted indexes. This project makes that concept concrete.
+
+## THEORY
+
+### The inverted index
+
+A forward index maps documents to words: `doc1 → ["java", "spring", "thread"]`.
+An inverted index maps words to documents: `"thread" → [doc1, doc4, doc17]`.
+
+Search is: look up each query term in the inverted index, intersect the result
+sets, rank by relevance. Without an inverted index, search is O(N × doc_length).
+With one, search is O(terms × postings) — typically sub-millisecond.
+
+```mermaid
+graph LR
+    Q["Query: java thread"] --> T1[lookup: java → doc1,doc4]
+    Q --> T2[lookup: thread → doc1,doc17]
+    T1 --> I[intersect: doc1]
+    T2 --> I
+    I --> R[rank by TF-IDF]
+    R --> OUT[results: doc1 (score 0.87)]
+```
+
+### TF-IDF ranking
+
+`TF-IDF(term, doc) = TF(term, doc) × IDF(term)`
+- **TF** (term frequency) = how often the term appears in the document
+- **IDF** (inverse document frequency) = `log(N / docs_containing_term)`
+  — common words ("the", "is") get near-zero IDF; rare words get high IDF
+
+Postgres uses `ts_rank` and `ts_rank_cd` (cover density), which approximate
+TF-IDF using the `tsvector` GIN index.
+
+### Postgres full-text search components
+
+```
+Raw text → to_tsvector('english', text) → tsvector (normalised tokens)
+Query    → to_tsquery('english', query)  → tsquery (AND/OR/PHRASE)
+Match    → tsvector @@ tsquery           → boolean
+Rank     → ts_rank(tsvector, tsquery)    → float
+```
+
+`to_tsvector('english', 'Running faster than threads')` →
+`'faster':2 'run':1 'thread':4` — lowercase, stemmed, stopwords removed.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "InvertedIndexVisualizer", "state": "search-engine-inverted-index" }
+```
+
+## CODE
+
+### Level 1 — Beginner: naive in-memory search with `contains`
+
+```java
+@Service
+public class NaiveSearchService {
+    private final List<Document> docs = new CopyOnWriteArrayList<>();
+
+    public void index(Document doc) { docs.add(doc); }
+
+    public List<Document> search(String query) {
+        String q = query.toLowerCase();
+        return docs.stream()
+                .filter(d -> d.content().toLowerCase().contains(q))
+                .toList();
+    }
+
+    public record Document(String id, String title, String content) {}
+}
+```
+
+**Problem**: O(N × doc_length), no ranking, no stemming, misses "run" when
+searching "running".
+
+### Level 2 — Intermediate: Postgres full-text search
+
+```sql
+-- Migration: add tsvector column with GIN index
+ALTER TABLE topics ADD COLUMN search_vector tsvector;
+
+UPDATE topics SET search_vector =
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(content, '')), 'B');
+
+CREATE INDEX topics_fts_idx ON topics USING GIN(search_vector);
+
+-- Auto-update on insert/update
+CREATE OR REPLACE FUNCTION topics_search_update() RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(NEW.content, '')), 'B');
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER topics_search_trigger
+BEFORE INSERT OR UPDATE ON topics
+FOR EACH ROW EXECUTE FUNCTION topics_search_update();
+```
+
+```java
+@Repository
+public interface TopicRepository extends JpaRepository<TopicEntity, String> {
+    @Query(value = """
+        SELECT t.*, ts_rank(t.search_vector, websearch_to_tsquery('english', :q)) AS rank
+        FROM topics t
+        WHERE t.search_vector @@ websearch_to_tsquery('english', :q)
+        ORDER BY rank DESC
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<TopicEntity> search(@Param("q") String query, @Param("limit") int limit);
+}
+```
+
+### Level 3 — Advanced: highlighting + faceted search
+
+```java
+@Service
+public class SearchService {
+    private final TopicRepository repo;
+    private final JdbcTemplate jdbc;
+
+    public SearchResponse search(SearchRequest req) {
+        String tsq = req.query().replaceAll("[^\\w\\s]", " ").trim();
+
+        List<SearchHit> hits = jdbc.query("""
+            SELECT
+                t.slug,
+                t.title,
+                t.path_slug,
+                ts_rank_cd(t.search_vector, websearch_to_tsquery('english', ?)) AS score,
+                ts_headline('english', t.content, websearch_to_tsquery('english', ?),
+                    'MaxFragments=2,FragmentDelimiter=…,StartSel=<mark>,StopSel=</mark>') AS snippet
+            FROM topics t
+            WHERE t.search_vector @@ websearch_to_tsquery('english', ?)
+              AND (? IS NULL OR t.path_slug = ?)
+            ORDER BY score DESC
+            LIMIT ? OFFSET ?
+            """,
+            ps -> {
+                ps.setString(1, tsq); ps.setString(2, tsq); ps.setString(3, tsq);
+                ps.setString(4, req.pathFilter()); ps.setString(5, req.pathFilter());
+                ps.setInt(6, req.limit()); ps.setInt(7, req.offset());
+            },
+            (rs, row) -> new SearchHit(
+                    rs.getString("slug"), rs.getString("title"),
+                    rs.getString("path_slug"), rs.getDouble("score"),
+                    rs.getString("snippet")));
+
+        return new SearchResponse(hits, hits.size());
+    }
+
+    public record SearchHit(String slug, String title, String path, double score, String snippet) {}
+    public record SearchResponse(List<SearchHit> hits, int total) {}
+}
+```
+
+### Level 4 — Expert: when to add Elasticsearch
+
+```java
+/**
+ * Postgres FTS is sufficient for:
+ *   < 10M documents, < 50 search QPS, simple ranking, one language.
+ *
+ * Add Elasticsearch when you need:
+ *   - Multi-language stemming (Postgres requires per-language index)
+ *   - Fuzzy matching ("jaav" → "java") via edit distance
+ *   - Autocomplete/suggest (edge n-gram tokenizer)
+ *   - Complex aggregations/facets at scale
+ *   - > 100M documents with sub-10ms p99
+ *
+ * Dual-write pattern: write to both Postgres and Elasticsearch.
+ * Postgres is the source of truth; ES is the search replica.
+ */
+@Service
+public class DualWriteSearchService {
+    private final TopicRepository postgres;
+    private final ElasticsearchClient elastic;
+
+    @Transactional
+    public void index(TopicEntity topic) {
+        postgres.save(topic);  // source of truth
+        try {
+            elastic.index(i -> i
+                    .index("topics")
+                    .id(topic.getSlug())
+                    .document(toSearchDoc(topic)));
+        } catch (Exception e) {
+            // Log and alert — ES index lag is tolerable; data loss is not
+            log.error("ES index failed for {}, will be caught by reconciler", topic.getSlug(), e);
+        }
+    }
+
+    // Nightly reconciliation: compare Postgres count vs ES count per path;
+    // re-index any slugs missing from ES.
+    @Scheduled(cron = "0 2 * * *")
+    public void reconcile() {
+        List<String> pgSlugs  = postgres.findAllSlugs();
+        List<String> esSlugs  = fetchAllEsSlugs();
+        Set<String> missing = new HashSet<>(pgSlugs);
+        missing.removeAll(new HashSet<>(esSlugs));
+        missing.forEach(slug ->
+            postgres.findBySlug(slug).ifPresent(this::index));
+        log.info("Reconciler re-indexed {} missing topics", missing.size());
+    }
+}
+```
+
+## REAL_WORLD
+
+**Postgres full-text search** powers Notion's in-page search, Supabase's
+built-in text search, and hundreds of SaaS products with under 50M documents.
+It requires no additional infrastructure and keeps search and data in the same
+ACID transaction.
+
+**Elasticsearch / OpenSearch** powers Airbnb, LinkedIn, and GitHub's code
+search. GitHub indexes 200TB of code with custom tokenizers for source code
+(camelCase splitting, method-name extraction). Their search cluster handles
+6B queries/day.
+
+**Meilisearch and Typesense** are modern Rust-based alternatives: simpler
+to operate than Elasticsearch, faster for small–medium datasets, built-in
+typo-tolerance and prefix search. Ideal for product catalogs and knowledge
+bases up to ~10M documents.
+
+## INTERVIEW
+
+### Q1 (Junior): Why is `LIKE '%java%'` slow for search?
+
+It cannot use a B-Tree index. The `%` at the start means the database must
+scan every row and check whether the string contains "java". On a table with
+1M rows and average 1KB text per row, that's 1GB of data scanned per query.
+A GIN index on `tsvector` reduces this to a direct index lookup — O(log N)
+per query term.
+
+### Q2 (Mid): What is a GIN index and why is it used for full-text search?
+
+GIN = Generalized Inverted Index. It stores a mapping from each lexeme
+(stemmed word) to the list of document IDs containing it. For a query
+`to_tsquery('java & thread')`, Postgres looks up both lexemes in the GIN index
+(two O(log N) index scans), intersects the two posting lists, and returns
+matching doc IDs — without touching the actual rows until the final fetch.
+B-Tree indexes are for scalars (integers, strings with prefix); GIN indexes
+are for set-valued types (arrays, tsvectors, JSONB).
+
+### Q3 (Mid→Senior): What is `setweight` and why do titles rank higher than body text?
+
+`setweight(tsvector, label)` assigns a weight (`A`, `B`, `C`, `D`) to each
+lexeme. `ts_rank_cd` considers weight when scoring: a query term found in
+an `A`-weighted field scores ~4× higher than in a `D`-weighted one. Title
+words should rank higher because a document titled "Java Thread Pool" is more
+likely to be *about* thread pools than a document that merely *mentions* them
+in the body. The weight system encodes this editorial judgment into the index.
+
+### Q4 (Senior): When does Postgres full-text search break and you need Elasticsearch?
+
+1. **Fuzzy search**: Postgres `to_tsquery` doesn't do edit-distance matching.
+   "jaav" won't find "java". Elasticsearch's `match` query with `fuzziness=AUTO`
+   handles typos. pg_trgm trigram index can approximate fuzzy, but degrades at scale.
+2. **Multilingual**: Postgres needs a separate index per language configuration.
+   Elasticsearch's language analyzers are pluggable per field.
+3. **Scale**: Postgres GIN on 50M+ documents starts exceeding available RAM for
+   the index. Elasticsearch shards the index horizontally across nodes.
+4. **Complex facets**: Elasticsearch's aggregations (count by category, price
+   histogram) are purpose-built. Postgres can do this with `GROUP BY` but
+   it re-scans rows on every query.
+
+### Q5 (Senior): How do you keep Elasticsearch in sync with your Postgres source of truth?
+
+Three patterns:
+1. **Dual-write**: every DB write also writes to ES. Simple but loses atomicity
+   (if ES write fails, they diverge). Add a reconciliation job for safety.
+2. **CDC (Change Data Capture)**: Debezium reads Postgres WAL, publishes to
+   Kafka, an ES sink connector consumes it. Eventually consistent (< 1s lag),
+   never loses an update. The gold standard for production.
+3. **Polling**: a job runs every minute, queries `WHERE updated_at > last_run`,
+   re-indexes changed rows. Simple, but misses deletes and has update latency.
+
+## FEYNMAN CHECK
+
+A search engine is like a book's index at the back. Instead of reading the
+whole book to find "thread", you flip to the index, find "thread: pages 42,
+87, 153", and go directly there. The inverted index is that back-of-book index
+for your database.
+
+### Q1: Why does `to_tsvector` remove "the" and "is" from the index?
+
+These are stopwords — so common they appear in nearly every document, giving
+them near-zero IDF. Indexing them would make the inverted index entries for
+"the" contain almost every document ID — useless for distinguishing relevant
+documents. Removing them shrinks the index by 20–30% and speeds up queries.
+
+### Q2: What is stemming and why does it help search?
+
+Stemming reduces words to their root form: "running", "runs", "ran" all become
+"run". When a user searches "running" and a document contains "ran", stemming
+ensures they match. Without stemming, "running" only matches documents that
+contain the exact string "running". The English stemmer in Postgres uses the
+Snowball algorithm.
+
+### Q3: Why is a GIN index different from a B-Tree index for text search?
+
+B-Tree stores values in sorted order — great for comparisons (`<`, `>`,
+range scans, prefix matching). But a `tsvector` value is a set of lexemes,
+not a scalar. GIN stores an inverted index: each lexeme maps to the row IDs
+containing it. The B-Tree has no representation for "which rows contain this
+word" — you'd have to scan every row. GIN answers that question directly.
+
+### Q4: What does `ts_headline` do and why is it useful in search results?
+
+`ts_headline` extracts fragments from the source text around where query terms
+appear, and wraps the matching terms in HTML markup (e.g., `<mark>java</mark>`).
+This produces the "snippet with highlighted matches" you see in every search
+result page. Without it, you'd have to send the full document to the client and
+do highlighting in JavaScript — much more data transfer and CPU on the client.
+
+### Q5: Why does indexing a new document into Postgres FTS not require reindexing the whole table?
+
+GIN is an online index — new rows are added to the index incrementally. When
+you `INSERT` a row, Postgres updates the GIN index structures for the new
+lexemes. There's no "rebuild index" needed. (GIN has a "pending list" for small
+batches that is merged periodically via `VACUUM` — but this is transparent.)
+Elasticsearch works the same way via Lucene segment merges.
+
+## BUILD
+
+**Mini-project (3–4 hours):** Full-text search over the DevMastery topics
+table with highlighting and path filtering.
+
+### Implement — checklist
+
+- [ ] `ALTER TABLE topics ADD COLUMN search_vector tsvector`
+- [ ] `GIN` index on `search_vector`
+- [ ] Trigger auto-updates `search_vector` on insert/update
+- [ ] `GET /v1/search?q=&path=&limit=&offset=` returns hits with snippets
+- [ ] Title weight `A`, content weight `B`
+- [ ] `ts_headline` with `<mark>` tags in snippet
+- [ ] Test: search "java thread" returns topics mentioning both words
+- [ ] Test: search "running" matches topic containing "run" (stemming)
+
+### Stretch goals
+
+1. Add trigram fuzzy search using `pg_trgm` for typo tolerance.
+2. Add autocomplete endpoint using `LIKE query%` on a trigram index.
+3. Build a search analytics table: log every query + hit count + zero-results
+   queries for content gap analysis.
+
+## SPACED REVIEW
+
+Day 1
+1. What is an inverted index?
+2. What does `to_tsvector` do to "Running faster than threads"?
+3. What index type does Postgres use for full-text search?
+
+Day 3
+4. What is TF-IDF and what does each component measure?
+5. Why are stopwords excluded from the search index?
+6. What does `setweight` do for ranking?
+
+Day 7
+7. Why is `LIKE '%query%'` slow and what makes GIN faster?
+8. Explain stemming with an example.
+9. What does `ts_headline` produce and why is it useful?
+
+Day 14
+10. When should you switch from Postgres FTS to Elasticsearch?
+11. Describe the CDC-based sync pattern for keeping ES in sync with Postgres.
+12. How would you implement autocomplete for a search box over 1M product names?
+

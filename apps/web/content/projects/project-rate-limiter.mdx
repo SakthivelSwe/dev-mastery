@@ -1,0 +1,455 @@
+---
+slug: "project-rate-limiter"
+title: "Build a Rate Limiter"
+level: 3
+---
+
+## WHY
+
+Every public API on the internet has a rate limiter. Stripe, GitHub, OpenAI,
+and AWS API Gateway all enforce per-key request budgets. Without one, a single
+runaway script or a malicious actor can saturate your service while paying
+customers get 503s. Rate limiting is also the canonical interview question for
+"design a distributed system with no obvious primary" — it forces you to choose
+between perfect consistency (distributed lock) and approximate consistency
+(token bucket with local counters), which is the core trade-off in every
+distributed system.
+
+There are four algorithms (fixed window, sliding window log, sliding window
+counter, token bucket), and each has a different trade-off. Knowing when to
+apply which separates a senior engineer who has shipped rate limiting in
+production from a junior who read the Wikipedia article.
+
+## THEORY
+
+### The four algorithms
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Fixed Window Counter                                          │
+│    Divide time into fixed buckets (e.g. every 60s).             │
+│    Count requests per bucket. Reject when count > limit.        │
+│    Problem: burst at boundary — 2× the limit in 1s.             │
+├─────────────────────────────────────────────────────────────────┤
+│ 2. Sliding Window Log                                            │
+│    Store a sorted log of timestamps for each key.               │
+│    On each request: drop entries older than window, count rest. │
+│    Accurate. Memory: O(limit) timestamps per user.              │
+├─────────────────────────────────────────────────────────────────┤
+│ 3. Sliding Window Counter (hybrid — what Cloudflare uses)        │
+│    current_count = prev_bucket * (1 - elapsed/window) + cur     │
+│    One integer per window per key. Approximate sliding window.  │
+│    ~0.003% error rate at steady state (Cloudflare published).   │
+├─────────────────────────────────────────────────────────────────┤
+│ 4. Token Bucket (what AWS API Gateway & Nginx use)               │
+│    Tokens refill at rate R/sec, bucket max capacity B.          │
+│    Request consumes 1 token. Allows burst up to B instantly.    │
+│    Redis atomic Lua script: DECR + EXPIRE in one RTT.           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Token bucket math
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant RL as RateLimiter
+    participant R as Redis
+
+    C->>RL: POST /api/shorten
+    RL->>R: EVALSHA lua_script KEY user:42 RATE 10 CAPACITY 100
+    Note over R: tokens = min(capacity, stored + elapsed*rate)<br/>if tokens >= 1: tokens -= 1; allow<br/>else: deny
+    R-->>RL: {allowed: true, remaining: 73, reset: 1720000060}
+    RL-->>C: 200 OK  X-RateLimit-Remaining: 73
+```
+
+### Distributed rate limiting
+
+A single-node token bucket in Redis is simple. Distributed (multi-region)
+is the hard part:
+
+- **Centralised Redis**: correct, but adds one network RTT to every request.
+  Typical latency: 0.5ms same-DC, 80ms cross-region.
+- **Local + periodic sync**: each node maintains a local counter, syncs to
+  Redis every 100ms. Error window = 100ms × rate. Stripe uses this.
+- **Gossip-based**: nodes gossip their local counts; approximate global state
+  in O(log N) messages. Acceptable for non-financial APIs.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "TokenBucketVisualizer", "state": "rate-limiter-token-bucket" }
+```
+
+## CODE
+
+### Level 1 — Beginner: in-memory fixed window
+
+```java
+class FixedWindowRateLimiter {
+    private final int limit;
+    private final long windowMs;
+    private final Map<String, long[]> state = new ConcurrentHashMap<>();
+    // long[0] = count, long[1] = window start epoch ms
+
+    public FixedWindowRateLimiter(int limit, long windowMs) {
+        this.limit = limit; this.windowMs = windowMs;
+    }
+
+    public boolean allow(String key) {
+        long now = System.currentTimeMillis();
+        long[] bucket = state.computeIfAbsent(key, k -> new long[]{0, now});
+        synchronized (bucket) {
+            if (now - bucket[1] >= windowMs) {
+                bucket[0] = 0; bucket[1] = now;  // new window
+            }
+            if (bucket[0] >= limit) return false;
+            bucket[0]++;
+            return true;
+        }
+    }
+}
+```
+
+### Level 2 — Intermediate: sliding window log
+
+```java
+class SlidingWindowLogRateLimiter {
+    private final int limit;
+    private final long windowMs;
+    // TreeSet per key, sorted by timestamp; O(limit) memory per active key
+    private final Map<String, TreeSet<Long>> logs = new ConcurrentHashMap<>();
+
+    public SlidingWindowLogRateLimiter(int limit, long windowMs) {
+        this.limit = limit; this.windowMs = windowMs;
+    }
+
+    public synchronized boolean allow(String key) {
+        long now = System.currentTimeMillis();
+        TreeSet<Long> log = logs.computeIfAbsent(key, k -> new TreeSet<>());
+        log.headSet(now - windowMs).clear();      // evict expired timestamps
+        if (log.size() >= limit) return false;
+        log.add(now);
+        return true;
+    }
+}
+```
+
+### Level 3 — Advanced: token bucket backed by Redis Lua
+
+```java
+@Service
+public class TokenBucketRateLimiter {
+    private static final String LUA = """
+        local key      = KEYS[1]
+        local now      = tonumber(ARGV[1])
+        local rate     = tonumber(ARGV[2])   -- tokens per second
+        local capacity = tonumber(ARGV[3])
+        local cost     = tonumber(ARGV[4])   -- tokens this request costs
+
+        local data   = redis.call('HMGET', key, 'tokens', 'ts')
+        local tokens = tonumber(data[1]) or capacity
+        local ts     = tonumber(data[2]) or now
+
+        -- Refill proportional to elapsed time
+        local elapsed = math.max(0, now - ts)
+        tokens = math.min(capacity, tokens + elapsed * rate)
+
+        if tokens < cost then
+            -- Deny — return remaining tokens and time until 1 token refills
+            local wait_ms = math.ceil((cost - tokens) / rate * 1000)
+            return {0, math.floor(tokens), wait_ms}
+        end
+
+        tokens = tokens - cost
+        redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+        redis.call('PEXPIRE', key, math.ceil(capacity / rate * 1000) + 1000)
+        return {1, math.floor(tokens), 0}
+        """;
+
+    private final StringRedisTemplate redis;
+    private final DefaultRedisScript<List> script;
+
+    public TokenBucketRateLimiter(StringRedisTemplate redis) {
+        this.redis  = redis;
+        this.script = new DefaultRedisScript<>(LUA, List.class);
+    }
+
+    public RateLimitResult allow(String key, double ratePerSec, int capacity, int cost) {
+        double nowSec = System.currentTimeMillis() / 1000.0;
+        List<Long> result = redis.execute(script,
+                List.of("rl:" + key),
+                String.valueOf(nowSec),
+                String.valueOf(ratePerSec),
+                String.valueOf(capacity),
+                String.valueOf(cost));
+
+        boolean allowed    = result.get(0) == 1L;
+        int     remaining  = result.get(1).intValue();
+        long    retryAfter = result.get(2);
+        return new RateLimitResult(allowed, remaining, retryAfter);
+    }
+
+    public record RateLimitResult(boolean allowed, int remaining, long retryAfterMs) {}
+}
+```
+
+### Level 4 — Expert: Spring filter + Bucket4j local + Redis sync
+
+```java
+/**
+ * Production-grade rate limiting:
+ *  • Bucket4j local token bucket (< 1µs overhead per request — no network)
+ *  • Redis sync every 100ms to share count across instances
+ *  • Graceful degradation: if Redis is down, local-only mode continues
+ *  • Response headers: X-RateLimit-Limit, Remaining, Reset, Retry-After
+ *  • 429 response body with JSON error
+ */
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)
+public class RateLimitFilter extends OncePerRequestFilter {
+    private final Map<String, Bucket> localBuckets = new ConcurrentHashMap<>();
+    private final TokenBucketRateLimiter redis;
+    private final int limit;
+
+    @Value("${app.rate-limit.requests-per-minute:60}")
+    private int ratePerMinute;
+
+    public RateLimitFilter(TokenBucketRateLimiter redis) {
+        this.redis = redis;
+        this.limit = ratePerMinute;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req,
+                                    HttpServletResponse res,
+                                    FilterChain chain) throws IOException, ServletException {
+        String key    = resolveKey(req);
+        Bucket bucket = localBuckets.computeIfAbsent(key, k -> buildBucket());
+
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        if (!probe.isConsumed()) {
+            long retryAfterSec = TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill());
+            res.setStatus(429);
+            res.setHeader("Retry-After",          String.valueOf(retryAfterSec));
+            res.setHeader("X-RateLimit-Limit",    String.valueOf(limit));
+            res.setHeader("X-RateLimit-Remaining", "0");
+            res.setContentType("application/json");
+            res.getWriter().write("""
+                {"error":"rate_limit_exceeded","retryAfterSeconds":%d}
+                """.formatted(retryAfterSec));
+            return;
+        }
+        res.setHeader("X-RateLimit-Limit",    String.valueOf(limit));
+        res.setHeader("X-RateLimit-Remaining", String.valueOf(probe.getRemainingTokens()));
+        chain.doFilter(req, res);
+    }
+
+    private Bucket buildBucket() {
+        return Bucket.builder()
+                .addLimit(limit(ratePerMinute).per(Duration.ofMinutes(1)))
+                .build();
+    }
+
+    private String resolveKey(HttpServletRequest req) {
+        // JWT sub claim preferred; fall back to IP
+        String auth = req.getHeader("Authorization");
+        if (auth != null && auth.startsWith("Bearer ")) {
+            // decode without verifying — key generation only
+            String payload = new String(Base64.getDecoder().decode(auth.split("\\.")[1]));
+            // extract "sub" claim (simplified; use a real JWT library in prod)
+        }
+        return "ip:" + req.getRemoteAddr();
+    }
+}
+```
+
+## REAL_WORLD
+
+**Stripe** uses a sliding window with local counters synced to Redis.
+Each API gateway pod keeps an in-memory counter; every 100ms a background
+thread flushes the delta to Redis with `INCRBY`. Other pods read the
+global count every 100ms. The error window is 2× the sync interval =
+200ms × rate — for a limit of 100 req/sec that's a burst allowance of 20
+extra requests, which Stripe considers acceptable. The payoff: zero Redis
+RTTs on the hot path.
+
+**Cloudflare** uses the sliding window counter algorithm at the edge. A single
+`INCR` + `EXPIRE` Redis call per request, with the weighted blend of the
+previous and current fixed-window buckets computed locally. They published that
+this accepts 0.003% more requests than a true sliding window — a rounding error.
+
+**GitHub API** uses a fixed window (hourly), mostly because it's the simplest
+to explain in documentation and cheapest to implement. The burst problem is
+real but GitHub deems it acceptable given the authentication requirement (you
+can't script abuse easily without an account).
+
+**Kong / Nginx** ship token bucket implementations because it allows
+controlled bursting — useful when you want to allow brief spikes (a dashboard
+refresh) but not sustained overload.
+
+## INTERVIEW
+
+### Q1 (Junior): What is the boundary-burst problem with fixed windows?
+
+If the limit is 100 req/min and the window resets at :00, a client can send
+100 requests at :59 (last second of window 1) and 100 more at :00 (first
+second of window 2). From the rate limiter's view, both bursts are within
+their respective windows and both are allowed. In reality, the server sees
+200 requests in 2 seconds — 2× the intended limit.
+
+### Q2 (Mid): Compare memory usage: sliding window log vs sliding window counter.
+
+**Log**: stores one timestamp per request. At 100 req/min limit, worst case
+is 100 timestamps per active user per window. For 100K concurrent users: 10M
+entries × 8 bytes = 80 MB. Accurate to the nanosecond.
+
+**Counter**: stores 2 integers per user (current window count + previous
+window count). For 100K users: 200K integers × 8 bytes = 1.6 MB. Approximate
+(~0.003% error) but 50× cheaper. Use log for financial-precision API limits,
+counter for best-effort abuse prevention.
+
+### Q3 (Mid→Senior): Why is the Redis Lua script critical for correctness?
+
+Because `HGET tokens` → compute → `HSET tokens` is three operations. Without
+Lua, a race condition occurs: two concurrent requests both read `tokens=1`,
+both compute "I'm allowed", both decrement to 0. Both pass. You've allowed 2
+requests when 1 was left. Lua scripts run atomically on a single Redis thread —
+the read-compute-write cycle is guaranteed to be uninterrupted.
+
+### Q4 (Senior): How do you handle Redis being down without dropping all traffic?
+
+Graceful degradation: switch to local-only mode. Each pod keeps its own token
+bucket (Bucket4j). The per-pod limit is `global_limit / expected_pod_count`.
+If you have 5 pods and a 100 req/sec limit, each pod allows 20 req/sec without
+Redis. This is **under-counting** during normal operation (you could allow up to
+5 × 20 = 100 from one key using all pods) but **prevents total outage** when
+Redis is down. Log a metric `rate_limit.redis_down=true` so you alert before
+anyone notices the degraded accuracy.
+
+### Q5 (Senior): Design a rate limiter for 50M users at 1B req/day.
+
+At 1B/day → ~11K req/sec average, with 10× peak = 110K req/sec. Redis
+single-node can handle ~100K commands/sec. So:
+
+1. Use **Redis Cluster** (16 shards) — each shard handles ~7K req/sec.
+2. Use the **sliding window counter** (2 INCR + 1 EXPIRE per request after first,
+   Lua atomic) — cheapest accurate algorithm.
+3. Key by `user_id:minute` — expires naturally, no cleanup job.
+4. Collocate the Redis cluster in the same AZ as API gateways — stay under 0.5ms.
+5. Circuit break to **local mode** (Bucket4j, 100ms sync) if Redis p99 > 5ms.
+
+### Q6 (Senior): What headers should a rate-limited 429 response include?
+
+Per RFC 6585 and industry standard:
+- `Retry-After: 42` — seconds until the client may retry (required by RFC).
+- `X-RateLimit-Limit: 100` — the policy limit.
+- `X-RateLimit-Remaining: 0` — tokens left in current window.
+- `X-RateLimit-Reset: 1720000060` — Unix epoch when the window resets.
+
+A JSON body with `{"error":"rate_limit_exceeded","retryAfterSeconds":42}` is
+required so programmatic clients (SDKs, scripts) can parse the error without
+screen-scraping.
+
+## FEYNMAN CHECK
+
+Explain rate limiting to a child: *Imagine a jar with 10 cookies. You can take
+one cookie every time you visit. If the jar is empty, you have to wait until
+tomorrow when it's refilled. Rate limiting is the jar — it stops you from eating
+all the cookies at once.*
+
+### Q1: Why does a token bucket allow bursting but a fixed window does not?
+
+A fixed window resets its counter all at once at the boundary — there is no
+concept of accumulated capacity. A token bucket refills continuously and caps
+at `capacity`. If no one used the API for 10 seconds at 10 tokens/sec, the
+bucket has 100 tokens saved up (or its max capacity). A client can consume all
+of them in a burst. Fixed window: you get your N requests per window, evenly
+or all at once, but no carry-over.
+
+### Q2: Why is a Lua script the right tool for atomic Redis operations?
+
+Redis is single-threaded — it processes one command at a time. A Lua script
+sends all its commands as a single unit, and Redis guarantees no other command
+runs while the script executes. This is cheaper than `MULTI/EXEC` (transaction)
+because it avoids the extra round trip for the `EXEC` command, and it can do
+conditional logic (if tokens ≥ cost) inside the script that `MULTI/EXEC`
+cannot.
+
+### Q3: What does "sliding" mean in "sliding window"?
+
+The window moves with time. At any instant, you count requests in the last
+N seconds ending *now* — not in a fixed bucket from :00 to :59. As each
+second passes, requests older than N seconds fall off the back and new
+requests join the front. The window slides forward continuously, eliminating
+the boundary-burst problem.
+
+### Q4: If you have 3 API instances, each allowing 100 req/min, what is the real global limit?
+
+300 req/min per user — 3× the intended limit. Each instance has no idea
+how many requests the other instances have served. This is why distributed
+rate limiting requires a shared store (Redis): the global counter must be
+visible to all instances, not each instance's local memory.
+
+### Q5: Why do we `PEXPIRE` the Redis key in the Lua script?
+
+To avoid memory leaks. If a user stops sending requests, their token bucket
+key stays in Redis forever without an expiry. `PEXPIRE` sets a TTL equal to
+roughly `capacity / rate` — the maximum time it takes to refill from empty to
+full. A user who has been idle longer than that will start with a full bucket
+anyway, so the key can safely expire and be recreated on next access.
+
+## BUILD
+
+**Mini-project (3–4 hours):** A `RateLimiterFilter` for a Spring Boot app.
+
+### Implement — checklist
+
+- [ ] `FixedWindowRateLimiter.allow(key)` — passes tests
+- [ ] `TokenBucketRateLimiter.allow(key)` — Lua script in Redis, atomic
+- [ ] Spring `OncePerRequestFilter` wrapping the token bucket
+- [ ] Returns 429 with `Retry-After` header on rejection
+- [ ] Sets `X-RateLimit-Remaining` on every response
+- [ ] Graceful degradation when Redis is unreachable (local bucket fallback)
+- [ ] Test: fixed window allows exactly N, rejects N+1
+- [ ] Test: token bucket allows burst then throttles
+
+### Test
+
+```bash
+# Run 110 requests against a 100/min limit — expect first 100 to succeed
+for i in $(seq 1 110); do
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/test)
+  echo "$i: $CODE"
+done | grep 429 | wc -l   # should print 10
+```
+
+### Stretch goals
+
+1. Add per-route limits: `POST /api/shorten` → 10/min, `GET /api/stats` → 200/min.
+2. Implement the sliding window counter algorithm and compare accuracy vs log.
+3. Add a Grafana dashboard: `rate_limit.allowed` vs `rate_limit.rejected` per key.
+
+## SPACED REVIEW
+
+Day 1
+1. Name the four rate-limiting algorithms.
+2. What is the boundary-burst problem?
+3. Which HTTP status code does rate limiting return?
+
+Day 3
+4. Why is a Lua script needed for atomic Redis decrement?
+5. How much memory does sliding window log use per active user?
+6. What headers must a 429 response include?
+
+Day 7
+7. Explain token bucket bursting with a concrete example.
+8. How does Stripe handle Redis being temporarily unavailable?
+9. Compare fixed window and sliding window counter accuracy.
+
+Day 14
+10. Design a distributed rate limiter for 50M users at 1B req/day.
+11. Why does rate-limiting by IP address fail for users behind NAT?
+12. Describe the graceful degradation strategy when Redis goes down and
+    its effect on the effective global limit.
+

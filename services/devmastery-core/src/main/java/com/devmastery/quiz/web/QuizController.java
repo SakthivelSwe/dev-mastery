@@ -23,4 +23,11 @@ public class QuizController {
                                          @RequestBody Map<UUID, String> answers) {
         return quiz.submit(userId, quizId, answers);
     }
+
+    /** GET /v1/quizzes/difficulty/{topicSlug} — returns current adaptive level (1–4) */
+    @GetMapping("/difficulty/{topicSlug}")
+    public Map<String, Integer> difficulty(@AuthenticationPrincipal UUID userId,
+                                            @PathVariable String topicSlug) {
+        return Map.of("level", quiz.getDifficultyLevel(userId, topicSlug));
+    }
 }

@@ -1,0 +1,123 @@
+name: Content Health
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web/content/**'
+      - 'scripts/audit-content-health.js'
+      - '.github/workflows/content-health.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/web/content/**'
+      - 'scripts/audit-content-health.js'
+      - '.github/workflows/content-health.yml'
+  workflow_dispatch:
+
+# Fail the build when the average score drops below this floor.
+# Bump this over time as debt is paid down.
+env:
+  MIN_AVG_SCORE: '70'
+
+jobs:
+  audit:
+    name: Audit 9-section schema
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run content health audit
+        id: audit
+        run: node scripts/audit-content-health.js
+
+      - name: Read summary metrics
+        id: metrics
+        run: |
+          AVG=$(node -e "console.log(require('./apps/web/content/_audit/health.json').overall.avgScore)")
+          RED=$(node -e "console.log(require('./apps/web/content/_audit/health.json').overall.red)")
+          YEL=$(node -e "console.log(require('./apps/web/content/_audit/health.json').overall.yellow)")
+          GRN=$(node -e "console.log(require('./apps/web/content/_audit/health.json').overall.green)")
+          TOT=$(node -e "console.log(require('./apps/web/content/_audit/health.json').overall.totalTopics)")
+          echo "avg=$AVG"     >> "$GITHUB_OUTPUT"
+          echo "red=$RED"     >> "$GITHUB_OUTPUT"
+          echo "yellow=$YEL"  >> "$GITHUB_OUTPUT"
+          echo "green=$GRN"   >> "$GITHUB_OUTPUT"
+          echo "total=$TOT"   >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        run: |
+          {
+            echo "# 📊 Content Health"
+            echo ""
+            echo "**Average score:** ${{ steps.metrics.outputs.avg }}/100 (floor: ${MIN_AVG_SCORE})"
+            echo ""
+            echo "| Status | Count |"
+            echo "| ------ | ----: |"
+            echo "| 🟢 Healthy | ${{ steps.metrics.outputs.green }} |"
+            echo "| 🟡 Shallow | ${{ steps.metrics.outputs.yellow }} |"
+            echo "| 🔴 Broken  | ${{ steps.metrics.outputs.red }} |"
+            echo "| **Total**  | **${{ steps.metrics.outputs.total }}** |"
+            echo ""
+            echo "Full report artifact: **content-health-report**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full report
+        uses: actions/upload-artifact@v4
+        with:
+          name: content-health-report
+          path: apps/web/content/_audit/
+          retention-days: 30
+
+      - name: Auto-fix candidate summary (top red topics per path)
+        # Never calls Gemini in CI (no key) — this is a diagnostic listing of
+        # which topics would receive proposals if a human ran `content:autofix`.
+        run: |
+          node -e "
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('apps/web/content/_audit/health.json','utf8'));
+            const byPath = new Map();
+            for (const t of report.topics.filter(t => t.status === 'red')) {
+              if (!byPath.has(t.pathSlug)) byPath.set(t.pathSlug, []);
+              byPath.get(t.pathSlug).push(t);
+            }
+            const rows = [];
+            rows.push('| Path | Red topics | Worst 3 (score) |');
+            rows.push('| --- | ---: | --- |');
+            [...byPath.entries()]
+              .sort((a,b) => b[1].length - a[1].length)
+              .slice(0, 15)
+              .forEach(([p, ts]) => {
+                ts.sort((a,b) => a.score - b.score);
+                const worst = ts.slice(0,3).map(t => t.topicSlug+'('+t.score+')').join(', ');
+                rows.push('| '+p+' | '+ts.length+' | '+worst+' |');
+              });
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+              '',
+              '## 🤖 Auto-fix candidates',
+              '',
+              'These are the top paths where running \`npm run content:autofix <path>\` would produce the biggest score lift.',
+              '',
+              ...rows,
+              '',
+              '_This step never contacts Gemini — it only lists candidates. Run the auto-fix locally with a \`GEMINI_API_KEY\` set._',
+              '',
+            ].join('\n'));
+          "
+
+      - name: Enforce minimum average score
+        run: |
+          AVG=${{ steps.metrics.outputs.avg }}
+          if [ "$AVG" -lt "$MIN_AVG_SCORE" ]; then
+            echo "::error::Average content health $AVG < floor $MIN_AVG_SCORE"
+            exit 1
+          fi
+          echo "Average content health $AVG >= floor $MIN_AVG_SCORE ✅"
+

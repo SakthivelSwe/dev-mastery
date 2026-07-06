@@ -6,7 +6,8 @@ import { usePathname } from 'next/navigation';
 import {
   Coffee, GitBranch, Database, Layout, Code2, Server, Cpu,
   Globe, Layers, Shield, BookOpen, ChevronDown, ChevronRight,
-  Menu, X, Zap, BarChart3, FileCode, Terminal, Network, PenTool, Box
+  Menu, X, Zap, BarChart3, FileCode, Terminal, Network, PenTool, Box,
+  Award, FlaskConical, MessageSquare, Cog
 } from 'lucide-react';
 
 // ─── Path Configuration ───────────────────────────────────────
@@ -207,6 +208,46 @@ export function Sidebar({ className = '' }: SidebarProps) {
           >
             <Zap size={13} style={{ color: 'var(--accent)' }} className="shrink-0" />
             <span>Open dashboard</span>
+          </Link>
+          <Link
+            href="/review"
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[13px] transition-colors"
+            style={{ color: 'var(--text-secondary)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+          >
+            <FlaskConical size={13} className="shrink-0" style={{ color: '#6366f1' }} />
+            <span>Spaced Review</span>
+          </Link>
+          <Link
+            href="/interview"
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[13px] transition-colors"
+            style={{ color: 'var(--text-secondary)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+          >
+            <MessageSquare size={13} className="shrink-0" style={{ color: '#10b981' }} />
+            <span>Mock Interview</span>
+          </Link>
+          <Link
+            href="/system-design/studio"
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[13px] transition-colors"
+            style={{ color: 'var(--text-secondary)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+          >
+            <Cog size={13} className="shrink-0" style={{ color: '#f97316' }} />
+            <span>Design Studio</span>
+          </Link>
+          <Link
+            href="/profile/certificates"
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[13px] transition-colors"
+            style={{ color: 'var(--text-secondary)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+          >
+            <Award size={13} className="shrink-0" style={{ color: '#eab308' }} />
+            <span>My Certificates</span>
           </Link>
         </div>
       )}

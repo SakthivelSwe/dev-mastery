@@ -231,3 +231,170 @@ export async function markLayerComplete(
     return false;
   }
 }
+
+// ─── Spaced Review ─────────────────────────────────────────
+
+export interface ReviewItem {
+  topicId:      string;
+  topicSlug:    string | null;
+  dueDate:      string;      // ISO date
+  repetitions:  number;
+  easeFactor:   number;
+}
+
+/** Fetch topics whose spaced-repetition schedule is due today or earlier. */
+export async function fetchDueReviews(token?: string | null): Promise<ReviewItem[]> {
+  try {
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    else if (typeof window !== 'undefined') {
+      const t = localStorage.getItem('auth_token');
+      if (t) headers['Authorization'] = `Bearer ${t}`;
+    }
+    const res = await fetch(`${PROGRESS_API}/v1/progress/reviews/due`, { headers, cache: 'no-store' });
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+/** Submit a 1–5 SM-2 recall rating for a topic just reviewed. */
+export async function submitReviewRating(
+  topicId: string,
+  rating: number,
+  token?: string | null,
+): Promise<boolean> {
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    else if (typeof window !== 'undefined') {
+      const t = localStorage.getItem('auth_token');
+      if (t) headers['Authorization'] = `Bearer ${t}`;
+    }
+    const res = await fetch(`${PROGRESS_API}/v1/progress/reviews/${topicId}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ rating }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Interview Sessions ────────────────────────────────────
+
+export interface InterviewTranscriptTurn {
+  role:    'user' | 'model';
+  content: string;
+  at?:     string;  // ISO8601
+}
+
+export interface InterviewScoreCard {
+  verdict:         string;   // reject | lean_no | lean_yes | strong_hire
+  technical:       number;   // 1..10
+  communication:   number;
+  problemSolving:  number;
+  seniority:       number;
+  strengths:       string[];
+  improvements:    string[];
+}
+
+export interface InterviewSessionSummary {
+  id:          string;
+  topicSlug:   string;
+  targetLevel: string;
+  startedAt:   string;
+  endedAt:     string | null;
+  verdict:     string | null;
+}
+
+export interface InterviewSessionDetail {
+  summary:    InterviewSessionSummary;
+  transcript: InterviewTranscriptTurn[];
+  scoreCard:  InterviewScoreCard | null;
+}
+
+function authHeaders(token?: string | null): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) h['Authorization'] = `Bearer ${token}`;
+  else if (typeof window !== 'undefined') {
+    const t = localStorage.getItem('auth_token');
+    if (t) h['Authorization'] = `Bearer ${t}`;
+  }
+  return h;
+}
+
+/** Persist a completed mock interview. */
+export async function saveInterviewSession(payload: {
+  topicSlug:   string;
+  targetLevel: string;
+  startedAt:   string;
+  endedAt:     string;
+  transcript:  InterviewTranscriptTurn[];
+  scoreCard?:  InterviewScoreCard | null;
+}, token?: string | null): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/v1/interviews`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    const json = await res.json() as { id: string };
+    return json.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** List the user's past mock interviews (newest first). */
+export async function fetchInterviewHistory(token?: string | null): Promise<InterviewSessionSummary[]> {
+  try {
+    const res = await fetch(`${API_BASE}/v1/interviews`, {
+      headers: authHeaders(token),
+      cache: 'no-store',
+    });
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+/** Fetch a single mock interview by session id. */
+export async function fetchInterviewSession(
+  sessionId: string,
+  token?: string | null,
+): Promise<InterviewSessionDetail | null> {
+  try {
+    const res = await fetch(`${API_BASE}/v1/interviews/${sessionId}`, {
+      headers: authHeaders(token),
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Parse and store the AI interviewer's markdown scorecard. */
+export async function gradeInterviewSession(
+  sessionId: string,
+  scorecardText: string,
+  token?: string | null,
+): Promise<InterviewScoreCard | null> {
+  try {
+    const res = await fetch(`${API_BASE}/v1/interviews/${sessionId}/grade`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: JSON.stringify({ scorecardText }),
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}

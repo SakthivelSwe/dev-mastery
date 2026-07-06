@@ -13,7 +13,7 @@ public interface ProgressService {
     void submitReview(UUID userId, UUID topicId, int rating);
 
     record ProgressSummary(UUID userId, long xp, int currentStreak, int longestStreak,
-                           int topicsCompleted, int badgesEarned) { }
+                           int topicsCompleted, int badgesEarned, int freezeCount) { }
 
     record ReviewItem(UUID topicId, String topicSlug, LocalDate dueDate,
                       int repetitions, double easeFactor) { }

@@ -1,0 +1,385 @@
+---
+slug: "project-chat"
+title: "Build a Real-Time Chat Service"
+level: 3
+---
+
+## WHY
+
+Real-time systems break every assumption of a stateless REST API. A chat
+service is the canonical interview question for WebSockets, fan-out,
+message ordering, presence detection, and at-least-once delivery guarantees.
+Slack, Discord, WhatsApp, and every collaborative app you will ever build
+share the same core architecture: a message broker between producers and
+consumers, with some form of persistence so late-joiners see history.
+
+Building this from scratch teaches you: why HTTP polling is not a solution,
+how WebSocket upgrade works at the protocol level, why message fan-out is
+expensive (N subscribers × M messages), and how Discord handles 2.5M concurrent
+WebSocket connections on a single server with Elixir.
+
+## THEORY
+
+### The fan-out problem
+
+```mermaid
+graph LR
+    A[Alice sends "Hello"] --> B[Chat Server]
+    B --> C[Bob's WebSocket]
+    B --> D[Carol's WebSocket]
+    B --> E[Dave's WebSocket]
+    B --> F[Eve's WebSocket - offline, needs persistence]
+```
+
+For a channel with 1000 members, one message triggers 999 WebSocket writes.
+At 100 messages/sec, that's 99,900 writes/sec per server. This is why chat
+services use pub/sub at the infrastructure level (Redis pub/sub, Kafka topics)
+to fan out across multiple servers, not just within one.
+
+### Message delivery guarantees
+
+| Guarantee | What it means | How to implement |
+|-----------|--------------|-----------------|
+| At-most-once | May lose messages | No ack, no retry |
+| At-least-once | May duplicate | Persist + ack + retry |
+| Exactly-once | No loss, no dup | Idempotency key + dedup table |
+
+Most chat systems use **at-least-once** with client-side deduplication by
+message ID. WhatsApp uses message IDs and a delivered/read receipt protocol.
+
+### Presence detection
+
+A user is "online" if their WebSocket connection is alive. Heartbeats (PING/PONG
+every 25s) detect dead connections that TCP didn't close cleanly. Presence is
+stored in Redis with TTL: `SETEX presence:user42 30 online`. If the TTL expires
+without a heartbeat renewal, the user is marked offline.
+
+## VISUALIZATION_CONFIG
+
+```json
+{ "component": "SequenceDiagram", "state": "chat-websocket-fanout" }
+```
+
+## CODE
+
+### Level 1 — Beginner: in-memory broadcast with Spring WebSocket
+
+```java
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/topic");      // in-memory broker
+        registry.setApplicationDestinationPrefixes("/app");
+    }
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws").withSockJS();   // SockJS fallback
+    }
+}
+
+@Controller
+public class ChatController {
+    private final SimpMessagingTemplate broker;
+
+    @MessageMapping("/chat.send")
+    public void send(ChatMessage msg, Principal user) {
+        msg.setSender(user.getName());
+        msg.setTimestamp(Instant.now());
+        broker.convertAndSend("/topic/room." + msg.getRoomId(), msg);
+    }
+}
+```
+
+### Level 2 — Intermediate: message persistence + history on join
+
+```java
+@Service
+public class ChatService {
+    private final MessageRepository messages;
+    private final SimpMessagingTemplate broker;
+
+    @Transactional
+    public ChatMessage send(String roomId, String senderId, String content) {
+        ChatMessage msg = messages.save(ChatMessage.builder()
+                .id(UUID.randomUUID())
+                .roomId(roomId)
+                .senderId(senderId)
+                .content(content)
+                .sentAt(Instant.now())
+                .build());
+        broker.convertAndSend("/topic/room." + roomId, msg);
+        return msg;
+    }
+
+    public List<ChatMessage> getHistory(String roomId, int limit) {
+        return messages.findTop50ByRoomIdOrderBySentAtDesc(roomId)
+                .stream().sorted(Comparator.comparing(ChatMessage::getSentAt))
+                .toList();
+    }
+}
+```
+
+### Level 3 — Advanced: Redis pub/sub for multi-instance fan-out
+
+```java
+/**
+ * When running multiple app instances, in-memory STOMP broker
+ * only reaches connections on the *same* instance.
+ * Redis pub/sub broadcasts across all instances.
+ */
+@Configuration
+public class RedisMessagingConfig {
+    @Bean
+    public RedisMessageListenerContainer container(RedisConnectionFactory factory,
+                                                    MessageListenerAdapter adapter) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        container.addMessageListener(adapter, new PatternTopic("chat:room:*"));
+        return container;
+    }
+
+    @Bean
+    public MessageListenerAdapter adapter(ChatRelayListener relay) {
+        return new MessageListenerAdapter(relay, "onMessage");
+    }
+}
+
+@Component
+public class ChatRelayListener {
+    private final SimpMessagingTemplate broker;
+    private final ObjectMapper mapper;
+
+    public void onMessage(String message, String channel) throws Exception {
+        ChatMessage msg = mapper.readValue(message, ChatMessage.class);
+        // Relay to local WebSocket clients subscribed to this room
+        broker.convertAndSend("/topic/" + channel.replace("chat:", ""), msg);
+    }
+}
+
+@Service
+public class ChatService {
+    private final StringRedisTemplate redis;
+
+    public void send(ChatMessage msg) {
+        // Publish to Redis — all instances receive and relay to their clients
+        redis.convertAndSend("chat:room:" + msg.getRoomId(), toJson(msg));
+    }
+}
+```
+
+### Level 4 — Expert: presence + typing indicators + read receipts
+
+```java
+@Service
+public class PresenceService {
+    private final StringRedisTemplate redis;
+    private static final Duration PRESENCE_TTL = Duration.ofSeconds(35);
+
+    public void heartbeat(String userId) {
+        redis.opsForValue().set("presence:" + userId, "online", PRESENCE_TTL);
+    }
+
+    public void disconnect(String userId) {
+        redis.delete("presence:" + userId);
+        // Publish presence-change event so UI updates immediately
+        redis.convertAndSend("presence:changes",
+                "{\"userId\":\"" + userId + "\",\"status\":\"offline\"}");
+    }
+
+    public Map<String, Boolean> bulkPresence(List<String> userIds) {
+        List<String> keys = userIds.stream().map(id -> "presence:" + id).toList();
+        List<String> values = redis.opsForValue().multiGet(keys);
+        Map<String, Boolean> result = new HashMap<>();
+        for (int i = 0; i < userIds.size(); i++) {
+            result.put(userIds.get(i), values.get(i) != null);
+        }
+        return result;
+    }
+}
+
+// WebSocket event listeners for connect/disconnect lifecycle
+@Component
+public class WebSocketEventListener {
+    private final PresenceService presence;
+
+    @EventListener
+    public void onConnect(SessionConnectedEvent event) {
+        String userId = event.getUser().getName();
+        presence.heartbeat(userId);
+    }
+
+    @EventListener
+    public void onDisconnect(SessionDisconnectEvent event) {
+        String userId = event.getUser().getName();
+        presence.disconnect(userId);
+    }
+}
+```
+
+## REAL_WORLD
+
+**Discord** runs Elixir processes (not threads) — one process per WebSocket
+connection, ~2KB each. At 2.5M concurrent connections, that's 5GB of process
+state — perfectly manageable. Elixir's BEAM VM provides preemptive scheduling
+so no single process can starve others. Message fan-out uses Erlang's built-in
+distributed PubSub (Phoenix.PubSub backed by Redis or distributed Erlang).
+
+**Slack** introduced a "presence" problem at scale: with 10M+ users, naively
+broadcasting every online/offline event to everyone on the platform is O(N²)
+messages. Their solution: subscriptions. A client explicitly subscribes to
+presence for specific users (teammates, DM contacts). The server only fans out
+presence changes to subscribed clients.
+
+**WhatsApp** uses XMPP (the chat XML protocol) underneath and a custom
+delivery/read receipt system. Every message has a unique ID; the client ACKs
+receipt. Undelivered messages are stored in the server until the recipient
+comes online. This is the canonical at-least-once delivery design.
+
+## INTERVIEW
+
+### Q1 (Junior): Why is HTTP polling inefficient for chat?
+
+Polling sends a request every N seconds. If N=1, you make 60 req/min even with
+no new messages — 99.9% wasted. If N=5, messages are delayed up to 5 seconds.
+WebSockets maintain a persistent connection; the server pushes messages
+instantly with zero polling overhead. Long polling (hold the connection open
+until a message arrives) is a partial improvement but still incurs TCP teardown
+and reconnect overhead on every message.
+
+### Q2 (Mid): How do WebSockets differ from Server-Sent Events (SSE)?
+
+WebSocket: **bidirectional** — both client and server can send messages on the
+same connection. Protocol: WS/WSS (separate from HTTP after upgrade).
+SSE: **server-to-client only** — the client can only send via separate HTTP
+requests. Protocol: standard HTTP with `Content-Type: text/event-stream`.
+For chat (client sends AND receives), WebSocket is required. For notifications
+or live dashboards (server pushes only), SSE is simpler and works through any
+HTTP proxy without the WS upgrade headache.
+
+### Q3 (Mid→Senior): How does Redis pub/sub enable horizontal scaling of WebSocket servers?
+
+Each instance subscribes to the Redis pub/sub channel for the rooms whose
+clients are connected to it. When a message is published to `chat:room:42`,
+Redis delivers it to all subscribing instances. Each instance then writes the
+message to local WebSocket connections. Without Redis (or Kafka), instance A's
+clients never see messages sent by clients connected to instance B.
+
+### Q4 (Senior): How would you handle 1M concurrent WebSocket connections?
+
+1. **Vertical**: each connection is ~10KB state. 1M × 10KB = 10GB RAM. A
+   single server with 64GB RAM can hold ~6M connections at the WebSocket
+   layer. But the CPU becomes the bottleneck if each connection is a thread.
+2. **Non-blocking IO**: use Netty or Vert.x — one event-loop thread per CPU,
+   non-blocking reads. No thread-per-connection. Netty handles 1M connections
+   on 8 threads.
+3. **Gateway tier**: a thin WebSocket gateway (Nginx, HAProxy, Envoy) holds
+   all connections; an application tier handles business logic over a message
+   bus (Kafka). The gateway is stateless except for the socket.
+
+### Q5 (Senior): Design message ordering guarantees for a distributed chat.
+
+Within one room, total ordering is required (messages appear in the same order
+for everyone). Approaches:
+
+1. **Sequence number from DB** — insert to Postgres; the `id` serial or
+   `created_at` timestamp determines order. Simple, correct, single-region.
+2. **Kafka partition per room** — a partition's offset guarantees total order
+   for all messages in that room. Consumers replay from offset on reconnect.
+3. **Lamport clock** — logical timestamp incremented on each send. Causally
+   ordered but not wall-clock ordered. Two concurrent messages from different
+   users may arbitrarily break ties.
+
+Discord uses approach 2 (Kafka partitioned by channel ID). The offset is the
+message's persistent position in history, used for "load messages before ID N".
+
+## FEYNMAN CHECK
+
+Chat is like a walkie-talkie channel: anyone on the frequency hears what
+anyone else broadcasts. The server is the repeater tower that receives your
+transmission and re-broadcasts it to everyone tuned in.
+
+### Q1: Why must the server, not the client, assign message IDs?
+
+Because two clients sending at the same millisecond would both generate
+`id = now()` and collide. The server (or database sequence) is the single
+source of truth for ordering. Client-generated IDs can be used for
+idempotency (deduplication) but should not be used as the canonical
+sequence number.
+
+### Q2: What is a heartbeat and why is it needed for WebSockets?
+
+A heartbeat is a PING frame sent by the server every ~25 seconds. The client
+replies with PONG. If PONG doesn't arrive, the server closes the connection.
+This is needed because TCP's own keep-alive fires after 2 hours by default —
+far too slow to detect a mobile device that lost signal and dropped its
+connection without a TCP FIN. WebSocket heartbeats detect dead connections
+in ~30 seconds.
+
+### Q3: Why store chat messages in a database if they are already published to WebSocket subscribers?
+
+Because subscribers who are offline miss the message. When they reconnect,
+they must request history (`GET /rooms/:id/messages?before=<timestamp>`). If
+messages were never persisted, offline users get a blank history. Persistence
+also enables search, compliance archiving, and showing a room's history to
+new members.
+
+### Q4: What is message fan-out and why is it expensive?
+
+Fan-out = sending one message to N subscribers. A room with 1000 members
+requires 1000 WebSocket writes per message. At 1000 messages/second, that's
+1M writes/second on one server. This is why Discord shards rooms: rooms with
+>10K members are served by dedicated "guild" servers, and the fan-out is
+distributed.
+
+### Q5: What does "typing indicator" require that message delivery does not?
+
+Ephemeral state that expires quickly. A typing indicator fires every 3 seconds
+while the user is typing. You don't want these in the persistent message log.
+They should be pub/sub only (Redis, not DB). The indicator expires automatically
+if no new "typing" event arrives within 5 seconds — no explicit "stopped typing"
+event needed. This is a classic "event with implicit tombstone" pattern.
+
+## BUILD
+
+**Mini-project (4–5 hours):** A group chat with rooms, history, and presence.
+
+### Implement — checklist
+
+- [ ] WebSocket endpoint at `/ws` with STOMP
+- [ ] `POST /rooms` — create a room
+- [ ] `POST /rooms/:id/join` — join a room, receive history (last 50 messages)
+- [ ] Send message via STOMP → persisted to DB → fan-out to room subscribers
+- [ ] Presence via Redis with 30s TTL and heartbeat renewal
+- [ ] Test: two clients in the same room both receive a message sent by one
+- [ ] Test: client rejoining a room receives last 50 messages
+
+### Stretch goals
+
+1. Add typing indicators (ephemeral, Redis pub/sub, no DB).
+2. Add read receipts: `seen_at` per user per message, `POST /messages/:id/read`.
+3. Scale to 2 instances behind a load balancer using Redis pub/sub fan-out.
+
+## SPACED REVIEW
+
+Day 1
+1. What is fan-out in a chat system?
+2. Why is HTTP polling inefficient?
+3. What HTTP status begins a WebSocket upgrade?
+
+Day 3
+4. What are the three message delivery guarantees?
+5. How does Redis pub/sub enable multi-instance WebSocket scaling?
+6. What is a heartbeat and what problem does it solve?
+
+Day 7
+7. Compare WebSocket vs SSE for chat vs notifications.
+8. How does Slack's subscription-based presence reduce N² fan-out?
+9. How would you implement typing indicators without persisting to the DB?
+
+Day 14
+10. Design message ordering guarantees for a distributed chat with 10M users.
+11. How does Discord handle 2.5M concurrent WebSocket connections on single servers?
+12. Describe an at-least-once delivery protocol with client-side deduplication.
+

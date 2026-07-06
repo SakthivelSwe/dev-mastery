@@ -63,20 +63,41 @@ export default function AdminDashboard() {
       <div className="max-w-6xl mx-auto">
 
         {/* Header */}
-        <div className="mb-8">
-          <h1
+        <div className="mb-8 flex items-end justify-between gap-4">
+          <div>
+            <h1
+              style={{
+                fontFamily: 'var(--font-display)',
+                fontSize: '1.9rem',
+                letterSpacing: '-0.015em',
+                color: 'var(--text-primary)',
+              }}
+            >
+              Content admin
+            </h1>
+            <p className="text-[13.5px] mt-1" style={{ color: 'var(--text-muted)' }}>
+              {stats.totalTopics} topics across all learning paths
+            </p>
+          </div>
+          <Link
+            href="/admin/content-health"
+            className="px-3 py-2 rounded-md border text-[13px] whitespace-nowrap transition-colors"
             style={{
-              fontFamily: 'var(--font-display)',
-              fontSize: '1.9rem',
-              letterSpacing: '-0.015em',
+              background: 'var(--bg-surface)',
+              borderColor: 'var(--border-default)',
               color: 'var(--text-primary)',
             }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = 'var(--accent)';
+              e.currentTarget.style.color = 'var(--accent)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = 'var(--border-default)';
+              e.currentTarget.style.color = 'var(--text-primary)';
+            }}
           >
-            Content admin
-          </h1>
-          <p className="text-[13.5px] mt-1" style={{ color: 'var(--text-muted)' }}>
-            {stats.totalTopics} topics across all learning paths
-          </p>
+            Content Health →
+          </Link>
         </div>
 
         {/* Stat tiles */}

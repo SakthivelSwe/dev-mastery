@@ -52,7 +52,8 @@ class ProgressServiceImpl implements ProgressService {
         return new ProgressSummary(userId, totalXp, s.getCurrentStreak(), s.getLongestStreak(),
                 (int) xp.findAll().stream().filter(e -> e.getUserId().equals(userId)
                         && "topic_completed".equals(e.getEventType())).count(),
-                (int) badges.countByUserId(userId));
+                (int) badges.countByUserId(userId),
+                s.getFreezeCount());
     }
 
     @Override
