@@ -36,7 +36,7 @@ public class SecurityConfig {
                     "/api/warmup",
                     "/v1/auth/**",
                     "/v1/ai/**",
-                    "/v1/execute",
+                    "/v1/execute", "/v1/execute/**",
                     "/v1/topics/**", "/v1/paths/**", "/v1/patterns/**",
                     "/v1/system-design/**", "/v1/search/**",
                     "/swagger-ui/**", "/v3/api-docs/**"

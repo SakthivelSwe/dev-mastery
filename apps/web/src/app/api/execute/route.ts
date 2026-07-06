@@ -20,6 +20,14 @@ export const runtime = 'edge';
 
 const PISTON_URL = process.env.PISTON_URL || '';
 
+// Fallback: if PISTON_URL isn't set, forward to the Spring Boot backend's
+// in-process executor (currently supports Java only — see LocalExecutor.java).
+// Same URL your other /api/ai/* edge routes already talk to.
+const RENDER_API_URL =
+  process.env.RENDER_API_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  'https://devmastery-core.onrender.com';
+
 /** Maps our language keys → Piston runtime + a sensible default version. */
 const PISTON_MAP: Record<string, { language: string; version: string; filename: string }> = {
   java:       { language: 'java',       version: '15.0.2',  filename: 'Main.java' },
@@ -76,12 +84,17 @@ export async function POST(req: NextRequest) {
   }
 
   if (!PISTON_URL) {
+    // No Piston — try the Spring Boot backend's built-in executor.
+    // It currently only handles Java, but that covers the primary DevMastery use case.
+    const backendResult = await tryRenderBackend(langKey, sourceCode, stdin);
+    if (backendResult) return NextResponse.json(backendResult);
+
     return NextResponse.json({
       stdout: null, stderr: null, compileOutput: null,
       message:
-        'Server-side code execution is not configured. This app uses Piston (open-source, self-hosted, free forever) ' +
-        `for compiled languages like ${langKey}. Deploy Piston in ~5 minutes and set the PISTON_URL environment variable. ` +
-        'See deploy/piston/README.md in the repository for one-command Fly.io / Render / Docker instructions.',
+        `Server-side execution for "${langKey}" is not available on this deployment. ` +
+        'JavaScript & Python already run in your browser. For compiled languages beyond Java, ' +
+        'deploy Piston in ~5 minutes (see deploy/piston/README.md) and set the PISTON_URL environment variable.',
       statusId: 0,
       statusDescription: 'Runtime Not Deployed',
       time: null, memory: null,
@@ -156,4 +169,34 @@ export async function POST(req: NextRequest) {
     runtime:           'piston',
     _pistonVersion:    p.version ?? null,
   });
+}
+
+/**
+ * Fallback: forward to the Spring Boot backend's built-in executor
+ * (`POST /v1/execute` — implemented by `LocalExecutor.java`).
+ * Currently supports Java only.
+ * Returns null on network / unsupported-language errors so the caller can
+ * fall through to the "not configured" message.
+ */
+async function tryRenderBackend(
+  language: string,
+  sourceCode: string,
+  stdin: string,
+): Promise<any | null> {
+  const SUPPORTED = new Set(['java']);
+  if (!SUPPORTED.has(language)) return null;
+
+  try {
+    const res = await fetch(`${RENDER_API_URL.replace(/\/$/, '')}/v1/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: sourceCode, language, stdin }),
+      // Render free tier cold starts can take 30-45 s.
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }

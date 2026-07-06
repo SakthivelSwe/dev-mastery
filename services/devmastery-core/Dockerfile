@@ -17,10 +17,12 @@ COPY src ./src
 RUN ./gradlew --no-daemon clean bootJar -x test
 
 # ---------- Stage 2: runtime ----------
-FROM eclipse-temurin:21-jre-alpine AS runtime
+# JDK (not JRE) so we can compile & run user-submitted Java code via `javac` / `java`.
+# The +150 MB is worth it — it removes the need for any external code-execution service.
+FROM eclipse-temurin:21-jdk-alpine AS runtime
 WORKDIR /app
 
-# Install curl for healthcheck
+# Install curl for healthcheck. `javac` / `java` come with the JDK image.
 RUN apk add --no-cache curl && \
     addgroup -S app && adduser -S app -G app
 USER app
