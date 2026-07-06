@@ -2,25 +2,119 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'edge';
 
-// ─── Code Execution — proxies to Render backend ───────────────────────────
-//
-// The Render backend (devmastery-core) already has JUDGE0_API_KEY set.
-// This edge route just forwards the request — NO Judge0 keys needed here.
-//
-// Flow:
-//   Browser → /api/execute (Cloudflare Pages Edge)
-//           → NEXT_PUBLIC_API_URL/v1/execute  (Render backend)
-//           → judge029 / judge0-ce (RapidAPI, with auto-fallback)
-//
-// Env var needed (already set everywhere):
-//   NEXT_PUBLIC_API_URL = https://devmastery-core.onrender.com
+// ─── Judge0 Dual-Provider with hardcoded fallback key ─────────────────────
+// API key is server-side only (never sent to browser).
+// Primary: judge029  → Fallback: judge0-ce  (auto-switches on any error/429)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || 'https://devmastery-core.onrender.com';
+const API_KEY =
+  process.env.JUDGE0_API_KEY ||
+  'REDACTED_RAPIDAPI_KEY'; // RapidAPI key
+
+const PROVIDERS = [
+  {
+    name: 'judge029',
+    url:  process.env.JUDGE0_PRIMARY_URL  || 'https://judge029.p.rapidapi.com',
+    host: process.env.JUDGE0_PRIMARY_HOST || 'judge029.p.rapidapi.com',
+  },
+  {
+    name: 'judge0-ce',
+    url:  process.env.JUDGE0_FALLBACK_URL  || 'https://judge0-ce.p.rapidapi.com',
+    host: process.env.JUDGE0_FALLBACK_HOST || 'judge0-ce.p.rapidapi.com',
+  },
+];
+
+const MAX_POLLS    = 20;
+const POLL_DELAY   = 700; // ms
+
+function rapidHeaders(host: string) {
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    'X-RapidAPI-Key':  API_KEY,
+    'X-RapidAPI-Host': host,
+  };
+}
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+function b64(s: string) {
+  if (typeof btoa !== 'undefined') return btoa(unescape(encodeURIComponent(s)));
+  return Buffer.from(s, 'utf-8').toString('base64');
+}
+function unb64(s: string | null | undefined): string | null {
+  if (!s) return null;
+  try {
+    return typeof atob !== 'undefined'
+      ? decodeURIComponent(escape(atob(s)))
+      : Buffer.from(s, 'base64').toString('utf-8');
+  } catch { return s; }
+}
+
+async function submitCode(provider: typeof PROVIDERS[number], sourceCode: string, languageId: number, stdin: string) {
+  try {
+    const res = await fetch(
+      `${provider.url}/submissions?base64_encoded=true&wait=false`,
+      {
+        method: 'POST',
+        headers: rapidHeaders(provider.host),
+        body: JSON.stringify({
+          source_code: b64(sourceCode),
+          language_id: languageId,
+          stdin: b64(stdin),
+        }),
+        signal: AbortSignal.timeout(8_000),
+      }
+    );
+    if (!res.ok) {
+      console.warn(`[execute] ${provider.name} submit HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json() as { token?: string };
+    return data?.token ?? null;
+  } catch (e: any) {
+    console.warn(`[execute] ${provider.name} submit error: ${e?.message}`);
+    return null;
+  }
+}
+
+async function pollResult(provider: typeof PROVIDERS[number], token: string) {
+  for (let i = 0; i < MAX_POLLS; i++) {
+    await sleep(POLL_DELAY);
+    try {
+      const res = await fetch(
+        `${provider.url}/submissions/${token}?base64_encoded=true&fields=stdout,stderr,compile_output,message,status,time,memory`,
+        { headers: rapidHeaders(provider.host), signal: AbortSignal.timeout(6_000) }
+      );
+      if (!res.ok) continue;
+
+      const d = await res.json() as {
+        stdout?: string; stderr?: string; compile_output?: string;
+        message?: string; status?: { id: number; description: string };
+        time?: string; memory?: number;
+      };
+
+      const statusId = d.status?.id ?? 0;
+      if (statusId === 1 || statusId === 2) continue; // still queued/running
+
+      return NextResponse.json({
+        stdout:            unb64(d.stdout),
+        stderr:            unb64(d.stderr),
+        compileOutput:     unb64(d.compile_output),
+        message:           d.message ?? null,
+        statusId,
+        statusDescription: d.status?.description ?? 'Unknown',
+        time:              d.time ? parseFloat(d.time) : null,
+        memory:            d.memory ?? null,
+        _provider:         provider.name,
+      });
+    } catch { continue; }
+  }
+  return null;
+}
 
 export async function POST(req: NextRequest) {
   let body: { sourceCode: string; languageId: number; stdin?: string };
-
   try {
     body = await req.json();
   } catch {
@@ -28,44 +122,23 @@ export async function POST(req: NextRequest) {
   }
 
   const { sourceCode, languageId, stdin = '' } = body;
-
   if (!sourceCode || !languageId) {
     return NextResponse.json({ error: 'sourceCode and languageId are required' }, { status: 400 });
   }
 
-  try {
-    const res = await fetch(`${BACKEND_URL}/v1/execute`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourceCode, languageId, stdin }),
-      // 30s timeout — backend handles up to 10s of polling internally
-      signal: AbortSignal.timeout(30_000),
-    });
+  // Try each provider in order — first success wins
+  for (const provider of PROVIDERS) {
+    const token = await submitCode(provider, sourceCode, languageId, stdin);
+    if (!token) continue;
 
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json({
-        stdout: null, stderr: null, compileOutput: null,
-        message: `Backend error (${res.status}): ${text}`,
-        statusId: res.status, statusDescription: 'Backend Error',
-        time: null, memory: null,
-      });
-    }
-
-    const data = await res.json();
-    return NextResponse.json(data);
-
-  } catch (err: any) {
-    // Render free tier cold start can take ~30s — show helpful message
-    const isTimeout = err?.name === 'TimeoutError' || err?.message?.includes('timeout');
-    return NextResponse.json({
-      stdout: null, stderr: null, compileOutput: null,
-      message: isTimeout
-        ? 'Execution service is warming up (Render free tier cold start). Please wait ~30s and try again.'
-        : `Failed to reach execution service: ${err?.message ?? 'Network error'}`,
-      statusId: 0,
-      statusDescription: isTimeout ? 'Cold Start' : 'Connection Error',
-      time: null, memory: null,
-    });
+    const result = await pollResult(provider, token);
+    if (result) return result;
   }
+
+  return NextResponse.json({
+    stdout: null, stderr: null, compileOutput: null,
+    message: 'Both Judge0 providers failed. Check RapidAPI quota or try again.',
+    statusId: 0, statusDescription: 'Unavailable',
+    time: null, memory: null,
+  });
 }
