@@ -13,8 +13,8 @@
  *   node scripts/audit-content-health.js --json        # print JSON to stdout
  *
  * Outputs:
- *   apps/web/content/_audit/health.json
- *   apps/web/content/_audit/health.md
+ *   apps/web/public/_audit/health.json
+ *   apps/web/public/_audit/health.md
  */
 
 'use strict';
@@ -24,7 +24,9 @@ const path = require('path');
 
 const ROOT         = path.resolve(__dirname, '..');
 const CONTENT_DIR  = path.join(ROOT, 'apps', 'web', 'content');
-const AUDIT_DIR    = path.join(CONTENT_DIR, '_audit');
+// Audit output lives under public/ so the /admin/content-health page can
+// fetch it as a static asset (edge-runtime safe — no node:fs at request time).
+const AUDIT_DIR    = path.join(ROOT, 'apps', 'web', 'public', '_audit');
 
 // ─── The mandatory 9 sections (headings must match exactly) ────────────
 const REQUIRED_SECTIONS = [

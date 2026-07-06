@@ -49,9 +49,11 @@ const PATHS: PathConfig[] = [
   { slug: 'mongodb',            label: 'MongoDB',              icon: <Database size={16} />, color: '#4DB33D',               group: 'Databases' },
   // Fullstack
   { slug: 'full-stack',         label: 'Full Stack',           icon: <BookOpen size={16} />, color: 'var(--accent-ai)',      group: 'Fullstack' },
+  // Real-World Projects (capstone builds — all 10 projects, 100/100 content-health)
+  { slug: 'projects',           label: 'Real-World Projects',  icon: <FlaskConical size={16} />, color: '#F97316',         group: 'Projects' },
 ];
 
-const GROUPS = ['Backend', 'Algorithms', 'Frontend', 'Architecture', 'Databases', 'Fullstack'];
+const GROUPS = ['Backend', 'Algorithms', 'Frontend', 'Architecture', 'Databases', 'Fullstack', 'Projects'];
 
 // ─── Sidebar Component ───────────────────────────────────────
 

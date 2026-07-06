@@ -1,9 +1,9 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import Link from 'next/link';
-import { AlertCircle, CheckCircle2, RefreshCcw, TriangleAlert } from 'lucide-react';
+'use client';
 
-export const dynamic = 'force-dynamic';
+import { useEffect, useState, useMemo } from 'react';
+import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
+import { AlertCircle, CheckCircle2, RefreshCcw, TriangleAlert } from 'lucide-react';
 
 interface TopicReport {
   pathSlug: string;
@@ -40,16 +40,6 @@ interface HealthReport {
   topics: TopicReport[];
 }
 
-async function loadReport(): Promise<HealthReport | null> {
-  const reportPath = path.join(process.cwd(), 'content', '_audit', 'health.json');
-  try {
-    const raw = await fs.readFile(reportPath, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
 function StatusPill({ status }: { status: 'green' | 'yellow' | 'red' }) {
   const map = {
     green:  { bg: '#0f2b1a', fg: '#3FB950', label: 'Healthy' },
@@ -65,13 +55,54 @@ function StatusPill({ status }: { status: 'green' | 'yellow' | 'red' }) {
   );
 }
 
-export default async function ContentHealthPage({
-  searchParams,
-}: { searchParams: Promise<{ path?: string; status?: string }> }) {
-  const report = await loadReport();
-  const params = await searchParams;
+function Stat({ icon, value, label, color }: { icon: React.ReactNode; value: React.ReactNode; label: string; color: string }) {
+  return (
+    <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-4 flex items-center gap-3">
+      <div style={{ color }}>{icon}</div>
+      <div>
+        <div className="text-xl font-semibold text-[#E6EDF3] leading-tight">{value}</div>
+        <div className="text-[12px] text-[#8B949E]">{label}</div>
+      </div>
+    </div>
+  );
+}
 
-  if (!report) {
+export default function ContentHealthPage() {
+  const search = useSearchParams();
+  const pathFilter   = search.get('path')   ?? '';
+  const statusFilter = search.get('status') ?? '';
+
+  const [report, setReport] = useState<HealthReport | null>(null);
+  const [state, setState]   = useState<'loading' | 'ready' | 'missing'>('loading');
+
+  useEffect(() => {
+    fetch('/_audit/health.json', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then((d: HealthReport | null) => {
+        if (d && d.overall) { setReport(d); setState('ready'); }
+        else                { setState('missing'); }
+      })
+      .catch(() => setState('missing'));
+  }, []);
+
+  const topics = useMemo(() => {
+    if (!report) return [] as TopicReport[];
+    return report.topics
+      .filter(t => !pathFilter   || t.pathSlug === pathFilter)
+      .filter(t => !statusFilter || t.status === statusFilter)
+      .sort((a, b) => a.score - b.score);
+  }, [report, pathFilter, statusFilter]);
+
+  if (state === 'loading') {
+    return (
+      <div className="max-w-3xl mx-auto p-8 font-sans">
+        <h1 className="text-2xl font-semibold text-[#E6EDF3] mb-2">Content Health</h1>
+        <p className="text-[#8B949E]">Loading audit report…</p>
+      </div>
+    );
+  }
+
+  if (state === 'missing' || !report) {
     return (
       <div className="max-w-3xl mx-auto p-8 font-sans">
         <h1 className="text-2xl font-semibold text-[#E6EDF3] mb-2">Content Health</h1>
@@ -81,17 +112,12 @@ export default async function ContentHealthPage({
         <pre className="bg-[#161B22] border border-[#30363D] rounded p-4 text-[13px] text-[#E6EDF3]">
           npm run content:audit
         </pre>
+        <p className="text-[12px] text-[#8B949E] mt-3">
+          The audit writes to <code>apps/web/public/_audit/health.json</code>, which this page fetches at runtime.
+        </p>
       </div>
     );
   }
-
-  const pathFilter   = params.path ?? '';
-  const statusFilter = params.status ?? '';
-
-  const topics = report.topics
-    .filter(t => !pathFilter   || t.pathSlug === pathFilter)
-    .filter(t => !statusFilter || t.status === statusFilter)
-    .sort((a, b) => a.score - b.score);
 
   return (
     <div className="max-w-7xl mx-auto p-8 font-sans">
@@ -213,16 +239,3 @@ export default async function ContentHealthPage({
     </div>
   );
 }
-
-function Stat({ icon, value, label, color }: { icon: React.ReactNode; value: React.ReactNode; label: string; color: string }) {
-  return (
-    <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-4 flex items-center gap-3">
-      <div style={{ color }}>{icon}</div>
-      <div>
-        <div className="text-xl font-semibold text-[#E6EDF3] leading-tight">{value}</div>
-        <div className="text-[12px] text-[#8B949E]">{label}</div>
-      </div>
-    </div>
-  );
-}
-
