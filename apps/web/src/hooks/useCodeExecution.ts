@@ -9,6 +9,8 @@ export interface CodeExecutionResult {
   statusDescription: string | null;
   time: number | null;
   memory: number | null;
+  /** URL the user should visit to fix the error (e.g. RapidAPI subscription page). */
+  actionUrl?: string | null;
 }
 
 export function useCodeExecution() {
