@@ -26,9 +26,10 @@ async function getCertificate(credentialId: string): Promise<Certificate | null>
 }
 
 export async function generateMetadata(
-  { params }: { params: { credentialId: string } }
+  { params }: { params: Promise<{ credentialId: string }> }
 ): Promise<Metadata> {
-  const cert = await getCertificate(params.credentialId);
+  const { credentialId } = await params;
+  const cert = await getCertificate(credentialId);
   if (!cert) return { title: 'Certificate Not Found — DevMastery' };
   return {
     title: `${cert.pathTitle} Certificate — DevMastery`,
@@ -41,9 +42,10 @@ export async function generateMetadata(
 }
 
 export default async function CertificateVerifyPage(
-  { params }: { params: { credentialId: string } }
+  { params }: { params: Promise<{ credentialId: string }> }
 ) {
-  const cert = await getCertificate(params.credentialId);
+  const { credentialId } = await params;
+  const cert = await getCertificate(credentialId);
 
   if (!cert) {
     return (
