@@ -29,14 +29,18 @@ export function CodeEditorShell({ initialCode, languageId, languageString = 'jav
   const [code, setCode] = useState(initialCode);
   const { executeCode, result, isExecuting } = useCodeExecution();
 
+  const lang = languageString.toLowerCase();
+  const runsInBrowser = lang === 'javascript' || lang === 'python';
+
   const handleRun = () => {
-    const id = languageId ?? LANGUAGE_IDS[languageString.toLowerCase()] ?? 62;
-    executeCode(code, id);
+    // Prefer the language string; fall back to the legacy numeric ID if that's all we have.
+    executeCode(code, lang || languageId || 'java');
   };
 
   const isSuccess     = result?.statusId === STATUS_SUCCESS;
   const isNotConfig   = result?.statusId === STATUS_NOT_CONFIGURED && result?.statusDescription === 'Not Configured';
-  const isUnavailable = result?.statusId === STATUS_NOT_CONFIGURED && result?.statusDescription === 'Unavailable';
+  const isUnavailable = result?.statusId === STATUS_NOT_CONFIGURED &&
+    (result?.statusDescription === 'Unavailable' || result?.statusDescription === 'Runtime Not Deployed');
   const isConnErr     = result?.statusDescription === 'Connection Error' || result?.statusDescription === 'Timeout' || result?.statusDescription === 'Cold Start';
 
   return (
@@ -72,6 +76,20 @@ export function CodeEditorShell({ initialCode, languageId, languageString = 'jav
           >
             {languageString.toUpperCase()} EDITOR
           </span>
+          {runsInBrowser && (
+            <span
+              className="text-[9.5px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-md ml-1"
+              style={{
+                background: 'rgba(98, 201, 122, 0.12)',
+                color: '#62C97A',
+                border: '1px solid rgba(98, 201, 122, 0.3)',
+                fontFamily: 'var(--font-code)',
+              }}
+              title="Runs securely in your browser — no server round-trip"
+            >
+              ⚡ Runs in browser
+            </span>
+          )}
         </div>
 
         <button
@@ -228,26 +246,23 @@ JUDGE0_API_HOST=judge029.p.rapidapi.com`}</pre>
                     )}
                   </div>
                 ) : isUnavailable ? (
-                  /* Judge0 not subscribed / quota exhausted — surface a direct action */
+                  /* Piston not deployed yet — point to self-hosting docs */
                   <div
                     className="rounded-lg p-4"
                     style={{
-                      background: 'rgba(255, 166, 87, 0.07)',
-                      border: '1px solid rgba(255, 166, 87, 0.25)',
+                      background: 'rgba(124, 143, 240, 0.07)',
+                      border: '1px solid rgba(124, 143, 240, 0.25)',
                     }}
                   >
-                    <p className="text-[12.5px] font-semibold mb-2 flex items-center gap-1.5" style={{ color: '#ffa657' }}>
-                      <AlertCircle size={13} /> Code execution needs one-time activation
+                    <p className="text-[12.5px] font-semibold mb-2 flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
+                      <AlertCircle size={13} /> Server-side runtime not deployed
                     </p>
                     <p className="text-[12px] mb-3" style={{ color: '#c9d1d9', lineHeight: 1.6 }}>
                       {result.message}
                     </p>
-                    <ol className="text-[11.5px] mb-3 pl-4 list-decimal space-y-1" style={{ color: '#8b949e', lineHeight: 1.6 }}>
-                      <li>Click the link below (opens RapidAPI in a new tab).</li>
-                      <li>Sign in with your existing RapidAPI account.</li>
-                      <li>Click <b style={{ color: '#c9d1d9' }}>Subscribe to Test</b> on the <b style={{ color: '#62C97A' }}>Basic (Free)</b> plan — no credit card required.</li>
-                      <li>Come back here and click <b style={{ color: '#c9d1d9' }}>Run Code</b> again.</li>
-                    </ol>
+                    <p className="text-[11.5px] mb-3" style={{ color: '#8b949e', lineHeight: 1.6 }}>
+                      <b style={{ color: '#c9d1d9' }}>Good news:</b> JavaScript and Python already run instantly right here in your browser — zero infrastructure needed. For compiled languages ({lang}), deploy the open-source Piston sandbox once and set the <code style={{ color: '#62C97A' }}>PISTON_URL</code> environment variable. Free forever, no API keys.
+                    </p>
                     {result.actionUrl && (
                       <a
                         href={result.actionUrl}
@@ -255,12 +270,12 @@ JUDGE0_API_HOST=judge029.p.rapidapi.com`}</pre>
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1.5 text-[12px] font-semibold px-3 py-1.5 rounded-md transition-all"
                         style={{
-                          background: 'rgba(255, 166, 87, 0.15)',
-                          border: '1px solid rgba(255, 166, 87, 0.4)',
-                          color: '#ffa657',
+                          background: 'rgba(124, 143, 240, 0.15)',
+                          border: '1px solid rgba(124, 143, 240, 0.4)',
+                          color: 'var(--accent)',
                         }}
                       >
-                        <ExternalLink size={12} /> Subscribe on RapidAPI (free)
+                        <ExternalLink size={12} /> How to deploy Piston (5 min)
                       </a>
                     )}
                   </div>
