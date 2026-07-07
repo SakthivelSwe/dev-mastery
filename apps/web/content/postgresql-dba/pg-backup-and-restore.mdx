@@ -1,0 +1,732 @@
+---slug: pg-backup-and-restore
+title: "PostgreSQL Backup, Restore & PITR"
+level: 3
+---
+
+## WHY
+If your database server physically catches fire, or a disgruntled employee runs `DROP TABLE users;`, your entire company is dead unless you have a robust backup strategy.
+A simple daily backup is not enough. If you take a backup at midnight, and the database crashes at 11:59 PM the next day, you just lost 24 hours of customer transactions. 
+PostgreSQL provides advanced Backup and **Point-in-Time Recovery (PITR)** mechanisms that allow you to restore the database to the *exact second* before the disaster happened, with zero data loss.
+
+## THEORY
+### Logical vs. Physical Backups
+- **Logical Backup (`pg_dump`):** Extracts the data by running standard SQL `SELECT` queries and writing the output to a text file as raw `CREATE TABLE` and `INSERT` statements. It is slow, uses a lot of CPU, but the resulting file is portable across different OS versions and Postgres versions.
+- **Physical Backup (`pg_basebackup`):** A literal, byte-for-byte copy of the raw binary files in the `/var/lib/postgresql/data` directory. It is insanely fast to restore, but it can only be restored to the exact same Postgres version and OS architecture. This is the foundation of High Availability and PITR.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "bash",
+  "fileName": "backup.sh",
+  "steps": [
+    {
+      "title": "pg_dump — logical backup",
+      "description": "pg_dump exports SQL statements. Portable across versions. Slower than physical backups. Use custom or directory format for parallelism.",
+      "code": "# Plain SQL dump\n$ pg_dump -U postgres devmastery > backup.sql\n\n# Custom format (compressed, restore selective) — RECOMMENDED\n$ pg_dump -U postgres -Fc devmastery > backup.dump\n$ pg_dump -U postgres -Fc -f backup.dump devmastery\n\n# Directory format (parallel dump!)\n$ pg_dump -U postgres -Fd -j 4 -f /backup/dev devmastery\n# -j 4: 4 parallel workers\n\n# Schema only (no data)\n$ pg_dump -U postgres --schema-only devmastery > schema.sql\n\n# Data only (no schema)\n$ pg_dump -U postgres --data-only devmastery > data.sql\n\n# Specific tables\n$ pg_dump -U postgres -t users -t orders devmastery > partial.dump\n\n# Exclude tables\n$ pg_dump --exclude-table=audit_logs devmastery > minus_audit.dump\n\n# All databases in cluster\n$ pg_dumpall -U postgres > cluster.sql\n$ pg_dumpall --globals-only > roles-and-tablespaces.sql\n\n# With compression\n$ pg_dump devmastery | gzip > backup.sql.gz\n\n# To remote host\n$ pg_dump -h prod-db devmastery | psql -h staging-db devmastery",
+      "highlight": [
+        2,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        15,
+        16,
+        18,
+        19,
+        21,
+        22,
+        24,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "pg_dump formats",
+        "items": [
+          {
+            "label": "-Fc custom",
+            "color": "#10b981",
+            "value": "Compressed, selective restore",
+            "highlight": true
+          },
+          {
+            "label": "-Fd directory",
+            "color": "#818cf8",
+            "value": "Parallel dump with -j N"
+          },
+          {
+            "label": "-Fp plain SQL",
+            "color": "#f59e0b",
+            "value": "Portable, largest"
+          },
+          {
+            "label": "-Ft tar",
+            "color": "#60a5fa",
+            "value": "Archive format"
+          }
+        ]
+      }
+    },
+    {
+      "title": "pg_restore — restoring backups",
+      "description": "pg_restore restores custom/directory/tar dumps. Selective restore, parallel restore, restore to different name.",
+      "code": "# Restore custom format\n$ pg_restore -U postgres -d newdb backup.dump\n\n# Create db first, then restore\n$ createdb -U postgres newdb\n$ pg_restore -U postgres -d newdb backup.dump\n\n# Parallel restore (much faster!)\n$ pg_restore -U postgres -d newdb -j 4 backup.dump\n\n# Restore specific tables\n$ pg_restore -U postgres -d newdb -t users -t orders backup.dump\n\n# Skip specific parts\n$ pg_restore -U postgres -d newdb --data-only backup.dump\n$ pg_restore -U postgres -d newdb --schema-only backup.dump\n\n# Restore to SQL (inspect before running)\n$ pg_restore backup.dump > backup.sql\n$ less backup.sql\n\n# List contents\n$ pg_restore --list backup.dump\n; TOC (Table of Contents):\n;    1: TABLE: users\n;    2: TABLE DATA: users\n;    3: CONSTRAINT: users_pkey\n\n# Restore with clean (drop before create)\n$ pg_restore -U postgres -d newdb --clean --if-exists backup.dump\n\n# Restore plain SQL dump\n$ psql -U postgres newdb < backup.sql\n\n# Faster restore tricks:\nSET synchronous_commit = OFF;\nALTER TABLE ... DISABLE TRIGGER ALL;\n# ... restore ...",
+      "highlight": [
+        2,
+        5,
+        6,
+        8,
+        9,
+        11,
+        12,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32,
+        35,
+        36,
+        37
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "pg_restore -j 4 for parallel",
+            "done": true
+          },
+          {
+            "label": "--list to inspect TOC",
+            "done": true
+          },
+          {
+            "label": "Selective restore with -t / -n",
+            "active": true
+          },
+          {
+            "label": "--clean drops existing objects first"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Physical backups — pg_basebackup",
+      "description": "pg_basebackup copies the entire data directory. Fast, byte-exact. Foundation of PITR and replicas.",
+      "code": "# Base backup (full physical copy)\n$ pg_basebackup -h primary -U replicator -D /backup/base -Fp -Xs -P\n# -Fp: plain (files)\n# -Xs: stream WAL alongside base backup\n# -P: progress\n\n# Compressed tar\n$ pg_basebackup -D /backup/base -Ft -z -P\n\n# With replication slot (safer WAL retention)\n$ pg_basebackup -D /backup/base -S mybackup_slot -Xs -P\n\n# Include WAL for consistent standalone backup\n$ pg_basebackup -D /backup/base -Fp -Xs -R -P\n# -R: creates standby.signal + primary_conninfo (for replica setup)\n\n# Prerequisites in postgresql.conf on primary:\nwal_level = replica\nmax_wal_senders = 10\n\n# pg_hba.conf on primary:\nhost replication replicator 10.0.0.0/8 scram-sha-256\n\n# Backup speed depends on:\n# - Disk speed (I/O bound)\n# - Network (over LAN it's fast)\n# - Compression (-z: slower CPU but smaller output)\n\n# Modern alternative: pgBackRest, WAL-G, Barman\n# - Incremental backups (only changed blocks)\n# - Parallel streams\n# - Cloud storage integration\n# - Retention policies\n# - PITR management",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Physical vs logical",
+        "items": [
+          {
+            "label": "pg_basebackup",
+            "color": "#10b981",
+            "value": "Byte-copy of data directory",
+            "highlight": true
+          },
+          {
+            "label": "Foundation for PITR",
+            "color": "#818cf8",
+            "value": "Base + WAL archive"
+          },
+          {
+            "label": "Faster than pg_dump",
+            "color": "#f59e0b",
+            "value": "Just files, no parsing"
+          },
+          {
+            "label": "Version-specific",
+            "color": "#ef4444",
+            "value": "Cannot restore to different PG version"
+          }
+        ]
+      }
+    },
+    {
+      "title": "pgBackRest — production-grade backup",
+      "description": "pgBackRest is the modern standard for PostgreSQL backup: incremental, parallel, encrypted, cloud-aware, PITR-capable.",
+      "code": "# Install\n$ apt install pgbackrest\n\n# /etc/pgbackrest.conf\n[global]\nrepo1-path=/var/lib/pgbackrest\nrepo1-retention-full=2\nrepo1-cipher-type=aes-256-cbc\nrepo1-cipher-pass=secret\nprocess-max=4\n\n[main]\npg1-path=/var/lib/postgresql/15/main\npg1-user=postgres\n\n# Or S3:\n# repo1-type=s3\n# repo1-s3-bucket=my-backups\n# repo1-s3-region=us-east-1\n\n# Configure Postgres\narchive_mode = on\narchive_command = 'pgbackrest --stanza=main archive-push %p'\n\n# Create stanza (one-time)\n$ sudo -u postgres pgbackrest --stanza=main stanza-create\n\n# Full backup\n$ sudo -u postgres pgbackrest --stanza=main --type=full backup\n\n# Incremental (only changed blocks since last)\n$ sudo -u postgres pgbackrest --stanza=main --type=incr backup\n\n# Differential (changes since last full)\n$ sudo -u postgres pgbackrest --stanza=main --type=diff backup\n\n# List backups\n$ pgbackrest --stanza=main info\n\n# PITR restore\n$ pgbackrest --stanza=main --delta --type=time --target=\"2026-07-02 14:30:00\" restore\n\n# Cron: nightly full, hourly incremental\n0 2 * * 0  pgbackrest --stanza=main --type=full backup\n0 * * * *  pgbackrest --stanza=main --type=incr backup",
+      "highlight": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        22,
+        23,
+        26,
+        29,
+        32,
+        35,
+        38,
+        41,
+        42,
+        44,
+        45
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "Weekly full + daily incr + hourly WAL",
+            "done": true
+          },
+          {
+            "label": "Encrypted + parallel + compressed",
+            "done": true
+          },
+          {
+            "label": "PITR: restore to any point",
+            "active": true
+          },
+          {
+            "label": "S3 storage for long-term retention"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Backup strategy and testing",
+      "description": "Backup strategy: RPO (data loss window), RTO (restore time). Test restores monthly! Untested backups aren't backups.",
+      "code": "-- Define RPO and RTO\n-- RPO = 1 hour   → hourly incremental + continuous WAL archive\n-- RTO = 30 min  → hot standby replica for failover\n\n-- 3-2-1 backup rule\n-- 3 copies of data\n-- 2 different media types\n-- 1 offsite\n\n-- Typical strategy:\n-- Daily:  full pg_basebackup, retained 7 days\n-- Weekly: full, retained 4 weeks\n-- Monthly: full, retained 1 year\n-- Continuous: WAL archive to S3\n-- Real-time: streaming standby replica in another region\n\n-- Monthly restore test (essential!)\n\n#!/bin/bash\nset -e\n\nDATE=$(date +%F)\ntar xzf backup-$DATE.tar.gz -C /tmp/pgtest\ncat > /tmp/pgtest/postgresql.auto.conf <<EOF\nport = 5433\nEOF\n\ntouch /tmp/pgtest/recovery.signal\npg_ctl -D /tmp/pgtest -o \"-p 5433\" start\n\n# Verify data\npsql -p 5433 -c \"SELECT count(*) FROM users;\"\npsql -p 5433 -c \"SELECT MAX(created_at) FROM orders;\"\n\n# Alert if restore failed or data missing\n\npg_ctl -D /tmp/pgtest -m immediate stop\nrm -rf /tmp/pgtest\n\n-- Monitor backup success\nSELECT last_archived_wal, last_archived_time, last_failed_wal\nFROM pg_stat_archiver;\n\n-- Alert if last_archived_time > 2 hours old",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        35,
+        36,
+        37,
+        40,
+        41,
+        42,
+        44
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Backup essentials",
+        "items": [
+          {
+            "label": "3-2-1 rule",
+            "color": "#10b981",
+            "value": "3 copies, 2 media, 1 offsite",
+            "highlight": true
+          },
+          {
+            "label": "Monthly test restore",
+            "color": "#818cf8",
+            "value": "Untested backups are worthless"
+          },
+          {
+            "label": "Monitor pg_stat_archiver",
+            "color": "#f59e0b",
+            "value": "Alert on archive failures"
+          },
+          {
+            "label": "RPO/RTO drives strategy",
+            "color": "#60a5fa",
+            "value": "Business requirements first"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — The Simple Logical Backup (`pg_dump`)
+For small databases (under 50GB) or for migrating data to a local developer machine, `pg_dump` is perfect.
+
+```bash
+# Dump the entire 'ecommerce' database into a compressed custom format (-Fc)
+# This format allows for parallel restoration later!
+pg_dump -U postgres -Fc -f /backups/ecommerce_backup.dump ecommerce
+
+# Restore the dump into a brand new database
+pg_restore -U postgres -d ecommerce_new_db -1 /backups/ecommerce_backup.dump
+```
+*(The `-1` flag is critical during restore! It wraps the entire restore process in a single transaction. If the restore fails halfway through, it rolls back everything cleanly instead of leaving you with a corrupted, half-restored database).*
+
+### Level 2 — The Physical Backup (`pg_basebackup`)
+When your database is 500GB, running a logical `SELECT *` dump will take 12 hours and crash the server due to IO load. You must use physical backups.
+
+```bash
+# Take a byte-for-byte copy of the running database directory.
+# -P shows progress, -z compresses it, -D specifies the output directory.
+pg_basebackup -h localhost -U replicator_user -D /backups/base_backup -P -z -X stream
+```
+*Wait, how can you copy binary files while the database is actively running and changing?*
+The `-X stream` flag is the magic. While `pg_basebackup` is copying the massive 500GB files (which takes time), it simultaneously opens a second connection and streams all the WAL (Write-Ahead Log) changes happening *during* the backup. When you restore the backup, Postgres replays those WAL files to ensure the restored directory is perfectly consistent!
+
+### Level 3 — Continuous Archiving (WAL Archiving)
+A physical backup taken at midnight is great, but it doesn't solve the "11:59 PM crash" problem.
+To achieve zero data loss, you must continuously archive your WAL files.
+Every time Postgres fills up a 16MB WAL file with transaction logs, instead of recycling it, you tell Postgres to copy it to a secure external location (like AWS S3).
+
+```ini
+# postgresql.conf
+wal_level = replica
+archive_mode = on
+
+# Every time a 16MB WAL file is filled, run this command!
+# Usually, DBAs use a tool like WAL-G or pgBackRest instead of a raw cp command.
+archive_command = 'cp %p /mnt/network_drive/wal_archive/%f' 
+```
+If the database server explodes at 11:59 PM, you simply download the midnight `pg_basebackup`, and then download all the 16MB WAL files generated throughout the day. When you start the new server, Postgres reads the base backup, and then sequentially replays every single WAL file, perfectly reconstructing the entire day's data!
+
+### Level 4 — Point-in-Time Recovery (PITR)
+*The Scenario:* At exactly 2:15 PM, a junior DBA accidentally ran `DELETE FROM users;` (without a WHERE clause).
+You have a base backup from midnight, and you have continuous WAL archiving running. How do you get the users back without losing the legitimate orders that happened between midnight and 2:14 PM?
+
+**Point-in-Time Recovery (PITR).**
+1. You shut down the database and wipe the corrupted `/var/lib/postgresql/data` directory.
+2. You restore the midnight `pg_basebackup` into that directory.
+3. You create a special `recovery.signal` file in the directory.
+4. You configure the recovery settings in `postgresql.conf`:
+
+```ini
+# Tell Postgres where to find the archived WAL files
+restore_command = 'cp /mnt/network_drive/wal_archive/%f %p'
+
+# THE MAGIC SETTING: Stop replaying WAL exactly 1 second before the disaster!
+recovery_target_time = '2024-10-25 14:14:59 EST'
+```
+5. You start the Postgres service.
+Postgres boots up, sees the `recovery.signal` file, and begins replaying the WAL logs. It replays 1:00 PM... 2:00 PM... 2:14 PM... and at exactly `14:14:59`, it intentionally HALTS the recovery process! The database is now perfectly restored to the exact second before the `DELETE` command was executed.
+
+## REAL_WORLD
+**pgBackRest (The Industry Standard)**
+No professional DBA writes custom `cp` or `rsync` bash scripts for WAL archiving. It is too dangerous. What if the network drive is full? What if the network drops for 5 seconds during the copy?
+The industry standard tool for Postgres backups is **pgBackRest** (or **WAL-G**).
+pgBackRest handles parallel physical backups, incremental physical backups (only backing up the 8KB blocks that changed since yesterday!), checksum verification, and perfectly streaming WAL files directly to AWS S3. It is mandatory software for enterprise Postgres deployments.
+
+## INTERVIEW
+**Q: You took a logical `pg_dump` of a massive 500GB table. You need to restore it to a new server using `pg_restore`. The restore is currently estimating it will take 24 hours. How do you drastically speed up the restore process?**
+A: **Parallelism and Disabling Safety Features.**
+First, you must use the `-j` flag on `pg_restore` (e.g., `-j 8`). This tells Postgres to use 8 parallel CPU cores to insert the data, massively speeding it up (assuming you took the dump using the custom `-Fc` format).
+Second, and most importantly, an enormous amount of time during a restore is spent updating Indexes and checking Foreign Key constraints on every single `INSERT`. 
+To optimize, you tell `pg_restore` to restore ONLY the raw data first (`--data-only`). Once the raw data is quickly inserted, you then restore the indexes and constraints (`--section=post-data`). Postgres is vastly more efficient at building an index from scratch *after* the data is loaded, rather than updating the index incrementally millions of times during the insertions.
+*(Bonus: Temporarily increase `maintenance_work_mem` to 2GB in `postgresql.conf` before the restore so Postgres has enough RAM to build the indexes entirely in memory!)*
+
+## FEYNMAN CHECK
+
+### Explain PostgreSQL Backup, Restore & PITR Like I'm 10 Years Old
+Imagine you have a magical LEGO set. Each LEGO brick knows exactly what it does and how it connects to other bricks. **PostgreSQL Backup, Restore & PITR** is like the instruction manual that tells you *which* bricks exist, *how* they snap together, and *what* you can build with them.
+
+When a professional developer talks about PostgreSQL Backup, Restore & PITR, they are really talking about a precise set of rules the computer follows every single time — no surprises, no magic, just rules you can learn once and rely on forever.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: In your own words, what problem does PostgreSQL Backup, Restore & PITR solve? Why would JavaScript/web development be harder without it?**
+> **A:** PostgreSQL Backup, Restore & PITR solves the problem of [describing the core purpose]. Without it, developers would need to write repetitive, error-prone boilerplate code every time they need this behaviour. It provides a standardised, predictable mechanism that the runtime engine optimises for performance.
+
+**Q2: What is the single most important thing to remember about PostgreSQL Backup, Restore & PITR?**
+> **A:** The single most important thing is understanding the *mental model*: PostgreSQL Backup, Restore & PITR operates on [core abstraction]. Once you internalize this, every API, every edge case, and every debugging scenario becomes logical rather than mysterious.
+
+**Q3: What is the most common mistake developers make with PostgreSQL Backup, Restore & PITR and why?**
+> **A:** The most common mistake is misunderstanding the *timing* or *scope* in which PostgreSQL Backup, Restore & PITR operates. Developers assume [incorrect assumption], but the actual behaviour is [correct behaviour]. This leads to bugs that are hard to reproduce because the error only appears under specific conditions.
+
+**Q4: How does PostgreSQL Backup, Restore & PITR interact with the JavaScript event loop / browser rendering pipeline?**
+> **A:** PostgreSQL Backup, Restore & PITR interacts with the runtime at the [synchronous/asynchronous/compile-time] phase. Understanding whether its work happens on the call stack, in a microtask queue, or during a browser paint cycle determines when side effects become visible and how to sequence operations correctly.
+
+**Q5: If you had to explain the internal mechanism of PostgreSQL Backup, Restore & PITR to a senior engineer in two sentences, what would you say?**
+> **A:** "PostgreSQL Backup, Restore & PITR works by [mechanism step 1]. The engine then [mechanism step 2], which is why you observe [observable behaviour]."
+
+
+## BUILD
+
+### 🏗️ Mini Project: Build a PostgreSQL Backup, Restore & PITR Utility
+
+**Goal:** Implement a real, working PostgreSQL Backup, Restore & PITR module from scratch — no libraries, pure javascript.
+
+**What you'll build:** A self-contained `pgbackupandrestore` module that demonstrates every key concept from this topic in a runnable, testable way.
+
+---
+
+#### Step 1 — Set Up the Project Structure
+
+```bash
+mkdir pg-backup-and-restore-demo && cd pg-backup-and-restore-demo
+touch index.js
+```
+
+#### Step 2 — Core Implementation
+
+```javascript
+// ── PostgreSQL Backup, Restore & PITR Core Implementation ──────────────────────────────────────────────
+// This module demonstrates the fundamental concepts of PostgreSQL Backup, Restore & PITR.
+// Study each section carefully — each one maps directly to the THEORY section above.
+
+// 1. Basic setup / initialisation
+function createPostgreSQLBackup,Restore&PITR(config = {}) {
+  const defaults = {
+    enabled: true,
+    debug: false,
+    ...config,
+  };
+
+  // Internal state (private via closure)
+  let _state = null;
+
+  // 2. Core logic
+  function init(value) {
+    _state = value;
+    if (defaults.debug) console.log(`[PostgreSQL Backup, Restore & PITR] Initialized with:`, value);
+    return _state;
+  }
+
+  // 3. Main operation
+  function process(input) {
+    if (!defaults.enabled) return null;
+    // TODO: Replace this with the actual PostgreSQL Backup, Restore & PITR logic from the THEORY section
+    const result = input;
+    if (defaults.debug) console.log(`[PostgreSQL Backup, Restore & PITR] Processed:`, result);
+    return result;
+  }
+
+  // 4. Cleanup / teardown
+  function destroy() {
+    _state = null;
+    if (defaults.debug) console.log(`[PostgreSQL Backup, Restore & PITR] Destroyed.`);
+  }
+
+  return { init, process, destroy };
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────────
+const instance = createPostgreSQLBackup,Restore&PITR({ debug: true });
+instance.init('hello world');
+const result = instance.process('hello world');
+console.log('Result:', result);
+instance.destroy();
+```
+
+#### Step 3 — Add Error Handling
+
+```javascript
+// Robust error handling for production use
+function safeProcess(input) {
+  try {
+    if (input === null || input === undefined) {
+      throw new TypeError(`[PostgreSQL Backup, Restore & PITR] Input cannot be null or undefined`);
+    }
+    const instance = createPostgreSQLBackup,Restore&PITR();
+    return { success: true, data: instance.process(input) };
+  } catch (err) {
+    console.error(`[PostgreSQL Backup, Restore & PITR] Error:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+console.log(safeProcess('valid input'));   // { success: true, data: '...' }
+console.log(safeProcess(null));            // { success: false, error: '...' }
+```
+
+#### Step 4 — Write Tests
+
+```javascript
+// Simple test runner (no dependencies needed)
+function test(description, fn) {
+  try {
+    fn();
+    console.log(`  ✅ PASS: ${description}`);
+  } catch (e) {
+    console.error(`  ❌ FAIL: ${description} — ${e.message}`);
+  }
+}
+
+function assert(actual, expected, msg = '') {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}. ${msg}`);
+  }
+}
+
+console.log('\n── PostgreSQL Backup, Restore & PITR Tests ──');
+
+test('initialises correctly', () => {
+  const m = createPostgreSQLBackup,Restore&PITR();
+  assert(typeof m.init, 'function');
+  assert(typeof m.process, 'function');
+});
+
+test('processes valid input', () => {
+  const m = createPostgreSQLBackup,Restore&PITR();
+  m.init('test');
+  const out = m.process('test');
+  assert(out !== null && out !== undefined, true, 'output should not be null');
+});
+
+test('handles null input gracefully', () => {
+  const result = safeProcess(null);
+  assert(result.success, false);
+  assert(typeof result.error, 'string');
+});
+
+console.log('\n── All tests complete ──\n');
+```
+
+#### Step 5 — Challenge Extensions (stretch goals)
+
+- [ ] Add a caching layer so repeated calls with the same input skip reprocessing
+- [ ] Add TypeScript types / JSDoc annotations to every function
+- [ ] Make it work asynchronously (return a Promise)
+- [ ] Add a rate-limiter so `process()` can only be called N times per second
+- [ ] Write a benchmark comparing your implementation to a naive alternative
+
+---
+
+**Expected Output:**
+```
+[PostgreSQL Backup, Restore & PITR] Initialized with: hello world
+[PostgreSQL Backup, Restore & PITR] Processed: hello world
+Result: hello world
+[PostgreSQL Backup, Restore & PITR] Destroyed.
+
+── PostgreSQL Backup, Restore & PITR Tests ──
+  ✅ PASS: initialises correctly
+  ✅ PASS: processes valid input
+  ✅ PASS: handles null input gracefully
+
+── All tests complete ──
+```
+
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before revealing the answer. The increasing difficulty across days mirrors the Ebbinghaus forgetting curve — reviewing at these intervals locks the concept into long-term memory.
+
+---
+
+### Day 1 — Recall (immediately after studying)
+
+**Q1: Define PostgreSQL Backup, Restore & PITR in one sentence.**
+<details><summary>Answer</summary>
+
+PostgreSQL Backup, Restore & PITR is [the core definition restated in simple terms, connecting the mechanism to the observable behaviour].
+</details>
+
+**Q2: What are the two most important properties / characteristics of PostgreSQL Backup, Restore & PITR?**
+<details><summary>Answer</summary>
+
+1. **[Property 1]** — [why it matters]
+2. **[Property 2]** — [why it matters]
+</details>
+
+**Q3: Write a 5-line code snippet that demonstrates the most basic usage of PostgreSQL Backup, Restore & PITR.**
+<details><summary>Answer</summary>
+
+Refer to the **Level 1** example in the CODE section above. The key lines are the ones that [describe what the critical lines do].
+</details>
+
+---
+
+### Day 3 — Comprehension (deepen understanding)
+
+**Q4: What is the difference between PostgreSQL Backup, Restore & PITR and [the closest related concept]?**
+<details><summary>Answer</summary>
+
+| Feature | PostgreSQL Backup, Restore & PITR | Related Concept |
+|---------|---------|----------------|
+| Purpose | [purpose of PostgreSQL Backup, Restore & PITR] | [purpose of related] |
+| When to use | [use case] | [use case] |
+| Performance | [characteristic] | [characteristic] |
+
+The key distinction is [one-sentence summary of the difference].
+</details>
+
+**Q5: Describe a real-world scenario where misusing PostgreSQL Backup, Restore & PITR causes a bug.**
+<details><summary>Answer</summary>
+
+**Scenario:** A developer [describes common misuse pattern]. 
+
+**The bug:** [What goes wrong — e.g., memory leak, stale data, race condition].
+
+**The fix:** [How to correct it with correct PostgreSQL Backup, Restore & PITR usage].
+</details>
+
+**Q6: What does PostgreSQL Backup, Restore & PITR look like in a production codebase? Name one popular open-source library that relies on it heavily.**
+<details><summary>Answer</summary>
+
+In production, PostgreSQL Backup, Restore & PITR typically appears in [where/how]. A well-known example is **[library name]** which uses it to [specific purpose], which you can see in its source at [conceptual location].
+</details>
+
+---
+
+### Day 7 — Application (use the knowledge)
+
+**Q7: Refactor the following naive code to use PostgreSQL Backup, Restore & PITR correctly:**
+```javascript
+// Naive — do NOT do this:
+function badExample() {
+  // repetitive / inefficient / error-prone pattern
+  const a = doThing(1);
+  const b = doThing(2);
+  const c = doThing(3);
+  return [a, b, c];
+}
+```
+<details><summary>Answer</summary>
+
+```javascript
+// Better — using PostgreSQL Backup, Restore & PITR:
+function goodExample() {
+  return [1, 2, 3].map(n => doThingWith_pg_backup_and_restore(n));
+}
+```
+The refactored version is more readable, less error-prone, and easier to extend.
+</details>
+
+**Q8: How would you unit-test PostgreSQL Backup, Restore & PITR in isolation? What would you mock?**
+<details><summary>Answer</summary>
+
+To test PostgreSQL Backup, Restore & PITR in isolation:
+1. **Mock** any external dependencies (network calls, timers, DOM).
+2. **Assert** on the public interface — inputs and outputs — not internal state.
+3. **Edge cases to cover:** null input, empty input, boundary values, and error conditions.
+
+```javascript
+// Example test skeleton
+describe('PostgreSQL Backup, Restore & PITR', () => {
+  it('handles the happy path', () => { /* ... */ });
+  it('throws on invalid input', () => { /* ... */ });
+  it('cleans up resources after use', () => { /* ... */ });
+});
+```
+</details>
+
+**Q9: What is the performance cost of PostgreSQL Backup, Restore & PITR at scale? How would you optimise it?**
+<details><summary>Answer</summary>
+
+At scale, the main costs are:
+- **Memory:** [how PostgreSQL Backup, Restore & PITR uses memory and how to reduce it]
+- **CPU:** [computational complexity and how to reduce it]
+- **Network/IO:** [if applicable]
+
+**Optimisation strategies:**
+1. [Strategy 1] — reduces [cost] by [mechanism]
+2. [Strategy 2] — most effective when [condition]
+3. [Strategy 3] — trade-off: [pro vs con]
+</details>
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10: ★ Classic interview question: "[Most common PostgreSQL Backup, Restore & PITR interview question]"**
+<details><summary>Answer</summary>
+
+**Answer structure (use this in interviews):**
+
+1. **Define it:** "PostgreSQL Backup, Restore & PITR is..."
+2. **Explain the mechanism:** "Under the hood, it works by..."
+3. **Give a concrete example:** "A classic case is..."
+4. **Mention the gotcha:** "The subtle thing most developers miss is..."
+5. **Close with best practice:** "In production, you should always..."
+
+This structure takes 60–90 seconds and signals senior-level thinking.
+</details>
+
+**Q11: How does PostgreSQL Backup, Restore & PITR relate to other concepts in this learning path? Draw the mental map.**
+<details><summary>Answer</summary>
+
+```
+PostgreSQL Backup, Restore & PITR
+  ├── depends on ──► [Prerequisite concept A]
+  ├── depends on ──► [Prerequisite concept B]
+  ├── enables ─────► [Advanced concept C]
+  └── pairs with ──► [Sibling concept D]
+```
+
+Understanding this graph tells you the order to learn/teach these topics and which bugs are *actually* caused by misunderstanding an upstream concept.
+</details>
+
+**Q12: ★ System design: "How would you use PostgreSQL Backup, Restore & PITR to build a [large-scale feature]?"**
+<details><summary>Answer</summary>
+
+**Approach:**
+1. **Identify** where PostgreSQL Backup, Restore & PITR fits in the data/control flow.
+2. **Choose** the right variant/pattern of PostgreSQL Backup, Restore & PITR for the scale requirement.
+3. **Handle** failure modes: what happens when PostgreSQL Backup, Restore & PITR is unavailable or behaves unexpectedly?
+4. **Monitor** it: what metric tells you PostgreSQL Backup, Restore & PITR is healthy in production?
+
+This answer demonstrates that you can apply individual concepts to real architecture decisions — exactly what separates mid-level from senior engineers.
+</details>

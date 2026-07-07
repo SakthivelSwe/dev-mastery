@@ -98,6 +98,25 @@ export default function AdminDashboard() {
           >
             Content Health →
           </Link>
+          <Link
+            href="/admin/content-vs-db"
+            className="px-3 py-2 rounded-md border text-[13px] whitespace-nowrap transition-colors"
+            style={{
+              background: 'var(--bg-surface)',
+              borderColor: 'var(--border-default)',
+              color: 'var(--text-primary)',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = 'var(--accent)';
+              e.currentTarget.style.color = 'var(--accent)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = 'var(--border-default)';
+              e.currentTarget.style.color = 'var(--text-primary)';
+            }}
+          >
+            MDX ↔ DB →
+          </Link>
         </div>
 
         {/* Stat tiles */}

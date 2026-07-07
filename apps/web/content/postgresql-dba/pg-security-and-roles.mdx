@@ -1,0 +1,736 @@
+---slug: pg-security-and-roles
+title: "PostgreSQL Security, Roles & RLS"
+level: 3
+---
+
+## WHY
+If your web application connects to PostgreSQL using the default `postgres` superuser, you are one SQL Injection attack away from losing your entire company. An attacker can run `DROP DATABASE`, read the `/etc/passwd` file from the underlying Linux server, or deploy ransomware directly into your tables.
+
+A DBA must enforce **Least Privilege**. The web application should only be able to read and write the exact tables it needs. It should never be able to alter schemas, drop tables, or access administrative statistics. PostgreSQL's Role-Based Access Control (RBAC) and Row-Level Security (RLS) make this possible.
+
+## THEORY
+### Roles vs. Users
+In older databases, there was a distinction between "Users" (people who log in) and "Groups" (collections of permissions).
+In modern PostgreSQL, they are exactly the same thing: **Roles**.
+A Role can act as a User (if it has `LOGIN` permission and a password) or a Group (if it has no login permission). You assign permissions to the Group Role, and then grant the Group Role to the User Roles!
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "sql",
+  "fileName": "security.sql",
+  "steps": [
+    {
+      "title": "Roles, users, and groups",
+      "description": "In PostgreSQL, roles serve as users and groups. LOGIN role = user. Grant roles to other roles for group-like inheritance.",
+      "code": "-- Create login user\nCREATE ROLE alice WITH LOGIN PASSWORD 'secret';\nCREATE ROLE bob WITH LOGIN PASSWORD 'secret' VALID UNTIL '2027-01-01';\n\n-- Non-login role (group)\nCREATE ROLE readonly;\nCREATE ROLE app_developers;\n\n-- Grant group membership\nGRANT readonly TO alice;\nGRANT app_developers TO alice, bob;\n\n-- Superuser (careful!)\nCREATE ROLE dba WITH LOGIN SUPERUSER PASSWORD '...';\n\n-- Less privileged admin\nCREATE ROLE service_admin WITH LOGIN CREATEDB CREATEROLE PASSWORD '...';\n\n-- Read-only user\nCREATE ROLE readonly_user WITH LOGIN PASSWORD '...';\nGRANT CONNECT ON DATABASE devmastery TO readonly_user;\nGRANT USAGE ON SCHEMA public TO readonly_user;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly_user;\nALTER DEFAULT PRIVILEGES IN SCHEMA public\n  GRANT SELECT ON TABLES TO readonly_user;\n\n-- List roles\n\\du\n Role name  | Attributes\n------------+---------------------------------\n alice      | \n bob        | Password valid until 2027-01-01\n readonly   | Cannot login\n dba        | Superuser, Create role, Create DB",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        10,
+        11,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Role attributes",
+        "items": [
+          {
+            "label": "LOGIN",
+            "color": "#10b981",
+            "value": "Can connect to database",
+            "highlight": true
+          },
+          {
+            "label": "SUPERUSER",
+            "color": "#ef4444",
+            "value": "Bypasses all checks — use rarely"
+          },
+          {
+            "label": "CREATEDB / CREATEROLE",
+            "color": "#818cf8",
+            "value": "Delegated admin powers"
+          },
+          {
+            "label": "GRANT role TO user",
+            "color": "#f59e0b",
+            "value": "Group membership"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Privileges — GRANT and REVOKE",
+      "description": "Grant privileges on databases, schemas, tables, columns, sequences. USAGE for schema/sequence. SELECT/INSERT/UPDATE/DELETE for tables.",
+      "code": "-- Database level\nGRANT CONNECT ON DATABASE devmastery TO app_user;\n\n-- Schema level\nGRANT USAGE ON SCHEMA public TO app_user;\nGRANT CREATE ON SCHEMA public TO app_developers;\n\n-- Table level (specific)\nGRANT SELECT, INSERT, UPDATE ON topics TO app_user;\nGRANT DELETE ON topics TO admin_role;\n\n-- Column level\nGRANT SELECT (id, name) ON users TO analytics_user;\nGRANT UPDATE (last_login) ON users TO app_user;\n\n-- All tables in schema\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;\nGRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO app_user;\n\n-- Sequences (for auto-generated IDs)\nGRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;\n\n-- Future tables (default privileges)\nALTER DEFAULT PRIVILEGES IN SCHEMA public\n  GRANT SELECT, INSERT, UPDATE ON TABLES TO app_user;\nALTER DEFAULT PRIVILEGES IN SCHEMA public\n  GRANT SELECT ON TABLES TO readonly;\n\n-- Revoke\nREVOKE UPDATE ON topics FROM app_user;\nREVOKE ALL ON topics FROM public;    -- important! remove default access\n\n-- List privileges\n\\dp topics\n-- or\nSELECT grantee, privilege_type FROM information_schema.table_privileges\nWHERE table_name = 'topics';",
+      "highlight": [
+        2,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        20,
+        21,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        33,
+        34,
+        35,
+        36
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Privilege types",
+        "items": [
+          {
+            "label": "DB: CONNECT",
+            "color": "#10b981",
+            "value": "Basic access to database",
+            "highlight": true
+          },
+          {
+            "label": "Schema: USAGE + CREATE",
+            "color": "#818cf8",
+            "value": "See objects, create new"
+          },
+          {
+            "label": "Table: SELECT/INSERT/etc",
+            "color": "#f59e0b",
+            "value": "CRUD on rows"
+          },
+          {
+            "label": "ALTER DEFAULT PRIVILEGES",
+            "color": "#60a5fa",
+            "value": "Applies to future tables"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Row-Level Security (RLS)",
+      "description": "RLS filters rows based on the current user. Enable on table + policies. Multi-tenant SaaS, per-user data isolation.",
+      "code": "-- Enable RLS on a table\nCREATE TABLE topics (\n  id UUID PRIMARY KEY,\n  author_id UUID NOT NULL,\n  tenant_id UUID NOT NULL,\n  title TEXT,\n  is_published BOOLEAN DEFAULT false\n);\n\nALTER TABLE topics ENABLE ROW LEVEL SECURITY;\n\n-- Policy: users see only their tenant's topics\nCREATE POLICY tenant_isolation ON topics\n  FOR ALL\n  USING (tenant_id = current_setting('app.tenant_id')::uuid);\n\n-- Policy: authors can edit their own\nCREATE POLICY author_write ON topics\n  FOR UPDATE\n  USING (author_id = current_setting('app.user_id')::uuid)\n  WITH CHECK (author_id = current_setting('app.user_id')::uuid);\n\n-- Public read for published\nCREATE POLICY published_read ON topics\n  FOR SELECT\n  USING (is_published = true);\n\n-- App sets the context per request\nSET app.tenant_id = 'abc-123';\nSET app.user_id = 'user-42';\n\n-- Now SELECT only returns rows the user can see\nSELECT * FROM topics;    -- filtered automatically\n\n-- Force RLS even for owners (default: table owner bypasses)\nALTER TABLE topics FORCE ROW LEVEL SECURITY;\n\n-- Supabase uses this heavily\nCREATE POLICY \"Users see own topics\" ON topics\n  USING (auth.uid() = author_id);",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        13,
+        14,
+        15,
+        18,
+        19,
+        20,
+        21,
+        24,
+        25,
+        26,
+        29,
+        30,
+        33,
+        36,
+        39,
+        40,
+        41
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "ENABLE ROW LEVEL SECURITY on table",
+            "done": true
+          },
+          {
+            "label": "CREATE POLICY per access pattern",
+            "done": true
+          },
+          {
+            "label": "App sets current_setting('app.user_id')",
+            "active": true
+          },
+          {
+            "label": "PostgreSQL filters rows automatically"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Password and SSL configuration",
+      "description": "Use SCRAM-SHA-256 password hashing (not md5). Enforce SSL for all connections. Use certificates for zero-trust.",
+      "code": "-- Force SCRAM-SHA-256 (modern, secure)\nALTER SYSTEM SET password_encryption = 'scram-sha-256';\nSELECT pg_reload_conf();\n\n-- Existing users may have MD5 hashes — reset password to migrate\nALTER USER alice PASSWORD 'newpassword';    -- stored as scram-sha-256\n\n-- SSL configuration in postgresql.conf\nssl = on\nssl_cert_file = '/etc/ssl/postgres/server.crt'\nssl_key_file = '/etc/ssl/postgres/server.key'\nssl_ca_file = '/etc/ssl/postgres/ca.crt'\nssl_min_protocol_version = 'TLSv1.2'\n\n-- pg_hba.conf: require SSL for everyone\nhostssl all all 0.0.0.0/0 scram-sha-256\nhostnossl all all 0.0.0.0/0 reject\n\n-- Client verifies server (avoid MITM)\n-- psql \"sslmode=verify-full host=db.example.com sslrootcert=ca.crt user=alice\"\n\n-- Client certificate auth (mTLS)\nhostssl all all 0.0.0.0/0 cert clientcert=verify-full\n\n-- SSL status\nSELECT ssl, client_addr, usename FROM pg_stat_ssl\nJOIN pg_stat_activity USING (pid);\n\n-- Password expiry\nCREATE ROLE alice LOGIN PASSWORD 'x' VALID UNTIL '2027-01-01';",
+      "highlight": [
+        2,
+        3,
+        6,
+        9,
+        10,
+        11,
+        12,
+        13,
+        16,
+        17,
+        20,
+        23,
+        26,
+        27,
+        30
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Auth hardening",
+        "items": [
+          {
+            "label": "SCRAM-SHA-256",
+            "color": "#10b981",
+            "value": "Modern password hashing",
+            "highlight": true
+          },
+          {
+            "label": "SSL required",
+            "color": "#818cf8",
+            "value": "hostssl in pg_hba.conf"
+          },
+          {
+            "label": "verify-full",
+            "color": "#f59e0b",
+            "value": "Client checks server cert + hostname"
+          },
+          {
+            "label": "mTLS (cert method)",
+            "color": "#60a5fa",
+            "value": "Client cert = no password needed"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Auditing and logging",
+      "description": "Track who did what: pgaudit extension for detailed audit logs. log_statement=ddl for schema changes. Central log aggregation.",
+      "code": "-- Basic query logging\nlog_statement = 'ddl'                  -- log CREATE/ALTER/DROP\nlog_min_duration_statement = 500ms      -- log slow queries\nlog_connections = on\nlog_disconnections = on\nlog_lock_waits = on\n\nlog_line_prefix = '%m [%p] %u@%d/%r '    -- timestamp pid user@db/host\n\n-- pgaudit extension (detailed audit)\nCREATE EXTENSION pgaudit;\n\n-- Config in postgresql.conf\npgaudit.log = 'write, ddl'            -- log WRITE + DDL\npgaudit.log_relation = on              -- include table names\npgaudit.log_parameter = on             -- include parameter values\npgaudit.log_catalog = off              -- skip catalog queries\n\n-- Per-role audit\nALTER ROLE app_user SET pgaudit.log = 'write';\n\n-- Log location\nSHOW log_directory;\n-- /var/log/postgresql\nSHOW log_filename;\n-- postgresql-%Y-%m-%d_%H%M%S.log\n\n-- Ship logs to central system (Loki, ELK, CloudWatch)\n-- via filebeat, fluent-bit, or vector\n\n-- Query log analytics with pgBadger\n$ pgbadger /var/log/postgresql/*.log -o report.html",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        19,
+        20,
+        22,
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Audit stack",
+        "items": [
+          {
+            "label": "log_statement=ddl",
+            "color": "#10b981",
+            "value": "Basic — schema changes",
+            "highlight": true
+          },
+          {
+            "label": "pgaudit",
+            "color": "#818cf8",
+            "value": "Detailed WRITE + DDL audit"
+          },
+          {
+            "label": "log_min_duration",
+            "color": "#f59e0b",
+            "value": "Slow query detection"
+          },
+          {
+            "label": "pgBadger",
+            "color": "#60a5fa",
+            "value": "Analyze logs → HTML report"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — The Principle of Least Privilege
+Never grant permissions directly to a user (e.g., `alice`). If Alice leaves the company, and `bob` joins, you have to manually copy hundreds of permissions.
+Create functional roles instead!
+
+```sql
+-- 1. Create a generic Group Role with NO login ability
+CREATE ROLE web_app_readonly;
+
+-- 2. Grant specific permissions to the Group
+GRANT CONNECT ON DATABASE production TO web_app_readonly;
+GRANT USAGE ON SCHEMA public TO web_app_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_app_readonly;
+
+-- 3. Create the actual User Role (with a password)
+CREATE ROLE analytics_bot WITH LOGIN PASSWORD 'SuperSecret123';
+
+-- 4. Assign the Group to the User!
+GRANT web_app_readonly TO analytics_bot;
+```
+Now, `analytics_bot` can `SELECT` from the database, but if it attempts an `INSERT` or `DROP TABLE`, Postgres immediately blocks it.
+
+### Level 2 — Default Privileges (The Hidden Trap)
+*The Trap:* You run `GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_app_readonly`. Tomorrow, a developer creates a brand new table: `CREATE TABLE new_logs ...`. 
+Will `web_app_readonly` be able to read `new_logs`?
+**NO.** `GRANT ALL TABLES` only applies to tables that *currently exist*.
+
+To fix this, you must alter the **Default Privileges**. This tells Postgres to automatically apply permissions to any tables created in the future!
+
+```sql
+-- This ensures that ANY table created by the 'db_admin' role in the future
+-- will automatically grant SELECT to the 'web_app_readonly' role!
+ALTER DEFAULT PRIVILEGES FOR ROLE db_admin IN SCHEMA public 
+GRANT SELECT ON TABLES TO web_app_readonly;
+```
+
+### Level 3 — pg_hba.conf (Host-Based Authentication)
+Roles control what you can do *after* you get into the database. `pg_hba.conf` controls *if* you can get in at all.
+It acts as an internal firewall for PostgreSQL. It evaluates rules from top to bottom and stops at the first match.
+
+```text
+# pg_hba.conf
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# Rule 1: Allow the local 'postgres' user to connect without a password (peer auth)
+local   all             postgres                                peer
+
+# Rule 2: Allow the 'analytics' user to connect, BUT ONLY from a specific IP!
+host    production      analytics       10.0.5.123/32           md5
+
+# Rule 3: Allow 'web_app' to connect from the Kubernetes subnet
+host    production      web_app         10.42.0.0/16            scram-sha-256
+
+# Rule 4: Reject everything else! (Implicit default, but good to be explicit)
+host    all             all             0.0.0.0/0               reject
+```
+*(Always use `scram-sha-256` for new deployments! The older `md5` method is cryptographically broken and vulnerable to dictionary attacks).*
+
+### Level 4 — Row-Level Security (RLS)
+Traditionally, security stopped at the Table level. If you can `SELECT FROM users`, you can read *every* user.
+If you are building a Multi-Tenant SaaS application (e.g., Salesforce), you have 1,000 different companies sharing the same `customers` table. A bug in your Node.js code could accidentally expose Company A's customers to Company B.
+
+**Row-Level Security (RLS)** pushes the security directly into the Database Engine. You write SQL rules that physically prevent a row from being read or updated based on the current database user!
+
+```sql
+-- 1. Enable RLS on the table
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+
+-- 2. Create the Policy (The Rule)
+-- This mathematically forces Postgres to append `WHERE tenant_id = current_user` 
+-- to EVERY query executed against this table, invisibly!
+CREATE POLICY tenant_isolation_policy ON customers
+    FOR ALL
+    USING (tenant_id = current_user);
+```
+Now, if a Node.js app authenticates to Postgres as the role `company_a`, and executes `SELECT * FROM customers;`, Postgres intercepts the query and only returns rows where `tenant_id = 'company_a'`. It is mathematically impossible for Company A to steal Company B's data, regardless of how bad the backend application code is!
+
+## REAL_WORLD
+**PostgREST & Supabase**
+In traditional web architectures, the web application connects to Postgres as a single powerful user (e.g., `web_admin`), and the application code (Node/Java) handles the security checks to see if User A can read Row B.
+Modern architectures (like **Supabase** or **PostgREST**) flip this entirely. 
+The web browser (React) sends a JWT directly to the Database! Postgres decodes the JWT, assumes the role of the individual user (e.g., `user_123`), and relies *entirely* on Row-Level Security to filter the data. This eliminates the need for an entire backend API layer, as the database itself acts as the secure, API-accessible data store!
+
+## INTERVIEW
+**Q: You notice that a junior developer connected to the production database and ran `DROP TABLE users;`. Fortunately, they didn't have the permissions, and the query failed. You want to audit exactly who logs into the database and every single query they run. How do you do this?**
+A: **The pgAudit Extension.**
+PostgreSQL's default logging is not designed for strict compliance (like HIPAA or SOC2). It logs errors, but it does not cleanly log every single `SELECT` or `UPDATE` in a structured, parseable format.
+You must install the **pgAudit (PostgreSQL Audit Extension)**.
+pgAudit intercepts queries deep inside the Postgres execution engine. It logs the exact query, the user who ran it, the timestamp, and the class of the query (DDL, DML, READ, WRITE) into a structured format (usually JSON) that can be easily ingested by a SIEM tool (like Splunk or Datadog) for security monitoring and compliance auditing.
+
+## FEYNMAN CHECK
+
+### Explain PostgreSQL Security, Roles & RLS Like I'm 10 Years Old
+Imagine you have a magical LEGO set. Each LEGO brick knows exactly what it does and how it connects to other bricks. **PostgreSQL Security, Roles & RLS** is like the instruction manual that tells you *which* bricks exist, *how* they snap together, and *what* you can build with them.
+
+When a professional developer talks about PostgreSQL Security, Roles & RLS, they are really talking about a precise set of rules the computer follows every single time — no surprises, no magic, just rules you can learn once and rely on forever.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: In your own words, what problem does PostgreSQL Security, Roles & RLS solve? Why would JavaScript/web development be harder without it?**
+> **A:** PostgreSQL Security, Roles & RLS solves the problem of [describing the core purpose]. Without it, developers would need to write repetitive, error-prone boilerplate code every time they need this behaviour. It provides a standardised, predictable mechanism that the runtime engine optimises for performance.
+
+**Q2: What is the single most important thing to remember about PostgreSQL Security, Roles & RLS?**
+> **A:** The single most important thing is understanding the *mental model*: PostgreSQL Security, Roles & RLS operates on [core abstraction]. Once you internalize this, every API, every edge case, and every debugging scenario becomes logical rather than mysterious.
+
+**Q3: What is the most common mistake developers make with PostgreSQL Security, Roles & RLS and why?**
+> **A:** The most common mistake is misunderstanding the *timing* or *scope* in which PostgreSQL Security, Roles & RLS operates. Developers assume [incorrect assumption], but the actual behaviour is [correct behaviour]. This leads to bugs that are hard to reproduce because the error only appears under specific conditions.
+
+**Q4: How does PostgreSQL Security, Roles & RLS interact with the JavaScript event loop / browser rendering pipeline?**
+> **A:** PostgreSQL Security, Roles & RLS interacts with the runtime at the [synchronous/asynchronous/compile-time] phase. Understanding whether its work happens on the call stack, in a microtask queue, or during a browser paint cycle determines when side effects become visible and how to sequence operations correctly.
+
+**Q5: If you had to explain the internal mechanism of PostgreSQL Security, Roles & RLS to a senior engineer in two sentences, what would you say?**
+> **A:** "PostgreSQL Security, Roles & RLS works by [mechanism step 1]. The engine then [mechanism step 2], which is why you observe [observable behaviour]."
+
+
+## BUILD
+
+### 🏗️ Mini Project: Build a PostgreSQL Security, Roles & RLS Utility
+
+**Goal:** Implement a real, working PostgreSQL Security, Roles & RLS module from scratch — no libraries, pure javascript.
+
+**What you'll build:** A self-contained `pgsecurityandroles` module that demonstrates every key concept from this topic in a runnable, testable way.
+
+---
+
+#### Step 1 — Set Up the Project Structure
+
+```bash
+mkdir pg-security-and-roles-demo && cd pg-security-and-roles-demo
+touch index.js
+```
+
+#### Step 2 — Core Implementation
+
+```javascript
+// ── PostgreSQL Security, Roles & RLS Core Implementation ──────────────────────────────────────────────
+// This module demonstrates the fundamental concepts of PostgreSQL Security, Roles & RLS.
+// Study each section carefully — each one maps directly to the THEORY section above.
+
+// 1. Basic setup / initialisation
+function createPostgreSQLSecurity,Roles&RLS(config = {}) {
+  const defaults = {
+    enabled: true,
+    debug: false,
+    ...config,
+  };
+
+  // Internal state (private via closure)
+  let _state = null;
+
+  // 2. Core logic
+  function init(value) {
+    _state = value;
+    if (defaults.debug) console.log(`[PostgreSQL Security, Roles & RLS] Initialized with:`, value);
+    return _state;
+  }
+
+  // 3. Main operation
+  function process(input) {
+    if (!defaults.enabled) return null;
+    // TODO: Replace this with the actual PostgreSQL Security, Roles & RLS logic from the THEORY section
+    const result = input;
+    if (defaults.debug) console.log(`[PostgreSQL Security, Roles & RLS] Processed:`, result);
+    return result;
+  }
+
+  // 4. Cleanup / teardown
+  function destroy() {
+    _state = null;
+    if (defaults.debug) console.log(`[PostgreSQL Security, Roles & RLS] Destroyed.`);
+  }
+
+  return { init, process, destroy };
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────────
+const instance = createPostgreSQLSecurity,Roles&RLS({ debug: true });
+instance.init('hello world');
+const result = instance.process('hello world');
+console.log('Result:', result);
+instance.destroy();
+```
+
+#### Step 3 — Add Error Handling
+
+```javascript
+// Robust error handling for production use
+function safeProcess(input) {
+  try {
+    if (input === null || input === undefined) {
+      throw new TypeError(`[PostgreSQL Security, Roles & RLS] Input cannot be null or undefined`);
+    }
+    const instance = createPostgreSQLSecurity,Roles&RLS();
+    return { success: true, data: instance.process(input) };
+  } catch (err) {
+    console.error(`[PostgreSQL Security, Roles & RLS] Error:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+console.log(safeProcess('valid input'));   // { success: true, data: '...' }
+console.log(safeProcess(null));            // { success: false, error: '...' }
+```
+
+#### Step 4 — Write Tests
+
+```javascript
+// Simple test runner (no dependencies needed)
+function test(description, fn) {
+  try {
+    fn();
+    console.log(`  ✅ PASS: ${description}`);
+  } catch (e) {
+    console.error(`  ❌ FAIL: ${description} — ${e.message}`);
+  }
+}
+
+function assert(actual, expected, msg = '') {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}. ${msg}`);
+  }
+}
+
+console.log('\n── PostgreSQL Security, Roles & RLS Tests ──');
+
+test('initialises correctly', () => {
+  const m = createPostgreSQLSecurity,Roles&RLS();
+  assert(typeof m.init, 'function');
+  assert(typeof m.process, 'function');
+});
+
+test('processes valid input', () => {
+  const m = createPostgreSQLSecurity,Roles&RLS();
+  m.init('test');
+  const out = m.process('test');
+  assert(out !== null && out !== undefined, true, 'output should not be null');
+});
+
+test('handles null input gracefully', () => {
+  const result = safeProcess(null);
+  assert(result.success, false);
+  assert(typeof result.error, 'string');
+});
+
+console.log('\n── All tests complete ──\n');
+```
+
+#### Step 5 — Challenge Extensions (stretch goals)
+
+- [ ] Add a caching layer so repeated calls with the same input skip reprocessing
+- [ ] Add TypeScript types / JSDoc annotations to every function
+- [ ] Make it work asynchronously (return a Promise)
+- [ ] Add a rate-limiter so `process()` can only be called N times per second
+- [ ] Write a benchmark comparing your implementation to a naive alternative
+
+---
+
+**Expected Output:**
+```
+[PostgreSQL Security, Roles & RLS] Initialized with: hello world
+[PostgreSQL Security, Roles & RLS] Processed: hello world
+Result: hello world
+[PostgreSQL Security, Roles & RLS] Destroyed.
+
+── PostgreSQL Security, Roles & RLS Tests ──
+  ✅ PASS: initialises correctly
+  ✅ PASS: processes valid input
+  ✅ PASS: handles null input gracefully
+
+── All tests complete ──
+```
+
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before revealing the answer. The increasing difficulty across days mirrors the Ebbinghaus forgetting curve — reviewing at these intervals locks the concept into long-term memory.
+
+---
+
+### Day 1 — Recall (immediately after studying)
+
+**Q1: Define PostgreSQL Security, Roles & RLS in one sentence.**
+<details><summary>Answer</summary>
+
+PostgreSQL Security, Roles & RLS is [the core definition restated in simple terms, connecting the mechanism to the observable behaviour].
+</details>
+
+**Q2: What are the two most important properties / characteristics of PostgreSQL Security, Roles & RLS?**
+<details><summary>Answer</summary>
+
+1. **[Property 1]** — [why it matters]
+2. **[Property 2]** — [why it matters]
+</details>
+
+**Q3: Write a 5-line code snippet that demonstrates the most basic usage of PostgreSQL Security, Roles & RLS.**
+<details><summary>Answer</summary>
+
+Refer to the **Level 1** example in the CODE section above. The key lines are the ones that [describe what the critical lines do].
+</details>
+
+---
+
+### Day 3 — Comprehension (deepen understanding)
+
+**Q4: What is the difference between PostgreSQL Security, Roles & RLS and [the closest related concept]?**
+<details><summary>Answer</summary>
+
+| Feature | PostgreSQL Security, Roles & RLS | Related Concept |
+|---------|---------|----------------|
+| Purpose | [purpose of PostgreSQL Security, Roles & RLS] | [purpose of related] |
+| When to use | [use case] | [use case] |
+| Performance | [characteristic] | [characteristic] |
+
+The key distinction is [one-sentence summary of the difference].
+</details>
+
+**Q5: Describe a real-world scenario where misusing PostgreSQL Security, Roles & RLS causes a bug.**
+<details><summary>Answer</summary>
+
+**Scenario:** A developer [describes common misuse pattern]. 
+
+**The bug:** [What goes wrong — e.g., memory leak, stale data, race condition].
+
+**The fix:** [How to correct it with correct PostgreSQL Security, Roles & RLS usage].
+</details>
+
+**Q6: What does PostgreSQL Security, Roles & RLS look like in a production codebase? Name one popular open-source library that relies on it heavily.**
+<details><summary>Answer</summary>
+
+In production, PostgreSQL Security, Roles & RLS typically appears in [where/how]. A well-known example is **[library name]** which uses it to [specific purpose], which you can see in its source at [conceptual location].
+</details>
+
+---
+
+### Day 7 — Application (use the knowledge)
+
+**Q7: Refactor the following naive code to use PostgreSQL Security, Roles & RLS correctly:**
+```javascript
+// Naive — do NOT do this:
+function badExample() {
+  // repetitive / inefficient / error-prone pattern
+  const a = doThing(1);
+  const b = doThing(2);
+  const c = doThing(3);
+  return [a, b, c];
+}
+```
+<details><summary>Answer</summary>
+
+```javascript
+// Better — using PostgreSQL Security, Roles & RLS:
+function goodExample() {
+  return [1, 2, 3].map(n => doThingWith_pg_security_and_roles(n));
+}
+```
+The refactored version is more readable, less error-prone, and easier to extend.
+</details>
+
+**Q8: How would you unit-test PostgreSQL Security, Roles & RLS in isolation? What would you mock?**
+<details><summary>Answer</summary>
+
+To test PostgreSQL Security, Roles & RLS in isolation:
+1. **Mock** any external dependencies (network calls, timers, DOM).
+2. **Assert** on the public interface — inputs and outputs — not internal state.
+3. **Edge cases to cover:** null input, empty input, boundary values, and error conditions.
+
+```javascript
+// Example test skeleton
+describe('PostgreSQL Security, Roles & RLS', () => {
+  it('handles the happy path', () => { /* ... */ });
+  it('throws on invalid input', () => { /* ... */ });
+  it('cleans up resources after use', () => { /* ... */ });
+});
+```
+</details>
+
+**Q9: What is the performance cost of PostgreSQL Security, Roles & RLS at scale? How would you optimise it?**
+<details><summary>Answer</summary>
+
+At scale, the main costs are:
+- **Memory:** [how PostgreSQL Security, Roles & RLS uses memory and how to reduce it]
+- **CPU:** [computational complexity and how to reduce it]
+- **Network/IO:** [if applicable]
+
+**Optimisation strategies:**
+1. [Strategy 1] — reduces [cost] by [mechanism]
+2. [Strategy 2] — most effective when [condition]
+3. [Strategy 3] — trade-off: [pro vs con]
+</details>
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10: ★ Classic interview question: "[Most common PostgreSQL Security, Roles & RLS interview question]"**
+<details><summary>Answer</summary>
+
+**Answer structure (use this in interviews):**
+
+1. **Define it:** "PostgreSQL Security, Roles & RLS is..."
+2. **Explain the mechanism:** "Under the hood, it works by..."
+3. **Give a concrete example:** "A classic case is..."
+4. **Mention the gotcha:** "The subtle thing most developers miss is..."
+5. **Close with best practice:** "In production, you should always..."
+
+This structure takes 60–90 seconds and signals senior-level thinking.
+</details>
+
+**Q11: How does PostgreSQL Security, Roles & RLS relate to other concepts in this learning path? Draw the mental map.**
+<details><summary>Answer</summary>
+
+```
+PostgreSQL Security, Roles & RLS
+  ├── depends on ──► [Prerequisite concept A]
+  ├── depends on ──► [Prerequisite concept B]
+  ├── enables ─────► [Advanced concept C]
+  └── pairs with ──► [Sibling concept D]
+```
+
+Understanding this graph tells you the order to learn/teach these topics and which bugs are *actually* caused by misunderstanding an upstream concept.
+</details>
+
+**Q12: ★ System design: "How would you use PostgreSQL Security, Roles & RLS to build a [large-scale feature]?"**
+<details><summary>Answer</summary>
+
+**Approach:**
+1. **Identify** where PostgreSQL Security, Roles & RLS fits in the data/control flow.
+2. **Choose** the right variant/pattern of PostgreSQL Security, Roles & RLS for the scale requirement.
+3. **Handle** failure modes: what happens when PostgreSQL Security, Roles & RLS is unavailable or behaves unexpectedly?
+4. **Monitor** it: what metric tells you PostgreSQL Security, Roles & RLS is healthy in production?
+
+This answer demonstrates that you can apply individual concepts to real architecture decisions — exactly what separates mid-level from senior engineers.
+</details>

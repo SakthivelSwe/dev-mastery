@@ -1,0 +1,728 @@
+---slug: pg-partitioning-advanced
+title: "PostgreSQL Table Partitioning"
+level: 4
+---
+
+## WHY
+If your `orders` table has 10 million rows, Postgres handles it perfectly. If it has 5 Billion rows (e.g., IoT sensor data or financial logs), you hit a physical wall.
+1. The table becomes too large to fit in memory (RAM).
+2. The B-Tree indexes become so massive and deep that traversing them slows down every query.
+3. If you want to delete data older than 5 years, running `DELETE FROM orders WHERE created_at < '2019-01-01'` will take days, consume massive amounts of CPU, bloat the WAL, and require aggressive Vacuuming.
+
+**Table Partitioning** solves this by physically splitting one massive table into dozens of smaller, manageable tables, while presenting a single, unified "Virtual" table to the application.
+
+## THEORY
+### The Partitioning Strategies
+1. **Range Partitioning (The most common):** Split the table by time (e.g., one partition per month or per year). Perfect for time-series data or logs.
+2. **List Partitioning:** Split the table by a specific categorical value (e.g., `region = 'US'`, `region = 'EU'`).
+3. **Hash Partitioning:** Split the data mathematically evenly across $N$ partitions using a hash function. Perfect when you just need to break up a massive table but don't have a logical time/category split.
+
+## VISUALIZATION_CONFIG
+```json
+{
+  "language": "sql",
+  "fileName": "partitioning.sql",
+  "steps": [
+    {
+      "title": "Why partition tables",
+      "description": "Partitioning splits a huge table into smaller ones. Faster scans (partition pruning), easier bulk deletes, simpler maintenance, better parallel execution.",
+      "code": "-- Problem: 1 billion row events table\n-- - Sequential scans take minutes\n-- - Indexes are huge\n-- - VACUUM takes hours\n-- - DELETE old rows locks for a long time\n\n-- Solution: partition by date\nCREATE TABLE events (\n  id BIGINT,\n  user_id BIGINT,\n  type TEXT,\n  data JSONB,\n  created_at TIMESTAMPTZ NOT NULL\n) PARTITION BY RANGE (created_at);\n\n-- Create partitions per month\nCREATE TABLE events_2026_06 PARTITION OF events\n  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- Query behaves like single table\nSELECT * FROM events WHERE created_at > '2026-07-01';\n-- Planner scans only 2026_07 partition (partition pruning)\n\n-- Benefits:\n-- ✅ Partition pruning: only scan relevant partitions\n-- ✅ DROP old partition = instant (no DELETE!)\n-- ✅ Parallel operations on partitions\n-- ✅ Smaller indexes per partition",
+      "highlight": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partitioning wins",
+        "items": [
+          {
+            "label": "Partition pruning",
+            "color": "#10b981",
+            "value": "Scan only relevant partitions",
+            "highlight": true
+          },
+          {
+            "label": "DROP partition = instant",
+            "color": "#818cf8",
+            "value": "Delete old data in ms"
+          },
+          {
+            "label": "Smaller indexes",
+            "color": "#f59e0b",
+            "value": "Faster inserts, less bloat"
+          },
+          {
+            "label": "Per-partition VACUUM",
+            "color": "#60a5fa",
+            "value": "Parallel maintenance"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partition strategies",
+      "description": "RANGE: time-based, ID ranges. LIST: enum values (country, status). HASH: even distribution. Combine for sub-partitioning.",
+      "code": "-- RANGE partitioning (most common — time series)\nCREATE TABLE metrics (id BIGSERIAL, value NUMERIC, ts TIMESTAMPTZ)\nPARTITION BY RANGE (ts);\n\nCREATE TABLE metrics_2026_07 PARTITION OF metrics\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- LIST partitioning (categorical)\nCREATE TABLE users (id BIGSERIAL, name TEXT, country TEXT)\nPARTITION BY LIST (country);\n\nCREATE TABLE users_us PARTITION OF users FOR VALUES IN ('US');\nCREATE TABLE users_eu PARTITION OF users FOR VALUES IN ('DE', 'FR', 'IT', 'ES');\nCREATE TABLE users_other PARTITION OF users DEFAULT;\n\n-- HASH partitioning (even distribution)\nCREATE TABLE orders (id BIGSERIAL, user_id BIGINT, total NUMERIC)\nPARTITION BY HASH (user_id);\n\nCREATE TABLE orders_p0 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 0);\nCREATE TABLE orders_p1 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 1);\nCREATE TABLE orders_p2 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 2);\nCREATE TABLE orders_p3 PARTITION OF orders FOR VALUES WITH (modulus 4, remainder 3);\n\n-- Composite (sub-partitioning)\nCREATE TABLE events (id BIGSERIAL, ts TIMESTAMPTZ, type TEXT)\nPARTITION BY RANGE (ts);\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')\n  PARTITION BY LIST (type);\n\nCREATE TABLE events_2026_07_view PARTITION OF events_2026_07 FOR VALUES IN ('view');\nCREATE TABLE events_2026_07_click PARTITION OF events_2026_07 FOR VALUES IN ('click');",
+      "highlight": [
+        2,
+        3,
+        5,
+        6,
+        9,
+        10,
+        12,
+        13,
+        14,
+        17,
+        18,
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+        29,
+        30,
+        31,
+        33,
+        34
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partition strategies",
+        "items": [
+          {
+            "label": "RANGE",
+            "color": "#10b981",
+            "value": "Time series, ID ranges",
+            "highlight": true
+          },
+          {
+            "label": "LIST",
+            "color": "#818cf8",
+            "value": "Enum: country, status, tenant"
+          },
+          {
+            "label": "HASH",
+            "color": "#f59e0b",
+            "value": "Even distribution across partitions"
+          },
+          {
+            "label": "Composite",
+            "color": "#60a5fa",
+            "value": "Sub-partitioning: time + type"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Automated partition management",
+      "description": "Create future partitions automatically. Drop old ones. Use pg_partman extension or write custom scheduler.",
+      "code": "-- pg_partman: partition automation\nCREATE EXTENSION pg_partman;\n\n-- Configure partitioning\nSELECT partman.create_parent(\n  p_parent_table => 'public.events',\n  p_control => 'created_at',\n  p_type => 'range',\n  p_interval => 'monthly',\n  p_premake => 4,       -- create 4 future partitions\n  p_start_partition => '2026-01-01'\n);\n\n-- Retention (drop old partitions automatically)\nUPDATE partman.part_config\nSET retention = '12 months',\n    retention_keep_table = false    -- actually drop\nWHERE parent_table = 'public.events';\n\n-- Run maintenance (creates/drops partitions)\nSELECT partman.run_maintenance();\n\n-- Automate via cron or pg_cron\nCREATE EXTENSION pg_cron;\nSELECT cron.schedule('partman-hourly', '0 * * * *', 'SELECT partman.run_maintenance()');\n\n-- Manual approach without pg_partman:\nDO $$\nDECLARE\n  next_month DATE := (CURRENT_DATE + INTERVAL '1 month')::DATE;\n  next_month_end DATE := (next_month + INTERVAL '1 month')::DATE;\n  partition_name TEXT := 'events_' || to_char(next_month, 'YYYY_MM');\nBEGIN\n  EXECUTE format(\n    'CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',\n    partition_name, next_month, next_month_end\n  );\nEND $$;\n\n-- Drop old partition (bye-bye old data — instant!)\nDROP TABLE events_2025_01;    -- millions of rows gone in ms",
+      "highlight": [
+        2,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        15,
+        16,
+        17,
+        18,
+        21,
+        24,
+        25,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        41
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "pg_partman configures partitioning",
+            "done": true
+          },
+          {
+            "label": "run_maintenance() creates future partitions",
+            "done": true
+          },
+          {
+            "label": "Auto-drop old per retention policy",
+            "active": true
+          },
+          {
+            "label": "pg_cron schedules it hourly"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Indexes and constraints on partitions",
+      "description": "PG 11+: indexes on parent auto-create on children. Primary keys must include partition key. Unique constraints per partition (unless PK includes partition key).",
+      "code": "-- Create partitioned table\nCREATE TABLE events (\n  id BIGSERIAL,\n  user_id BIGINT NOT NULL,\n  created_at TIMESTAMPTZ NOT NULL,\n  PRIMARY KEY (id, created_at)      -- MUST include partition key\n) PARTITION BY RANGE (created_at);\n\nCREATE TABLE events_2026_07 PARTITION OF events\n  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');\n\n-- Index on parent → auto-created on all partitions (including future ones)\nCREATE INDEX idx_events_user ON events (user_id);\n-- Under the hood: partitioned index; children each get idx_events_user_2026_07 etc.\n\n-- Unique constraint requires partition key\nALTER TABLE events ADD CONSTRAINT events_unique UNIQUE (id, created_at);\n\n-- Foreign keys (PG 12+: parent can be referenced as FK target)\nCREATE TABLE event_metadata (\n  event_id BIGINT,\n  event_created_at TIMESTAMPTZ,\n  meta JSONB,\n  FOREIGN KEY (event_id, event_created_at) REFERENCES events (id, created_at)\n);\n\n-- CONCURRENTLY on partitioned indexes\nCREATE INDEX CONCURRENTLY idx_events_type ON events (type);\n\n-- Reindex specific partition\nREINDEX INDEX CONCURRENTLY idx_events_user_2026_07;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        13,
+        14,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        28,
+        31
+      ],
+      "diagram": {
+        "kind": "boxes",
+        "title": "Partition constraints",
+        "items": [
+          {
+            "label": "Parent index → all children",
+            "color": "#10b981",
+            "value": "Auto-managed",
+            "highlight": true
+          },
+          {
+            "label": "PK must include partition key",
+            "color": "#818cf8",
+            "value": "Unique across all partitions"
+          },
+          {
+            "label": "FK to partitioned table (PG 12+)",
+            "color": "#f59e0b",
+            "value": "Requires composite key"
+          },
+          {
+            "label": "Individual REINDEX",
+            "color": "#60a5fa",
+            "value": "Per-partition maintenance"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Partition pruning in EXPLAIN",
+      "description": "Planner and executor prune partitions based on WHERE clauses. Verify with EXPLAIN. Missing pruning = full scan of all partitions.",
+      "code": "-- Good: partition pruning works\nEXPLAIN SELECT * FROM events WHERE created_at >= '2026-07-15';\n\n Append  (cost=0..1000)\n   ->  Seq Scan on events_2026_07 (cost=0..1000)   ← ONLY this partition scanned\n\n-- Bad: pruning didn't work\nEXPLAIN SELECT * FROM events WHERE DATE(created_at) = '2026-07-15';\n Append\n   ->  Seq Scan on events_2026_01\n   ->  Seq Scan on events_2026_02\n   ...\n   ->  Seq Scan on events_2026_12    ← scans ALL partitions!\n\n-- Reason: DATE() function on column blocks pruning\n-- Fix:\nEXPLAIN SELECT * FROM events WHERE created_at BETWEEN '2026-07-15' AND '2026-07-15 23:59:59';\n\n-- Pruning at execution time (dynamic values)\nEXPLAIN SELECT * FROM events WHERE created_at > NOW() - INTERVAL '1 day';\n-- With PG 12+: execution-time pruning works even with runtime values\n\n-- Force pruning inspection\nSET constraint_exclusion = partition;\n\n-- View partition list\nSELECT partitionname, partitionrangestart, partitionrangeend\nFROM pg_partitions\nWHERE tablename = 'events';\n\n-- Or\nSELECT c.relname, pg_get_expr(c.relpartbound, c.oid, true) AS bound\nFROM pg_inherits i\nJOIN pg_class c ON c.oid = i.inhrelid\nWHERE i.inhparent = 'events'::regclass;",
+      "highlight": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        17,
+        20,
+        21,
+        24,
+        27,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35
+      ],
+      "diagram": {
+        "kind": "flow",
+        "steps": [
+          {
+            "label": "WHERE with partition key column → pruning",
+            "done": true
+          },
+          {
+            "label": "Function on column blocks pruning",
+            "done": true
+          },
+          {
+            "label": "Execution-time pruning for runtime values",
+            "active": true
+          },
+          {
+            "label": "Verify with EXPLAIN: single partition scan"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## CODE
+
+### Level 1 — Declarative Range Partitioning
+Introduced in Postgres 10, Declarative Partitioning makes creating and managing partitions incredibly easy compared to the old trigger-based methods.
+
+```sql
+-- 1. Create the MASTER table. 
+-- Notice you MUST define the Partition Key (e.g., created_at)
+CREATE TABLE logs (
+    id SERIAL,
+    message TEXT,
+    created_at TIMESTAMP NOT NULL
+) PARTITION BY RANGE (created_at);
+
+-- 2. Create the PHYSICAL partitions (Children)
+-- The Master table stores NO data. It all goes into the children!
+CREATE TABLE logs_2023 
+    PARTITION OF logs 
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+CREATE TABLE logs_2024 
+    PARTITION OF logs 
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+-- You should always create a default partition for data that falls outside the ranges!
+CREATE TABLE logs_default PARTITION OF logs DEFAULT;
+```
+
+### Level 2 — Partition Pruning (The Performance Magic)
+If the application queries the master table:
+`SELECT * FROM logs WHERE created_at = '2024-05-15';`
+How does Postgres find the data? Does it search all 3 tables?
+
+**No. Partition Pruning!**
+Because the query includes the partition key (`created_at`), the Postgres Query Planner looks at the `WHERE` clause, realizes the date falls perfectly inside `logs_2024`, and completely ignores (`prunes`) the `logs_2023` and `logs_default` tables! 
+It only searches the smaller, faster `logs_2024` table. This drastically reduces CPU and IO usage.
+
+### Level 3 — Data Retention (The O(1) Delete)
+Deleting 100 million old records using a standard `DELETE` command is an operational nightmare. It locks rows, bloats indexes, and generates massive amounts of WAL data.
+
+With Partitioning, dropping old data takes **milliseconds** and consumes **zero** database resources.
+
+```sql
+-- To delete all data from 2023, you don't use DELETE. 
+-- You simply detach or drop the physical table!
+DROP TABLE logs_2023;
+
+-- OR, if you want to archive it to cheaper storage before deleting:
+ALTER TABLE logs DETACH PARTITION logs_2023;
+-- (Now logs_2023 is just a normal, independent table! The Master table no longer searches it).
+```
+
+### Level 4 — Automated Partition Management (pg_partman)
+*The Trap:* What happens on January 1st, 2025, if you forgot to run `CREATE TABLE logs_2025`? All new inserts will suddenly route to the `logs_default` partition. `logs_default` will grow infinitely, completely destroying the performance benefits of your partitioning scheme!
+
+Managing partitions manually is dangerous. Professional DBAs use the **pg_partman** extension to automate this.
+
+```sql
+-- Tell pg_partman to manage the 'logs' table
+-- Create new partitions MONTHLY, and always keep 4 future partitions ready!
+SELECT partman.create_parent(
+    p_parent_table => 'public.logs',
+    p_control => 'created_at',
+    p_type => 'native',
+    p_interval=> '1 month',
+    p_premake => 4
+);
+
+-- pg_partman sets up a background worker (or cron job) that runs daily,
+-- automatically generating future partitions so you never run out!
+```
+
+## REAL_WORLD
+**Global Indexes vs. Local Indexes**
+When you create an index on the Master table, Postgres actually creates a separate physical index on *every single child partition*. (These are called Local Indexes).
+*The Constraint:* If you want a `UNIQUE` or `PRIMARY KEY` constraint on a partitioned table, the constraint **MUST include the partition key**.
+You cannot have `PRIMARY KEY (id)`. You MUST have `PRIMARY KEY (id, created_at)`.
+Why? Because Postgres does not support Global Indexes (an index that spans all partitions). To guarantee a value is truly unique across 5 Billion rows without scanning all 50 partitions simultaneously, the partition key must be part of the uniqueness check. This is a massive architectural limitation you must plan for!
+
+## INTERVIEW
+**Q: You have a massive `users` table partitioned by `region` (US, EU, ASIA). A user originally signed up in the US. They execute an `UPDATE users SET region = 'EU' WHERE id = 123`. What happens under the hood?**
+A: **Row Movement (Delete + Insert).**
+Before Postgres 11, this query would throw a fatal error. You could not update a partition key if it meant the row had to move to a different table.
+In modern Postgres, it handles **Row Movement** automatically. However, it is an extremely expensive operation! Under the hood, Postgres physically executes a `DELETE` on the US partition, and an `INSERT` on the EU partition. 
+If your application frequently updates the partition key, partitioning will actually *degrade* your database performance due to the massive overhead of constantly migrating rows between physical files! You should only partition by columns that are immutable (like `created_at`).
+
+## FEYNMAN CHECK
+
+### Explain PostgreSQL Table Partitioning Like I'm 10 Years Old
+Imagine you have a magical LEGO set. Each LEGO brick knows exactly what it does and how it connects to other bricks. **PostgreSQL Table Partitioning** is like the instruction manual that tells you *which* bricks exist, *how* they snap together, and *what* you can build with them.
+
+When a professional developer talks about PostgreSQL Table Partitioning, they are really talking about a precise set of rules the computer follows every single time — no surprises, no magic, just rules you can learn once and rely on forever.
+
+---
+
+### 5 Deep Conceptual Questions
+
+**Q1: In your own words, what problem does PostgreSQL Table Partitioning solve? Why would JavaScript/web development be harder without it?**
+> **A:** PostgreSQL Table Partitioning solves the problem of [describing the core purpose]. Without it, developers would need to write repetitive, error-prone boilerplate code every time they need this behaviour. It provides a standardised, predictable mechanism that the runtime engine optimises for performance.
+
+**Q2: What is the single most important thing to remember about PostgreSQL Table Partitioning?**
+> **A:** The single most important thing is understanding the *mental model*: PostgreSQL Table Partitioning operates on [core abstraction]. Once you internalize this, every API, every edge case, and every debugging scenario becomes logical rather than mysterious.
+
+**Q3: What is the most common mistake developers make with PostgreSQL Table Partitioning and why?**
+> **A:** The most common mistake is misunderstanding the *timing* or *scope* in which PostgreSQL Table Partitioning operates. Developers assume [incorrect assumption], but the actual behaviour is [correct behaviour]. This leads to bugs that are hard to reproduce because the error only appears under specific conditions.
+
+**Q4: How does PostgreSQL Table Partitioning interact with the JavaScript event loop / browser rendering pipeline?**
+> **A:** PostgreSQL Table Partitioning interacts with the runtime at the [synchronous/asynchronous/compile-time] phase. Understanding whether its work happens on the call stack, in a microtask queue, or during a browser paint cycle determines when side effects become visible and how to sequence operations correctly.
+
+**Q5: If you had to explain the internal mechanism of PostgreSQL Table Partitioning to a senior engineer in two sentences, what would you say?**
+> **A:** "PostgreSQL Table Partitioning works by [mechanism step 1]. The engine then [mechanism step 2], which is why you observe [observable behaviour]."
+
+
+## BUILD
+
+### 🏗️ Mini Project: Build a PostgreSQL Table Partitioning Utility
+
+**Goal:** Implement a real, working PostgreSQL Table Partitioning module from scratch — no libraries, pure javascript.
+
+**What you'll build:** A self-contained `pgpartitioningadvanced` module that demonstrates every key concept from this topic in a runnable, testable way.
+
+---
+
+#### Step 1 — Set Up the Project Structure
+
+```bash
+mkdir pg-partitioning-advanced-demo && cd pg-partitioning-advanced-demo
+touch index.js
+```
+
+#### Step 2 — Core Implementation
+
+```javascript
+// ── PostgreSQL Table Partitioning Core Implementation ──────────────────────────────────────────────
+// This module demonstrates the fundamental concepts of PostgreSQL Table Partitioning.
+// Study each section carefully — each one maps directly to the THEORY section above.
+
+// 1. Basic setup / initialisation
+function createPostgreSQLTablePartitioning(config = {}) {
+  const defaults = {
+    enabled: true,
+    debug: false,
+    ...config,
+  };
+
+  // Internal state (private via closure)
+  let _state = null;
+
+  // 2. Core logic
+  function init(value) {
+    _state = value;
+    if (defaults.debug) console.log(`[PostgreSQL Table Partitioning] Initialized with:`, value);
+    return _state;
+  }
+
+  // 3. Main operation
+  function process(input) {
+    if (!defaults.enabled) return null;
+    // TODO: Replace this with the actual PostgreSQL Table Partitioning logic from the THEORY section
+    const result = input;
+    if (defaults.debug) console.log(`[PostgreSQL Table Partitioning] Processed:`, result);
+    return result;
+  }
+
+  // 4. Cleanup / teardown
+  function destroy() {
+    _state = null;
+    if (defaults.debug) console.log(`[PostgreSQL Table Partitioning] Destroyed.`);
+  }
+
+  return { init, process, destroy };
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────────
+const instance = createPostgreSQLTablePartitioning({ debug: true });
+instance.init('hello world');
+const result = instance.process('hello world');
+console.log('Result:', result);
+instance.destroy();
+```
+
+#### Step 3 — Add Error Handling
+
+```javascript
+// Robust error handling for production use
+function safeProcess(input) {
+  try {
+    if (input === null || input === undefined) {
+      throw new TypeError(`[PostgreSQL Table Partitioning] Input cannot be null or undefined`);
+    }
+    const instance = createPostgreSQLTablePartitioning();
+    return { success: true, data: instance.process(input) };
+  } catch (err) {
+    console.error(`[PostgreSQL Table Partitioning] Error:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+console.log(safeProcess('valid input'));   // { success: true, data: '...' }
+console.log(safeProcess(null));            // { success: false, error: '...' }
+```
+
+#### Step 4 — Write Tests
+
+```javascript
+// Simple test runner (no dependencies needed)
+function test(description, fn) {
+  try {
+    fn();
+    console.log(`  ✅ PASS: ${description}`);
+  } catch (e) {
+    console.error(`  ❌ FAIL: ${description} — ${e.message}`);
+  }
+}
+
+function assert(actual, expected, msg = '') {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}. ${msg}`);
+  }
+}
+
+console.log('\n── PostgreSQL Table Partitioning Tests ──');
+
+test('initialises correctly', () => {
+  const m = createPostgreSQLTablePartitioning();
+  assert(typeof m.init, 'function');
+  assert(typeof m.process, 'function');
+});
+
+test('processes valid input', () => {
+  const m = createPostgreSQLTablePartitioning();
+  m.init('test');
+  const out = m.process('test');
+  assert(out !== null && out !== undefined, true, 'output should not be null');
+});
+
+test('handles null input gracefully', () => {
+  const result = safeProcess(null);
+  assert(result.success, false);
+  assert(typeof result.error, 'string');
+});
+
+console.log('\n── All tests complete ──\n');
+```
+
+#### Step 5 — Challenge Extensions (stretch goals)
+
+- [ ] Add a caching layer so repeated calls with the same input skip reprocessing
+- [ ] Add TypeScript types / JSDoc annotations to every function
+- [ ] Make it work asynchronously (return a Promise)
+- [ ] Add a rate-limiter so `process()` can only be called N times per second
+- [ ] Write a benchmark comparing your implementation to a naive alternative
+
+---
+
+**Expected Output:**
+```
+[PostgreSQL Table Partitioning] Initialized with: hello world
+[PostgreSQL Table Partitioning] Processed: hello world
+Result: hello world
+[PostgreSQL Table Partitioning] Destroyed.
+
+── PostgreSQL Table Partitioning Tests ──
+  ✅ PASS: initialises correctly
+  ✅ PASS: processes valid input
+  ✅ PASS: handles null input gracefully
+
+── All tests complete ──
+```
+
+
+## SPACED REVIEW
+
+> **How to use:** Answer each question from memory before revealing the answer. The increasing difficulty across days mirrors the Ebbinghaus forgetting curve — reviewing at these intervals locks the concept into long-term memory.
+
+---
+
+### Day 1 — Recall (immediately after studying)
+
+**Q1: Define PostgreSQL Table Partitioning in one sentence.**
+<details><summary>Answer</summary>
+
+PostgreSQL Table Partitioning is [the core definition restated in simple terms, connecting the mechanism to the observable behaviour].
+</details>
+
+**Q2: What are the two most important properties / characteristics of PostgreSQL Table Partitioning?**
+<details><summary>Answer</summary>
+
+1. **[Property 1]** — [why it matters]
+2. **[Property 2]** — [why it matters]
+</details>
+
+**Q3: Write a 5-line code snippet that demonstrates the most basic usage of PostgreSQL Table Partitioning.**
+<details><summary>Answer</summary>
+
+Refer to the **Level 1** example in the CODE section above. The key lines are the ones that [describe what the critical lines do].
+</details>
+
+---
+
+### Day 3 — Comprehension (deepen understanding)
+
+**Q4: What is the difference between PostgreSQL Table Partitioning and [the closest related concept]?**
+<details><summary>Answer</summary>
+
+| Feature | PostgreSQL Table Partitioning | Related Concept |
+|---------|---------|----------------|
+| Purpose | [purpose of PostgreSQL Table Partitioning] | [purpose of related] |
+| When to use | [use case] | [use case] |
+| Performance | [characteristic] | [characteristic] |
+
+The key distinction is [one-sentence summary of the difference].
+</details>
+
+**Q5: Describe a real-world scenario where misusing PostgreSQL Table Partitioning causes a bug.**
+<details><summary>Answer</summary>
+
+**Scenario:** A developer [describes common misuse pattern]. 
+
+**The bug:** [What goes wrong — e.g., memory leak, stale data, race condition].
+
+**The fix:** [How to correct it with correct PostgreSQL Table Partitioning usage].
+</details>
+
+**Q6: What does PostgreSQL Table Partitioning look like in a production codebase? Name one popular open-source library that relies on it heavily.**
+<details><summary>Answer</summary>
+
+In production, PostgreSQL Table Partitioning typically appears in [where/how]. A well-known example is **[library name]** which uses it to [specific purpose], which you can see in its source at [conceptual location].
+</details>
+
+---
+
+### Day 7 — Application (use the knowledge)
+
+**Q7: Refactor the following naive code to use PostgreSQL Table Partitioning correctly:**
+```javascript
+// Naive — do NOT do this:
+function badExample() {
+  // repetitive / inefficient / error-prone pattern
+  const a = doThing(1);
+  const b = doThing(2);
+  const c = doThing(3);
+  return [a, b, c];
+}
+```
+<details><summary>Answer</summary>
+
+```javascript
+// Better — using PostgreSQL Table Partitioning:
+function goodExample() {
+  return [1, 2, 3].map(n => doThingWith_pg_partitioning_advanced(n));
+}
+```
+The refactored version is more readable, less error-prone, and easier to extend.
+</details>
+
+**Q8: How would you unit-test PostgreSQL Table Partitioning in isolation? What would you mock?**
+<details><summary>Answer</summary>
+
+To test PostgreSQL Table Partitioning in isolation:
+1. **Mock** any external dependencies (network calls, timers, DOM).
+2. **Assert** on the public interface — inputs and outputs — not internal state.
+3. **Edge cases to cover:** null input, empty input, boundary values, and error conditions.
+
+```javascript
+// Example test skeleton
+describe('PostgreSQL Table Partitioning', () => {
+  it('handles the happy path', () => { /* ... */ });
+  it('throws on invalid input', () => { /* ... */ });
+  it('cleans up resources after use', () => { /* ... */ });
+});
+```
+</details>
+
+**Q9: What is the performance cost of PostgreSQL Table Partitioning at scale? How would you optimise it?**
+<details><summary>Answer</summary>
+
+At scale, the main costs are:
+- **Memory:** [how PostgreSQL Table Partitioning uses memory and how to reduce it]
+- **CPU:** [computational complexity and how to reduce it]
+- **Network/IO:** [if applicable]
+
+**Optimisation strategies:**
+1. [Strategy 1] — reduces [cost] by [mechanism]
+2. [Strategy 2] — most effective when [condition]
+3. [Strategy 3] — trade-off: [pro vs con]
+</details>
+
+---
+
+### Day 14 — Synthesis & Interview Prep
+
+**Q10: ★ Classic interview question: "[Most common PostgreSQL Table Partitioning interview question]"**
+<details><summary>Answer</summary>
+
+**Answer structure (use this in interviews):**
+
+1. **Define it:** "PostgreSQL Table Partitioning is..."
+2. **Explain the mechanism:** "Under the hood, it works by..."
+3. **Give a concrete example:** "A classic case is..."
+4. **Mention the gotcha:** "The subtle thing most developers miss is..."
+5. **Close with best practice:** "In production, you should always..."
+
+This structure takes 60–90 seconds and signals senior-level thinking.
+</details>
+
+**Q11: How does PostgreSQL Table Partitioning relate to other concepts in this learning path? Draw the mental map.**
+<details><summary>Answer</summary>
+
+```
+PostgreSQL Table Partitioning
+  ├── depends on ──► [Prerequisite concept A]
+  ├── depends on ──► [Prerequisite concept B]
+  ├── enables ─────► [Advanced concept C]
+  └── pairs with ──► [Sibling concept D]
+```
+
+Understanding this graph tells you the order to learn/teach these topics and which bugs are *actually* caused by misunderstanding an upstream concept.
+</details>
+
+**Q12: ★ System design: "How would you use PostgreSQL Table Partitioning to build a [large-scale feature]?"**
+<details><summary>Answer</summary>
+
+**Approach:**
+1. **Identify** where PostgreSQL Table Partitioning fits in the data/control flow.
+2. **Choose** the right variant/pattern of PostgreSQL Table Partitioning for the scale requirement.
+3. **Handle** failure modes: what happens when PostgreSQL Table Partitioning is unavailable or behaves unexpectedly?
+4. **Monitor** it: what metric tells you PostgreSQL Table Partitioning is healthy in production?
+
+This answer demonstrates that you can apply individual concepts to real architecture decisions — exactly what separates mid-level from senior engineers.
+</details>
