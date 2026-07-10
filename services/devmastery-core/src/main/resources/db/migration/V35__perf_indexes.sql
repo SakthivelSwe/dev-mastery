@@ -21,8 +21,9 @@ CREATE INDEX IF NOT EXISTS idx_lessons_topic_section
     ON lessons (topic_id, section_type);
 
 -- SpacedReviewEntity.findByUserIdAndNextReviewDateLessThanEqual (spaced-review queue)
+-- Table is "spaced_review_schedules" (see V1__baseline_schema.sql + SpacedReviewEntity @Table)
 CREATE INDEX IF NOT EXISTS idx_spaced_reviews_user_due
-    ON spaced_reviews (user_id, next_review_date);
+    ON spaced_review_schedules (user_id, next_review_date);
 
 -- Interview history: GET /v1/interviews orders by started_at DESC for user.
 CREATE INDEX IF NOT EXISTS idx_interview_sessions_user_started

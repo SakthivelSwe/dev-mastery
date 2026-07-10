@@ -59,6 +59,13 @@ android {
         excludes += "/META-INF/{AL2.0,LGPL2.1}"
       }
     }
+
+    lint {
+        // False positive: androidx.activity 1.13.0 is well above the 1.3.0 threshold
+        // required for ActivityResult APIs, but the lint check doesn't detect the
+        // transitive dependency path correctly when Fragment is not added directly.
+        disable += "InvalidFragmentVersionForActivityResult"
+    }
 }
 
 kotlin {
