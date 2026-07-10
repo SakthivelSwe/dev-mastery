@@ -33,6 +33,21 @@ class AuthViewModel(
             val result = authRepository.login(email, password)
             result.onSuccess { response ->
                 tokenManager.saveToken(response.token)
+                tokenManager.saveUser(response.user.id, response.user.name, response.user.email)
+                _authState.value = AuthState.Success(response.token, response.user.name)
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "An error occurred")
+            }
+        }
+    }
+
+    fun register(fullName: String, email: String, password: String) {
+        _authState.value = AuthState.Loading
+        viewModelScope.launch {
+            val result = authRepository.register(fullName, email, password)
+            result.onSuccess { response ->
+                tokenManager.saveToken(response.token)
+                tokenManager.saveUser(response.user.id, response.user.name, response.user.email)
                 _authState.value = AuthState.Success(response.token, response.user.name)
             }.onFailure { error ->
                 _authState.value = AuthState.Error(error.message ?: "An error occurred")

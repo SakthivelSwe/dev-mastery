@@ -8,32 +8,57 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(primary = Purple80, secondary = PurpleGrey80, tertiary = Pink80)
+private val DarkColorScheme = darkColorScheme(
+  primary = Accent,
+  onPrimary = OnAccent,
+  primaryContainer = AccentSoft,
+  onPrimaryContainer = TextPrimary,
+  secondary = Accent,
+  onSecondary = OnAccent,
+  secondaryContainer = BgSurfaceVariant,
+  onSecondaryContainer = TextPrimary,
+  tertiary = Accent,
+  background = BgPrimary,
+  onBackground = TextPrimary,
+  surface = BgSurface,
+  onSurface = TextPrimary,
+  surfaceVariant = BgSurfaceVariant,
+  onSurfaceVariant = TextSecondary,
+  outline = BorderDefault,
+  error = ErrorRed,
+  onError = OnErrorRed,
+  errorContainer = ErrorContainer,
+  onErrorContainer = OnErrorContainer,
+)
 
 private val LightColorScheme =
   lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40,
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
+    primary = AccentLight,
     onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    primaryContainer = BgSurfaceLight,
+    onPrimaryContainer = TextPrimaryLight,
+    secondary = AccentLight,
+    secondaryContainer = Color(0xFFEDEFF7),
+    onSecondaryContainer = TextPrimaryLight,
+    tertiary = AccentLight,
+    background = BgPrimaryLight,
+    onBackground = TextPrimaryLight,
+    surface = BgSurfaceLight,
+    onSurface = TextPrimaryLight,
+    surfaceVariant = Color(0xFFEDEFF7),
+    onSurfaceVariant = TextSecondaryLight,
+    outline = BorderLight,
+    error = Color(0xFFB3261E),
   )
 
 @Composable
 fun DevMasteryTheme(
   darkTheme: Boolean = isSystemInDarkTheme(),
-  // Dynamic color is available on Android 12+
-  dynamicColor: Boolean = true,
+  // Brand-consistent by default — dynamic color off so the DevMastery palette shows.
+  dynamicColor: Boolean = false,
   content: @Composable () -> Unit,
 ) {
   val colorScheme =

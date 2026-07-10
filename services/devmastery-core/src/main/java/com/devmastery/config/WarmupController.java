@@ -9,11 +9,12 @@ import java.sql.ResultSet;
 import java.util.Map;
 
 /**
- * Warmup endpoint for UptimeRobot keep-alive pings.
+ * Warmup endpoint hit by the internal {@link KeepAliveScheduler} every 14 min.
  *
- * <p>Serves two purposes:
+ * <p>No external uptime service is required. Serves two purposes:
  * <ol>
- *   <li>Prevents Render free tier from spinning down (ping every 14 min)</li>
+ *   <li>Provides real inbound HTTP traffic so Render's free tier does not
+ *       spin down (the scheduler self-pings this URL every 14 min)</li>
  *   <li>Executes a lightweight DB query to keep Supabase project active
  *       (Supabase pauses after 7 days without DB activity)</li>
  * </ol></p>

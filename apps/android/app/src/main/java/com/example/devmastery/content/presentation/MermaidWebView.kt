@@ -41,7 +41,7 @@ fun MermaidWebView(
                 mermaid.initialize({ 
                     startOnLoad: true, 
                     theme: 'dark',
-                    securityLevel: 'loose'
+                    securityLevel: 'strict'
                 });
             </script>
         </head>
@@ -60,12 +60,22 @@ fun MermaidWebView(
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                // ── Security hardening: no local file/content access from this WebView.
+                settings.allowFileAccess = false
+                settings.allowContentAccess = false
+                @Suppress("DEPRECATION")
+                settings.allowFileAccessFromFileURLs = false
+                @Suppress("DEPRECATION")
+                settings.allowUniversalAccessFromFileURLs = false
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                settings.setGeolocationEnabled(false)
                 webViewClient = WebViewClient()
-                loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
+                // Non-null https base gives the page a defined secure origin.
+                loadDataWithBaseURL("https://devmastery.local/", htmlContent, "text/html", "UTF-8", null)
             }
         },
         update = { webView ->
-            webView.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
+            webView.loadDataWithBaseURL("https://devmastery.local/", htmlContent, "text/html", "UTF-8", null)
         }
     )
 }

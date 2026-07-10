@@ -52,7 +52,34 @@ data class PathRoadmapResponse(
     val levels: List<LevelRoadmapDto>
 )
 
+// ── Learning paths (mirrors web LearningPath in apps/web/src/lib/api.ts) ──
+
+data class TopicSummaryDto(
+    val id: String,
+    val slug: String,
+    val title: String,
+    val level: Int = 1,
+    val order: Int = 0
+)
+
+data class LearningPathDto(
+    val id: String,
+    val slug: String,
+    val title: String,
+    val description: String? = null,
+    val icon: String? = null,
+    val accentColor: String? = null,
+    val totalTopics: Int = 0,
+    val topics: List<TopicSummaryDto> = emptyList()
+)
+
 interface ContentApi {
+    @GET("paths")
+    suspend fun getAllPaths(): List<LearningPathDto>
+
+    @GET("paths/{slug}")
+    suspend fun getPath(@Path("slug") slug: String): LearningPathDto
+
     @GET("paths/{slug}/roadmap")
     suspend fun getPathRoadmap(@Path("slug") slug: String): PathRoadmapResponse
 

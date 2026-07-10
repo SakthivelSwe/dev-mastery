@@ -81,8 +81,10 @@ export interface ActivityItem {
 export async function fetchTopic(slug: string): Promise<Topic | null> {
   try {
     const res = await fetch(`${CONTENT_API}/v1/topics/${slug}`, {
-      // Always pull fresh content in dev so DB updates show up immediately.
-      cache: 'no-store',
+      // Topic content changes rarely and the backend has both Caffeine +
+      // Cache-Control (public, max-age=600, SWR=3600). Let Next's data
+      // cache honour it — huge win on Render free-tier cold starts.
+      next: { revalidate: 600, tags: [`topic:${slug}`] },
     });
     if (!res.ok) return null;
     const raw = await res.json();

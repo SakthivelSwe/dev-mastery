@@ -11,4 +11,13 @@ class AuthRepository(
             Result.failure(e)
         }
     }
+
+    suspend fun register(fullName: String, email: String, password: String): Result<AuthResponse> {
+        return try {
+            val response = authApi.register(RegisterRequest(fullName, email, password))
+            Result.success(response)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 }

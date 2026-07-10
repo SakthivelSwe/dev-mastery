@@ -7,8 +7,24 @@ const { setupDevPlatform } = process.env.NODE_ENV === 'development'
 const nextConfig = {
   reactStrictMode: true,
 
-  // Required for @cloudflare/next-on-pages
-  experimental: {},
+  // Emit response bodies gzip-compressed. Cloudflare Pages will re-compress
+  // with Brotli at the edge, but this makes local `next start` fast too.
+  compress: true,
+  poweredByHeader: false,
+
+  // Tree-shake barrel imports from these libraries so we don't ship dead code
+  // from lucide-react (icon set) or framer-motion. Massively cuts JS payload
+  // on the mobile-critical /dashboard / /review / /profile routes.
+  experimental: {
+    optimizePackageImports: [
+      'lucide-react',
+      'framer-motion',
+      'recharts',
+      'react-markdown',
+      '@tanstack/react-query',
+      'date-fns',
+    ],
+  },
 
   webpack: (config) => {
     // NOTE: A previous version aliased `react`/`react-dom` to force a single

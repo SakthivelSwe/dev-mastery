@@ -21,14 +21,27 @@
     @retrofit2.http.* <methods>;
 }
 
-# Keep Gson data classes
+# Retrofit / OkHttp / Okio — upstream shipped rules are packaged with the
+# dependencies, but keep these belt-and-braces entries in case R8 misses one.
+-dontwarn retrofit2.**
+-dontwarn org.codehaus.mojo.animal_sniffer.*
+-dontwarn javax.annotation.**
+-keep class retrofit2.** { *; }
+
+# Gson data classes
 -keepclassmembers,allowobfuscation class * {
     @com.google.gson.annotations.SerializedName <fields>;
 }
+# Gson generic type info survives R8
+-keep,allowobfuscation,allowshrinking class com.google.gson.reflect.TypeToken
+-keep,allowobfuscation,allowshrinking class * extends com.google.gson.reflect.TypeToken
 
 # Keep OkHttp
 -dontwarn okhttp3.**
 -dontwarn okio.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
 
 # Keep Compose
 -keep class androidx.compose.** { *; }

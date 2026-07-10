@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useRouter } from 'next/navigation';
 import { ArrowRight, Loader2, Sparkles } from 'lucide-react';
+import { registerSchema, fieldErrors } from '@/lib/validation';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
@@ -13,6 +14,7 @@ export default function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const { login } = useAuthStore();
   const router = useRouter();
@@ -20,6 +22,14 @@ export default function RegisterPage() {
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setErrors({});
+
+    const parsed = registerSchema.safeParse({ fullName, email, password });
+    if (!parsed.success) {
+      setErrors(fieldErrors(parsed.error));
+      return;
+    }
+
     setSubmitting(true);
 
     try {
@@ -30,6 +40,9 @@ export default function RegisterPage() {
       });
 
       if (!res.ok) {
+        if (res.status === 429) {
+          throw new Error('Too many attempts. Please wait a minute and try again.');
+        }
         let msg = `Registration failed (${res.status})`;
         try {
           const errorData = await res.json();
@@ -107,6 +120,7 @@ export default function RegisterPage() {
 
           {error && (
             <div
+              role="alert"
               className="mt-5 px-3 py-2.5 rounded-md text-[13px]"
               style={{
                 background: 'rgba(224, 122, 122, 0.08)',
@@ -118,7 +132,7 @@ export default function RegisterPage() {
             </div>
           )}
 
-          <form onSubmit={handleRegister} className="mt-6 flex flex-col gap-4">
+          <form onSubmit={handleRegister} className="mt-6 flex flex-col gap-4" noValidate>
             <Field
               label="Full name"
               type="text"
@@ -126,6 +140,7 @@ export default function RegisterPage() {
               onChange={setFullName}
               placeholder="Jane Doe"
               autoFocus
+              error={errors.fullName}
             />
             <Field
               label="Email"
@@ -133,6 +148,7 @@ export default function RegisterPage() {
               value={email}
               onChange={setEmail}
               placeholder="you@example.com"
+              error={errors.email}
             />
             <Field
               label="Password"
@@ -141,6 +157,7 @@ export default function RegisterPage() {
               onChange={setPassword}
               placeholder="At least 8 characters"
               minLength={8}
+              error={errors.password}
             />
 
             <button
@@ -178,7 +195,7 @@ export default function RegisterPage() {
 }
 
 function Field({
-  label, type, value, onChange, placeholder, autoFocus, minLength,
+  label, type, value, onChange, placeholder, autoFocus, minLength, error,
 }: {
   label: string;
   type: 'text' | 'email' | 'password';
@@ -187,7 +204,9 @@ function Field({
   placeholder?: string;
   autoFocus?: boolean;
   minLength?: number;
+  error?: string;
 }) {
+  const errorId = error ? `${label.toLowerCase().replace(/\s+/g, '-')}-error` : undefined;
   return (
     <label className="block">
       <span
@@ -204,10 +223,12 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         autoFocus={autoFocus}
+        aria-invalid={!!error}
+        aria-describedby={errorId}
         className="w-full px-3 py-2.5 rounded-md text-[14px] outline-none transition-all"
         style={{
           background: 'var(--bg-inset)',
-          border: '1px solid var(--border-default)',
+          border: `1px solid ${error ? 'var(--error)' : 'var(--border-default)'}`,
           color: 'var(--text-primary)',
         }}
         onFocus={(e) => {
@@ -215,10 +236,22 @@ function Field({
           e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-ring)';
         }}
         onBlur={(e) => {
-          e.currentTarget.style.borderColor = 'var(--border-default)';
+          e.currentTarget.style.borderColor = error
+            ? 'var(--error)'
+            : 'var(--border-default)';
           e.currentTarget.style.boxShadow = 'none';
         }}
       />
+      {error && (
+        <span
+          id={errorId}
+          role="alert"
+          className="mt-1 block text-[12px]"
+          style={{ color: 'var(--error)' }}
+        >
+          {error}
+        </span>
+      )}
     </label>
   );
 }

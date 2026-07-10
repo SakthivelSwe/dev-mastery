@@ -29,4 +29,12 @@ class ProgressRepository(
             Result.failure(e)
         }
     }
+
+    suspend fun getSummary(userId: String): Result<ProgressSummaryDto> {
+        return try {
+            Result.success(progressApi.getSummary(userId))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 }

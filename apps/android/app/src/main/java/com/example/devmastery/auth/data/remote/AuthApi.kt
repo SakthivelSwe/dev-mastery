@@ -5,6 +5,12 @@ import retrofit2.http.POST
 
 data class LoginRequest(val email: String, val password: String)
 
+data class RegisterRequest(
+    val fullName: String,
+    val email: String,
+    val password: String
+)
+
 data class UserDto(
     val id: String,
     val email: String,
@@ -21,4 +27,7 @@ data class AuthResponse(
 interface AuthApi {
     @POST("auth/login")
     suspend fun login(@Body request: LoginRequest): AuthResponse
+
+    @POST("auth/register")
+    suspend fun register(@Body request: RegisterRequest): AuthResponse
 }

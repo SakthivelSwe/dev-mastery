@@ -13,6 +13,11 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+
+        // Default (debug/emulator) API base. Release overrides below.
+        buildConfigField("String", "API_BASE_URL", "\"http://10.0.2.2:8080/v1/\"")
+        // Deployed Next.js app used by the visualizer WebView fast-path.
+        buildConfigField("String", "WEB_BASE_URL", "\"http://10.0.2.2:3000\"")
     }
 
     signingConfigs {
@@ -32,6 +37,10 @@ android {
             isShrinkResources = true
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+
+            // Production endpoints (Render backend + Cloudflare Pages web app).
+            buildConfigField("String", "API_BASE_URL", "\"https://devmastery-core.onrender.com/v1/\"")
+            buildConfigField("String", "WEB_BASE_URL", "\"https://devmastery.pages.dev\"")
         }
     }
     compileOptions {
@@ -41,7 +50,7 @@ android {
     buildFeatures {
       compose = true
       aidl = false
-      buildConfig = false
+      buildConfig = true
       shaders = false
     }
 
@@ -103,4 +112,13 @@ dependencies {
 
   // Security
   implementation(libs.androidx.security.crypto)
+
+  // Background work (daily spaced-review reminders)
+  implementation(libs.androidx.work.runtime)
+
+  // Splash screen (Android 12+ native, back-ported to older APIs)
+  implementation(libs.androidx.core.splashscreen)
+
+  // Biometric app lock (opt-in in Settings)
+  implementation(libs.androidx.biometric)
 }
