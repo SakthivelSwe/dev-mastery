@@ -5,6 +5,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -38,8 +40,8 @@ fun SettingsScreen(
     // ── Offline downloads panel ──
     val scope = rememberCoroutineScope()
     val cache = remember { TopicCache(context) }
-    var downloadedCount by remember { mutableStateOf(0) }
-    var cacheBytes by remember { mutableStateOf(0L) }
+    var downloadedCount by remember { mutableIntStateOf(0) }
+    var cacheBytes by remember { mutableLongStateOf(0L) }
     LaunchedEffect(Unit) {
         downloadedCount = cache.starredSlugs().size
         cacheBytes = cache.cacheSizeBytes()

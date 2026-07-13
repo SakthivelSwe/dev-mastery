@@ -53,14 +53,14 @@ class ReviewReminderWorker(
             setPackage(applicationContext.packageName)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
-        val pendingFlags =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            else PendingIntent.FLAG_UPDATE_CURRENT
+        // minSdk is 24, so FLAG_IMMUTABLE (API 23+) is always available.
+        val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val openPending = PendingIntent.getActivity(applicationContext, 0, openReview, pendingFlags)
 
         val notification = NotificationCompat.Builder(applicationContext, ReviewReminders.CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            // A monochrome silhouette — status bars mask the small icon to its
+            // alpha channel, so a full-colour mipmap would render as a white box.
+            .setSmallIcon(R.drawable.ic_stat_notify)
             .setContentTitle("Time to review 🧠")
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)

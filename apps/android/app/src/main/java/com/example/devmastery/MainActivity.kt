@@ -29,7 +29,25 @@ class MainActivity : FragmentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     // Install the splash screen BEFORE super.onCreate — hands off to
     // Theme.DevMastery once the first Compose frame is ready.
-    installSplashScreen()
+    val splashScreen = installSplashScreen()
+
+    // Keep the splash on screen briefly so the animated "draw-in" glyph can
+    // play through, then exit with a smooth fade + zoom for a modern feel.
+    val splashStart = System.currentTimeMillis()
+    splashScreen.setKeepOnScreenCondition {
+      System.currentTimeMillis() - splashStart < SPLASH_MIN_DURATION_MS
+    }
+    splashScreen.setOnExitAnimationListener { splashProvider ->
+      val iconView = splashProvider.iconView
+      iconView.animate()
+        .alpha(0f)
+        .scaleX(1.25f)
+        .scaleY(1.25f)
+        .setDuration(320L)
+        .withEndAction { splashProvider.remove() }
+        .start()
+    }
+
     super.onCreate(savedInstanceState)
 
     // Ask for notification permission on Android 13+ so review reminders can show.
@@ -75,5 +93,11 @@ class MainActivity : FragmentActivity() {
         }
       }
     }
+  }
+
+  private companion object {
+    // Minimum time the animated splash icon stays on screen so its draw-in
+    // animation can complete before the app content takes over.
+    const val SPLASH_MIN_DURATION_MS = 800L
   }
 }
