@@ -53,3 +53,36 @@
 
 # Keep application classes
 -keep class com.example.devmastery.** { *; }
+
+# ─── AndroidX WorkManager ────────────────────────────────────────────────────
+# WorkManager uses Room internally. R8 renames WorkDatabase and related classes
+# causing "Failed to create an instance of class WorkDatabase" at startup.
+-keep class androidx.work.** { *; }
+-keep interface androidx.work.** { *; }
+-keepnames class androidx.work.** { *; }
+
+# WorkManager's ListenableWorker subclasses must be kept by name so the
+# WorkerFactory can instantiate them via reflection.
+-keep public class * extends androidx.work.ListenableWorker {
+    public <init>(android.content.Context, androidx.work.WorkerParameters);
+}
+
+# ─── Room (used internally by WorkManager) ───────────────────────────────────
+-keep class androidx.room.** { *; }
+-keepclassmembers class * extends androidx.room.RoomDatabase {
+    abstract *;
+}
+# Room generates _Impl classes at compile time; keep them by pattern.
+-keep class **_Impl { *; }
+-keep class **_Impl$* { *; }
+
+# ─── AndroidX Startup (InitializationProvider crash) ─────────────────────────
+# The androidx.startup.InitializationProvider is a ContentProvider that
+# bootstraps WorkManager. R8 must not rename or remove it.
+-keep class androidx.startup.** { *; }
+-keep class * implements androidx.startup.Initializer { *; }
+-keepnames class * implements androidx.startup.Initializer
+
+# ─── SQLite / SupportSQLiteDatabase (Room dependency) ────────────────────────
+-keep class androidx.sqlite.** { *; }
+-dontwarn androidx.sqlite.**
