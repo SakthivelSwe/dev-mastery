@@ -54,6 +54,25 @@
 # Keep application classes
 -keep class com.example.devmastery.** { *; }
 
+# ─── WorkManager + Room (androidx.startup auto-init) ───
+# R8 full-mode strips Room's generated *_Impl classes because they are only
+# referenced reflectively by Room.getGeneratedImplementation(). Without these
+# rules the release build crashes at launch with:
+#   "Failed to create an instance of class androidx.work.impl.WorkDatabase"
+# thrown from androidx.startup.InitializationProvider.onCreate.
+-keep class androidx.room.** { *; }
+-dontwarn androidx.room.**
+-keep class * extends androidx.room.RoomDatabase { <init>(); *; }
+-keep class androidx.work.** { *; }
+-dontwarn androidx.work.**
+-keep class androidx.work.impl.WorkDatabase_Impl { *; }
+-keep class androidx.sqlite.** { *; }
+-dontwarn androidx.sqlite.**
+-keep class androidx.startup.** { *; }
+-keep class * implements androidx.startup.Initializer { *; }
+# Belt-and-braces: keep every Room-generated implementation class.
+-keep class **_Impl { *; }
+
 # ─── AndroidX WorkManager ────────────────────────────────────────────────────
 # WorkManager uses Room internally. R8 renames WorkDatabase and related classes
 # causing "Failed to create an instance of class WorkDatabase" at startup.

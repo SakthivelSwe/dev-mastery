@@ -33,7 +33,3 @@ CREATE INDEX IF NOT EXISTS idx_interview_sessions_user_started
 CREATE INDEX IF NOT EXISTS idx_certificates_user_issued
     ON certificates (user_id, issued_at DESC);
 
--- Comments on a topic (public view) — sorted newest first.
--- NOTE: topic_comments uses topic_slug (not topic_id); the covering index
--- idx_tc_topic_slug ON topic_comments (topic_slug, created_at DESC) was already
--- created in V33__topic_comments.sql, so no duplicate index is needed here.

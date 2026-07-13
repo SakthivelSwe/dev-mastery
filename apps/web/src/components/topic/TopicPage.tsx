@@ -19,12 +19,6 @@ import { MarkdownView } from './MarkdownView';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
 import { fetchTopic, markLayerComplete } from '@/lib/api';
-import dynamic from 'next/dynamic';
-
-const DiscussionPanel = dynamic(() => import('@/components/community/DiscussionPanel'), {
-  ssr: false,
-  loading: () => null,
-});
 
 const COLD_START_TIMEOUT_MS = 15_000;
 
@@ -247,12 +241,6 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
         {/* Content */}
         <div className="flex-1 overflow-y-auto px-6 sm:px-8 py-6">
           {renderContent()}
-          {/* Community discussion — lazy loaded below the lesson content */}
-          <DiscussionPanel
-            topicSlug={topicSlug}
-            token={token ?? null}
-            userId={user?.id ?? null}
-          />
         </div>
 
         {/* Footer nav */}
