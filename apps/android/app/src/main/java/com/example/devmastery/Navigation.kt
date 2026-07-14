@@ -3,6 +3,8 @@ package com.example.devmastery
 import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -32,6 +34,16 @@ import com.example.devmastery.quiz.presentation.QuizScreen
 
 @Composable
 fun MainNavigation(deepLinkUri: Uri? = null) {
+    val context = LocalContext.current
+
+    // ── Auto-login: if a JWT is already stored, land on dashboard ──
+    // The AuthInterceptor clears the token on 401, so stale tokens are
+    // cleaned up automatically on the first authenticated request.
+    val startDestination = remember {
+        val app = context.applicationContext as DevMasteryApp
+        if (!app.container.tokenManager.getToken().isNullOrBlank()) "dashboard" else "login"
+    }
+
     val navController = rememberNavController()
 
     // Deep-link handling. Supported URIs:
@@ -59,7 +71,7 @@ fun MainNavigation(deepLinkUri: Uri? = null) {
         }
     }
 
-    NavHost(navController = navController, startDestination = "login") {
+    NavHost(navController = navController, startDestination = startDestination) {
         composable("login") {
             LoginScreen(
                 onLoginSuccess = {

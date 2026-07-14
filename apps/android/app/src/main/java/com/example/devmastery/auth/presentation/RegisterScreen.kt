@@ -2,12 +2,16 @@ package com.example.devmastery.auth.presentation
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -24,11 +28,16 @@ fun RegisterScreen(
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
 
+    val emailFocusRequester = remember { FocusRequester() }
+    val passwordFocusRequester = remember { FocusRequester() }
+
     // Local validation mirrors the web app's Zod rules (registerSchema).
     val nameValid = fullName.trim().length >= 2
     val emailValid = Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(email.trim())
     val passwordValid = password.length >= 8
     val formValid = nameValid && emailValid && passwordValid
+
+    val isLoading = authState is AuthState.Loading
 
     LaunchedEffect(authState) {
         if (authState is AuthState.Success) {
@@ -61,6 +70,13 @@ fun RegisterScreen(
             supportingText = {
                 if (fullName.isNotEmpty() && !nameValid) Text("Please enter your name")
             },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Text,
+                imeAction = ImeAction.Next
+            ),
+            keyboardActions = KeyboardActions(
+                onNext = { emailFocusRequester.requestFocus() }
+            ),
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(modifier = Modifier.height(12.dp))
@@ -73,8 +89,16 @@ fun RegisterScreen(
             supportingText = {
                 if (email.isNotEmpty() && !emailValid) Text("Enter a valid email address")
             },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-            modifier = Modifier.fillMaxWidth()
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Email,
+                imeAction = ImeAction.Next
+            ),
+            keyboardActions = KeyboardActions(
+                onNext = { passwordFocusRequester.requestFocus() }
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(emailFocusRequester)
         )
         Spacer(modifier = Modifier.height(12.dp))
         OutlinedTextField(
@@ -87,8 +111,20 @@ fun RegisterScreen(
                 if (password.isNotEmpty() && !passwordValid) Text("At least 8 characters")
             },
             visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth()
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(
+                onDone = {
+                    if (!isLoading && formValid) {
+                        viewModel.register(fullName.trim(), email.trim(), password)
+                    }
+                }
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(passwordFocusRequester)
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -96,9 +132,9 @@ fun RegisterScreen(
         Button(
             onClick = { viewModel.register(fullName.trim(), email.trim(), password) },
             modifier = Modifier.fillMaxWidth(),
-            enabled = authState !is AuthState.Loading && formValid
+            enabled = !isLoading && formValid
         ) {
-            if (authState is AuthState.Loading) {
+            if (isLoading) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(24.dp),
                     color = MaterialTheme.colorScheme.onPrimary
@@ -122,4 +158,3 @@ fun RegisterScreen(
         }
     }
 }
-

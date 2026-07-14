@@ -33,8 +33,13 @@ class AuthViewModel(
             val result = authRepository.login(email, password)
             result.onSuccess { response ->
                 tokenManager.saveToken(response.token)
-                tokenManager.saveUser(response.user.id, response.user.name, response.user.email)
-                _authState.value = AuthState.Success(response.token, response.user.name)
+                // Use fullName from the fixed UserDto (was 'name' before, causing null crash)
+                tokenManager.saveUser(
+                    response.user.id,
+                    response.user.fullName,
+                    response.user.email
+                )
+                _authState.value = AuthState.Success(response.token, response.user.fullName)
             }.onFailure { error ->
                 _authState.value = AuthState.Error(error.message ?: "An error occurred")
             }
@@ -47,8 +52,13 @@ class AuthViewModel(
             val result = authRepository.register(fullName, email, password)
             result.onSuccess { response ->
                 tokenManager.saveToken(response.token)
-                tokenManager.saveUser(response.user.id, response.user.name, response.user.email)
-                _authState.value = AuthState.Success(response.token, response.user.name)
+                // Use fullName from the fixed UserDto
+                tokenManager.saveUser(
+                    response.user.id,
+                    response.user.fullName,
+                    response.user.email
+                )
+                _authState.value = AuthState.Success(response.token, response.user.fullName)
             }.onFailure { error ->
                 _authState.value = AuthState.Error(error.message ?: "An error occurred")
             }

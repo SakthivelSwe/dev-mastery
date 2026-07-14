@@ -11,14 +11,27 @@ data class RegisterRequest(
     val password: String
 )
 
+/**
+ * Maps to AuthService.UserView on the server:
+ *   record UserView(UUID id, String email, String fullName, List<String> roles)
+ *
+ * NOTE: Gson maps JSON field "fullName" → fullName, "roles" → roles.
+ *       The old "name" field caused silent null deserialization; fixed here.
+ */
 data class UserDto(
     val id: String,
     val email: String,
-    val name: String,
-    val role: String,
-    val xp: Int
-)
+    val fullName: String,
+    val roles: List<String> = listOf("USER")
+) {
+    /** Convenience accessor used by TokenManager and the UI. */
+    val displayName: String get() = fullName
+}
 
+/**
+ * Maps to AuthService.AuthResult on the server:
+ *   record AuthResult(String token, UserView user)
+ */
 data class AuthResponse(
     val token: String,
     val user: UserDto
