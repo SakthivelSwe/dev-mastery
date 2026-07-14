@@ -22,9 +22,9 @@ android {
     versionCode   = 1
     versionName   = "1.0"
 
-    // Backend URL — override in local.properties: API_BASE_URL=http://192.168.x.x:8080
+    // Backend URL — override in local.properties if needed
     buildConfigField("String", "API_BASE_URL",
-      "\"${project.findProperty("API_BASE_URL") ?: "http://10.0.2.2:8080"}\"")
+      "\"${project.findProperty("API_BASE_URL") ?: "https://devmastery-core.onrender.com"}\"")
   }
 
   buildTypes {
