@@ -1,10 +1,12 @@
 package com.devmastery.content.internal;
 
+import com.devmastery.auth.api.AuthService;
 import com.devmastery.common.events.LessonCompletedEvent;
 import com.devmastery.common.exception.ResourceNotFoundException;
 import com.devmastery.config.CacheNames;
 import com.devmastery.content.api.ContentCommandService;
 import com.devmastery.content.api.ContentService;
+import com.devmastery.integration.SoloLevelingWebhookService;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.context.ApplicationEventPublisher;
@@ -36,16 +38,22 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     private final ExternalRunnerLinkBuilder runners;
     private final ApplicationEventPublisher events;
     private final JdbcTemplate jdbc;
+    private final SoloLevelingWebhookService soloLevelingWebhook;
+    private final AuthService authService;
 
     ContentServiceImpl(TopicRepository topics, LessonRepository lessons,
                        LearningPathRepository paths, CodeExampleRepository codeExamples,
                        LessonCompletionRepository completions,
                        ExternalRunnerLinkBuilder runners,
                        ApplicationEventPublisher events,
-                       JdbcTemplate jdbc) {
+                       JdbcTemplate jdbc,
+                       SoloLevelingWebhookService soloLevelingWebhook,
+                       AuthService authService) {
         this.topics = topics; this.lessons = lessons; this.paths = paths;
         this.codeExamples = codeExamples; this.completions = completions;
         this.runners = runners; this.events = events; this.jdbc = jdbc;
+        this.soloLevelingWebhook = soloLevelingWebhook;
+        this.authService = authService;
     }
 
     @Override
@@ -261,12 +269,26 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
     public void completeLesson(UUID userId, UUID lessonId) {
         LessonEntity lesson = lessons.findById(lessonId)
                 .orElseThrow(() -> new ResourceNotFoundException("Lesson not found"));
-        if (completions.findByUserIdAndLessonId(userId, lessonId).isEmpty()) {
+        boolean isNew = completions.findByUserIdAndLessonId(userId, lessonId).isEmpty();
+        if (isNew) {
             completions.save(LessonCompletionEntity.builder()
                     .userId(userId).lessonId(lessonId).build());
         }
         events.publishEvent(new LessonCompletedEvent(
                 userId, lessonId, lesson.getTopicId(), Instant.now()));
+
+        // Notify THE SYSTEM (solo-leveling) asynchronously — fire-and-forget
+        if (isNew) {
+            try {
+                TopicEntity topic = topics.findById(lesson.getTopicId()).orElse(null);
+                if (topic != null) {
+                    AuthService.UserView user = authService.getCurrent(userId);
+                    soloLevelingWebhook.notifyTopicCompleted(user.email(), topic.getId(), topic.getTitle(), topic.getPathId(), 50);
+                }
+            } catch (Exception ex) {
+                log.warn("Could not fire Solo Leveling webhook for userId={}: {}", userId, ex.getMessage());
+            }
+        }
     }
 
     // ─── mappers ───────────────────────────────────────────
