@@ -4,10 +4,10 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useRouter } from 'next/navigation';
-import { ArrowRight, Loader2, Sparkles } from 'lucide-react';
+import { ArrowRight, Loader2, Sparkles, Eye, EyeOff } from 'lucide-react';
 import { loginSchema, fieldErrors } from '@/lib/validation';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || (typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? 'https://devmastery-core.onrender.com' : 'http://localhost:8080');
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
@@ -223,40 +223,59 @@ function Field({
   error?: string;
 }) {
   const errorId = error ? `${label.toLowerCase()}-error` : undefined;
+  const [showPassword, setShowPassword] = useState(false);
+  
+  const isPassword = type === 'password';
+  const inputType = isPassword && showPassword ? 'text' : type;
+
   return (
-    <label className="block">
+    <label className="block relative">
       <span
         className="block mb-1.5 text-[12.5px] font-medium"
         style={{ color: 'var(--text-secondary)' }}
       >
         {label}
       </span>
-      <input
-        type={type}
-        required
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        autoFocus={autoFocus}
-        aria-invalid={!!error}
-        aria-describedby={errorId}
-        className="w-full px-3 py-2.5 rounded-md text-[14px] outline-none transition-all"
-        style={{
-          background: 'var(--bg-inset)',
-          border: `1px solid ${error ? 'var(--error)' : 'var(--border-default)'}`,
-          color: 'var(--text-primary)',
-        }}
-        onFocus={(e) => {
-          e.currentTarget.style.borderColor = 'var(--accent)';
-          e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-ring)';
-        }}
-        onBlur={(e) => {
-          e.currentTarget.style.borderColor = error
-            ? 'var(--error)'
-            : 'var(--border-default)';
-          e.currentTarget.style.boxShadow = 'none';
-        }}
-      />
+      <div className="relative">
+        <input
+          type={inputType}
+          required
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          autoFocus={autoFocus}
+          aria-invalid={!!error}
+          aria-describedby={errorId}
+          className="w-full px-3 py-2.5 rounded-md text-[14px] outline-none transition-all"
+          style={{
+            background: 'var(--bg-inset)',
+            border: `1px solid ${error ? 'var(--error)' : 'var(--border-default)'}`,
+            color: 'var(--text-primary)',
+            paddingRight: isPassword ? '40px' : '12px'
+          }}
+          onFocus={(e) => {
+            e.currentTarget.style.borderColor = 'var(--accent)';
+            e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-ring)';
+          }}
+          onBlur={(e) => {
+            e.currentTarget.style.borderColor = error
+              ? 'var(--error)'
+              : 'var(--border-default)';
+            e.currentTarget.style.boxShadow = 'none';
+          }}
+        />
+        {isPassword && (
+          <button
+            type="button"
+            onClick={() => setShowPassword(!showPassword)}
+            className="absolute right-3 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-[var(--bg-surface)] transition-colors"
+            style={{ color: 'var(--text-secondary)' }}
+            aria-label={showPassword ? "Hide password" : "Show password"}
+          >
+            {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+          </button>
+        )}
+      </div>
       {error && (
         <span
           id={errorId}
