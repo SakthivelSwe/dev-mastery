@@ -15,6 +15,8 @@ import {
   Target,
   Waves,
 } from 'lucide-react';
+import { useAuthStore } from '@/store/useAuthStore';
+import { useEffect, useState } from 'react';
 
 /* ────────────────────────────────────────────────────────────────
    Learning paths — slugs MUST match learning_paths.slug in the DB.
@@ -56,7 +58,7 @@ const LAYERS = [
 /* ────────────────────────────────────────────────────────────────
    Navbar
    ──────────────────────────────────────────────────────────────── */
-function Navbar() {
+function Navbar({ isAuthenticated, mounted }: { isAuthenticated: boolean; mounted: boolean }) {
   return (
     <nav
       className="fixed top-0 left-0 right-0 z-50 border-b backdrop-blur-md"
@@ -94,13 +96,24 @@ function Navbar() {
         </div>
 
         <div className="flex items-center gap-2">
-          <Link href="/login" id="nav-signin" className="btn-quiet">
-            Sign in
-          </Link>
-          <Link href="/dashboard" id="nav-continue" className="btn-primary text-sm px-4 py-2">
-            Open workspace
-            <ArrowRight size={14} />
-          </Link>
+          {!mounted ? (
+            <div className="w-24 h-9 bg-[var(--bg-inset)] rounded-md animate-pulse"></div>
+          ) : isAuthenticated ? (
+            <Link href="/dashboard" id="nav-continue" className="btn-primary text-sm px-4 py-2">
+              Dashboard
+              <ArrowRight size={14} />
+            </Link>
+          ) : (
+            <>
+              <Link href="/login" id="nav-signin" className="btn-quiet">
+                Sign in
+              </Link>
+              <Link href="/register" id="nav-continue" className="btn-primary text-sm px-4 py-2">
+                Create account
+                <ArrowRight size={14} />
+              </Link>
+            </>
+          )}
         </div>
       </div>
     </nav>
@@ -110,7 +123,7 @@ function Navbar() {
 /* ────────────────────────────────────────────────────────────────
    Hero — quiet, no marketing chatter
    ──────────────────────────────────────────────────────────────── */
-function Hero() {
+function Hero({ isAuthenticated, mounted }: { isAuthenticated: boolean; mounted: boolean }) {
   return (
     <section
       id="hero"
@@ -187,11 +200,20 @@ function Hero() {
         </p>
 
         <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-3">
-          <Link href="/dashboard" id="hero-continue" className="btn-primary px-6 py-3">
-            Continue where you left off
-            <ArrowRight size={16} />
-          </Link>
-          <a href="#paths" id="hero-paths" className="btn-ghost px-6 py-3">
+          {!mounted ? (
+            <div className="w-48 h-12 bg-[var(--bg-inset)] rounded-md animate-pulse"></div>
+          ) : isAuthenticated ? (
+            <Link href="/dashboard" className="btn-primary flex items-center gap-2 px-6 py-3 text-[15px]">
+              Continue where you left off
+              <ArrowRight size={16} />
+            </Link>
+          ) : (
+            <Link href="/register" className="btn-primary flex items-center gap-2 px-6 py-3 text-[15px]">
+              Create an account
+              <ArrowRight size={16} />
+            </Link>
+          )}
+          <a href="#paths" className="btn-quiet px-6 py-3 text-[15px]">
             Browse paths
           </a>
         </div>
@@ -398,7 +420,7 @@ function FeaturesSection() {
 /* ────────────────────────────────────────────────────────────────
    Quiet CTA
    ──────────────────────────────────────────────────────────────── */
-function CtaSection() {
+function CtaSection({ isAuthenticated, mounted }: { isAuthenticated: boolean; mounted: boolean }) {
   return (
     <section
       className="py-20 sm:py-28"
@@ -414,13 +436,24 @@ function CtaSection() {
           Your progress, streak, and next topics live in the workspace.
         </p>
         <div className="mt-8 flex flex-col sm:flex-row gap-3 justify-center">
-          <Link href="/dashboard" id="cta-continue" className="btn-primary px-6 py-3">
-            Open workspace
-            <ArrowRight size={16} />
-          </Link>
-          <Link href="/login" id="cta-signin" className="btn-ghost px-6 py-3">
-            Sign in
-          </Link>
+          {!mounted ? (
+            <div className="w-48 h-12 bg-[var(--bg-inset)] rounded-md animate-pulse mx-auto"></div>
+          ) : isAuthenticated ? (
+            <Link href="/dashboard" id="cta-continue" className="btn-primary px-6 py-3">
+              Open workspace
+              <ArrowRight size={16} />
+            </Link>
+          ) : (
+            <>
+              <Link href="/register" id="cta-continue" className="btn-primary px-6 py-3">
+                Create account
+                <ArrowRight size={16} />
+              </Link>
+              <Link href="/login" id="cta-signin" className="btn-ghost px-6 py-3">
+                Sign in
+              </Link>
+            </>
+          )}
         </div>
       </div>
     </section>
@@ -464,16 +497,24 @@ function Footer() {
 /* ────────────────────────────────────────────────────────────────
    Page
    ──────────────────────────────────────────────────────────────── */
-export default function HomePage() {
+export default function LandingPage() {
+  const { isAuthenticated, hydrate } = useAuthStore();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    hydrate();
+    setMounted(true);
+  }, [hydrate]);
+
   return (
     <>
-      <Navbar />
+      <Navbar isAuthenticated={isAuthenticated} mounted={mounted} />
       <main>
-        <Hero />
+        <Hero isAuthenticated={isAuthenticated} mounted={mounted} />
         <PathsSection />
         <MethodSection />
         <FeaturesSection />
-        <CtaSection />
+        <CtaSection isAuthenticated={isAuthenticated} mounted={mounted} />
       </main>
       <Footer />
     </>

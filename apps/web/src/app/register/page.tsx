@@ -72,67 +72,81 @@ export default function RegisterPage() {
       className="min-h-screen flex items-center justify-center px-5 py-12 relative overflow-hidden"
       style={{ background: 'var(--bg-primary)' }}
     >
+      {/* Dynamic Animated Grid Background */}
+      <div 
+        className="absolute inset-0 z-0 pointer-events-none opacity-20"
+        style={{
+          backgroundImage: `
+            linear-gradient(to right, var(--border-default) 1px, transparent 1px),
+            linear-gradient(to bottom, var(--border-default) 1px, transparent 1px)
+          `,
+          backgroundSize: '40px 40px',
+          maskImage: 'radial-gradient(ellipse at center, black, transparent 70%)',
+          WebkitMaskImage: 'radial-gradient(ellipse at center, black, transparent 70%)'
+        }}
+      />
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0"
+        className="pointer-events-none absolute inset-0 z-0 opacity-40 animate-pulse-slow"
         style={{
           background:
-            'radial-gradient(900px 400px at 50% -10%, var(--accent-soft) 0%, transparent 55%)',
+            'radial-gradient(600px circle at 50% 0%, var(--accent-soft) 0%, transparent 60%)',
         }}
       />
 
-      <div className="relative w-full max-w-sm">
+      <div className="relative z-10 w-full max-w-sm flex flex-col items-center">
         <Link
           href="/"
-          className="mb-8 inline-flex items-center gap-2 text-[15px]"
+          className="mb-10 inline-flex items-center gap-2.5 text-[16px] hover:opacity-80 transition-opacity"
           style={{ color: 'var(--text-primary)' }}
         >
           <span
-            className="inline-flex w-7 h-7 rounded-md items-center justify-center"
-            style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+            className="inline-flex w-8 h-8 rounded-lg items-center justify-center shadow-lg shadow-[var(--accent-soft)]"
+            style={{ background: 'var(--accent)', color: 'var(--bg-primary)' }}
           >
-            <Sparkles size={15} />
+            <Sparkles size={16} />
           </span>
-          <span className="font-medium tracking-tight">DevMastery</span>
+          <span className="font-semibold tracking-tight">DevMastery</span>
         </Link>
 
         <div
-          className="rounded-[14px] border p-7"
+          className="w-full rounded-2xl p-8 shadow-2xl backdrop-blur-xl border"
           style={{
-            background: 'var(--bg-surface)',
-            borderColor: 'var(--border-default)',
+            background: 'rgba(255,255,255,0.02)',
+            borderColor: 'rgba(255,255,255,0.08)',
           }}
         >
-          <h1
-            className="mb-1"
-            style={{
-              fontFamily: 'var(--font-display)',
-              fontSize: '1.75rem',
-              lineHeight: 1.15,
-              letterSpacing: '-0.01em',
-            }}
-          >
-            Create your account.
-          </h1>
-          <p className="text-[13.5px]" style={{ color: 'var(--text-secondary)' }}>
-            One workspace for every path you study.
-          </p>
+          <div className="mb-8 text-center">
+            <h1
+              className="mb-2 text-2xl font-bold tracking-tight"
+              style={{
+                fontFamily: 'var(--font-display)',
+                color: 'var(--text-primary)',
+              }}
+            >
+              Create your account
+            </h1>
+            <p className="text-[14px]" style={{ color: 'var(--text-secondary)' }}>
+              One workspace for every path you study.
+            </p>
+          </div>
 
           {error && (
             <div
               role="alert"
-              className="mt-5 px-3 py-2.5 rounded-md text-[13px]"
+              className="mb-6 px-4 py-3 rounded-lg text-[13px] font-medium flex items-start gap-2"
               style={{
-                background: 'rgba(224, 122, 122, 0.08)',
-                border: '1px solid rgba(224, 122, 122, 0.25)',
+                background: 'rgba(224, 122, 122, 0.1)',
+                border: '1px solid rgba(224, 122, 122, 0.3)',
                 color: 'var(--error)',
               }}
             >
-              {error}
+              <div className="mt-0.5">•</div>
+              <div>{error}</div>
             </div>
           )}
 
-          <form onSubmit={handleRegister} className="mt-6 flex flex-col gap-4" noValidate>
+          <form onSubmit={handleRegister} className="flex flex-col gap-5" noValidate>
             <Field
               label="Full name"
               type="text"
@@ -143,7 +157,7 @@ export default function RegisterPage() {
               error={errors.fullName}
             />
             <Field
-              label="Email"
+              label="Email address"
               type="email"
               value={email}
               onChange={setEmail}
@@ -163,17 +177,18 @@ export default function RegisterPage() {
             <button
               type="submit"
               disabled={submitting}
-              className="btn-primary w-full mt-2 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed"
+              className="w-full mt-4 py-3 rounded-xl font-medium text-[15px] flex items-center justify-center gap-2 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-60 disabled:hover:scale-100"
+              style={{ background: 'var(--text-primary)', color: 'var(--bg-primary)' }}
             >
               {submitting ? (
                 <>
-                  <Loader2 size={15} className="animate-spin" />
+                  <Loader2 size={18} className="animate-spin" />
                   Creating account…
                 </>
               ) : (
                 <>
                   Create account
-                  <ArrowRight size={15} />
+                  <ArrowRight size={18} />
                 </>
               )}
             </button>
@@ -181,11 +196,15 @@ export default function RegisterPage() {
         </div>
 
         <p
-          className="mt-6 text-center text-[13px]"
-          style={{ color: 'var(--text-muted)' }}
+          className="mt-8 text-center text-[14px]"
+          style={{ color: 'var(--text-secondary)' }}
         >
           Already have an account?{' '}
-          <Link href="/login" className="font-medium" style={{ color: 'var(--accent)' }}>
+          <Link
+            href="/login"
+            className="font-medium hover:underline underline-offset-4 transition-all"
+            style={{ color: 'var(--text-primary)' }}
+          >
             Sign in
           </Link>
         </p>
