@@ -55,7 +55,7 @@ class TopicEntity {
 
     // ── Fields not present in the V≥5 schema — kept transient so existing code
     //    that touches them still compiles and returns sensible defaults. ─────
-    @Transient private int xpReward;
+    @Column(name = "xp_reward") private int xpReward;
     @Transient private List<String> tags;
     @Transient private String status;
     @Transient private String why;
