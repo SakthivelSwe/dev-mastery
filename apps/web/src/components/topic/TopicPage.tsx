@@ -238,14 +238,17 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
           </button>
         </header>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto px-6 sm:px-8 py-6">
-          {renderContent()}
+        {/* Content with futuristic shell */}
+        <div className="flex-1 overflow-y-auto px-6 sm:px-8 py-6 relative">
+          <div className="absolute inset-0 bg-gradient-radial from-accent/5 to-transparent pointer-events-none opacity-50" />
+          <div className="h-full relative z-10 animate-fade-up border border-transparent shadow-[0_0_15px_rgba(124,143,240,0.05)] rounded-2xl bg-surface/30 backdrop-blur-sm p-1">
+             {renderContent()}
+          </div>
         </div>
 
         {/* Footer nav */}
         <footer
-          className="h-14 flex items-center justify-between px-5 sm:px-6 shrink-0 border-t"
+          className="relative h-14 flex items-center justify-between px-5 sm:px-6 shrink-0 border-t"
           style={{
             background: 'var(--bg-surface)',
             borderColor: 'var(--border-default)',
@@ -261,11 +264,28 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
           </button>
 
           {xpFlash && (
-            <div
-              className="absolute bottom-16 right-32 flex items-center gap-1 text-[13px] font-semibold animate-bounce"
-              style={{ color: 'var(--accent)' }}
-            >
-              <Sparkles size={13} /> +{topic?.xpReward ?? 10} XP
+            <div className="absolute inset-x-0 bottom-full mb-4 flex justify-center animate-fade-up pointer-events-none z-50">
+              <div
+                className="flex items-center gap-3 px-5 py-3 rounded-2xl shadow-glow overflow-hidden relative"
+                style={{
+                  background: 'rgba(8, 10, 16, 0.95)',
+                  border: '1px solid var(--accent)',
+                  backdropFilter: 'blur(10px)',
+                }}
+              >
+                <div className="absolute inset-0 bg-gradient-to-r from-accent/0 via-accent/20 to-accent/0 animate-shimmer" />
+                <div className="relative z-10 flex items-center justify-center w-8 h-8 rounded-full bg-accent/20 text-accent">
+                  <Sparkles size={16} className="animate-pulse" />
+                </div>
+                <div className="relative z-10 flex flex-col">
+                  <span className="text-[14px] font-bold text-white tracking-wide uppercase font-code drop-shadow-[0_0_8px_rgba(255,255,255,0.5)]">
+                    Objective Complete
+                  </span>
+                  <span className="text-[12px] font-medium text-accent">
+                    + {topic?.xpReward || 10} XP Rewarded
+                  </span>
+                </div>
+              </div>
             </div>
           )}
 
