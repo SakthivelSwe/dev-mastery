@@ -39,6 +39,10 @@ class UserEntity {
     @Column(nullable = false)
     private String subscription; // CHECK: 'free' | 'pro'
 
+    /** LeetCode username for auto-sync of solved problems */
+    @Column(name = "leetcode_username")
+    private String leetcodeUsername;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

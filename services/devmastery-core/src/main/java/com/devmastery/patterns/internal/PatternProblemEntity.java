@@ -30,6 +30,12 @@ class PatternProblemEntity {
     @Column(name = "starter_code", columnDefinition = "text")
     private String starterCode;
 
+    @Column(name = "sort_order")
+    private Integer sortOrder;
+
+    @Column(name = "xp_value")
+    private Integer xpValue;
+
     @Column(name = "created_at")
     private Instant createdAt;
 }
