@@ -29,7 +29,7 @@ interface TopicPageProps {
 }
 
 export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: TopicPageProps) {
-  const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted } = useTopicStore();
+  const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted, setCurrentTopic, completedTabs } = useTopicStore();
   const { user, token } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
     topicSlug,
@@ -60,11 +60,13 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
   }, [topicSlug]);
 
   useEffect(() => {
+    // Tell the store which topic is active so completions are persisted per-topic.
+    setCurrentTopic(topicSlug);
     if (initialTopic) { setTopic(initialTopic); return; }
     loadTopic();
     retryRef.current = setTimeout(() => setWaitingTooLong(true), COLD_START_TIMEOUT_MS);
     return () => { if (retryRef.current) clearTimeout(retryRef.current); };
-  }, [topicSlug, initialTopic, loadTopic]);
+  }, [topicSlug, initialTopic, loadTopic, setCurrentTopic]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
   useEffect(() => { startTime.current = Date.now(); }, [activeTab]);
