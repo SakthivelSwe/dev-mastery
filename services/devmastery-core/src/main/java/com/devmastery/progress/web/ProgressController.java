@@ -46,9 +46,9 @@ public class ProgressController {
 
         ProgressService.ProgressSummary updated = progress.summary(userId);
         return ResponseEntity.ok(Map.of(
-                "xpAwarded",      10,
-                "totalXp",        updated.totalXp(),
-                "topicsCompleted",updated.topicsCompleted()
+                "xpAwarded",       10,
+                "totalXp",         updated.xp(),
+                "topicsCompleted", updated.topicsCompleted()
         ));
     }
 
