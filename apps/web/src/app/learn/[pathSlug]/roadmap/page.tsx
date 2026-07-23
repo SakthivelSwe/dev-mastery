@@ -18,7 +18,8 @@ export default function PathRoadmapPage() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+
+    const load = async () => {
       try {
         const data = await fetchRoadmap(pathSlug);
         if (!cancelled && data) setRoadmapData(data as unknown as PathRoadmapResponse);
@@ -27,8 +28,27 @@ export default function PathRoadmapPage() {
       } finally {
         if (!cancelled) setLoading(false);
       }
-    })();
-    return () => { cancelled = true; };
+    };
+
+    load();
+
+    // Refresh when user returns to the tab (e.g., coming back from a topic page)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') load();
+    };
+    const onFocus = () => load();
+    const onProgressUpdate = () => load();
+
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('devmastery:progress-update', onProgressUpdate);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('devmastery:progress-update', onProgressUpdate);
+    };
   }, [pathSlug]);
 
   if (loading) {

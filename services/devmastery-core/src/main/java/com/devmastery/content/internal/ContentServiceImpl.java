@@ -142,7 +142,7 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         try {
             List<UUID> ids = jdbc.query(
                     """
-                    select distinct x.reference_id
+                    select distinct x.reference_id as topic_id
                       from user_xp_events x
                       join topics t on t.id = x.reference_id
                      where x.user_id = ?

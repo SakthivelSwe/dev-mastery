@@ -78,11 +78,15 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
       if (user) await markLayerComplete(user.id, topicSlug, activeTab, timeSpent, token);
       markTabCompleted(activeTab);
 
+      // Trigger topic completion when the user completes spaced-review (the final step).
+      // Also check if all currently-tracked tabs are done (including the one just completed).
       const state = useTopicStore.getState();
       const topicCompletions = state.completionsByTopic[topicSlug] || {};
-      const isAllComplete = Object.values(topicCompletions).every(v => v === true);
+      // Merge the current tab being completed (state update may be async)
+      const updatedCompletions = { ...topicCompletions, [activeTab]: true };
+      const isAllComplete = Object.values(updatedCompletions).every(v => v === true);
 
-      if (isAllComplete && user) {
+      if (user && (activeTab === 'spaced-review' || isAllComplete)) {
         await markTopicComplete(user.id, topicSlug, token);
       }
 
