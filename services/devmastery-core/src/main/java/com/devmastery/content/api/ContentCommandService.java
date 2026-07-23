@@ -12,6 +12,9 @@ public interface ContentCommandService {
     /** Marks a lesson as completed; publishes {@link LessonCompletedEvent}. */
     void completeLesson(UUID userId, UUID lessonId);
 
+    /** Marks a full topic as completed; publishes TopicCompletedEvent if not already completed. */
+    void completeTopic(UUID userId, String topicSlug);
+
     /**
      * Upserts a single topic section (lesson) by topic slug.
      * Creates a new lesson row if one doesn't exist, updates it if it does.

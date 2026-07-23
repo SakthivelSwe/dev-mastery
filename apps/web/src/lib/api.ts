@@ -234,6 +234,28 @@ export async function markLayerComplete(
   }
 }
 
+export async function markTopicComplete(
+  userId: string,
+  topicSlug: string,
+  token?: string | null
+): Promise<boolean> {
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    else if (typeof window !== 'undefined') {
+      const t = localStorage.getItem('auth_token');
+      if (t) headers['Authorization'] = `Bearer ${t}`;
+    }
+    const res = await fetch(`${CONTENT_API}/v1/topics/${topicSlug}/complete`, {
+      method: 'POST',
+      headers,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Spaced Review ─────────────────────────────────────────
 
 export interface ReviewItem {

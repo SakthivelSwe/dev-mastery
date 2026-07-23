@@ -72,4 +72,11 @@ public class ContentController {
             @PathVariable UUID lessonId) {
         commands.completeLesson(userId, lessonId);
     }
+
+    @PostMapping("/topics/{slug}/complete")
+    public void completeTopic(
+            @AuthenticationPrincipal UUID userId,
+            @PathVariable String slug) {
+        commands.completeTopic(userId, slug);
+    }
 }

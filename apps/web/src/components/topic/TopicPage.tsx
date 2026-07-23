@@ -18,7 +18,7 @@ import SpacedReviewWidget from './SpacedReviewWidget';
 import { MarkdownView } from './MarkdownView';
 import { useAiChat } from '@/hooks/useAiChat';
 import type { Topic } from '@/lib/api';
-import { fetchTopic, markLayerComplete } from '@/lib/api';
+import { fetchTopic, markLayerComplete, markTopicComplete } from '@/lib/api';
 
 const COLD_START_TIMEOUT_MS = 15_000;
 
@@ -77,6 +77,15 @@ export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: 
       const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
       if (user) await markLayerComplete(user.id, topicSlug, activeTab, timeSpent, token);
       markTabCompleted(activeTab);
+
+      const state = useTopicStore.getState();
+      const topicCompletions = state.completionsByTopic[topicSlug] || {};
+      const isAllComplete = Object.values(topicCompletions).every(v => v === true);
+
+      if (isAllComplete && user) {
+        await markTopicComplete(user.id, topicSlug, token);
+      }
+
       setXpFlash(true);
       setTimeout(() => setXpFlash(false), 2000);
       if (typeof window !== 'undefined') {

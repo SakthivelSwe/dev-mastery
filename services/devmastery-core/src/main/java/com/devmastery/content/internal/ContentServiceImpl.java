@@ -142,18 +142,17 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         try {
             List<UUID> ids = jdbc.query(
                     """
-                    select up.topic_id
-                      from user_progress up
-                      join topics t on t.id = up.topic_id
-                     where up.user_id = ?
-                       and up.status  = 'completed'
+                    select distinct x.topic_id
+                      from user_xp_events x
+                      join topics t on t.id = x.topic_id
+                     where x.user_id = ?
+                       and x.event_type = 'topic_completed'
                        and t.path_id  = ?
                     """,
                     (rs, i) -> (UUID) rs.getObject("topic_id"),
                     userId, pathId);
             return new HashSet<>(ids);
         } catch (Exception ignored) {
-            // user_progress missing or query failure → treat as no completions
             return Set.of();
         }
     }
@@ -276,15 +275,31 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         }
         events.publishEvent(new LessonCompletedEvent(
                 userId, lessonId, lesson.getTopicId(), Instant.now()));
+    }
 
-        // Notify THE SYSTEM (solo-leveling) asynchronously — fire-and-forget
-        if (isNew) {
+    @Override
+    @Transactional
+    public void completeTopic(UUID userId, String topicSlug) {
+        TopicEntity topic = topics.findBySlug(topicSlug)
+                .orElseThrow(() -> new ResourceNotFoundException("Topic not found: " + topicSlug));
+
+        // Check if already completed to avoid duplicate XP
+        boolean alreadyCompleted = false;
+        try {
+            Integer count = jdbc.queryForObject(
+                    "select count(*) from user_xp_events where user_id = ? and topic_id = ? and event_type = 'topic_completed'",
+                    Integer.class, userId, topic.getId());
+            alreadyCompleted = (count != null && count > 0);
+        } catch (Exception ignored) {}
+
+        if (!alreadyCompleted) {
+            events.publishEvent(new com.devmastery.common.events.TopicCompletedEvent(
+                    userId, topic.getId(), Instant.now()));
+                    
+            // Notify THE SYSTEM (solo-leveling) asynchronously — fire-and-forget
             try {
-                TopicEntity topic = topics.findById(lesson.getTopicId()).orElse(null);
-                if (topic != null) {
-                    AuthService.UserView user = authService.getCurrent(userId);
-                    soloLevelingWebhook.notifyTopicCompleted(user.email(), topic.getId(), topic.getTitle(), topic.getPathId(), 50);
-                }
+                AuthService.UserView user = authService.getCurrent(userId);
+                soloLevelingWebhook.notifyTopicCompleted(user.email(), topic.getId(), topic.getTitle(), topic.getPathId(), 50);
             } catch (Exception ex) {
                 log.warn("Could not fire Solo Leveling webhook for userId={}: {}", userId, ex.getMessage());
             }
