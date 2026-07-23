@@ -294,7 +294,7 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
 
         if (!alreadyCompleted) {
             events.publishEvent(new com.devmastery.common.events.TopicCompletedEvent(
-                    userId, topic.getId(), Instant.now()));
+                    userId, topic.getId(), topicSlug, Instant.now()));
                     
             // Notify THE SYSTEM (solo-leveling) asynchronously — fire-and-forget
             try {

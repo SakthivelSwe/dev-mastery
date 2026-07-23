@@ -114,7 +114,7 @@ class ProgressServiceImpl implements ProgressService {
     public void onTopicCompleted(TopicCompletedEvent event) {
         awardXp(event.userId(), event.topicId(), TOPIC_XP, "topic_completed");
         bumpStreak(event.userId());
-        scheduleInitialReview(event.userId(), event.topicId());
+        scheduleInitialReview(event.userId(), event.topicId(), event.topicSlug());
     }
 
     @Async
@@ -146,10 +146,10 @@ class ProgressServiceImpl implements ProgressService {
         streaks.save(s);
     }
 
-    private void scheduleInitialReview(UUID userId, UUID topicId) {
+    private void scheduleInitialReview(UUID userId, UUID topicId, String topicSlug) {
         if (reviews.findByUserIdAndTopicId(userId, topicId).isPresent()) return;
         reviews.save(SpacedReviewEntity.builder()
-                .userId(userId).topicId(topicId)
+                .userId(userId).topicId(topicId).topicSlug(topicSlug)
                 .easeFactor(2.5).intervalDays(1).repetitions(0)
                 .nextReviewDate(LocalDate.now().plusDays(1)).build());
     }

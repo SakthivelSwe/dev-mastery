@@ -6,5 +6,6 @@ import java.util.UUID;
 public record TopicCompletedEvent(
         UUID userId,
         UUID topicId,
+        String topicSlug,
         Instant occurredAt
 ) { }
