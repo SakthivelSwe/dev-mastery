@@ -93,6 +93,11 @@ interface BackendPath {
   icon: string;
 }
 
+interface RoadmapResponse {
+  path: { slug: string; title: string; totalTopics: number };
+  levels: { topicCount: number; completedCount: number }[];
+}
+
 async function buildDashboard(token: string | null): Promise<DashboardSummary> {
   // Pull progress summary (auth) + path list (public) in parallel.
   const [summaryRes, pathsRes] = await Promise.allSettled([
@@ -110,16 +115,29 @@ async function buildDashboard(token: string | null): Promise<DashboardSummary> {
     paths = pathsRes.value as BackendPath[];
   }
 
-  // Build per-path placeholders. We don't fetch each roadmap here (N+1) —
-  // accurate per-path counts will show up once the user opens that path's
-  // roadmap (which uses the dedicated /v1/paths/{slug}/roadmap endpoint).
-  const pathProgress: PathProgressSummary[] = paths.map(p => ({
-    pathSlug: p.slug,
-    completedTopics: 0,
-    totalTopics: 0,
-    xpEarned: 0,
-    lastStudied: null,
-  }));
+  // Fetch per-path roadmap progress in parallel (with auth so completed flags are populated).
+  // Using allSettled so a single path failure doesn't break the whole dashboard.
+  const roadmapResults = await Promise.allSettled(
+    paths.map(p => authedFetcher(`${CONTENT_API}/v1/paths/${p.slug}/roadmap`, token))
+  );
+
+  const pathProgress: PathProgressSummary[] = paths.map((p, i) => {
+    const res = roadmapResults[i];
+    if (res.status === 'fulfilled') {
+      const roadmap = res.value as RoadmapResponse;
+      const totalTopics = roadmap.path?.totalTopics ??
+        roadmap.levels.reduce((acc, l) => acc + l.topicCount, 0);
+      const completedTopics = roadmap.levels.reduce((acc, l) => acc + l.completedCount, 0);
+      return {
+        pathSlug: p.slug,
+        completedTopics,
+        totalTopics,
+        xpEarned: 0,
+        lastStudied: null,
+      };
+    }
+    return { pathSlug: p.slug, completedTopics: 0, totalTopics: 0, xpEarned: 0, lastStudied: null };
+  });
 
   const totalXp = summary?.totalXp ?? 0;
   return {
@@ -144,7 +162,7 @@ export function useDashboard() {
   const { data, error, isLoading, mutate } = useSWR(
     userId ? ['dashboard', userId, token] : null,
     () => buildDashboard(token),
-    { refreshInterval: 60_000, fallbackData: EMPTY_DASHBOARD, revalidateOnFocus: false }
+    { refreshInterval: 30_000, fallbackData: EMPTY_DASHBOARD, revalidateOnFocus: true }
   );
 
   // Listen for topic completions and immediately revalidate
