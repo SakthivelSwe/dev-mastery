@@ -29,7 +29,7 @@ interface TopicPageProps {
 }
 
 export default function TopicPage({ topicSlug, pathSlug, topic: initialTopic }: TopicPageProps) {
-  const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted, setCurrentTopic, completedTabs } = useTopicStore();
+  const { activeTab, isAiDrawerOpen, toggleAiDrawer, markTabCompleted, setCurrentTopic } = useTopicStore();
   const { user, token } = useAuthStore();
   const { messages, sendMessage, isLoading: aiLoading } = useAiChat({
     topicSlug,

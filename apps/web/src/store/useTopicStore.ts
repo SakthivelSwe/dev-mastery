@@ -27,8 +27,6 @@ interface TopicState {
   currentTopic: string;
   setCurrentTopic: (slug: string) => void;
   setActiveTab: (tab: TabState) => void;
-  /** Computed view: completedTabs for the currently open topic. */
-  completedTabs: Record<TabState, boolean>;
   markTabCompleted: (tab: TabState) => void;
   toggleAiDrawer: () => void;
 }
@@ -52,12 +50,6 @@ export const useTopicStore = create<TopicState>()(
       },
 
       setActiveTab: (tab) => set({ activeTab: tab }),
-
-      /** Returns completedTabs for the currently open topic (or all-false if new). */
-      get completedTabs() {
-        const { completionsByTopic, currentTopic } = get();
-        return completionsByTopic[currentTopic] ?? { ...EMPTY_TABS };
-      },
 
       markTabCompleted: (tab) =>
         set((state) => {

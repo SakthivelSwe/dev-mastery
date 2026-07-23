@@ -20,7 +20,8 @@ const tabs: { id: TabState; label: string; icon: any; est: string }[] = [
 ];
 
 export default function LessonNav() {
-  const { activeTab, setActiveTab, completedTabs } = useTopicStore();
+  const { activeTab, setActiveTab, completionsByTopic, currentTopic } = useTopicStore();
+  const completedTabs = completionsByTopic[currentTopic] || {};
 
   return (
     <div
