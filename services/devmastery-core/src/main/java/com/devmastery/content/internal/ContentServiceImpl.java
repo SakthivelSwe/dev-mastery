@@ -142,9 +142,9 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         try {
             List<UUID> ids = jdbc.query(
                     """
-                    select distinct x.topic_id
+                    select distinct x.reference_id
                       from user_xp_events x
-                      join topics t on t.id = x.topic_id
+                      join topics t on t.id = x.reference_id
                      where x.user_id = ?
                        and x.event_type = 'topic_completed'
                        and t.path_id  = ?
@@ -287,7 +287,7 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         boolean alreadyCompleted = false;
         try {
             Integer count = jdbc.queryForObject(
-                    "select count(*) from user_xp_events where user_id = ? and topic_id = ? and event_type = 'topic_completed'",
+                    "select count(*) from user_xp_events where user_id = ? and reference_id = ? and event_type = 'topic_completed'",
                     Integer.class, userId, topic.getId());
             alreadyCompleted = (count != null && count > 0);
         } catch (Exception ignored) {}

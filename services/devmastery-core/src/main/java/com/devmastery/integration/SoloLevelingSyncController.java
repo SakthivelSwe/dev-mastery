@@ -48,13 +48,13 @@ public class SoloLevelingSyncController {
                 t.title AS "topicTitle",
                 lp.slug AS "pathSlug",
                 uxp.xp_amount AS "xpEarned",
-                uxp.created_at AS "timestamp"
+                uxp.earned_at AS "timestamp"
             FROM user_xp_events uxp
-            JOIN topics t ON t.id = uxp.topic_id
+            JOIN topics t ON t.id = uxp.reference_id
             LEFT JOIN learning_paths lp ON lp.id = t.path_id
             JOIN users u ON u.id = uxp.user_id
             WHERE u.email = ? AND uxp.event_type = 'topic_completed'
-            ORDER BY uxp.created_at ASC
+            ORDER BY uxp.earned_at ASC
         """;
 
         return jdbc.queryForList(sql, email);
