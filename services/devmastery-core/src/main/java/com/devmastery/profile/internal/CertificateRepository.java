@@ -23,5 +23,9 @@ interface CertificateRepository extends JpaRepository<CertificateEntity, UUID> {
     @Modifying
     @Query("UPDATE CertificateEntity c SET c.pdfUrl = :pdfUrl WHERE c.id = :id")
     void updatePdfUrl(@Param("id") UUID id, @Param("pdfUrl") String pdfUrl);
+
+    @Modifying
+    @Query("DELETE FROM CertificateEntity c WHERE c.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 }
 

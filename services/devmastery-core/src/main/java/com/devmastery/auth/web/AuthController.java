@@ -33,6 +33,12 @@ public class AuthController {
         return auth.getCurrent(userId);
     }
 
+    @DeleteMapping("/me")
+    @org.springframework.web.bind.annotation.ResponseStatus(org.springframework.http.HttpStatus.NO_CONTENT)
+    public void deleteMe(@AuthenticationPrincipal UUID userId) {
+        auth.deleteAccount(userId);
+    }
+
     public record RegisterRequest(
             @Email @NotBlank String email,
             @NotBlank @Size(min = 8, max = 100) String password,

@@ -79,6 +79,13 @@ class CertificateServiceImpl implements CertificateService {
                         "Certificate not found: " + credentialId));
     }
 
+    @org.springframework.scheduling.annotation.Async
+    @org.springframework.context.event.EventListener
+    @Transactional
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        repo.deleteByUserId(event.userId());
+    }
+
     // ── helpers ──────────────────────────────────────────────────
 
     private CertificateView toView(CertificateEntity e) {

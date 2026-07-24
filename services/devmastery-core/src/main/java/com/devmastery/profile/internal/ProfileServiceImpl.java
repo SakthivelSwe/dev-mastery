@@ -57,6 +57,16 @@ class ProfileServiceImpl implements ProfileService {
         return url;
     }
 
+    @org.springframework.scheduling.annotation.Async
+    @org.springframework.context.event.EventListener
+    @Transactional
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        profiles.deleteById(event.userId());
+        // TODO: We could also delete the avatar from storage, but leaving it for now
+        // as it might be complex or we want to retain it for some reason, or delete later.
+        // The DB record is gone.
+    }
+
     private ProfileView toView(AuthService.UserView user, UserProfileEntity p) {
         return new ProfileView(user.id(), user.fullName(), user.email(),
                 p.getBio(), p.getAvatarUrl(), p.getGithubUrl(), p.getLinkedinUrl(),

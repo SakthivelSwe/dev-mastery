@@ -17,9 +17,10 @@ class AuthServiceImpl implements AuthService {
     private final UserRepository repo;
     private final PasswordEncoder encoder;
     private final JwtTokenProvider jwt;
+    private final org.springframework.context.ApplicationEventPublisher events;
 
-    AuthServiceImpl(UserRepository repo, PasswordEncoder encoder, JwtTokenProvider jwt) {
-        this.repo = repo; this.encoder = encoder; this.jwt = jwt;
+    AuthServiceImpl(UserRepository repo, PasswordEncoder encoder, JwtTokenProvider jwt, org.springframework.context.ApplicationEventPublisher events) {
+        this.repo = repo; this.encoder = encoder; this.jwt = jwt; this.events = events;
     }
 
     @Override
@@ -51,6 +52,16 @@ class AuthServiceImpl implements AuthService {
     public UserView getCurrent(UUID userId) {
         return repo.findById(userId).map(this::toView)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
+    }
+
+    @Override
+    @Transactional
+    public void deleteAccount(UUID userId) {
+        if (!repo.existsById(userId)) {
+            throw new ResourceNotFoundException("User not found");
+        }
+        repo.deleteById(userId);
+        events.publishEvent(new com.devmastery.common.events.UserDeletedEvent(userId, java.time.Instant.now()));
     }
 
     private AuthResult issue(UserEntity u) {

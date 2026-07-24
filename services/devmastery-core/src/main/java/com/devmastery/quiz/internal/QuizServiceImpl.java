@@ -71,6 +71,13 @@ class QuizServiceImpl implements QuizService {
                 .orElse(2);  // default: Intermediate
     }
 
+    @org.springframework.scheduling.annotation.Async
+    @org.springframework.context.event.EventListener
+    @Transactional
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        difficulties.deleteByIdUserId(event.userId());
+    }
+
     // ── helpers ──────────────────────────────────────────────────
 
     private int updateDifficulty(UUID userId, String topicSlug, int scored, int outOf) {

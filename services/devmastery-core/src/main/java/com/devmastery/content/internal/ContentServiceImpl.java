@@ -306,6 +306,13 @@ class ContentServiceImpl implements ContentService, ContentCommandService {
         }
     }
 
+    @org.springframework.scheduling.annotation.Async
+    @org.springframework.context.event.EventListener
+    @Transactional
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        completions.deleteByUserId(event.userId());
+    }
+
     // ─── mappers ───────────────────────────────────────────
 
     private TopicSummary toSummary(TopicEntity t) {

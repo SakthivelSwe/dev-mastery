@@ -83,6 +83,13 @@ class InterviewServiceImpl implements InterviewService {
         return card;
     }
 
+    @org.springframework.scheduling.annotation.Async
+    @org.springframework.context.event.EventListener
+    @Transactional
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        repo.deleteByUserId(event.userId());
+    }
+
     // ─── JSON helpers (isolated so tests can stub) ──────────────
 
     private static String writeJson(Object o) {

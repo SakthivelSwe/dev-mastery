@@ -15,6 +15,8 @@ public interface AuthService {
 
     UserView getCurrent(UUID userId);
 
+    void deleteAccount(UUID userId);
+
     record AuthResult(String token, UserView user) { }
 
     record UserView(UUID id, String email, String fullName, List<String> roles) { }

@@ -126,6 +126,18 @@ class ProgressServiceImpl implements ProgressService {
         if (award > 0) awardXp(event.userId(), null, award, "quiz_completed");
     }
 
+    @Async
+    @EventListener
+    @Transactional
+    @CacheEvict(value = CacheNames.USER_PROGRESS, key = "#event.userId()")
+    public void onUserDeleted(com.devmastery.common.events.UserDeletedEvent event) {
+        UUID uid = event.userId();
+        xp.deleteByUserId(uid);
+        streaks.deleteByUserId(uid);
+        badges.deleteByUserId(uid);
+        reviews.deleteByUserId(uid);
+    }
+
     private void awardXp(UUID userId, UUID topicId, int amount, String type) {
         xp.save(UserXpEventEntity.builder()
                 .userId(userId).topicId(topicId).xpAmount(amount).eventType(type).build());
