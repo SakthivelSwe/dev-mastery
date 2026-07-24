@@ -6,7 +6,8 @@ import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/shell/Sidebar';
 import { Topbar } from '@/components/shell/Topbar';
 import { CommandPalette } from '@/components/shell/CommandPalette';
-import { Settings, Bell, Shield, Sun, Moon, User, Check, LogOut } from 'lucide-react';
+import { Settings, Bell, Shield, Sun, Moon, User, Check, LogOut, Trash2 } from 'lucide-react';
+import { deleteAccount } from '@/lib/api';
 
 export default function SettingsPage() {
   const router = useRouter();
@@ -14,6 +15,7 @@ export default function SettingsPage() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [dailyGoal, setDailyGoal] = useState(100);
   const [saved, setSaved] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     useAuthStore.getState().hydrate();
@@ -30,6 +32,19 @@ export default function SettingsPage() {
     document.documentElement.setAttribute('data-theme', theme);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!window.confirm("Are you absolutely sure you want to delete your account? This action cannot be undone and all your data will be permanently lost.")) return;
+    setIsDeleting(true);
+    const ok = await deleteAccount();
+    setIsDeleting(false);
+    if (ok) {
+      logout();
+      router.push('/');
+    } else {
+      alert("Failed to delete account. Please try again later.");
+    }
   };
 
   const Section = ({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) => (
@@ -137,7 +152,7 @@ export default function SettingsPage() {
             >
               <button
                 onClick={() => { logout(); router.push('/'); }}
-                className="flex items-center gap-2 text-[13px] px-4 py-2 rounded-md border transition-colors"
+                className="flex items-center gap-2 text-[13px] px-4 py-2 rounded-md border transition-colors w-full"
                 style={{
                   background: 'color-mix(in oklab, var(--error) 8%, transparent)',
                   borderColor: 'color-mix(in oklab, var(--error) 30%, var(--border-default))',
@@ -148,6 +163,30 @@ export default function SettingsPage() {
               >
                 <LogOut size={13} /> Sign out of all devices
               </button>
+
+              <div className="pt-2 border-t" style={{ borderColor: 'var(--border-default)' }}></div>
+
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>Delete account</h3>
+                  <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>Permanently remove your account and all data</p>
+                </div>
+                <button
+                  onClick={handleDeleteAccount}
+                  disabled={isDeleting}
+                  className="flex items-center gap-2 text-[13px] px-4 py-2 rounded-md border transition-colors"
+                  style={{
+                    background: 'var(--bg-elevated)',
+                    borderColor: 'color-mix(in oklab, var(--error) 50%, var(--border-default))',
+                    color: 'var(--error)',
+                    opacity: isDeleting ? 0.5 : 1,
+                  }}
+                  onMouseEnter={(e) => { if (!isDeleting) e.currentTarget.style.background = 'color-mix(in oklab, var(--error) 10%, transparent)'; }}
+                  onMouseLeave={(e) => { if (!isDeleting) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                >
+                  <Trash2 size={13} /> {isDeleting ? 'Deleting...' : 'Delete Account'}
+                </button>
+              </div>
             </Section>
 
             {/* Save */}

@@ -422,3 +422,16 @@ export async function gradeInterviewSession(
     return null;
   }
 }
+
+/** Delete the user's account and all associated data. */
+export async function deleteAccount(token?: string | null): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/v1/auth/me`, {
+      method: 'DELETE',
+      headers: authHeaders(token),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
